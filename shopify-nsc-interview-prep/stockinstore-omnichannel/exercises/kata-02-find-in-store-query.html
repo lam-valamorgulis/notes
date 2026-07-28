@@ -1,0 +1,84 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 02 — Find-in-Store Query API (build from blank)</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Kata 02 · Build from blank · ~25 min</p>
+  <h1>Find-in-Store Query API</h1>
+  <p class="subtitle">The read-path endpoint the product-page widget calls thousands of times: "which stores near me have this SKU, right now?" — fast, cached, and honest about freshness.</p>
+
+  <div class="win">
+    <strong>Do this first:</strong> cover the model answer. 25-minute timer. Clarify, plan, then type it from blank while narrating the latency and caching decisions. Maps to <a href="../lessons/0004-find-in-store-read-path.html">Lesson 4</a>.
+  </div>
+
+  <h2>The prompt</h2>
+  <div class="note">
+    <span class="label">Task</span>
+    "Write the public endpoint <code>GET /find-in-store?sku=&amp;lat=&amp;lng=&amp;radius=&amp;limit=</code> that returns the nearest stores with that SKU's availability state. It's called from the shopper's browser on the product page; keep it under ~100 ms."
+  </div>
+
+  <h2>Step 1 — Clarify out loud</h2>
+  <ul>
+    <li>"This is a <b>read hint</b>, not the buy-time guarantee — so it can be cached and slightly stale (the strict check is at checkout, Kata 03)."</li>
+    <li>"I read a <b>pre-computed <code>availability</code></b> table — the threshold/prediction maths already ran on the write side (Lesson 3). No availability calculation in the request."</li>
+    <li>"Nearest-stores is a <b>geospatial</b> query — spatial index, not a distance loop over every store."</li>
+    <li>"It's a <b>public browser endpoint</b> — public per-merchant key, CORS, rate limit; return a <b>state + age</b>, not a bare number."</li>
+  </ul>
+
+  <h2>Step 2 — Say the plan</h2>
+  <div class="diagram">
+  1. Cache key = (sku, coarse area e.g. postcode/geohash). Hit -> return (a few ms).
+  2. Miss -> single-flight rebuild: geospatial KNN over locations
+            JOIN pre-computed availability, LIMIT N, on a read replica.
+  3. Cache the result with a short TTL; return state + updated-age per store.
+  </div>
+
+  <h2>Step 3 — Build it (open your editor)</h2>
+  <div id="recall"></div>
+
+  <h2>The traps this kata tests</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>Why it fails</th></tr>
+    <tr><td>Computing availability in the request</td><td>Couples every page view to your heaviest logic and the write DB. Pre-compute on write; read a stored state.</td></tr>
+    <tr><td>Distance loop over all stores</td><td>Doesn't scale. Use a spatial index (PostGIS GiST + <code>&lt;-&gt;</code> KNN, or Redis GEO).</td></tr>
+    <tr><td>Caching on exact lat/lng</td><td>Every shopper gets a unique key → ~0% hit rate. Round to postcode/geohash so an area shares one entry.</td></tr>
+    <tr><td>No single-flight on miss</td><td>A hot SKU expiring lets thousands of requests rebuild the same key at once (thundering herd).</td></tr>
+    <tr><td>Returning a bare quantity</td><td>Loses the honesty rule. Return a state (in_stock / call_to_confirm / …) and an age.</td></tr>
+    <tr><td>Reading the write primary</td><td>Product-page traffic then competes with ingestion. Read a replica.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    "Display is a cached hint, so I read a pre-computed availability table off a replica, find nearest stores with a spatial index, and cache on (SKU, coarse area) with a short TTL and single-flight rebuild. I return a state and an age, never a bare number — the guarantee happens at checkout, not here."
+  </div>
+
+  <h2>Say how you'd test it</h2>
+  <ul>
+    <li>Second identical request in the same area → served from cache (fast, no DB).</li>
+    <li>Store with no coordinates → excluded, query doesn't crash on NULL.</li>
+    <li>No stores in radius → widen once, then "ships from warehouse", never an empty crash.</li>
+    <li>Concurrent misses on one key → one rebuild, others wait (single-flight).</li>
+  </ul>
+
+  <nav class="footer-nav">
+    <a href="kata-01-inventory-upsert.html">← Kata 01 · Inventory upsert</a>
+    <a href="kata-03-click-collect-reservation.html">Next → Kata 03 · Click &amp; Collect reservation</a>
+  </nav>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderRecall('#recall', [
+    {
+      prompt: "MODEL ANSWER — reveal after your own attempt. TypeScript (Express-style) + PostGIS + Redis.",
+      answer: "<pre style='white-space:pre-wrap'>app.get('/find-in-store', rateLimit(), async (req, res) =&gt; {\n  const { sku } = req.query;\n  const lat = Number(req.query.lat), lng = Number(req.query.lng);\n  const radius = Number(req.query.radius ?? 50000), limit = Number(req.query.limit ?? 5);\n\n  // 1. Cache key on a COARSE area so nearby shoppers share one entry.\n  const area = geohash(lat, lng, 5);            // ~5-char precision ≈ suburb\n  const key = `fis:${sku}:${area}:${radius}:${limit}`;\n\n  const cached = await redis.get(key);\n  if (cached) return res.json(JSON.parse(cached));   // hit: a few ms\n\n  // 2. Miss -> single-flight so a hot key rebuilds once, not N times.\n  const result = await singleFlight(key, async () =&gt; {\n    // Geospatial KNN + JOIN to PRE-COMPUTED availability, on the REPLICA.\n    const rows = await replica.query(\n      `SELECT s.location_id, s.name,\n              ST_Distance(s.geog, ST_MakePoint($2,$1)::geography) AS metres,\n              a.state, a.qty_shown, a.computed_at\n         FROM locations s\n         JOIN availability a\n           ON a.location_id = s.location_id AND a.sku = $3\n        WHERE s.active\n          AND ST_DWithin(s.geog, ST_MakePoint($2,$1)::geography, $4)\n        ORDER BY s.geog &lt;-&gt; ST_MakePoint($2,$1)::geography\n        LIMIT $5`,\n      [lat, lng, sku, radius, limit]);\n\n    return {\n      sku,\n      stores: rows.map(r =&gt; ({\n        id: r.location_id, name: r.name,\n        distance_km: Math.round(r.metres / 100) / 10,\n        state: r.state,                         // NOT a bare number\n        qty_shown: r.qty_shown,\n        updated_min_ago: minutesSince(r.computed_at),\n      })),\n    };\n  });\n\n  // 3. Short TTL: it's a hint, and the strict check is at checkout.\n  await redis.set(key, JSON.stringify(result), 'EX', 60);\n  res.json(result);\n});</pre><b>Why it wins:</b> no availability maths in the request (reads the pre-computed <code>availability</code> table), a <b>spatial index</b> via <code>ST_DWithin</code> + <code>&lt;-&gt;</code> KNN, a cache keyed on a <b>coarse area</b> so an entire suburb shares one entry, <b>single-flight</b> against the thundering herd, reads on the <b>replica</b>, a short <b>TTL</b> because it's a hint, and a response of <b>state + age</b> not a raw count. Public endpoint is rate-limited and (not shown) CORS-scoped to the storefront with a public merchant key."
+    },
+    {
+      prompt: "Q: 'Why cache on postcode/geohash instead of exact coordinates?'",
+      answer: "Exact lat/lng makes almost every request a unique key, so the cache hit rate is near zero and the cache is useless. Rounding to a <b>coarse area</b> (a geohash prefix or postcode) means every shopper in that area shares one cached answer — so the hot, popular queries are served from memory in a few milliseconds and the database only rebuilds once per area per TTL. It trades a little geographic precision (which doesn't matter for 'stores near you') for a huge hit-rate gain."
+    }
+  ]);
+</script>

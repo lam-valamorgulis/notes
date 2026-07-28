@@ -1,0 +1,192 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 — Webhooks Done Right</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 2 · Day 1 · Shopify from the server side</p>
+  <h1>Webhooks Done Right</h1>
+  <p class="subtitle">This is the classic "show me you can build backend integrations" question. Get the four rules right and you sound senior instantly.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> confidently answer <em>"How do you build a <b>reliable</b> Shopify webhook handler?"</em> — with the four rules, out loud, in under a minute.
+  </div>
+
+  <p class="small">Ties to your <a href="../MISSION.md">mission</a>: the JD is a Shopify + Node.js backend role syncing store data to other systems (ERP/CRM). Webhooks are how that sync starts. This is a guaranteed question.</p>
+
+  <h2>1. What a webhook is (and why it beats polling)</h2>
+  <p>A <a href="../reference/glossary.html#webhook">webhook</a> is an HTTP <code>POST</code> that Shopify sends to <em>your</em> server the moment something happens — an order is created, a product is updated, a customer is deleted. You subscribe to a <b>topic</b> (like <code>orders/create</code>) and give Shopify a URL. Shopify calls that URL with the event data as JSON.</p>
+  <p>The alternative is <b>polling</b>: your app asks "any new orders?" every minute, forever. Polling wastes rate-limit budget, adds delay, and misses nothing only if you never stop. Webhooks flip it: Shopify pushes the event to you the instant it happens. Push beats pull for freshness and cost.</p>
+  <div class="note">
+    <span class="label">Say this</span>
+    <b>Webhooks are push; polling is pull.</b> I use webhooks for near-real-time events and keep polling only as a backup safety net.
+  </div>
+
+  <h2>2. The four rules of a reliable handler</h2>
+  <p>Almost every webhook bug comes from breaking one of these four rules. Memorise them as a list — interviewers love a numbered answer.</p>
+
+  <h3>Rule 1 — Verify HMAC on the RAW body</h3>
+  <p>Anyone can <code>POST</code> to your URL. To prove a request is really from Shopify, you verify its <a href="../reference/glossary.html#hmac">HMAC</a>. Compute <b>HMAC-SHA256</b> over the <b>raw request body</b> using your app's <b>client secret</b>, then compare the result to the <code>X-Shopify-Hmac-SHA256</code> header. If they do not match, reject with <code>401</code>.</p>
+  <div class="trap">
+    <span class="label">The #1 mistake</span>
+    You must hash the <b>raw bytes</b> of the body, <b>before</b> any JSON parsing. If your framework auto-parses the body (e.g. <code>express.json()</code>), the re-serialized JSON differs from the original bytes and the HMAC will never match. Capture the raw body first.
+  </div>
+
+  <h3>Rule 2 — Respond 200 inside the 5-second budget</h3>
+  <p>Shopify has a <b>1-second connection timeout</b> and a <b>5-second total timeout</b>. If you do not return <code>200 OK</code> in time, Shopify treats it as a failure and retries. So your handler must be fast: verify, accept, and reply. Do <b>not</b> call the ERP, resize an image, or run a long database job before you answer.</p>
+
+  <h3>Rule 3 — Be idempotent (dedupe on the webhook id)</h3>
+  <p>Shopify may deliver the same event more than once (that is normal for at-least-once delivery). Your handler must be <a href="../reference/glossary.html#idempotency">idempotent</a>: processing the same event twice has the same effect as once. Use the <code>X-Shopify-Webhook-Id</code> header as the <a href="../reference/glossary.html#idempotency-key">idempotency key</a> — store seen ids and skip any you have already handled.</p>
+
+  <h3>Rule 4 — Do the real work asynchronously via a queue</h3>
+  <p>Because of Rule 2, the handler cannot do slow work inline. So it pushes a job onto a <a href="../reference/glossary.html#queue">queue</a> (SQS, RabbitMQ) and returns <code>200</code> at once. A separate <b>worker</b> picks up the job later and does the heavy lifting: transform the data, call the ERP, retry on failure. This is the "ack fast, process later" pattern.</p>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Name the four rules from memory before scrolling.</div>
+
+  <h2>3. Retries and auto-removal</h2>
+  <p>If your endpoint fails or times out, Shopify <b>retries up to 8 times over roughly 4 hours</b> with growing gaps (<a href="../reference/glossary.html#backoff">backoff</a>). This is why idempotency matters — a retry of an event you already processed must not create a second order in your ERP.</p>
+  <div class="trap">
+    <span class="label">The scary part</span>
+    If deliveries keep failing, Shopify eventually <b>auto-removes the subscription</b>. Then you silently stop receiving that event. Monitor delivery failures, and use reconciliation (next section) so a removed subscription does not quietly break your sync.
+  </div>
+
+  <h2>4. Ack fast, process later — the flow</h2>
+  <div class="diagram">Shopify event (orders/create)
+        |
+        v  POST + X-Shopify-Hmac-SHA256 + X-Shopify-Webhook-Id
+  +----------------------------+
+  |  Your webhook endpoint     |
+  |  1. verify HMAC (raw body) |
+  |  2. dedupe on webhook-id   |
+  |  3. enqueue job            |
+  |  4. return 200  (&lt; 5s)     |
+  +----------------------------+
+        |
+        v
+  [ Queue: SQS / RabbitMQ ] --(on repeated failure)--> [ DLQ ]
+        |
+        v
+  +----------------------------+
+  |  Worker (background)       |
+  |  transform + retry/backoff |
+  +----------------------------+
+        |
+        v
+  [ ERP / CRM sync ]</div>
+
+  <p>The queue also gives you a <a href="../reference/glossary.html#dlq">dead-letter queue (DLQ)</a>: after a worker fails a job too many times, the message goes to the DLQ so you can inspect it instead of losing it.</p>
+
+  <h2>5. The ack-then-enqueue handler (pseudo-code)</h2>
+  <pre><code>app.post('/webhooks/orders-create',
+  rawBody(),                         // keep the raw bytes
+  (req, res) =&gt; {
+    const digest = hmacSha256(req.rawBody, CLIENT_SECRET);
+    if (!safeEqual(digest, req.header('X-Shopify-Hmac-SHA256')))
+      return res.status(401).end();  // Rule 1: not from Shopify
+
+    const id = req.header('X-Shopify-Webhook-Id');
+    if (seen.has(id)) return res.status(200).end(); // Rule 3: dedupe
+
+    queue.enqueue({ id, topic: 'orders/create', body: req.rawBody });
+    seen.add(id);
+    return res.status(200).end();    // Rule 2 + 4: ack fast, work later
+  });</code></pre>
+  <p>Notice what the handler does <b>not</b> do: it never talks to the ERP. That job belongs to the worker.</p>
+  <div class="trap">
+    <span class="label">Senior talking point — the in-memory Set is a demo shortcut</span>
+    In production the dedupe store must be shared and durable — a unique key in Postgres or Redis — not an in-memory <code>Set</code>, or a restart or a second instance re-processes events. The <code>const seen = new Set()</code> above only works for one process that never restarts; say this out loud when you show this code.
+  </div>
+
+  <h2>6. Reconciliation — the safety net</h2>
+  <p>Webhooks can be missed: your server was down, a subscription was auto-removed, or a rare event never arrived. So a mature integration also runs a scheduled <a href="../reference/glossary.html#reconciliation">reconciliation job</a>. On a timer (say hourly), it re-reads the source of truth from Shopify's Admin API — "give me all orders changed since the last sync" — and fixes anything the webhooks missed. Webhooks give speed; reconciliation gives correctness.</p>
+
+  <h2>7. How this feeds an ERP/CRM sync</h2>
+  <p>Put it together and you have the exact system this job builds: Shopify emits an event, your endpoint verifies and enqueues it, a worker maps Shopify fields to the ERP's shape and calls the ERP API with its own retries, and a nightly reconciliation job repairs any gaps. Loose coupling, survives spikes, safe to retry.</p>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (memorise the shape)</span>
+    <p>"I follow four rules. One: verify the HMAC-SHA256 over the raw body with the app secret before parsing. Two: return 200 inside Shopify's 5-second budget. Three: be idempotent — dedupe on the X-Shopify-Webhook-Id header so retries are safe. Four: do the real work asynchronously — enqueue a job and let a worker call the ERP. Shopify retries about 8 times over 4 hours and removes a subscription that keeps failing, so I also run a reconciliation job to catch missed events."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Instant feedback. Then say each answer out loud.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read this one)</h2>
+  <p>📖 <a href="https://shopify.dev/docs/apps/build/webhooks">Shopify — Build webhooks</a>. The canonical guide: HMAC verification, the timeout and retry behaviour, duplicate detection via the webhook id, and the "acknowledge fast, process async" best practice. Read the "Best practices" section twice.<sup><a href="#c1">[1]</a></sup></p>
+
+  <p class="small" id="c1">[1] Verified against shopify.dev, API version 2026-07 (checked 2026-07-09): verify HMAC-SHA256 over the raw body with the client secret vs the <code>X-Shopify-Hmac-SHA256</code> header; 1s connection / 5s total timeout; up to 8 retries over ~4 hours; subscription auto-removed after repeated failures; dedupe via <code>X-Shopify-Webhook-Id</code>; handlers must be idempotent; acknowledge fast then process via a queue; run reconciliation for missed events.</p>
+
+  <h2>Exit task — type it from a blank file</h2>
+  <div class="note">
+    <span class="label">Live-coding muscle (do this before "next lesson")</span>
+    Open an empty file and type the handler from memory: verify HMAC-SHA256 on the <b>raw body</b> → return <code>200</code> fast → enqueue the job (no ERP call inline). Do not peek. When done, compare it to the §5 pseudo-code above. Say out loud the one line about why the dedupe store must be shared and durable, not an in-memory <code>Set</code>.
+  </div>
+
+  <div class="tip"><span class="label">You've got it when…</span>you can name the four rules with the tab closed, type the verify → ack 200 → enqueue handler from a blank file, and explain why the in-memory <code>Set</code> would break on a restart or a second instance.</div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the raw-body trick in real Express or a NestJS guard? Or how the worker should map an order into an ERP payload? Just ask. When you're ready, say <b>"next lesson"</b> and I'll open <b>Lesson 3 — App Auth: Session Tokens &amp; Token Exchange</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../lessons/0001-shopify-two-apis-and-rate-limits.html">← Lesson 1: Two APIs</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="../lessons/0003-app-auth-session-tokens-token-exchange.html">Next: Lesson 3 — App Auth →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "To verify a Shopify webhook, you compute the HMAC over what exactly?",
+      options: ["The raw request body", "The parsed JSON body", "The saved event body", "The plain request URL"],
+      answer: 0,
+      why: "Compute HMAC-SHA256 over the raw request body with your app's client secret, before any JSON parsing, then compare to the X-Shopify-Hmac-SHA256 header."
+    },
+    {
+      q: "How quickly must your endpoint return 200 to Shopify?",
+      options: ["Within five seconds only", "Within ten minutes only", "Within one hour only", "Within one day only"],
+      answer: 0,
+      why: "Shopify has a 1-second connection timeout and a 5-second total timeout. Miss it and Shopify treats the delivery as failed and retries."
+    },
+    {
+      q: "How do you recognise a repeated webhook so you can skip it?",
+      options: ["Check the webhook id header", "Check the current server clock", "Check the total payload size", "Check the network round trip"],
+      answer: 0,
+      why: "Shopify sends X-Shopify-Webhook-Id. Store the ids you have handled and skip duplicates — this is what makes the handler idempotent."
+    },
+    {
+      q: "To keep the response fast, you should do the real work:",
+      options: ["later inside a queue worker", "first inside the same handler", "twice across two more servers", "again after every retry cycle"],
+      answer: 0,
+      why: "Acknowledge fast with 200, then process asynchronously: enqueue a job and let a background worker call the ERP. This meets the 5-second budget."
+    },
+    {
+      q: "If your endpoint keeps failing to respond, Shopify will eventually:",
+      options: ["retry then drop the hook", "email then page your team", "pause then wait one week", "cache then merge each event"],
+      answer: 0,
+      why: "Shopify retries about 8 times over ~4 hours, then auto-removes (drops) the subscription. That is why you also run a reconciliation job."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: How do you build a reliable Shopify webhook handler?",
+      answer: "I follow four rules. <b>One:</b> verify the HMAC-SHA256 over the <b>raw</b> body with the app secret, before parsing, against the <code>X-Shopify-Hmac-SHA256</code> header. <b>Two:</b> return <code>200</code> inside Shopify's 5-second timeout. <b>Three:</b> be <b>idempotent</b> — dedupe on <code>X-Shopify-Webhook-Id</code> so retries are safe. <b>Four:</b> do the real work <b>asynchronously</b> — enqueue a job and let a worker do it. I also run a reconciliation job to catch anything missed."
+    },
+    {
+      prompt: "Q: Why acknowledge fast and process later instead of doing the work inline?",
+      answer: "Shopify only waits ~5 seconds and retries on timeout. If I call the ERP inline, a slow ERP makes me miss the budget, Shopify retries, and I risk duplicate work. So I verify, enqueue, and return <code>200</code> immediately. A background <b>worker</b> then does the heavy work with its own retries and <a href='../reference/glossary.html#backoff'>backoff</a>, and failed jobs land in a <a href='../reference/glossary.html#dlq'>DLQ</a> for inspection."
+    },
+    {
+      prompt: "Q: Webhooks can be missed. How do you guarantee your ERP stays correct?",
+      answer: "Webhooks give speed but are best-effort — a subscription can be auto-removed after repeated failures, or my server could be down. So I add a scheduled <a href='../reference/glossary.html#reconciliation'>reconciliation job</a> that re-reads the source of truth from the Admin API (for example, orders changed since the last sync) and repairs any gaps. Webhooks for freshness, reconciliation for correctness."
+    }
+  ]);
+</script>

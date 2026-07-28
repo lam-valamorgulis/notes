@@ -1,0 +1,78 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 05 — Retry &amp; Dead-Letter Queue (build from blank)</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Kata 05 · Build from blank · ~25 min</p>
+  <h1>Retry &amp; Dead-Letter</h1>
+  <p class="subtitle">A sync worker that never gives up will hammer a broken ERP forever; one that gives up too easily loses data. This kata is the reliability layer between those two failures: bounded retry with backoff, then a dead-letter queue.</p>
+
+  <div class="win">
+    <strong>Do this first:</strong> cover the model answer. This kata is about <em>what happens when the write keeps failing</em> — the exact reliability instinct this role is hiring for. Narrate every decision.
+  </div>
+
+  <h2>The prompt</h2>
+  <div class="note">
+    <span class="label">Task</span>
+    "Your ERP write can fail transiently (network blip) or permanently (a malformed order the ERP rejects). Make the worker resilient: retry the transient failures, but don't lose or infinitely retry the permanent ones."
+  </div>
+
+  <h2>Step 1 — Clarify out loud</h2>
+  <ul>
+    <li>"Two failure kinds. <b>Transient</b> (timeout, 503) → retry with <b>backoff</b>. <b>Permanent</b> (400 bad data) → retrying won't help, so send it to the <b>dead-letter queue</b> immediately."</li>
+    <li>"Retries need a <b>cap</b> (say 5) and <b>exponential backoff with jitter</b>, so I don't stampede a recovering ERP."</li>
+    <li>"After the cap, the message goes to a <b>DLQ</b> — not dropped — so a human can inspect and replay it. I alert on DLQ depth."</li>
+  </ul>
+
+  <h2>Step 2 — Say the plan</h2>
+  <div class="diagram">
+  try the ERP write
+   ├─ success                     -> ack, done
+   ├─ permanent error (4xx bad)   -> send to DLQ now (retry is pointless)
+   └─ transient error (timeout/5xx)
+        ├─ attempts &lt; MAX -> wait backoff(attempt) + jitter, retry
+        └─ attempts = MAX -> send to DLQ, alert
+  </div>
+
+  <h2>Step 3 — Build it (open your editor)</h2>
+  <div id="recall"></div>
+
+  <h2>The traps this kata tests</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>Why it fails</th></tr>
+    <tr><td>Retrying a permanent (400) error</td><td>Malformed data will fail the same way every time. Retrying 5x just wastes 5x the calls and delays the DLQ. Detect permanent errors and DLQ them at once.</td></tr>
+    <tr><td>Fixed-delay retries with no backoff</td><td>If the ERP is down, every worker retrying every 1s becomes a stampede that stops it recovering. Back off exponentially.</td></tr>
+    <tr><td>Backoff with no jitter</td><td>Without jitter, all workers retry at the same instants — a synchronized thundering herd. Add randomness.</td></tr>
+    <tr><td>No cap — retry forever</td><td>One poison message blocks the worker and fills logs forever. Cap attempts, then DLQ.</td></tr>
+    <tr><td>Dropping the message after max retries</td><td>Silently discarding = data loss. The DLQ keeps it for inspection and replay. Losing an order is the one unforgivable outcome.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    "I split failures into transient and permanent. Transient ones retry with exponential backoff and jitter, capped at five attempts, so I never stampede a recovering ERP. Permanent ones and anything past the cap go to a dead-letter queue — never dropped — and I alert on DLQ depth so I find out before the client does."
+  </div>
+
+  <p class="small">Note: managed queues (SQS, RabbitMQ, BullMQ) give you retry + DLQ as config. Knowing the <em>mechanism</em> — as in this kata — is what lets you configure them correctly and explain them.</p>
+
+  <nav class="footer-nav">
+    <a href="kata-04-nestjs-orders-module.html">← Kata 04 · NestJS module</a>
+    <a href="README.md">Back to the katas →</a>
+  </nav>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderRecall('#recall', [
+    {
+      prompt: "MODEL ANSWER — reveal after your own attempt. TypeScript + NestJS (@nestjs/bullmq).",
+      answer: "<pre style='white-space:pre-wrap'>// 1. Retry + backoff are DECLARED when you register the queue.\n@Module({\n  imports: [\n    BullModule.registerQueue({\n      name: 'orders',\n      defaultJobOptions: {\n        attempts: 5,                                   // cap the retries\n        backoff: { type: 'exponential', delay: 1000 }, // 1s,2s,4s,8s...\n        removeOnComplete: true,\n      },\n    }),\n    BullModule.registerQueue({ name: 'orders-dlq' }),  // the dead-letter queue\n  ],\n})\nexport class OrdersQueueModule {}\n\n// 2. The processor. Throwing = retry. UnrecoverableError = stop retrying now.\n@Processor('orders')\nexport class OrdersProcessor extends WorkerHost {\n  constructor(@InjectQueue('orders-dlq') private readonly dlq: Queue) { super(); }\n\n  async process(job: Job&lt;OrderCreateJob&gt;): Promise&lt;void&gt; {\n    try {\n      await writeToErp(job.data.order);\n    } catch (err) {\n      if (isPermanent(err)) {\n        // Bad data (400) — retrying is pointless. Stop immediately.\n        throw new UnrecoverableError('ERP rejected the order');\n      }\n      throw err;   // transient — let BullMQ retry with backoff\n    }\n  }\n\n  // 3. When retries are exhausted (or unrecoverable), dead-letter it.\n  @OnWorkerEvent('failed')\n  async onFailed(job: Job&lt;OrderCreateJob&gt;, err: Error) {\n    const exhausted = job.attemptsMade &gt;= (job.opts.attempts ?? 1);\n    if (exhausted || err instanceof UnrecoverableError) {\n      await this.dlq.add('dead', { data: job.data, reason: err.message });\n      // metric on DLQ depth -> alert; message kept for inspection + replay\n    }\n  }\n}</pre><b>Why it wins (NestJS idioms):</b> retry count and <b>exponential backoff</b> are <b>configuration</b> (<code>attempts</code> + <code>backoff</code>), not a hand-rolled loop; a permanent error throws <code>UnrecoverableError</code> so BullMQ stops retrying at once; and the <code>@OnWorkerEvent('failed')</code> handler moves exhausted jobs to a real <b>dead-letter queue</b> — never dropped. You alert on DLQ depth.<br><br><b>Say out loud:</b> \"BullMQ gives me retry and backoff declaratively, so I don't hand-roll the loop. I add jitter via a custom backoff strategy to avoid a thundering herd, throw <code>UnrecoverableError</code> for bad data, and dead-letter anything that exhausts its attempts so nothing is silently lost.\""
+    },
+    {
+      prompt: "Q: 'Why not just retry every failure until it works?'",
+      answer: "Two reasons. First, some failures are <b>permanent</b> — a malformed order the ERP will reject every time — so retrying wastes calls and delays handling it; I detect those and dead-letter them immediately. Second, unbounded retries on a <b>transient</b> outage become a <b>stampede</b> that stops the ERP recovering, and one poison message would block the worker forever. So I cap attempts with <b>exponential backoff and jitter</b>, and after the cap the message goes to a <b>dead-letter queue</b> for inspection and replay — never dropped."
+    }
+  ]);
+</script>

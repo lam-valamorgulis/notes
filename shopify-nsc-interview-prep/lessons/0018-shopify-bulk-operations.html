@@ -1,0 +1,175 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 18 — Shopify Bulk Operations</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 18 · Day 1 · Shopify from the server side</p>
+  <h1>Bulk Operations</h1>
+  <p class="subtitle">How Shopify hands you huge datasets without hitting the rate limit — a job, a file, and a sorting trick.</p>
+
+  <div class="win">
+    <strong>Your win:</strong> answer <em>"How do bulk operations actually return data, and when do you use them?"</em> — clearly, out loud.
+  </div>
+
+  <p class="small">Ties to your <a href="../MISSION.md">mission</a>: this is the standard way to do the <b>initial full import</b> in a Shopify↔ERP sync (<a href="./0005-shopify-integration-patterns.html">L5</a>, <a href="./0011-system-design-shopify-erp-sync.html">L11</a>) and the answer to <em>"export a million products"</em>.</p>
+
+  <p class="small">Why this lesson is here: it is a Day-1 insert, so its number (18) is out of order. Read it right after the Shopify core lessons; the footer sends you back to L6.</p>
+
+  <h2>1. The one idea: a job, not a request</h2>
+  <p>A normal GraphQL query is a <b>request</b> — you ask, you get data back right away. A <b><a href="../reference/glossary.html#bulk-ops">bulk operation</a> is a job</b> — you start it, Shopify works in the background, and later gives you a <b>file</b> to download. Lock that in; everything else follows from it.</p>
+
+  <div class="note">
+    <span class="label">The warehouse picture</span>
+    A <b>normal query</b> is asking a clerk at the counter for a few items — fast, but ask for too much and they say "slow down" (the <a href="../reference/glossary.html#query-cost">rate limit</a>). A <b>bulk operation</b> is handing the warehouse a big order form: they pack it in the back (no clerk, no limit) and later give you <b>one big box</b> plus a <b>pickup slip</b> (a download link).
+  </div>
+
+  <h2>2. The four steps</h2>
+  <div class="diagram">1. START    bulkOperationRunQuery(query: "...")   → job created
+2. WAIT     currentBulkOperation { status url }    → CREATED → RUNNING → COMPLETED
+3. DOWNLOAD when COMPLETED, GET the `url`          → one JSONL file
+4. SORT     read the file line by line             → rebuild your data</div>
+  <p>Start, wait, download, sort. Note: a bulk query has <b>no <code>first:</code> arguments</b> inside it — the whole point is that it fetches <em>everything</em>, not one page.</p>
+
+  <h3>Start the job</h3>
+  <pre><code>mutation {
+  bulkOperationRunQuery(query: """
+    { orders { edges { node {
+        id name createdAt
+        lineItems { edges { node { id name quantity } } }
+    } } } }
+  """) {
+    bulkOperation { id status }
+    userErrors { field message }
+  }
+}</code></pre>
+
+  <h3>Check on it</h3>
+  <pre><code>query {
+  currentBulkOperation {
+    status        # CREATED → RUNNING → COMPLETED (or FAILED / CANCELED)
+    objectCount   # running total of records processed
+    url           # the JSONL download link, once COMPLETED (expires in 7 days)
+  }
+}</code></pre>
+  <p>Poll every few seconds — <b>or</b> subscribe to the <code>bulk_operations/finish</code> webhook so Shopify tells you when it's done instead of you asking.</p>
+
+  <h2>3. What's in the box: JSONL + <code>__parentId</code></h2>
+  <p>The file is <b>JSONL</b> — "JSON Lines" — <b>one record per line</b>, not one big nested object. Here's the part everyone forgets: the box is <b>loose</b>. An order and its line items are <b>not</b> packed together. Each line item is its own line, with a <b>sticky note</b> — the <code>__parentId</code> field — saying which order it belongs to:</p>
+  <pre><code>{"id":"gid://shopify/Order/1001","name":"#1001"}
+{"id":"gid://shopify/LineItem/55","name":"Backpack","quantity":2,"__parentId":"gid://shopify/Order/1001"}
+{"id":"gid://shopify/LineItem/56","name":"Bottle","quantity":1,"__parentId":"gid://shopify/Order/1001"}
+{"id":"gid://shopify/Order/1002","name":"#1002"}</code></pre>
+  <p>So <b>you</b> do the sorting: read each line and use <code>__parentId</code> to put line items back under their order. Shopify emits children right after their parent, so a common pattern is: hold the current parent, attach the child lines that follow, and flush when the next parent appears.</p>
+
+  <div class="trap">
+    <span class="label">Stream it — don't load it all</span>
+    The file can be gigabytes. Never <code>JSON.parse</code> the whole thing — you'll run out of memory. <b>Read one line, handle it, drop it.</b> Memory stays flat no matter how big the store. This is the "export a million products" answer.
+  </div>
+
+  <div class="recall">
+    <span class="label">Recall — cover the page</span>
+    Say it out loud before you scroll: in the JSONL file, how do you know which order a line item belongs to?
+  </div>
+
+  <h2>4. When to use it (and when not to)</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Use a bulk operation</th><th>Use a normal query</th></tr>
+    <tr><td>Export/import huge datasets</td><td>Fetch one order by id</td></tr>
+    <tr><td>Initial full ERP/CRM import</td><td>A small, quick read</td></tr>
+    <tr><td>Nightly "all products" job</td><td>Live request in a page</td></tr>
+    <tr><td>Avoiding the rate-limit bucket</td><td>You need the data instantly</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this</span>
+    <p>"A bulk operation is an async job. I start it with <code>bulkOperationRunQuery</code>, poll <code>currentBulkOperation</code> (or use the finish webhook) until it's <code>COMPLETED</code>, then download a JSONL file from the <code>url</code>. The file is flattened — children like line items carry a <code>__parentId</code>, so I stream it line by line and re-group children under their parent. That keeps memory flat and avoids the rate-limit bucket, which is why it's right for large exports and the initial ERP sync."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Options shuffle each time, so read them fresh.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source</h2>
+  <p>📖 <a href="https://shopify.dev/docs/api/usage/bulk-operations/queries">Shopify — Bulk operations (queries)</a>: the official guide to <code>bulkOperationRunQuery</code>, polling, and the JSONL result with <code>__parentId</code>. Skim it once; the JSONL example is the key part.</p>
+
+  <p class="small" id="c1">Verified against shopify.dev, Admin API 2026-07 (checked 2026-07-09): <code>bulkOperationRunQuery</code> returns results as a JSONL file; <code>currentBulkOperation</code> exposes <code>status</code>, <code>objectCount</code>, <code>rootObjectCount</code>, <code>url</code>, and <code>partialDataUrl</code>; <code>url</code> expires after 7 days; child records are linked by <code>__parentId</code>.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can say the start → poll → download → stream-and-regroup sequence and explain <code>__parentId</code> without looking.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the <code>bulkOperationRunMutation</code> version for bulk <em>writes</em>? Or a small Node snippet that streams the JSONL and re-groups by <code>__parentId</code>? Just ask. Then say <b>"next lesson"</b> to continue to <b>L6 — Node.js async</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="./0005-shopify-integration-patterns.html">← L5 · Integration patterns</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="./0006-nodejs-async-event-loop.html">Next: L6 · Node.js async →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "A bulk operation is best described as:",
+      options: ["A background export job", "A normal instant query", "A webhook event stream", "A theme rendering call"],
+      answer: 0,
+      why: "It's an asynchronous job that runs in the background and returns a file — not an instant response like a normal query."
+    },
+    {
+      q: "When the job finishes, what do you get?",
+      options: ["A JSONL file link", "A single JSON object", "A paginated edges list", "A live websocket stream"],
+      answer: 0,
+      why: "Shopify gives you a `url` to download a JSONL file (one record per line). It is not returned inline like a normal query."
+    },
+    {
+      q: "In the result file, a line item is linked to its order by:",
+      options: ["The __parentId field", "A nested array", "The order cursor", "A foreign key"],
+      answer: 0,
+      why: "Children are flattened onto their own lines and carry a __parentId pointing to the parent's id. You re-group them yourself."
+    },
+    {
+      q: "You read the result file line by line because:",
+      options: ["The file can be huge", "JSON arrays are banned", "It avoids the cost", "Cursors expire fast"],
+      answer: 0,
+      why: "The file may be gigabytes. Streaming one line at a time keeps memory flat, no matter how large the dataset is."
+    },
+    {
+      q: "You reach for a bulk operation when:",
+      options: ["Exporting or importing huge datasets", "Fetching one order by id", "Rendering a product on theme", "Sending a single webhook payload"],
+      answer: 0,
+      why: "Bulk operations are for very large reads/writes (exports, the initial ERP import). For small, instant reads, use a normal query."
+    },
+    {
+      q: "To check the job's progress you query:",
+      options: ["currentBulkOperation for status", "recentOrders for status", "shopStatus for status", "jobQueue for status"],
+      answer: 0,
+      why: "currentBulkOperation returns the status (RUNNING/COMPLETED/…) and, once done, the url to download the JSONL file."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: How do bulk operations actually return data?",
+      answer: "They don't return data inline — a bulk operation is an <b>async job</b>. I start it with <code>bulkOperationRunQuery</code>, poll <code>currentBulkOperation</code> (or use the finish webhook) until <code>COMPLETED</code>, then download a <b>JSONL file</b> from the <code>url</code>. I <b>stream the file line by line</b> and re-group child records under their parents."
+    },
+    {
+      prompt: "Q: In the JSONL file, how do you know which order a line item belongs to, and why does that matter?",
+      answer: "Each child record (like a line item) is its own line and carries a <code>__parentId</code> field pointing to its parent's id. It matters because the file is <b>flattened</b> — you don't get a tidy nested <code>order.lineItems</code> array, so you must <b>rebuild the structure yourself</b> using <code>__parentId</code> as you stream."
+    },
+    {
+      prompt: "Q: Why use a bulk operation instead of a normal paginated query?",
+      answer: "For very large data, a paginated loop is slow and burns the <b>rate-limit bucket</b>. A bulk operation runs one background job and returns a file, so it <b>sidesteps rate limits</b>, and streaming the file keeps <b>memory flat</b>. I use it for big exports and the <b>initial full import</b> into an ERP/CRM."
+    }
+  ]);
+</script>

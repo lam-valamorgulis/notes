@@ -1,0 +1,122 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 — System-Design Interview: "Design stockinstore"</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 10 · The interview · Capstone</p>
+  <h1>System-Design Interview: "Design stockinstore"</h1>
+  <p class="subtitle">The whole course in one answer. This is the rehearsal script for "design an omnichannel stock and click-and-collect platform" — run it end to end, out loud, then handle the follow-ups.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> deliver the full design in seven moves — clarify, draw the architecture, walk the three flows, defend reliability, scale it, break it, and summarise — and answer the deep "why?" follow-ups without hesitating. Everything here is a synthesis of Lessons 1–9.
+  </div>
+
+  <p class="small">This mirrors your round-1 "Shopify ↔ ERP sync" design, pointed at the omnichannel domain. Same seven-step shape; new content.</p>
+
+  <h2>1. Clarify first (never skip)</h2>
+  <p>Ask before you draw. The answers reshape the design, and asking is the senior signal.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Ask</th><th>Why it changes the design</th></tr>
+    <tr><td>How many retailers, stores, SKUs? Franchise?</td><td>Sets multi-tenancy, the number of feeds, and whether sources are heterogeneous (many POS types).</td></tr>
+    <tr><td>How do stores feed stock — webhook, API, file?</td><td>Push/pull/file each have different freshness and different ingestion code (L2).</td></tr>
+    <tr><td>Which features — Find in Store, C&amp;C, Ship from Store?</td><td>Read-only display is far simpler than reservations + allocation. Scope it.</td></tr>
+    <tr><td>Freshness &amp; latency targets?</td><td>Near-real-time display vs strict buy-time; the product-page latency budget (L4).</td></tr>
+    <tr><td>Traffic shape — sale-day spikes?</td><td>Drives queueing, caching, and horizontal scaling (L7, L9).</td></tr>
+    <tr><td>Cost / SLA budget?</td><td>Decides how much cache, replica, and redundancy you buy, and how often reconciliation full-reads run (they cost API budget).</td></tr>
+  </table>
+  </div>
+  <p><b>Lead with the core constraint.</b> Before the boxes, name the one hard truth (from Lesson 1): <em>"I don't own the stock and can never fully trust the number a store gives me — it's external, uncertain, and often stale. So the whole design is about managing that uncertainty without overselling."</em> Every choice below is a response to that sentence.</p>
+  <div class="note">
+    <span class="label">Working assumptions for this answer</span>
+    ~30 retailers; a franchise with ~400 stores across 3 POS types + head-office ERP; Find in Store + Click &amp; Collect + Ship from Store; near-real-time display (seconds–minutes), strict at purchase; heavy product-page reads with sale-day spikes. Must never oversell a Click &amp; Collect pickup.
+  </div>
+
+  <h2>2. The architecture (one whiteboard)</h2>
+  <div class="diagram">   WRITE PATH (stock in)                        READ PATH (shopper)
+   POS/ERP ─push/pull/file─► INGESTION edge      shopper product page
+   (per store)   verify→[ingestion queue]→        │ widget "near me?" (L4)
+        ▲          normalise→idempotent upsert     ▼
+        │ write-back      │                    cache + edge ──miss──► replica
+        │ (stock+finance  ▼                        ▲  reads
+        │  L8)      inventory_levels ─► AVAILABILITY (L3) ┘ (pre-computed state)
+        │                                     threshold/buffer/predict
+        │
+        │   ORDER PATH (buy)
+        │   Shopify webhooks ─► [order/event queue] ─► workers (L7)
+        │        (orders/create,       │  outbox → event bus (fan-out):
+        │         fulfillment_orders/*)│  cache-invalidate · notify · analytics
+        │                              ▼
+        └──── reserve (L5, strong) ─► allocate (OMS, L6) ─► fulfillmentOrderMove
+                   all multi-tenant (retailer_id) · observability/SLOs (L9)</div>
+  <p class="small">Two <em>separate</em> queues: an <b>ingestion queue</b> (edge → normalise worker, on the write path) and an <b>order/event queue</b> (fed by Shopify webhooks, on the order path). They don't share capacity — that's why a feed flood never slows checkout.</p>
+
+  <h2>3. Walk the three flows</h2>
+  <ol>
+    <li><b>Stock in (write path).</b> POS/ERP feeds arrive push/pull/file → verify + enqueue → normalise (map codes, convert units) → idempotent, version-guarded upsert into <code>inventory_levels</code> → the availability engine recomputes a safe <code>state</code> — <code>available = on_hand − reserved − buffer</code>, gated by a threshold, then decayed for staleness — and stores it. Reconciliation re-reads full snapshots to repair drift. <span class="small">(L2, L3)</span></li>
+    <li><b>Shopper read (read path).</b> The widget asks "nearest N stores with SKU X" → a geospatial query (PostGIS KNN) joined to the pre-computed <code>availability</code> → served from cache/edge on a read replica, under ~100 ms. Display is a hint with an age. <span class="small">(L4)</span></li>
+    <li><b>Buy (order path).</b> Click &amp; Collect: carry the chosen store to checkout → re-check + atomic reserve → Shopify pickup order (PICK_UP fulfillment order, <code>committed</code>) → pick task → notify → fulfil + release. Ship from Store: the OMS scores stores (coverage × proximity × fairness) and places the work with <code>fulfillmentOrderMove</code>, reassigning on rejection. <span class="small">(L5, L6)</span></li>
+  </ol>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: the seven steps, and the three flows with the one hard thing each must get right (idempotent upsert / fast cached read / atomic reserve).</div>
+
+  <h2>4. Reliability (the part they push on)</h2>
+  <ul>
+    <li><b>At-least-once everywhere</b> → idempotent consumers keyed on event id; the timestamp/version guard handles ordering. Exactly-once <em>effect</em>, not exactly-once delivery. <span class="small">(L7)</span></li>
+    <li><b>Transactional outbox</b> so a DB write and its event can't drift apart. <span class="small">(L8)</span></li>
+    <li><b>Reconciliation</b> re-reads sources to catch missed events; Shopify webhooks can be dropped and even auto-removed after prolonged failure, so never rely on the stream alone. <span class="small">(L2, L7)</span></li>
+    <li><b>Strong consistency only where needed</b> — the reservation is one atomic guarded row update on the primary; everything else is eventually consistent. <span class="small">(L8)</span></li>
+  </ul>
+
+  <h2>5. Scale, watch, and cost</h2>
+  <p>Three workloads, three axes: <b>reads</b> scale with cache + edge + replicas; <b>writes</b> with more queue workers + per-source partitions; <b>orders</b> stay correct because contention is normally isolated to one <code>(location, SKU)</code> row — with a hot SKU at one store handled as a genuine hotspot (tiny lock, retry on the row), not scaled away. Multi-tenant: <code>retailer_id</code> everywhere with row-level security, per-tenant rate limits and queue partitions so no retailer is a noisy neighbour, and outbound calls respect Shopify's per-shop API budget. <span class="small">(L9)</span></p>
+  <p><b>Observability:</b> "how do I know it's healthy?" — I watch a few SLIs against SLOs and page on error-budget burn: feed age per store, queue depth vs lag, DLQ depth, read p95, reservation-reject rate, and a lagging "availability accuracy" that ties back to the core promise. <b>Cost:</b> strong consistency is confined to one cheap row; a split shipment costs an extra parcel (so I prefer one store); and reconciliation full-reads run off-peak to bound API spend. <span class="small">(L9, L6, L2)</span></p>
+
+  <h2>6. Break it (failure modes)</h2>
+  <p>Name the top ones and the defence for each: stale feed → conservative availability + alert; duplicate event → idempotent no-op; SKU off a full feed → zero it; store rejects → reassign, capped; abandoned reservation → TTL release; spike → queue + workers; hot product → single-flight cache; one tenant floods → per-tenant limits. <span class="small">(L2, L3, L5, L6, L7, L9)</span></p>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the whole design, ~90 seconds — lead with the constraint)</span>
+    <p>"The one hard truth is that I don't own the stock and can't fully trust the number a store gives me — it's external, uncertain, and stale — so the whole design manages that uncertainty without overselling. I split the system into a write path, a read path, and an order path. On the write path, POS/ERP feeds arrive by webhook, poll, or file; I verify, enqueue, normalise, and do an idempotent, version-guarded upsert into a canonical inventory table. An availability engine then turns each raw count into a safe state — on_hand minus reserved and a buffer, gated by a threshold, decayed for staleness. On the read path, the Find-in-Store widget asks 'nearest stores with this SKU'; I answer with a geospatial query joined to the pre-computed availability, served from cache and a read replica under about a hundred milliseconds, as a hint with an age. On the order path, buying turns the hint into a guarantee: Click &amp; Collect carries the chosen store to checkout, re-checks, and reserves atomically on a single row, then places a Shopify pickup order, sends a pick task, and notifies the customer. Ship from Store scores candidate stores on coverage, proximity, and fairness, places the work with fulfillmentOrderMove, and reassigns if a store can't deliver. It's glued together by events with at-least-once delivery, so consumers are idempotent, a transactional outbox keeps writes and events in step, and reconciliation repairs anything the stream drops. The only strongly-consistent operation is the reservation — one atomic guarded update on the primary — everything else is eventually consistent because feeds lag. It's multi-tenant with retailer_id and row-level security, the three workloads scale on separate axes, I watch SLIs against SLOs, and every component degrades gracefully so a failure loses one feature, not the platform."</p>
+  </div>
+
+  <h2>7. The deep follow-ups (drill these)</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>They ask…</th><th>Crisp answer</th></tr>
+    <tr><td>"Two shoppers, one last unit — what stops a double-sell?"</td><td>A single guarded <code>UPDATE ... WHERE on_hand - reserved - buffer >= qty</code> on the primary; 0 rows ⇒ refuse. Row lock serialises them. (L5/L8)</td></tr>
+    <tr><td>"The POS number is 6 hours old — what do you show?"</td><td>Decay it by the store's rolling sell rate × <em>trading</em> hours since the reading — decay only ever <em>lowers</em>, never raises, because I can't see returns/restock until the next feed; gate on threshold; fall back to 'call to confirm' when too stale. The strict reservation at purchase is the real guarantee. (L3)</td></tr>
+    <tr><td>"A store's POS feed dies for a day."</td><td>That store degrades to 'call to confirm' + alert; reconciliation repairs on recovery. Other stores are unaffected. (L3/L2)</td></tr>
+    <tr><td>"(Separately) your ingest endpoint is down for hours — what about the webhooks?"</td><td>Shopify retries ~8×/4h, then auto-removes <em>Admin-API-created</em> subscriptions (app-specific ones aren't removed), so I detect the removal and re-subscribe, then reconcile the gap. (L7)</td></tr>
+    <tr><td>"The widget is public browser JS — how is your API secured?"</td><td>Public, read-only endpoint; per-merchant <em>public</em> key (no secrets in the browser); CORS to the storefront origin; per-key and per-IP rate limits because it's scrapeable. (L4)</td></tr>
+    <tr><td>"How do a DB write and its event stay in sync?"</td><td>Transactional outbox — event row committed in the same transaction; a relay publishes at-least-once. (L8)</td></tr>
+    <tr><td>"One store has 2 of 3 items — how do you fulfil?"</td><td>Prefer one store that has all 3; else split — <code>fulfillmentOrderMove</code> a subset, Shopify leaves the rest in a <code>remainingFulfillmentOrder</code>. (L6)</td></tr>
+    <tr><td>"Why not just push all stock into Shopify and use its inventory?"</td><td>You can (model each store as a Location), but your source of truth is external POS stock Shopify can't see, so you own availability + reservation and use Shopify for the order. (L2/L5/L8)</td></tr>
+    <tr><td>"A viral product page — does stock sync slow down?"</td><td>No — reads run on cache + replica, writes on a separate worker pool; the paths don't share capacity. (L4/L9)</td></tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can run the seven steps in ~6 minutes on a whiteboard, draw the one architecture from memory, deliver the summary in about 90 seconds (leading with the uncertainty constraint), and field every row of the follow-up table with the right lesson behind it.
+  </div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 This lesson synthesises Lessons 1–9 of this sub-course — follow any citation there for the primary source.<br>
+  📖 <a href="../../lessons/0011-system-design-shopify-erp-sync.html">Main course L11 — Shopify ↔ ERP sync design</a> — the seven-step framework this mirrors.<br>
+  📖 <a href="../../reference/system-design-cheatsheet.html">Main course — System Design Cheat Sheet</a> — the general design vocabulary.</p>
+
+  <p class="small" id="c1">[1] This is a synthesis lesson; all factual claims (stockinstore behaviour and Shopify mechanics) are cited and verified in the source lessons L1–L9. Numbers in the assumptions and latency budget are illustrative interview figures.</p>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want me to run this as a live mock (I ask, you answer, I push on the "why?"), or time you through the seven steps? Just ask. When you're ready, say <b>"next"</b> to move on to the <b>katas</b> — where you type these ideas from a blank file.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0009-scale-multitenancy-failure-modes.html">← Prev: Scale &amp; Failure</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="../exercises/kata-01-inventory-upsert.html">Next: Kata 01 →</a>
+  </div>
+</div>

@@ -1,0 +1,215 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14 — Testing &amp; Quality</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 14 · Day 3 · Breadth</p>
+  <h1>Testing &amp; Quality</h1>
+  <p class="subtitle">You are light on backend testing — so learn the shape, the words, and one good story. That is enough to sound senior here.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> confidently answer <em>"How do you test a backend plus Shopify integration?"</em> — the test pyramid, how you mock Shopify, and how you prove idempotency — out loud, in under a minute.
+  </div>
+
+  <p class="small">Ties to your <a href="../MISSION.md">mission</a>: the JD wants a senior who ships safe code. You do not need to be a testing expert — you need a clear mental model and the right vocabulary. That is what this lesson gives you.</p>
+
+  <h2>1. The test pyramid — and why it is a pyramid</h2>
+  <p>The <b>test pyramid</b> is a simple rule for <em>how many</em> of each kind of test to write. Many small tests at the bottom, fewer big tests at the top.</p>
+
+  <div class="diagram">        /\
+       /  \      few   →  End-to-end (E2E): whole system, real browser/HTTP
+      /----\
+     /      \    some  →  Integration: your code + DB / queue / HTTP
+    /--------\
+   /          \  many  →  Unit: one function, no I/O, milliseconds
+  /------------\</div>
+
+  <p>Why this shape? It is about <b>speed, cost, and how clearly a failure points at the bug</b>:</p>
+  <ul>
+    <li><b>Unit tests</b> are fast (milliseconds) and cheap. When one fails, you know exactly which function broke.</li>
+    <li><b>Integration tests</b> are slower and need real dependencies (a database, a queue). They catch bugs at the seams between parts.</li>
+    <li><b>E2E tests</b> are slowest and most brittle. One failure can mean anything, and they are painful to debug. So you keep only a few, for the most important flows.</li>
+  </ul>
+
+  <div class="trap">
+    <span class="label">The anti-pattern to name</span>
+    The <b>"ice-cream cone"</b>: mostly slow E2E and manual tests, few unit tests. It is slow, flaky, and expensive to keep. Saying you avoid this shows you have felt the pain.
+  </div>
+
+  <h2>2. What to UNIT test</h2>
+  <p>Unit tests are for <b>pure logic</b> — code that takes input and returns output with no database, no network, no clock. In a Shopify integration, the highest-value unit tests are:</p>
+  <ul>
+    <li><b>Business rules</b> — "apply this discount", "is this order eligible for sync", "which tier is this customer".</li>
+    <li><b>Data transforms</b> — turning a Shopify order into your internal shape, formatting money, mapping statuses.</li>
+    <li><b>The ERP mapping</b> — the function that converts a Shopify product/order into the exact fields the ERP or CRM expects. This is where silent bugs hide, so test it hard: missing SKU, null address, a currency you did not expect.</li>
+  </ul>
+  <div class="tip">
+    <span class="label">Why this matters for you</span>
+    The mapping layer is <b>your</b> code, not Shopify's. It is easy to test (input JSON → expected object) and it is exactly where integration bugs live. If you only unit test one thing, test the mapping.
+  </div>
+
+  <h2>3. INTEGRATION tests — the seams</h2>
+  <p>Integration tests check that your code works with a <b>real dependency</b>, not a fake. They are slower, so you write fewer of them, but they catch what unit tests cannot:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Dependency</th><th>What the integration test proves</th></tr>
+    <tr><td><b>Database</b></td><td>Your query, schema, and migration actually work. Run against a real Postgres in Docker, not a mock.</td></tr>
+    <tr><td><b>Queue</b></td><td>A job you push to the <a href="../reference/glossary.html#queue">queue</a> is picked up and processed once. Retries and the dead-letter path behave.</td></tr>
+    <tr><td><b>HTTP / API</b></td><td>Your client sends the right request and parses the real response shape (headers, pagination, errors).</td></tr>
+  </table>
+  </div>
+  <p>A common, cheap way to get a real database in tests is a throwaway container (for example <b>Testcontainers</b>, or a Postgres service in CI). The test spins it up, runs, and throws it away.</p>
+
+  <h2>4. Testing a Shopify integration WITHOUT hitting Shopify</h2>
+  <p>This is the part interviewers love, because it separates people who have done it from people who have not. You <b>never call the real Shopify API in a test</b> — it is slow, rate-limited, and not repeatable. Instead:</p>
+
+  <h3>a) Mock the Admin API</h3>
+  <p>Intercept the outgoing HTTP call and return a canned response. In Node you use a tool like <b><a href="https://github.com/nock/nock">nock</a></b> (intercepts at the HTTP layer) or <b><a href="https://mswjs.io/">msw</a></b> (Mock Service Worker). Your code thinks it called Shopify; really it got your fixture.</p>
+  <pre><code>// Mock the Admin API with nock — no real network call
+nock('https://my-shop.myshopify.com')
+  .post('/admin/api/2026-07/graphql.json')
+  .reply(200, { data: { order: { id: 'gid://shopify/Order/123' } } });
+
+const result = await syncOrderToErp('123');
+expect(result.erpId).toBe('ERP-123');</code></pre>
+
+  <h3>b) Use recorded webhook fixtures</h3>
+  <p>Save a real Shopify webhook body once as a JSON file (a "fixture"). Then your tests feed that fixture to your handler again and again. No waiting for Shopify to send a real event.</p>
+
+  <h3>c) Test your HMAC verification with a known secret and body</h3>
+  <p>Your webhook endpoint must verify the <a href="../reference/glossary.html#hmac">HMAC</a> signature. You can test this fully offline: take a known secret, a fixed raw body, compute the expected signature yourself, and assert your verifier accepts it — and <b>rejects a tampered body</b>.</p>
+  <pre><code>const secret = 'test_secret';
+const body = '{"id":123}';
+const good = crypto.createHmac('sha256', secret)
+  .update(body).digest('base64');
+
+expect(verify(body, good, secret)).toBe(true);   // real signature passes
+expect(verify(body, 'AAAA', secret)).toBe(false); // fake signature fails</code></pre>
+
+  <div class="recall">
+    <span class="label">Recall — cover the page</span>
+    Say the 3 ways to test a Shopify integration without calling Shopify out loud before you scroll back up.
+  </div>
+
+  <h2>5. Testing IDEMPOTENCY and RETRIES</h2>
+  <p>Shopify can send the <b>same webhook more than once</b>, and your queue will retry failed jobs. So your handler must be <a href="../reference/glossary.html#idempotency">idempotent</a>: running it twice must have the <b>same single effect</b> as running it once.</p>
+  <p>The test is beautifully simple — <b>send the same webhook twice and assert one effect</b>:</p>
+  <pre><code>const event = loadFixture('order-created.json'); // same X-Shopify-Webhook-Id
+
+await handleWebhook(event);
+await handleWebhook(event); // duplicate delivery
+
+const rows = await db.orders.count({ shopifyId: 123 });
+expect(rows).toBe(1); // exactly one order, not two</code></pre>
+  <div class="note">
+    <span class="label">Say the mechanism, not just the word</span>
+    Idempotency is usually done with an <a href="../reference/glossary.html#idempotency-key">idempotency key</a> — store the <code>X-Shopify-Webhook-Id</code>, and skip the work if you have seen it. Testing retries is the same idea: run the job twice and assert the outcome is identical.
+  </div>
+
+  <h2>6. TDD in one paragraph</h2>
+  <p><b>Test-Driven Development (TDD)</b> is a loop: <b>red → green → refactor</b>. First write a small failing test (red). Then write the least code to make it pass (green). Then clean up the code while the test stays green (refactor). Repeat. The point is not the tests themselves — it is that writing the test first forces you to design a clear, testable interface and gives you a safety net to refactor without fear.</p>
+
+  <h2>7. Coverage — a target, not a rule</h2>
+  <p>Coverage is the percent of your code lines that tests run. A common target is <b>around 80%</b>. But the senior point is this:</p>
+  <div class="soundbite">
+    <span class="label">Say it like this (the mature take)</span>
+    <p>"I aim for about 80% coverage, but I test behavior, not lines. 100% coverage can still miss the bug that matters, and testing the last few lines is usually wasted effort. I put my tests where the risk is — the ERP mapping, HMAC verification, and idempotency."</p>
+  </div>
+
+  <h2>8. Tests run in CI on every push</h2>
+  <p>None of this helps if tests only run on your laptop. They must run in <a href="../reference/glossary.html#cicd">CI/CD</a> automatically on every push and every pull request. A red build blocks the merge. That is how the team keeps quality without trusting memory.</p>
+  <div class="soundbite">
+    <span class="label">The full 30-second answer (memorise the shape)</span>
+    <p>"I follow the test pyramid: many unit tests for pure logic like my ERP mapping and data transforms, some integration tests for the database, queue and HTTP, and a few end-to-end tests for the critical flows. I never call the real Shopify API in tests — I mock the Admin API with nock or msw, replay recorded webhook fixtures, and test HMAC verification with a known secret and body. I prove idempotency by sending the same webhook twice and asserting one effect. I aim for around 80% coverage on behavior, and everything runs in CI on every push."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Instant feedback. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source</h2>
+  <p>📖 <a href="https://martinfowler.com/articles/practical-test-pyramid.html">Martin Fowler — The Practical Test Pyramid</a>. The clearest write-up of what a unit / integration / E2E test really is, why the pyramid shape, and why the "ice-cream cone" hurts. Read the definitions section carefully — it fixes the vocabulary interviewers use.</p>
+
+  <p class="small">Citation: Ham Vocke, "The Practical Test Pyramid", martinfowler.com (accessed 2026-07-09). The pyramid concept is originally from Mike Cohn; Fowler's article is the standard modern reference.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can say the full 30-second answer — pyramid, mock Shopify 3 ways, prove idempotency, ~80% on behavior, runs in CI — out loud with no notes.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want a full Jest test file for a Shopify webhook handler, or how Testcontainers spins up a real Postgres in CI? Just ask. When you're ready, say <b>"next lesson"</b> and I'll open <b>Lesson 15 — Behavioral, English &amp; the Senior Narrative</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../lessons/0013-devops-docker-cicd-cloud.html">← Lesson 13: DevOps, Docker &amp; CI/CD</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="../lessons/0017-agile-delivery-and-teamwork.html">Next: Lesson 17 — Agile &amp; Teamwork →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "In the test pyramid, which layer should have the most tests?",
+      options: ["Fast isolated unit tests", "Slow whole system tests", "Broad manual click tests", "Full remote smoke tests"],
+      answer: 0,
+      why: "The pyramid puts many fast, isolated unit tests at the base, fewer integration tests in the middle, and few end-to-end tests on top."
+    },
+    {
+      q: "Which code is the best fit for unit tests?",
+      options: ["Pure business mapping logic", "Full external service calls", "Real database commit steps", "Slow browser render tests"],
+      answer: 0,
+      why: "Unit tests suit pure logic like data transforms and your ERP field mapping — no database, network, or browser needed."
+    },
+    {
+      q: "How do you test a Shopify call without hitting Shopify?",
+      options: ["Mock the API responses", "Hit the live endpoint", "Poll the real orders", "Ping the prod server"],
+      answer: 0,
+      why: "Mock the Admin API with a tool like nock or msw, replay recorded webhook fixtures, and never touch the real store in tests."
+    },
+    {
+      q: "How do you unit test your webhook HMAC check?",
+      options: ["Use a known secret", "Trust the raw header", "Drop the whole check", "Log the sent bytes"],
+      answer: 0,
+      why: "Feed a known secret and a fixed raw body, compute the expected HMAC yourself, then assert your verifier accepts it and rejects a tampered body."
+    },
+    {
+      q: "How do you prove your webhook handler is idempotent?",
+      options: ["Send the same message twice", "Send the same message once", "Send a fresh unique message", "Send the wrong test message"],
+      answer: 0,
+      why: "Idempotency means the same input causes one single effect. Send the same webhook (same X-Shopify-Webhook-Id) twice and assert exactly one row was written."
+    },
+    {
+      q: "What is a healthy coverage target for this backend?",
+      options: ["About eighty percent", "Always one hundred", "Roughly ten percent", "Exactly zero percent"],
+      answer: 0,
+      why: "Aim for roughly 80% coverage, but chase meaningful behavior tests, not the last few lines. 100% is usually wasted effort."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: How do you test a backend plus Shopify integration?",
+      answer: "I follow the <b>test pyramid</b>: many <b>unit</b> tests for pure logic — my ERP mapping, data transforms, business rules — then some <b>integration</b> tests for the database, queue, and HTTP, and a few <b>end-to-end</b> tests for the critical flows. I never call the real Shopify API in tests: I <b>mock the Admin API</b> with nock or msw, replay recorded <b>webhook fixtures</b>, and test HMAC with a known secret and body. I prove <b>idempotency</b> by sending the same webhook twice and asserting one effect. Everything runs in CI on every push."
+    },
+    {
+      prompt: "Q: How do you test a Shopify integration without calling Shopify?",
+      answer: "Three ways. First, <b>mock the Admin API</b> at the HTTP layer with nock or msw so my code gets a canned response, not a real call. Second, save a real webhook body once as a <b>fixture</b> and replay it in every test. Third, test <b>HMAC verification</b> fully offline: with a known secret and fixed raw body I compute the expected signature myself and assert my verifier accepts the real one and rejects a tampered one. Tests stay fast, repeatable, and off the rate limit."
+    },
+    {
+      prompt: "Q: How do you test idempotency and retries?",
+      answer: "Idempotency means running the handler twice has the <b>same single effect</b> as once. My test sends the <b>same webhook twice</b> — same <code>X-Shopify-Webhook-Id</code> — and asserts exactly one row was written, not two. Under the hood I use an <b>idempotency key</b>: store the webhook id and skip work I have already done. Testing retries is the same idea — run the job twice and assert the outcome is identical."
+    },
+    {
+      prompt: "Q: What is your coverage target and how do you think about TDD?",
+      answer: "I aim for <b>around 80%</b> coverage, but I test <b>behavior, not lines</b> — I put tests where the risk is (mapping, HMAC, idempotency), not on trivial getters. On <b>TDD</b> I follow <b>red → green → refactor</b>: write a small failing test, write the least code to pass it, then clean up while it stays green. Writing the test first forces a clear, testable design and lets me refactor without fear."
+    }
+  ]);
+</script>

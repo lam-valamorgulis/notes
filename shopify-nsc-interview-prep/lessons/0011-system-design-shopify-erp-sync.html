@@ -1,0 +1,337 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11 — Design: Shopify ↔ ERP/CRM Sync at Scale</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 11 · Day 2 · System design</p>
+  <h1>Design: Shopify &#8596; ERP/CRM Sync at Scale</h1>
+  <p class="subtitle">The one system design question you are most likely to get for this role. This is a full worked answer — run it end to end.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> design a system that <em>keeps Shopify and an ERP/CRM in sync at scale, end to end</em> — ingestion, queue, workers, reconciliation, idempotency, rate limits, and failure recovery, all named out loud.
+  </div>
+
+  <p class="small">Ties to your <a href="../MISSION.md">mission</a>: the JD is a Shopify backend role, and "keep Shopify in sync with an ERP/CRM" is the classic design prompt for it. This lesson combines the 7-step framework from Lesson 10 with the Shopify facts from Day 1 (webhooks, rate limits, bulk operations).</p>
+
+  <h2>1. Clarify first (never skip this)</h2>
+  <p>Before drawing anything, ask. The answers reshape the whole design, and asking is the senior signal.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Question to ask</th><th>Why it changes the design</th></tr>
+    <tr><td><b>Which entities?</b> Orders, products, inventory, customers?</td><td>Each has different volume and direction. Orders are high-volume and mostly one-way; inventory is two-way and time-sensitive.</td></tr>
+    <tr><td><b>Which direction?</b> One-way (Shopify → ERP) or two-way?</td><td>Two-way means you must prevent echo loops and resolve conflicts (who wins when both sides change?).</td></tr>
+    <tr><td><b>Volume?</b> Steady rate and sale-day spikes?</td><td>"Thousands of orders/day, 10x on sale days" tells you to buffer with a queue, not write straight through.</td></tr>
+    <tr><td><b>Latency target?</b> Seconds, or minutes acceptable?</td><td>Near-real-time points to webhooks + queue; nightly is fine points to batch.</td></tr>
+    <tr><td><b>Consistency need?</b> Exactly-once feel?</td><td>Delivery is at-least-once, so you build idempotency to <em>simulate</em> exactly-once at the ERP.</td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <span class="label">My working assumptions for this answer</span>
+    Orders + inventory + customers. Mostly Shopify → ERP, with inventory two-way. ~5,000 orders/day, 10x spikes on sales (~500 order events at peak in a burst). Target near-real-time (seconds to a couple of minutes). Must never lose or double-apply an order.
+  </div>
+
+  <h2>2. Architecture (the whole flow)</h2>
+  <p>Three data paths, one system: <b>real-time events</b> (webhooks), a safety net (<b>reconciliation</b>), and a first fill (<b>bulk import</b>).</p>
+  <ol>
+    <li><b>Real-time:</b> Shopify <a href="../reference/glossary.html#webhook">webhook</a> &#8594; ingestion endpoint (verify HMAC, return 200 fast) &#8594; <a href="../reference/glossary.html#queue">message queue</a> &#8594; worker pool (transform &#8594; write to ERP).</li>
+    <li><b>Safety net:</b> a scheduled <a href="../reference/glossary.html#reconciliation">reconciliation</a> job re-reads Shopify and compares against the ERP to catch any missed or dropped events.</li>
+    <li><b>First fill:</b> a one-time <a href="../reference/glossary.html#bulk-ops">bulk import</a> (bulkOperationRunQuery &#8594; JSONL) to load all historical data without hitting rate limits.</li>
+  </ol>
+
+  <div class="diagram">                       INITIAL LOAD  (run once, at setup)
+  Shopify ──bulkOperationRunQuery──► JSONL file ──► import worker ──► ERP
+  ─────────────────────────────────────────────────────────────────────────
+
+                       STEADY STATE  (ongoing, real-time)
+
+  ┌──────────┐   webhook     ┌────────────────┐   enqueue    ┌──────────┐
+  │ Shopify  │──────────────►│   Ingestion    │─────────────►│ Message  │
+  │  Store   │  order /      │   endpoint     │  (ack fast)  │  Queue   │
+  │          │  product /    │ 1. verify HMAC │              └────┬─────┘
+  │          │  inventory    │ 2. return 200  │                   │
+  └────┬─────┘               └────────────────┘                   ▼
+       │ ▲                                                  ┌─────────────┐
+       │ │                                                  │  Worker     │
+       │ │ re-read to catch                                 │  pool       │
+       │ │ missed events                                    │ transform + │
+       │ │                                                  │ dedupe      │
+       │ │                    ┌───────────────┐   write     └──────┬──────┘
+       │ │                    │  Mapping DB   │◄───────────────────┤
+       │ │                    │ shopify_id ↔  │                     │
+       │ │                    │ erp_id  +     │                     ▼
+       │ │                    │ dedupe keys   │               ┌──────────┐
+  ┌────┴─┴────────┐           └───────────────┘               │   ERP    │
+  │ Reconciliation│──── compare & re-sync missed ────────────►│  / CRM   │
+  │  (scheduled)  │                                           └──────────┘
+  └───────────────┘        poison msgs ──► Dead-Letter Queue (DLQ) ──► alert</div>
+
+  <div class="tip">
+    <span class="label">Why the queue is the heart of this</span>
+    The webhook must return 200 within Shopify's <b>5-second timeout</b> (that 5s is the <b>total</b> window — roughly the first second goes just to connecting, so you really have very little time to work). You cannot write to a slow ERP inside that window. So the endpoint does the minimum — verify, enqueue, ack — and the queue absorbs spikes and feeds workers at a rate the ERP can take. The queue is your shock absorber and your backpressure valve.
+  </div>
+
+  <h2>3. Reliability (the part they push on)</h2>
+  <p>Webhooks are <b>at-least-once</b>: Shopify retries on failure (about 8 times over ~4 hours), so the same event can arrive more than once, and events can arrive out of order. You design for all of that.</p>
+  <ul>
+    <li><b><a href="../reference/glossary.html#idempotency">Idempotency</a>:</b> dedupe on <code>X-Shopify-Webhook-Id</code> (plus a per-resource <a href="../reference/glossary.html#idempotency-key">idempotency key</a>). Store seen IDs in a dedupe table; if it's already there, skip. Every ERP write is "create-or-update on the mapped id," never a blind insert.</li>
+    <li><b>Retries with <a href="../reference/glossary.html#backoff">exponential backoff</a>:</b> if the ERP write fails, the worker retries with growing delays instead of hammering it.</li>
+    <li><b><a href="../reference/glossary.html#dlq">Dead-letter queue</a>:</b> a message that keeps failing (bad data, "poison message") moves to a DLQ after N attempts, so it stops blocking the line. A dashboard + alert lets a human inspect and replay it.</li>
+    <li><b>Ordering:</b> global ordering is hard and usually unnecessary. Keep <b>per-resource</b> order (all events for order #1001 processed in sequence) by partitioning the queue on the resource id, or by using the event timestamp so an older update can't overwrite a newer one.</li>
+  </ul>
+
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    Trying to make the pipeline "exactly-once." You can't guarantee exactly-once delivery. You <b>accept at-least-once delivery and build idempotent consumers</b> — that gives exactly-once <em>effect</em> at the ERP. Say this sentence and you sound senior.
+  </div>
+
+  <h3>Step through the two reliability paths</h3>
+  <p>Trace the two cases interviewers push on. Say each arrow out loud.</p>
+  <div class="diagram">  DUPLICATE WEBHOOK  (at-least-once delivery)
+
+  Shopify resends order #1001 (same X-Shopify-Webhook-Id)
+     │
+     ▼  ingestion verifies HMAC, returns 200, enqueues
+     │
+     ▼  worker checks dedupe table → webhook_id ALREADY SEEN
+     │
+  NO-OP: skip the ERP write. No double order.
+  ───────────────────────────────────────────────────────
+
+  ERP IS DOWN  (queue buffers, workers retry)
+
+  events keep arriving → ingestion still returns 200 to Shopify
+     │
+     ▼  messages pile up SAFELY in the queue (nothing lost)
+     │
+     ▼  worker tries ERP write → fails → retry with backoff
+     │
+  ERP RETURNS → workers drain the backlog and catch up.
+  (still failing after N tries → message → Dead-Letter Queue → alert)</div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: a duplicate webhook arrives, then the ERP goes down for an hour — trace what happens in each case, arrow by arrow.</div>
+
+  <h2>3½. Kata — type the ingestion handler from a blank file</h2>
+  <p>This is the most likely live-coding task for this role. Open a blank file and type the ingestion handler from memory: <b>verify HMAC on the raw body → dedupe check → enqueue → return 200</b>. Then compare to the model.</p>
+  <div class="tip">
+    <span class="label">Your task (cover the model)</span>
+    Write a handler that <b>(1)</b> reads the <b>raw</b> body, <b>(2)</b> verifies the <code>X-Shopify-Hmac-SHA256</code> header and rejects with 401 if it fails, <b>(3)</b> skips if the <code>X-Shopify-Webhook-Id</code> is already in the dedupe table, <b>(4)</b> enqueues the event, <b>(5)</b> returns 200 fast — with no ERP write inside the request.
+  </div>
+  <pre><code>import crypto from 'crypto';
+
+// The HMAC must be computed on the RAW body bytes, not parsed JSON.
+app.post('/webhooks/orders',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const hmac = req.get('X-Shopify-Hmac-SHA256') || '';
+    const digest = crypto
+      .createHmac('sha256', process.env.SHOPIFY_SECRET)
+      .update(req.body)                 // req.body is a Buffer (raw)
+      .digest('base64');
+
+    // constant-time compare — reject spoofed calls
+    const ok = hmac.length === digest.length &&
+      crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(digest));
+    if (!ok) return res.sendStatus(401);
+
+    const webhookId = req.get('X-Shopify-Webhook-Id');
+    if (await seenBefore(webhookId)) return res.sendStatus(200); // dedupe → no-op
+
+    await markSeen(webhookId);
+    await queue.enqueue(JSON.parse(req.body.toString())); // hand off to workers
+    return res.sendStatus(200);         // ack fast; ERP write happens off-queue
+  });</code></pre>
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: name the four steps of the ingestion handler in order, and why the HMAC must use the raw body.</div>
+
+  <h2>4. Rate limits on BOTH sides</h2>
+  <p>Two systems, two limits. Name both.</p>
+  <ul>
+    <li><b>Shopify (reads):</b> the Admin GraphQL API uses <a href="../reference/glossary.html#query-cost">calculated query cost</a> — a 1000-point bucket refilling 50 points/sec on standard plans. Read <code>extensions.cost.throttleStatus</code> and <a href="../reference/glossary.html#backoff">back off</a> before you hit zero. For big pulls (reconciliation, initial load), use <a href="../reference/glossary.html#bulk-ops">bulk operations</a> so you never fight the bucket.</li>
+    <li><b>ERP (writes):</b> the ERP has its own limits and can be slow. <b>Batch writes</b> where the ERP supports it, and let the queue apply <b>backpressure</b> — workers pull only as fast as the ERP can accept, so a spike in Shopify events never overruns the ERP.</li>
+  </ul>
+
+  <div class="note">
+    <span class="label">One line to remember</span>
+    The queue protects the ERP from Shopify's spikes; bulk operations and backoff protect you from Shopify's rate limits. You respect both buckets, from both directions.
+  </div>
+
+  <h2>5. Data mapping (how records match)</h2>
+  <p>You need to know which Shopify record equals which ERP record — otherwise updates create duplicates. Keep a <b>mapping store</b>.</p>
+  <ul>
+    <li>A DB table: <code>shopify_id &#8596; erp_id</code> (plus entity type, last-synced timestamp, and a hash of the last payload to skip no-op writes).</li>
+    <li>Or, for the reverse lookup, store the ERP id back on Shopify as a <b>metafield</b> so the record carries its own link.</li>
+  </ul>
+  <p>This mapping is what makes writes <b>idempotent</b>: a repeated event resolves to the same <code>erp_id</code> and updates the same record instead of creating a new one. It's also how you decide <b>create vs update</b> on every incoming event.</p>
+
+  <pre><code>-- dedupe + mapping, the two tables that make it safe
+webhook_dedupe(webhook_id PK, received_at)          -- skip if seen
+id_map(entity, shopify_id, erp_id, last_hash,       -- match + no-op skip
+       last_synced_at, UNIQUE(entity, shopify_id))</code></pre>
+
+  <h2>5½. Two-way sync &amp; conflicts</h2>
+  <p>Two-way sync (e.g. inventory changing on both sides) raises the two hardest follow-ups. A senior answer names both problems and a concrete fix for each.</p>
+
+  <h3>(a) Prevent echo loops</h3>
+  <p>The danger: a Shopify → ERP write triggers an ERP change event → which writes back to Shopify → which fires another Shopify webhook → and round it goes forever. Two ways to break the loop:</p>
+  <ul>
+    <li><b>Tag the write origin.</b> When you write to a side <em>because of a sync</em>, mark that write (a metafield, a header, or a <code>source: "sync"</code> flag). When an event comes back carrying your own tag, skip it — you caused it, so it is not real news.</li>
+    <li><b>Skip if the content hash is unchanged.</b> Store a hash of the last payload you wrote in the mapping table (the <code>last_hash</code> column). Before writing, hash the incoming record; if it matches what is already stored, it is a no-op — do not write, so no new event fires and the loop dies.</li>
+  </ul>
+
+  <h3>(b) Resolve conflicts (both sides changed)</h3>
+  <p>When Shopify and the ERP both change the same field before a sync catches up, you need a rule chosen up front:</p>
+  <ul>
+    <li><b>Source of truth per field.</b> Declare which system owns each field — for example Shopify owns price and product content; the ERP owns inventory and cost. The owner always wins; the other side only reads that field.</li>
+    <li><b>Newest wins (timestamp or version).</b> Where no single owner fits, keep an <code>updated_at</code> or a version number per record and let the most recent change win (last-write-wins). A version number is safer than a clock, because clocks on two systems drift apart.</li>
+  </ul>
+  <div class="tip">
+    <span class="label">Say it like this</span>
+    "For two-way sync I stop echo loops by tagging the sync origin and by skipping no-op writes with a content hash. For conflicts I declare a source of truth per field — Shopify owns content, the ERP owns inventory — and fall back to newest-version-wins where there is no clear owner."
+  </div>
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: name the two ways to stop an echo loop, and the two ways to resolve a field conflict.</div>
+
+  <h2>6. Scale &amp; ops</h2>
+  <ul>
+    <li><b>Horizontal workers:</b> the worker pool is stateless — add workers to drain the queue faster on sale days. This is <a href="../reference/glossary.html#scaling">horizontal scaling</a> in action.</li>
+    <li><b>Partition by shop / entity:</b> if you serve many shops, partition the queue by shop id (fairness, isolation) and keep per-resource ordering inside a partition.</li>
+    <li><b>Monitoring + alerting:</b> track <b>queue lag</b> (how far behind are we?), error rate, retry rate, and DLQ depth. Alert when lag or DLQ crosses a threshold.</li>
+    <li><b>DLQ dashboard:</b> a place to see, inspect, and replay poison messages by hand.</li>
+  </ul>
+
+  <h2>7. Failure modes + recovery</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What breaks</th><th>What happens / how you recover</th></tr>
+    <tr><td><b>ERP is down (e.g. 2 hours)</b></td><td>Workers fail the write and retry with backoff; messages stay safely in the queue (it buffers). Nothing is lost. Shopify already got its 200, so it does not retry. When the ERP returns, workers drain the backlog. Messages that never succeed land in the DLQ for replay.</td></tr>
+    <tr><td><b>A webhook is missed / dropped</b></td><td>The scheduled <a href="../reference/glossary.html#reconciliation">reconciliation</a> job re-reads Shopify (via bulk ops), compares against the ERP using the mapping table, and re-syncs anything missing. This is why you never rely on webhooks alone.</td></tr>
+    <tr><td><b>Duplicate events arrive</b></td><td>The dedupe table (<code>X-Shopify-Webhook-Id</code>) and idempotent create-or-update mean the second copy is a no-op. No double orders.</td></tr>
+    <tr><td><b>Poison message (bad data)</b></td><td>After N failed retries it moves to the DLQ so it stops blocking the queue. Alert fires; a human inspects and replays after a fix.</td></tr>
+    <tr><td><b>Our ingestion endpoint is down</b></td><td>Shopify retries the webhook (~8x over ~4h). If still missed, reconciliation catches it later. Two safety nets.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the whole design in 6 sentences)</span>
+    <p>"Shopify sends webhooks to an ingestion endpoint that verifies the HMAC and returns 200 within the 5-second timeout, then pushes the event onto a message queue. A pool of stateless workers pulls from the queue, transforms each event, looks up the record in a mapping table, and does an idempotent create-or-update into the ERP. Because delivery is at-least-once, I dedupe on the Shopify webhook id and make every write idempotent, so duplicates and retries are safe. I respect rate limits on both sides — bulk operations and backoff for Shopify reads, batching and queue backpressure for ERP writes. A scheduled reconciliation job re-reads Shopify to catch any missed events, and a one-time bulk import loads the history. Failures are contained: the queue buffers when the ERP is down, poison messages go to a dead-letter queue, and monitoring on queue lag and DLQ depth tells me when to act."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Instant feedback. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://shopify.dev/docs/apps/build/webhooks">Shopify — Webhooks</a>: HMAC verification, the 5-second timeout, retries, <code>X-Shopify-Webhook-Id</code> for dedupe, and "acknowledge fast, process async." This is the backbone of the ingestion side.<br>
+  📖 <a href="https://github.com/donnemartin/system-design-primer">The System Design Primer</a>: queues, workers, idempotency, and reliability patterns — the general shape behind this specific design.</p>
+
+  <p class="small" id="c1">[1] Verified against shopify.dev, API version 2026-07 (checked 2026-07-09): webhooks verify HMAC-SHA256 of the raw body against <code>X-Shopify-Hmac-SHA256</code>, must return 200 within a 5-second timeout, retry about 8 times over ~4 hours, and expose <code>X-Shopify-Webhook-Id</code> for dedupe; handlers must be idempotent and should ack fast then process via a queue, with a reconciliation job to recover missed events. Admin GraphQL uses calculated query cost (1000-point bucket, +50/s standard); <code>bulkOperationRunQuery</code> runs a GraphQL query async and returns a JSONL file for large imports/exports.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can whiteboard the whole flow (webhook → ingestion → queue → workers → ERP, plus reconciliation and DLQ), type the HMAC-verify + dedupe + enqueue handler from a blank file, and answer the two-way follow-ups — echo loops and conflict resolution — without hesitating.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want me to draw the two-way inventory variant (with echo-loop prevention)? Or write the actual HMAC-verify + enqueue handler in Node? Just ask. When you're ready, say <b>"next lesson"</b> and I'll open <b>Lesson 12 — Event-driven messaging</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../lessons/0010-system-design-fundamentals.html">← Prev: System Design Fundamentals</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="../lessons/0012-event-driven-messaging.html">Next: Event-Driven Messaging →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "Why should the webhook ingestion endpoint return 200 quickly?",
+      options: [
+        "Shopify times out fast",
+        "GraphQL costs stay lower",
+        "The queue drains faster",
+        "The HMAC becomes valid"
+      ],
+      answer: 0,
+      why: "Shopify enforces a 5-second webhook timeout and retries on failure. So you verify the HMAC, enqueue the event, and return 200 immediately, then do the ERP write off the queue."
+    },
+    {
+      q: "How do you confirm a webhook really came from Shopify?",
+      options: [
+        "Compare HMAC-SHA256 of raw body",
+        "Check the sender IP address",
+        "Trust the webhook topic header",
+        "Read the shop domain field"
+      ],
+      answer: 0,
+      why: "You compute HMAC-SHA256 over the raw request body with your app secret and compare it to X-Shopify-Hmac-SHA256. IP, topic, and shop fields can be spoofed; the HMAC cannot."
+    },
+    {
+      q: "To stop processing the same order event twice, you use:",
+      options: [
+        "An idempotency dedupe key",
+        "A faster network link",
+        "A bigger worker pool",
+        "A second message queue"
+      ],
+      answer: 0,
+      why: "Delivery is at-least-once, so duplicates happen. You store X-Shopify-Webhook-Id (or a resource idempotency key) in a dedupe table and skip anything already seen. Consumers must be idempotent."
+    },
+    {
+      q: "If the ERP is down for two hours, what keeps events safe?",
+      options: [
+        "The queue buffers and retries",
+        "The webhook is sent again",
+        "The cache serves the writes",
+        "The endpoint returns an error"
+      ],
+      answer: 0,
+      why: "Writes wait in the queue while workers retry with backoff. Nothing is lost, and Shopify already got its 200. Messages that keep failing move to a dead-letter queue for later replay."
+    },
+    {
+      q: "For the first big import of all historical Shopify data, use:",
+      options: [
+        "Shopify async bulk operations",
+        "Many small paged queries",
+        "One enormous single query",
+        "Repeated live REST calls"
+      ],
+      answer: 0,
+      why: "bulkOperationRunQuery runs a GraphQL query asynchronously and returns a JSONL file. It avoids fighting the rate-limit bucket with thousands of live calls — ideal for a one-time backfill."
+    },
+    {
+      q: "To match a Shopify record to its ERP record, you keep:",
+      options: [
+        "A persisted id mapping",
+        "A larger retry window",
+        "A wider ingestion buffer",
+        "A separate read replica"
+      ],
+      answer: 0,
+      why: "A mapping store — a shopify_id to erp_id table (or a metafield) — lets you decide create vs update and makes writes idempotent, so retries update the same ERP record instead of duplicating it."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Walk me through the whole Shopify to ERP sync design.",
+      answer: "Shopify sends <b>webhooks</b> to an ingestion endpoint that verifies the HMAC and returns 200 within the 5-second timeout, then pushes the event onto a <b>message queue</b>. A pool of stateless <b>workers</b> pulls each event, transforms it, looks it up in a <b>mapping table</b>, and does an idempotent <b>create-or-update</b> into the ERP. A scheduled <b>reconciliation</b> job re-reads Shopify to catch missed events, and a one-time <b>bulk import</b> loads history. I respect rate limits on both sides, dedupe on the webhook id, and send poison messages to a <b>dead-letter queue</b>, with monitoring on queue lag and DLQ depth."
+    },
+    {
+      prompt: "Q: How do you guarantee no order is lost or processed twice?",
+      answer: "Not lost: the webhook is acknowledged fast and the event sits durably in the <b>queue</b>; if the ERP write fails, workers <b>retry with backoff</b>, and a scheduled <b>reconciliation</b> job re-reads Shopify to recover anything a webhook missed. Not twice: delivery is <b>at-least-once</b>, so I dedupe on <code>X-Shopify-Webhook-Id</code> in a dedupe table and make every ERP write an <b>idempotent create-or-update</b> on the mapped id. So duplicates and retries become no-ops — at-least-once delivery with idempotent consumers gives an exactly-once effect."
+    },
+    {
+      prompt: "Q: The ERP goes down for 2 hours — what happens?",
+      answer: "Nothing is lost. The ingestion endpoint keeps returning 200 to Shopify, so Shopify does not retry, and events pile up safely in the <b>queue</b>. Workers try the ERP write, fail, and <b>retry with exponential backoff</b> instead of hammering it. When the ERP comes back, the workers <b>drain the backlog</b> and catch up. Anything that still fails after N attempts goes to the <b>dead-letter queue</b>, and my <b>queue-lag and DLQ alerts</b> tell me the system was degraded so I can verify recovery."
+    },
+    {
+      prompt: "Q: How do you respect rate limits on both Shopify and the ERP?",
+      answer: "On the <b>Shopify</b> side, reads use calculated query cost — a 1000-point bucket refilling 50/s — so I read <code>throttleStatus</code> and back off before hitting zero, and I use <b>bulk operations</b> for big pulls like reconciliation and the initial load so I never fight the bucket. On the <b>ERP</b> side, I <b>batch writes</b> where it allows and let the <b>queue apply backpressure</b> — workers pull only as fast as the ERP can accept, so a Shopify sale-day spike never overruns it. The queue decouples the two rate profiles."
+    }
+  ]);
+</script>

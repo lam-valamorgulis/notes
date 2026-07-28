@@ -1,0 +1,490 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 — Inventory Ingestion &amp; Multi-Source Sync</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 2 · Architecture · The input problem</p>
+  <h1>Inventory Ingestion &amp; Multi-Source Sync</h1>
+  <p class="subtitle">Stock lives in dozens of store systems you do not control, in dozens of formats. This lesson is how you pull it in, normalise it, and store it safely — the foundation everything else reads from.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> design the <em>ingestion pipeline</em> that turns many messy POS/ERP feeds into one clean, canonical stock view — and explain the three ways stock arrives (push, pull, and file), why every write must be idempotent, and how you keep the number fresh without hammering anyone.
+  </div>
+
+  <p class="small">Builds on <a href="0001-omnichannel-problem-and-domain.html">Lesson 1</a> (the hard problem: stock is external and uncertain) and on your round-1 "Shopify ↔ ERP sync" design. This is that design, pointed at a fleet of stores instead of one ERP.</p>
+
+  <h2>1. The canonical model: what you are actually storing</h2>
+  <p>Before pipelines, define the target. Everything you ingest normalises into one core fact:</p>
+  <div class="note">
+    <span class="label">The atom of the whole system</span>
+    <b>inventory_level = (location_id, sku, on_hand, updated_at, source)</b> — "how many of this SKU are at this location, as last reported, by whom." Every feed, in every format, becomes rows of this shape. Get this atom right and the rest of the system has firm ground. (This is the raw number; the <em>safe-to-sell</em> number is computed on top of it in <a href="0003-stock-availability-engine.html">Lesson 3</a>.)
+  </div>
+  <pre><code>-- the canonical target every feed normalises into
+locations(location_id PK, retailer_id, name, lat, lng, timezone, active)
+products(sku PK, retailer_id, title, barcode)          -- catalogue
+inventory_levels(
+  location_id, sku,
+  on_hand      INT,          -- raw count the source reported
+  updated_at   TIMESTAMPTZ,  -- when the SOURCE measured it (UTC), not when we saved it
+  source       TEXT,         -- which POS/ERP/feed it came from
+  PRIMARY KEY (location_id, sku)
+)</code></pre>
+  <p>Two column choices carry weight. <code>updated_at</code> is the <b>source's</b> measurement time, not your insert time — you need it to reject stale updates that arrive out of order (an older reading must never overwrite a newer one). And it is <code>TIMESTAMPTZ</code> stored in <b>UTC</b>: your stores span time zones, so a naive <code>TIMESTAMP</code> would corrupt both the staleness guard below and the "feed age" and trading-hours maths in Lesson 3. Convert to <code>locations.timezone</code> only for display and for the trading-hours decay, never for comparison.</p>
+
+  <h2>2. Three ways stock arrives</h2>
+  <p>Different stores can feed you differently. A good answer names all three and when each fits.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Mode</th><th>How it works</th><th>When it fits</th><th>Freshness</th></tr>
+    <tr><td><b>Push (webhook / API)</b></td><td>The POS calls <em>your</em> endpoint when stock changes. You verify, enqueue, ack fast.</td><td>Modern POS with outbound webhooks. Best case.</td><td>Near real time (seconds).</td></tr>
+    <tr><td><b>Pull (poll their API)</b></td><td>You call the POS/ERP API on a schedule and diff against what you have.</td><td>Systems with a read API but no webhooks.</td><td>Minutes (your poll interval).</td></tr>
+    <tr><td><b>File drop (batch)</b></td><td>The store uploads a CSV/JSONL to SFTP/S3 on a schedule; you parse and load it.</td><td>Old or offline systems; nightly full exports.</td><td>Hours (often nightly).</td></tr>
+  </table>
+  </div>
+  <div class="tip">
+    <span class="label">The senior framing</span>
+    "I support push, pull, and file ingestion behind one normalisation layer, because a franchise will have a mix — a few modern stores push in real time, most poll, and the legacy ones drop a nightly file. The freshness of each store's data depends on its mode, and I surface that (a 'last updated' age) rather than pretending all stock is equally fresh."
+  </div>
+
+  <h2>3. The pipeline (one shape for all three modes)</h2>
+  <p>No matter how stock arrives, it flows through the same stages. This is the diagram to draw.</p>
+  <div class="diagram">                     MANY SOURCES                    ONE CANONICAL VIEW
+
+  ┌──────────────┐ push ┌───────────────┐
+  │ Store A POS  │─────►│               │
+  │ (webhook)    │      │               │
+  └──────────────┘      │               │  enqueue   ┌──────────┐
+  ┌──────────────┐ pull │  INGESTION    │───────────►│  Queue   │
+  │ Store B ERP  │◄─────│  EDGE         │ (raw feed  │ (per-    │
+  │ (poll API)   │─────►│               │  events)   │  source  │
+  └──────────────┘      │ • auth/verify │            │  partition)
+  ┌──────────────┐ file │ • adapter per │            └────┬─────┘
+  │ Store C      │─────►│   source type │                 │
+  │ (SFTP CSV)   │      │ • ack fast    │                 ▼
+  └──────────────┘      └───────────────┘          ┌─────────────────┐
+                                                    │  NORMALISE      │
+                                                    │  WORKER         │
+                                                    │ • map to SKU    │
+                                                    │ • map to        │
+                                                    │   location_id   │
+                                                    │ • unit/format   │
+                                                    │ • drop if stale │
+                                                    └───────┬─────────┘
+                                                            │ idempotent upsert
+                                                            ▼
+                                            ┌───────────────────────────┐
+   reconciliation (scheduled) ─── repair ──►│  inventory_levels (canon) │
+   re-reads each source, fixes drift        └───────────────────────────┘</div>
+
+  <ol>
+    <li><b>Ingestion edge</b> — one endpoint per mode. A <b>source adapter</b> knows the quirks of that POS/ERP (auth, field names, units). It <b>authenticates</b> the feed, does the minimum, and enqueues the raw event. For push it must ack fast — the same acknowledge-first discipline as Shopify webhooks (Shopify's own timeout is 5 seconds; a store's POS may allow more, so treat "reply fast, process off the queue" as the principle).</li>
+    <li><b>Queue</b> — buffers bursts and decouples ingestion speed from database speed. Partition it for <b>fairness and isolation</b> — so one store dumping a huge file cannot starve the real-time feeds. If you also want strict per-location ordering, partition on <code>(source, location_id)</code> so all events for one store's SKU land in the same partition with one in-order consumer. But note you should not <em>rely</em> on ordering: the timestamp guard in step 5 makes out-of-order arrival safe anyway, so partitioning is really about fairness, not correctness.</li>
+    <li><b>Normalise worker</b> — the brain. It maps the source's product code to your canonical <code>sku</code>, its store code to your <code>location_id</code>, converts units (see §4), drops readings older than what you already have, then does an <b>idempotent upsert</b> into <code>inventory_levels</code>.</li>
+    <li><b>Reconciliation</b> — a scheduled job that re-reads each source's full stock and repairs anything the event stream missed. Non-negotiable, because feeds drop events. It depends on the source being able to give a <b>full snapshot</b>; a push-only POS with no bulk export cannot be reconciled this way, so for those you lean harder on the event stream and on feed-age alerts. Bound its cost — a full re-read of 40 stores hits the same rate limits §6 warns about, so schedule it off-peak and stagger stores.</li>
+  </ol>
+
+  <div class="tip">
+    <span class="label">How you actually authenticate a push feed</span>
+    Same mechanism as a Shopify webhook: the source signs the raw body with a <b>shared secret</b> using <b>HMAC-SHA256</b> and sends the signature in a header; you recompute it over the raw bytes and compare with a <b>constant-time</b> check (reject on mismatch). Add a <b>timestamp or nonce</b> in the signed payload and reject old ones, so a captured request cannot be replayed. Never trust source IP or an unsigned "store id" field alone — both are easy to spoof.
+  </div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: name the three ingestion modes, and the four pipeline stages every feed flows through.</div>
+
+  <h2>4. The mapping problem (why normalisation is hard)</h2>
+  <p>Two stores rarely agree on identifiers. Store A calls it <code>SHOE-RED-42</code>; Store B calls the same shoe <code>0042-RD</code>; your catalogue calls it SKU <code>1001</code>. If you do not map these to one canonical SKU, "who has this shoe?" returns nothing. Mapping is the unglamorous core of ingestion.</p>
+  <ul>
+    <li><b>SKU / barcode mapping</b> — a lookup table from each source's product code (or barcode/GTIN) to your canonical <code>sku</code>. Barcodes are the most reliable join key across systems.</li>
+    <li><b>Location mapping</b> — from each source's store code to your <code>location_id</code>.</li>
+    <li><b>Unit-of-measure (UoM) conversion</b> — sources count differently. One reports <em>eaches</em> (a "12" means 12 items); another reports <em>cases</em> (a "1" means one case of 12); weight-based items report kilograms. If you skip this, a case-pack source shows 1/12th of the real stock (undersell) or an each-pack source multiplied by the case size (oversell). Store a per-source, per-SKU multiplier and convert to a single unit before the upsert.</li>
+    <li><b>Unmapped items</b> — a feed row you cannot map does <em>not</em> silently vanish. It lands in a <b>quarantine / dead-letter</b> table with an alert, so a human can add the missing mapping. Silent drops are how stock quietly goes wrong.</li>
+  </ul>
+
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    Assuming all sources speak your identifiers. They do not. Without a mapping layer (source code → canonical SKU/location), Find in Store shows "no stock" for products that are actually on the shelf — because the feed row never matched anything. Always name the mapping table and the quarantine path for rows that do not map.
+  </div>
+
+  <h2>5. Safe writes: dedupe key + staleness guard</h2>
+  <p>Feeds retry. Polls overlap. The same reading arrives twice. So every write must be safe to repeat. You never blind-insert a stock row; you <b>upsert</b> on the primary key <code>(location_id, sku)</code>, and you only accept the write if it is <em>newer</em> than what you have.</p>
+  <pre><code>-- upsert with a staleness guard (PostgreSQL)
+INSERT INTO inventory_levels (location_id, sku, on_hand, updated_at, source)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (location_id, sku) DO UPDATE
+  SET on_hand    = EXCLUDED.on_hand,
+      updated_at = EXCLUDED.updated_at,
+      source     = EXCLUDED.source
+  WHERE EXCLUDED.updated_at >= inventory_levels.updated_at;  -- reject only OLDER readings</code></pre>
+  <div class="tip">
+    <span class="label">Two different jobs — don't confuse them</span>
+    The <code>WHERE</code> clause is a <b>staleness guard</b>: it stops an older reading (a slow poll that lands after a fresh webhook) from moving stock backwards in time. It is <em>not</em> true idempotency — a genuine re-send stamped with a new send-time would still pass it. For exact-once <em>application</em>, dedupe on a <b>source event id</b> (a per-event key from the feed) in a seen-events table, exactly like <code>X-Shopify-Webhook-Id</code>. Real systems use both: the event-id dedupe kills duplicates, the timestamp guard handles ordering.
+  </div>
+  <div class="trap">
+    <span class="label">Two subtle bugs in the guard</span>
+    (1) <b>Clock skew.</b> The guard trusts each source's clock. When one <code>(location_id, sku)</code> is fed by two sources with drifting clocks, a laggy clock can wrongly win or lose. Prefer a single authoritative source per location; where you can't, add a monotonic sequence number from the feed instead of leaning on wall-clock time. (2) <b>Equal timestamps.</b> Feeds with one-second granularity emit many readings sharing the same second — a strict <code>&gt;</code> would drop the legitimate later one. Using <code>&gt;=</code> (above) lets a same-timestamp reading through; pair it with the event-id dedupe so a true duplicate is still a no-op.
+  </div>
+
+  <h2>5½. Full snapshot vs delta feeds (the silent-oversell bug)</h2>
+  <p>The upsert above only touches SKUs that appear in the feed. That is correct for a <b>delta feed</b> (it only sends what changed, so a SKU that is absent means "unchanged"). It is <b>dangerous for a full snapshot feed</b> (a nightly file listing everything the store has). If yesterday the store had <code>SHOE-RED-42</code> and today's full file no longer lists it, the real answer is "0 left" — but the upsert leaves the old positive count in place forever. The product shows in stock at a shop that sold out. This is one of the most common real oversell bugs.</p>
+  <div class="tip">
+    <span class="label">The fix: know the feed type, and zero the missing</span>
+    Tag each feed as <b>delta</b> or <b>full</b>. For a full snapshot, stamp every row you write with a batch id, then in one statement set <code>on_hand = 0</code> for any row of that <code>(source, location)</code> not seen in this batch. For a delta feed, never do this — absent means unchanged. Getting this one distinction wrong causes either phantom stock (full feed, not zeroed) or wiped stock (delta feed, wrongly zeroed).
+  </div>
+
+  <h2>6. Freshness without hammering</h2>
+  <p>You want fresh stock, but you cannot poll every store's API every second — you would blow their rate limits and yours. Balance it:</p>
+  <ul>
+    <li><b>Prefer push</b> where a store supports it — zero polling, seconds-fresh.</li>
+    <li><b>Adaptive polling</b> for pull sources — poll fast-moving stores/SKUs more often, slow ones less. Or poll only what changed (a "since" cursor) instead of the full catalogue.</li>
+    <li><b>Backpressure via the queue</b> — workers pull only as fast as the database accepts, so a nightly full-file drop from 40 stores does not overwhelm writes.</li>
+    <li><b>Track feed age</b> — store <code>updated_at</code> per row and expose "last updated N minutes ago." A stale feed is a first-class signal the availability engine (L3) uses, and an ops alert when a store goes silent.</li>
+  </ul>
+
+  <div class="note">
+    <span class="label">Shopify's side of this — two designs, know Shopify's model</span>
+    Shopify already has a real multi-location inventory model: an <code>InventoryItem</code> has an <code>InventoryLevel</code> per <code>Location</code>, and each level tracks distinct quantity states — <code>on_hand</code>, <code>available</code>, <code>committed</code>, <code>reserved</code>, <code>incoming</code>, <code>damaged</code>, <code>safety_stock</code> — where <code>on_hand = available + committed + reserved + …</code>. That gives you two design choices. <b>(A) Serve the widget from your own API:</b> keep availability in your database and let the Find-in-Store widget read it directly; Shopify never sees per-store stock. Simplest, and the usual pattern. <b>(B) Model each physical store as a Shopify Location</b> and publish per-store quantities into Shopify with <code>inventorySetQuantities</code> / <code>inventoryAdjustQuantities</code> (bulk operations for the first big load), under the calculated-cost budget. If you pick (B), write the <em>raw</em> <code>on_hand</code> and let Shopify compute <code>available</code> from its own <code>committed</code>/<code>reserved</code> — do not push your already-reduced number into <code>available</code>, or you double-count Shopify's own reservations.
+  </div>
+
+  <h2>7. Failure modes</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What breaks</th><th>How you handle it</th></tr>
+    <tr><td><b>A store feed goes silent</b> (POS offline)</td><td>Feed age grows; alert fires. The availability engine treats stale stock cautiously (L3). Reconciliation resumes when the feed returns.</td></tr>
+    <tr><td><b>A row won't map</b> (unknown SKU/store)</td><td>Goes to a quarantine table with an alert — never silently dropped. A human adds the mapping and it replays.</td></tr>
+    <tr><td><b>Duplicate / repeated readings</b></td><td>Dedupe on the source event id; the upsert on <code>(location_id, sku)</code> is a no-op for a repeat.</td></tr>
+    <tr><td><b>Out-of-order events</b></td><td>The <code>updated_at</code> staleness guard rejects readings older than what's stored.</td></tr>
+    <tr><td><b>SKU drops off a full-snapshot feed</b></td><td>Batch-id sweep sets absent rows to <code>on_hand = 0</code> (full feeds only) — see §5½. Prevents phantom in-stock.</td></tr>
+    <tr><td><b>A full-file drop lands mid-day</b></td><td>Queue + backpressure smooth the write load; partitioning for fairness stops it starving the real-time push feeds.</td></tr>
+    <tr><td><b>Poison feed (corrupt file)</b></td><td>After N failed parses the batch moves to a dead-letter store; alert; a human inspects and replays.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the ingestion design in 6 sentences)</span>
+    <p>"Stock arrives from many store systems three ways — push webhooks, polled APIs, and batch file drops — so I put a source adapter per system behind one normalisation layer. The edge verifies the feed's HMAC signature and acks fast, then enqueues raw events onto a queue partitioned for fairness so one noisy store can't starve the others. A normalise worker maps the source's product and store codes to my canonical SKU and location, converts units, then writes to a single inventory_levels table keyed on location and SKU. Because delivery is at-least-once, I dedupe on the source event id for exact-once application, and I add a source-timestamp staleness guard so an out-of-order older reading can't move stock backwards. I track whether each feed is a delta or a full snapshot, and for full snapshots I zero any SKU that dropped off, so a sold-out item doesn't stay phantom in-stock. Rows that won't map go to a quarantine table with an alert instead of vanishing, and a scheduled reconciliation re-reads each source that supports a full export to repair drift, while feed-age alerts catch the ones that don't."</p>
+  </div>
+
+  <h2>8. Deep-dive Q&amp;A — the write-path questions worked through</h2>
+  <p class="small">The exact confusions to be ready for when the client asks "why?" three times deep. Cover each answer, say it out loud, then scroll.</p>
+
+  <h3>Q1. Trace one shoe through a real franchise — 40 stores on 3 POS systems (and the "6 lines of code" widget)</h3>
+  <p>A franchise is never on one system. A realistic split that adds up to 40 stores:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Stores</th><th>POS system</th><th>How stock arrives</th><th>Fresh</th><th>Code for the red shoe</th><th>Their unit</th></tr>
+    <tr><td>18</td><td>Modern cloud POS</td><td><b>Push</b> — webhooks your endpoint on each change</td><td>seconds</td><td><code>RUN-RED-9</code></td><td>eaches (1 = 1 pair)</td></tr>
+    <tr><td>15</td><td>Older POS with a read API</td><td><b>Pull</b> — you poll every 3 min with a <code>since</code> cursor</td><td>minutes</td><td><code>0092-RED</code></td><td><b>cases (1 = 6 pairs)</b></td></tr>
+    <tr><td>7</td><td>Independent franchisees</td><td><b>File</b> — nightly <b>full</b> CSV to SFTP</td><td>hours</td><td>barcode <code>9312345678901</code></td><td>eaches</td></tr>
+  </table>
+  </div>
+  <p>All three normalise to the same canonical <code>sku 1001</code>. Three traps live in that one row: (1) <b>mapping</b> — three different strings for one shoe, so barcode is your safest join key; miss it and Find in Store says "no stock" for a shoe on the shelf. (2) <b>units</b> — the 15 poll stores report <em>cases of 6</em>, so without a ×6 multiplier a store with 10 cases shows 10 pairs, not 60 (undersell). (3) <b>full-vs-delta</b> — the 7 nightly-CSV stores send full snapshots, so a sold-out shoe that drops off the file must be zeroed (see Q4).</p>
+  <div class="diagram">Store A (push)  --\
+Store B (poll)  ---> adapter --> QUEUE --> NORMALISE WORKER --> inventory_levels
+Store C (file)  --/                          |  map codes -> canonical sku 1001
+                                             |  x6 case->pair unit convert
+                                             |  dedupe (event id) + staleness guard
+                                             |  full feed: zero the missing</div>
+  <div class="note">
+    <span class="label">The read path: what "6 lines of code" really is</span>
+    The vendor's "6 lines" is just a <b>loader</b> (the legacy <code>ScriptTag</code> snippet; modern themes use a theme app extension). At runtime the widget calls <em>your</em> API: <code>GET /v1/availability?shop=…&amp;sku=RUN-RED-9&amp;lat=…&amp;lng=…&amp;radius=25</code> with a <b>public, read-only key</b> (never the Admin token — it runs in the shopper's browser). Your API answers from a <b>precomputed availability view</b>, nearest stores first, returning a <em>status</em> (<code>in_stock</code> / <code>low</code> / <code>call</code>) not a raw count, plus each store's feed age ("14 h ago"). It must <b>fail fast and never block add-to-cart</b>. That "14 h ago" is the same <code>updated_at</code> the write path wrote — the read path is honest about the write path's freshness.
+  </div>
+
+  <h3>Q2. Staleness guard vs event-id dedupe — why you need both</h3>
+  <p>They answer two different questions, and neither can do the other's job.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Mechanism</th><th>Question it answers</th><th>Problem it solves</th></tr>
+    <tr><td><b>Staleness guard</b> (<code>WHERE EXCLUDED.updated_at &gt;= …</code>)</td><td>"Is this reading <b>newer</b> than what I have?"</td><td><b>Out-of-order</b> arrival</td></tr>
+    <tr><td><b>Event-id dedupe</b> (a <code>seen_events</code> table)</td><td>"Have I <b>already processed this exact event</b>?"</td><td><b>Duplicate</b> delivery</td></tr>
+  </table>
+  </div>
+  <p>Two <em>different</em> events (a fresh webhook + a slow poll) have different event ids, so dedupe waves both through — only the guard knows one is older. And the guard uses <code>&gt;=</code> on purpose (to let legitimate same-second readings through), so a true duplicate with an equal timestamp <em>passes</em> the guard — only dedupe kills it. A duplicate is harmless for a pure state write, but doubles any <b>side effect</b> (emit an event, append a ledger, decrement a counter) or any <b>delta</b> ("sold 2") — that is the real bug dedupe prevents.</p>
+  <div class="tip">
+    <span class="label">Order of operations in the worker</span>
+    Check <code>seen_events</code> for the event id → if seen, stop (dedupe kills copies). If new, record the id and run the guarded upsert (the guard then picks the freshest of the genuinely-distinct readings).
+  </div>
+
+  <h3>Q3. Why is the guard needed at all — doesn't the queue keep things in order?</h3>
+  <p>No — a queue does not guarantee your <b>writes</b> land in order, even from one source. Standard queues are best-effort; even Kafka only orders <em>within a partition</em>. Two things reorder the writes regardless: <b>parallel workers</b> (you run several for throughput) and <b>retries</b> (a failed message is re-injected after newer ones). A single <code>(location, sku)</code> can also have two sources (a webhook plus a reconciliation poll).</p>
+  <div class="diagram">enqueued :02  on_hand = 8   (measured 10:00:02)   &lt;- in-order enqueue
+enqueued :05  on_hand = 5   (measured 10:00:05)
+
+W1 grabs :02  -> slow DB / GC pause ...
+W2 grabs :05  -> finishes first, writes 5      (correct so far)
+W1 wakes up   -> writes 8                       (OLDER reading lands LAST)
+
+no guard   :  final = 8   -> oversell 3 pairs
+with guard :  :02 >= :05 is false -> rejected -> stays 5   (correct)</div>
+  <div class="note">
+    <span class="label">The principle (the senior answer)</span>
+    Don't make correctness depend on ordering — make each write safe <em>regardless</em> of arrival order. The guard makes the write commutative: throw the same readings in any order and you still land on the freshest. That is why partitioning is for <b>fairness</b> (one noisy store can't starve others), not correctness — the guard owns correctness.
+  </div>
+
+  <h3>Q4. Full vs delta feeds — the batch-id zero sweep (and the nuance)</h3>
+  <p>It all turns on one question: <b>when a SKU is missing from the feed, what does missing mean?</b> A <b>full snapshot</b> = "everything I have right now", so missing = <b>0</b>. A <b>delta feed</b> = "only what changed", so missing = <b>unchanged</b>. Same absence, opposite meaning. The plain upsert only touches SKUs that appear — correct for delta, but for a full feed it leaves a sold-out shoe's old count sitting there forever (phantom in-stock).</p>
+  <p>Fix — full feeds only, two steps:</p>
+  <pre><code>-- step 1: upsert every row in today's file, stamping THIS batch id
+--   blue  -> batch_id = 8842,  green -> batch_id = 8842
+--   red   -> NOT written (absent), so it KEEPS yesterday's id 8841
+
+-- step 2: zero anything this store didn't send tonight
+UPDATE inventory_levels
+SET on_hand = 0
+WHERE source = 'store-C-csv' AND location_id = 'store-C'   -- scope! or you wipe other stores
+  AND batch_id &lt;&gt; 8842;                                 -- "old batch = not seen tonight"</code></pre>
+  <div class="trap">
+    <span class="label">The nuance — it's not "no batch id", it's "not THIS batch id"</span>
+    Every row always carries <em>a</em> batch id — the one from whenever it was last written. The sold-out red shoe isn't blank; it still has <b>yesterday's</b> id (8841). So the test is <code>batch_id &lt;&gt; 8842</code> (an <em>older</em> batch), not <code>IS NULL</code>. And never run this sweep on a <b>delta</b> feed — there, absent blue and green mean "nothing changed", so zeroing them <b>wipes real stock</b>.
+  </div>
+
+  <h3>Q5. Which clock does the guard compare — measurement time, not write time</h3>
+  <p>If worker A already stored the row with <code>updated_at = 10:00</code> and worker B brings an event with <code>updated_at = 9:55</code>, the guard checks <code>9:55 &gt;= 10:00</code> → false → <b>rejected</b>. Correct. The trap: "10:00" is the <b>source's measurement time</b> (when the POS counted), <em>not</em> the wall-clock moment a worker ran the write. Worker B might physically execute at 10:01, after A — irrelevant. The guard compares the two <code>updated_at</code> values the source stamped, so the freshest reading wins no matter who commits last. It only engages because both writes hit the same <code>(location_id, sku)</code> row, so <code>ON CONFLICT</code> fires and the <code>WHERE</code> arbitrates.</p>
+
+  <h3>Q6. Partitioning the ingestion queue — why, and what "key on (source, location_id)" means</h3>
+  <p>A queue splits its stream into <b>partitions</b> (parallel lanes). The only ordering guarantee is: messages <b>within one partition</b> are processed in order (one consumer per lane); <b>across</b> lanes there is none. The <b>partition key</b> is the dial that picks what stays ordered — <code>partition = hash(key) % N</code>, so <b>same key → same lane → ordered</b>; different keys → different lanes → parallel.</p>
+  <p>Keying on <code>(source, location_id)</code> means "put every event about one store's feed in the same lane", so <b>each store's own timeline stays in order while different stores run in parallel</b>. Its real payoff is <b>fairness/isolation</b>: a store dumping a 500k-row nightly file floods only its own lane, so it can't block another store's real-time webhook in a different lane.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Partition key</th><th>What stays ordered</th><th>Parallelism</th></tr>
+    <tr><td><code>source</code> only</td><td>a whole feed (all its stores)</td><td>low</td></tr>
+    <tr><td><code>(source, location_id)</code></td><td>one store's whole stream</td><td>medium — one lane per store</td></tr>
+    <tr><td><code>(source, location_id, sku)</code></td><td>one single row's stream</td><td>high — one lane per SKU</td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <span class="label">Fairness, not correctness</span>
+    Correctness only ever needs per-row order (<code>location_id, sku</code>), and the staleness guard already delivers that whatever the arrival order. So partition ordering is a <em>nice-to-have</em>, never the mechanism — and it isn't airtight anyway (a retry, a consumer-group rebalance, or two sources feeding one row can still reorder). Say it as: "I partition for <b>fairness</b> so a batch store can't starve a real-time one; I don't lean on partition order for correctness — the timestamp guard makes out-of-order writes safe."
+  </div>
+
+  <h2>9. The two workers in code — poll-with-cursor (pull) and SFTP/CSV loader (file)</h2>
+  <p>Both reuse the idempotent write from <a href="../exercises/kata-01-inventory-upsert.html">Kata 01</a> — <code>applyReading()</code> (dedupe on <code>eventId</code> + the guarded upsert) and <code>zeroMissingAfterFullSnapshot()</code> — so each worker only owns its <em>transport</em> quirks. TypeScript + PostgreSQL, same as the kata.</p>
+
+  <h3>Worker A — poll-with-cursor (a PULL / delta source)</h3>
+  <p>Poll the POS read API on a schedule, fetch <em>only what changed</em> since last time (a <code>since</code> cursor), apply each reading, and advance the cursor only after the page is durably written. A cursor feed is a <b>delta</b>, so it never zeroes.</p>
+  <pre><code>// PULL: poll a POS API for changes since a saved cursor, normalise, apply.
+async function pollOnce(db: Db, api: PosApi, loc: StoreConfig): Promise&lt;void&gt; {
+  // 1. Where did we stop last time? (null on the very first run)
+  let since = await loadCursor(db, loc.source, loc.locationId);
+  let page: PosPage;
+
+  do {
+    // 2. Fetch ONLY the delta since the cursor. Back off on 429/5xx (respect Retry-After).
+    page = await withRetry(() =&gt; api.getInventoryChanges(loc, { since, limit: 500 }));
+
+    // 3. Normalise + apply each row. applyReading is idempotent, so if a re-poll
+    //    overlaps the last page, the dedupe + staleness guard absorb the repeat.
+    for (const raw of page.items) {
+      const reading = normalise(raw, loc);       // source codes -&gt; sku/location, unit convert
+      if (!reading) { await quarantine(db, raw, loc, 'unmapped'); continue; }  // never drop
+      await applyReading(db, reading);           // Kata 01: dedupe + guarded upsert
+    }
+
+    // 4. Advance the cursor ONLY after the page is durably applied. Crash before this
+    //    and we simply re-poll from the old cursor next run — at-least-once, and safe.
+    since = page.nextCursor;
+    await saveCursor(db, loc.source, loc.locationId, since);
+  } while (page.hasMore);
+}</code></pre>
+  <div class="note">
+    <span class="label">The one decision that makes it crash-safe</span>
+    Advance the cursor <b>after</b> the page is written, never before. If the worker dies mid-page the cursor still points at the old spot, so the next run re-fetches that page — and because <code>applyReading</code> is idempotent, re-applying it changes nothing. Advance the cursor <em>first</em> and a crash would <b>skip</b> unapplied changes forever (silent stock loss). Poll cadence is adaptive (fast-movers more often), and backoff uses jitter so many stores don't retry in lockstep.
+  </div>
+
+  <h3>Worker B — SFTP/CSV batch loader (a FILE / full source)</h3>
+  <p>Pull the nightly file, stream-parse it (files can be huge), apply each row under one <code>batchId</code>, quarantine what won't map, then — because a nightly file is a <b>full snapshot</b> — zero the SKUs that dropped off.</p>
+  <pre><code>// FILE: pull a nightly CSV over SFTP, stream it, apply under a batchId, then zero the missing.
+async function loadNightlyFile(db: Db, sftp: SftpClient, loc: StoreConfig): Promise&lt;void&gt; {
+  const batchId = await newBatchId(db, loc.source, loc.locationId);   // one id per load
+  const path = loc.dropPath;                                         // e.g. /out/stock.csv
+
+  try {
+    // 1. STREAM the file — never buffer a 500k-row file into memory.
+    const rows = parseCsvStream(sftp.createReadStream(path));        // async iterable
+
+    // 2. Apply each row under this batchId. Same guarded upsert as Kata 01, plus it
+    //    stamps last_batch_id = batchId (Kata 01's column) so step 4 can find what
+    //    this file did NOT touch.
+    let seen = 0;
+    for await (const raw of rows) {
+      const reading = normalise(raw, loc);
+      if (!reading) { await quarantine(db, raw, loc, 'unmapped'); continue; }
+      await applyReadingWithBatch(db, reading, batchId);
+      seen++;
+    }
+
+    // 3. GUARD: a truncated or empty drop must NOT reach the zero sweep, or it would
+    //    wipe the whole store. No rows -&gt; treat as a failed drop, not "everything sold out".
+    if (seen === 0) throw new Error(`empty/truncated file for ${loc.locationId}`);
+
+    // 4. FULL snapshot only: zero any SKU at this store not written by this batch
+    //    (it dropped off the file = sold out). A DELTA feed SKIPS this step.
+    await zeroMissingAfterFullSnapshot(db, loc.source, loc.locationId, batchId);
+
+    // 5. Archive the file so it can't be loaded twice.
+    await sftp.rename(path, `${path}.done.${batchId}`);
+  } catch (err) {
+    // Poison file (corrupt/unparseable) or a mid-file failure: alert, don't half-trust it.
+    // Re-running later converges — the upsert is idempotent and the sweep is keyed on the
+    // batchId — so a partial load self-heals on the next successful run.
+    await deadLetterFile(db, loc, path, err);
+    throw err;
+  }
+}
+
+// the guarded upsert, plus last_batch_id so the full-snapshot sweep can find absent SKUs
+async function applyReadingWithBatch(db: Db, r: StockReading, batchId: string): Promise&lt;void&gt; {
+  await db.query(
+    `INSERT INTO inventory_levels(location_id, sku, on_hand, updated_at, source, last_batch_id)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (location_id, sku) DO UPDATE
+       SET on_hand = EXCLUDED.on_hand, updated_at = EXCLUDED.updated_at,
+           source = EXCLUDED.source, last_batch_id = EXCLUDED.last_batch_id
+     WHERE EXCLUDED.updated_at &gt;= inventory_levels.updated_at`,
+    [r.locationId, r.sku, r.onHand, r.measuredAt, r.source, batchId]);
+}</code></pre>
+  <div class="trap">
+    <span class="label">The bug that wipes a whole store</span>
+    Skipping the <code>seen === 0</code> guard. If tonight's file is empty (an SFTP hiccup, a truncated upload) and you run the zero sweep anyway, <em>every</em> SKU is "not in this batch" — so you set the entire store to <code>on_hand = 0</code> and it shows sold out of everything. Always prove the snapshot actually arrived before you let it zero anything.
+  </div>
+  <div class="tip">
+    <span class="label">Why these two are the same worker in different clothes</span>
+    Strip the transport away and both do the same thing: <code>normalise → (quarantine if unmapped) → applyReading</code>. The pull worker adds a <b>cursor</b>; the file worker adds a <b>batchId + zero sweep</b>. The safe write in the middle is identical — which is exactly why "one normalisation layer behind three transports" (§3) is the right shape. Push (webhook) is the third: verify HMAC, enqueue, and the same <code>applyReading</code> runs off the queue.
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://www.stockinstore.com/faqs/">stockinstore FAQs</a> — confirms data comes from "POS, ERP system and Web platform" and is "designed so data can come from multiple systems" (franchises).<br>
+  📖 <a href="https://shopify.dev/docs/apps/build/orders-fulfillment/inventory-management-apps/manage-quantities-states">Shopify — manage inventory quantities and states</a> — the real multi-location model and the <code>inventorySetQuantities</code> / <code>inventoryAdjustQuantities</code> / <code>inventoryMoveQuantities</code> mutations, and the quantity states (<code>on_hand</code>, <code>available</code>, <code>committed</code>, <code>reserved</code>, …).<br>
+  📖 <a href="https://shopify.dev/docs/apps/build/webhooks">Shopify — Webhooks</a> — the ack-fast / verify / enqueue discipline you reuse for push feeds.</p>
+
+  <p class="small" id="c1">[1] Ingestion patterns follow the same reliability model verified in round 1 (checked 2026-07-16): at-least-once delivery → idempotent, order-guarded upserts; queue + backpressure; scheduled reconciliation to recover missed events. Multi-source and threshold facts verified against stockinstore.com/faqs.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can draw the one pipeline that serves push, pull, and file feeds; write the idempotent, timestamp-guarded upsert from a blank file; and explain why unmapped rows must go to quarantine rather than being dropped.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> The poll-with-cursor worker and the SFTP/CSV batch loader are now written out in §9 above. Want the scheduled <b>reconciliation job</b> in Node next (the drift-repair pass that re-reads a full export), or the <b>push webhook</b> edge that acks fast and enqueues? Just ask. When you're ready, say <b>"next"</b> for <b>Lesson 3 — The Stock Availability Engine</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0001-omnichannel-problem-and-domain.html">← Prev: The Domain</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0003-stock-availability-engine.html">Next: Availability Engine →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "Why does the upsert include WHERE EXCLUDED.updated_at > inventory_levels.updated_at?",
+      options: [
+        "So an older, out-of-order reading can't overwrite a newer one",
+        "To make the query run faster",
+        "To delete rows that are too old",
+        "To bill each store for its updates"
+      ],
+      answer: 0,
+      why: "Events arrive out of order (a slow poll can land after a fresh webhook). Guarding on the source timestamp makes the write both idempotent (same event twice = no change) and order-safe (older reading = ignored), so stock never goes backwards in time."
+    },
+    {
+      q: "A feed row has a product code your system doesn't recognise. What happens?",
+      options: [
+        "It goes to a quarantine table with an alert for a human to map",
+        "It is silently dropped",
+        "It overwrites the nearest matching SKU",
+        "The whole feed is rejected"
+      ],
+      answer: 0,
+      why: "Silent drops make stock quietly wrong (products show 'no stock' when they're on the shelf). Unmappable rows land in quarantine with an alert so someone adds the missing mapping and replays it."
+    },
+    {
+      q: "What are the three ways stock can arrive?",
+      options: [
+        "Push (webhook), pull (poll API), and file drop (batch)",
+        "Email, phone, and fax",
+        "Only nightly CSV files",
+        "Only real-time webhooks"
+      ],
+      answer: 0,
+      why: "A franchise has a mix: modern stores push webhooks (seconds-fresh), others expose an API you poll (minutes), and legacy systems drop CSV/JSONL files on a schedule (hours). One normalisation layer sits behind all three."
+    },
+    {
+      q: "Why do you partition the ingestion queue?",
+      options: [
+        "For fairness/isolation — one noisy store can't starve the others",
+        "To guarantee global ordering of all events",
+        "Because Shopify requires it",
+        "To avoid needing a database"
+      ],
+      answer: 0,
+      why: "Partitioning is about fairness and isolation (a store dumping a huge file shouldn't block real-time feeds). It does NOT give correctness through ordering — the timestamp staleness guard makes out-of-order arrival safe, so you don't rely on order. If you do want strict per-location order, key the partition on (source, location_id)."
+    },
+    {
+      q: "A store sends a FULL nightly file. Yesterday it listed SKU 42; today's file omits it. What must happen?",
+      options: [
+        "Set SKU 42 to on_hand = 0 (it's absent from a full snapshot)",
+        "Leave SKU 42 unchanged — absent means unchanged",
+        "Delete the whole store's inventory",
+        "Double SKU 42's previous count"
+      ],
+      answer: 0,
+      why: "In a FULL snapshot, absent = sold out = 0. Leaving the old positive count creates phantom in-stock (a classic oversell bug). In a DELTA feed the opposite is true — absent means unchanged — so you must know which feed type each source sends."
+    },
+    {
+      q: "The upsert's timestamp WHERE clause guarantees what — and NOT what?",
+      options: [
+        "It guards against stale/older readings; it is NOT true idempotency",
+        "It guarantees exactly-once and needs nothing else",
+        "It makes the query faster",
+        "It authenticates the feed"
+      ],
+      answer: 0,
+      why: "The timestamp guard stops an older reading overwriting a newer one (ordering). It is not idempotency — a re-send with a new send-time still passes it. For exact-once application you also dedupe on a source event id, like X-Shopify-Webhook-Id."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Walk me through the ingestion pipeline end to end.",
+      answer: "Stock arrives three ways — <b>push</b> webhooks, <b>pull</b> polled APIs, <b>file</b> drops. A <b>source adapter</b> per system sits at the ingestion edge: it <b>verifies the HMAC</b>, does the minimum, acks fast, and enqueues the raw event onto a queue <b>partitioned for fairness</b>. A <b>normalise worker</b> maps the source's product/store codes to canonical <code>sku</code>/<code>location_id</code>, <b>converts units</b>, and writes to one <code>inventory_levels</code> table keyed on <code>(location_id, sku)</code> — deduping on the <b>source event id</b> (exact-once) with a <b>timestamp staleness guard</b> (ordering). For <b>full-snapshot</b> feeds it zeroes SKUs that dropped off. Unmappable rows go to <b>quarantine</b> with an alert. A scheduled <b>reconciliation</b> re-reads each source that supports a full export to repair drift."
+    },
+    {
+      prompt: "Q: How do you keep stock fresh without hammering store APIs?",
+      answer: "<b>Prefer push</b> where supported (no polling). Use <b>adaptive / cursor-based polling</b> for pull sources — poll fast-movers more often and only fetch what changed. Let the <b>queue apply backpressure</b> so a nightly 40-store file drop doesn't overrun writes. And <b>track feed age</b> per row so a silent store becomes an alert and a caution signal for the availability engine, rather than a silent stale number."
+    },
+    {
+      prompt: "Q: Why is the mapping layer the hard core of ingestion?",
+      answer: "Sources don't share identifiers — the same shoe is <code>SHOE-RED-42</code> in one POS, <code>0042-RD</code> in another, SKU <code>1001</code> in your catalogue. Without a <b>SKU/barcode → canonical SKU</b> and <b>store code → location_id</b> mapping, feed rows match nothing and products show as out of stock when they're on the shelf. Barcodes/GTINs are the most reliable join key, and anything that won't map goes to quarantine, never dropped."
+    },
+    {
+      prompt: "Q: The queue delivers in order, so why keep the timestamp guard?",
+      answer: "A queue doesn't guarantee your <b>writes</b> land in order. You run <b>parallel workers</b> for throughput, so a slow worker can commit an <b>older</b> reading after a fast worker committed a newer one; <b>retries</b> re-inject old messages after new ones; and one <code>(location, sku)</code> may have two sources. The guard (<code>EXCLUDED.updated_at &gt;= stored</code>) makes the write order-independent — it compares the source's <b>measurement time</b>, not when a worker ran — so the freshest reading always wins. Partitioning is for fairness, not correctness."
+    },
+    {
+      prompt: "Q: A full nightly file drops a sold-out SKU. How do you avoid phantom in-stock — without wiping a delta feed?",
+      answer: "Tag each feed <b>full</b> or <b>delta</b>. For a full snapshot: stamp every row you write with tonight's <code>batch_id</code>, then set <code>on_hand = 0</code> for rows of that <code>(source, location)</code> whose <code>batch_id</code> is an <em>older</em> one (they weren't sent tonight) — scoped to that store, or you zero everyone else. Never do this on a <b>delta</b> feed — absent there means unchanged, so zeroing wipes real stock."
+    },
+    {
+      prompt: "Q: What is the ingestion queue's partition key for, and what does keying on (source, location_id) buy you?",
+      answer: "A partition is a lane; order holds <b>within</b> a lane, not across. The key picks what stays ordered (<code>hash(key) % N</code>): keying on <code>(source, location_id)</code> puts one store's whole stream in one lane, so that store stays in order while other stores run in parallel. Its real value is <b>fairness/isolation</b> — a store dumping a huge file floods only its own lane and can't starve a real-time feed. It is <b>not</b> the correctness mechanism: the timestamp staleness guard already makes out-of-order writes safe, so I partition for fairness and never rely on partition order."
+    },
+    {
+      prompt: "Q: In the poll-with-cursor worker, when do you advance the cursor — and what breaks if you get it wrong?",
+      answer: "Advance the cursor <b>only after</b> the page is durably applied, never before. If the worker crashes mid-page the cursor still points at the old spot, so the next run re-fetches that page; because <code>applyReading</code> is idempotent, re-applying it is a no-op. Advance <em>first</em> and a crash <b>skips</b> unapplied changes forever — silent stock loss. (A cursor feed is a delta, so it never runs the zero sweep.)"
+    },
+    {
+      prompt: "Q: The SFTP loader gets an empty file tonight. What must it do, and why?",
+      answer: "Refuse to run the zero sweep. An empty/truncated drop makes <em>every</em> SKU look 'not in this batch', so sweeping would set the whole store to <code>on_hand = 0</code> and show it sold out of everything. Guard on <code>seen === 0</code> → treat it as a failed drop (dead-letter + alert), not as 'everything sold out'. Only a snapshot you've proven arrived is allowed to zero anything."
+    }
+  ]);
+</script>

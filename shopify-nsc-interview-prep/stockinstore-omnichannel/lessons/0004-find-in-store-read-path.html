@@ -1,0 +1,431 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 4 — Find in Store &amp; Store Locator: the Read Path</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 4 · The read path · Answering the shopper</p>
+  <h1>Find in Store &amp; Store Locator: the Read Path</h1>
+  <p class="subtitle">The shopper asks one question on the product page — "which shops near me have this, right now?" — and expects an answer before they lose interest. This is a latency problem, not a stock problem.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> design the read path that answers "who near me has SKU X available?" in well under a second — the <em>geospatial</em> "near me" query, joined to the <em>availability</em> signal from Lesson 3, served from a cache within a strict latency budget, behind the "six lines of code" widget.
+  </div>
+
+  <p class="small">Builds on <a href="0003-stock-availability-engine.html">Lesson 3</a> (the availability signal you are about to serve) and <a href="0002-inventory-ingestion-multi-source-sync.html">Lesson 2</a> (the data you are reading). Ingestion is the <b>write</b> path; this is the <b>read</b> path, and the two are designed separately.</p>
+
+  <h2>1. The one query</h2>
+  <p>Find in Store and Store Locator are the same query with a different filter. Both start from the shopper's location and a product, and return nearby stores:</p>
+  <div class="note">
+    <span class="label">What the widget actually asks your API</span>
+    <b>"Given SKU X and location (lat, lng), return the N nearest stores, each with its distance and its availability state."</b> Store Locator is the same call without a SKU (just "nearest stores"), or with the SKU used only to label stock status. One endpoint serves both.
+  </div>
+  <p>So the answer is a <b>join of two things</b> you must compute fast: <b>proximity</b> (which stores are near) and <b>availability</b> (does each have it, per Lesson 3). The whole lesson is how to make that join cheap.</p>
+
+  <h2>2. The geospatial part — "near me"</h2>
+  <p>"Nearest stores to a point" is a classic geospatial query. Do <em>not</em> compute distance to every store in a loop — that does not scale and it is slow. Use a spatial index.</p>
+  <ul>
+    <li><b>PostGIS (Postgres):</b> store each location as a <code>geography(Point)</code>, add a <b>GiST</b> spatial index, and let the database find nearest neighbours. Two operators do the work: <code>ST_DWithin(geog, point, meters)</code> filters to a radius, and the <code>&lt;-&gt;</code> KNN operator orders by true distance using the index.</li>
+    <li><b>Redis GEO:</b> for a hot, in-memory read path, <code>GEOSEARCH … BYRADIUS … ASC</code> returns nearby members ordered by distance in microseconds.</li>
+    <li><b>Cheap approximation:</b> a bounding-box filter (lat/lng between ±δ) to shrink the set, then exact distance on the survivors. Works without PostGIS, but a real spatial index is better.</li>
+  </ul>
+  <pre><code>-- nearest 5 stores within 50 km that have this SKU, with availability
+-- (PostGIS; :lat/:lng from the shopper, :sku the product)
+SELECT s.location_id, s.name, s.lat, s.lng,
+       ST_Distance(s.geog, ST_MakePoint(:lng, :lat)::geography) AS metres,
+       a.state, a.qty_shown
+FROM   locations s
+JOIN   availability a ON a.location_id = s.location_id AND a.sku = :sku
+WHERE  s.active
+  AND  ST_DWithin(s.geog, ST_MakePoint(:lng, :lat)::geography, 50000)   -- 50 km radius
+ORDER  BY s.geog &lt;-&gt; ST_MakePoint(:lng, :lat)::geography                -- KNN, index-ordered
+LIMIT  5;</code></pre>
+  <div class="tip">
+    <span class="label">Note what this query reads</span>
+    It reads an <code>availability</code> table, not raw <code>inventory_levels</code>. The Lesson-3 engine (threshold, buffer, prediction) has already been applied and the <em>result</em> stored, so the read path does no availability maths at request time — it just reads a pre-computed state. Pushing the expensive work off the request is the core read-path move.
+  </div>
+
+  <h2>3. The latency budget (why this is a read problem)</h2>
+  <p>This call happens on the product page, often on load, for every visitor. It must feel instant. Put a number on it so you can defend the design:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Layer</th><th>Target (p95)</th><th>Why</th></tr>
+    <tr><td>Whole page feels instant</td><td>&lt; ~300 ms</td><td>Above this, shoppers notice and bounce.</td></tr>
+    <tr><td>Your availability API</td><td>&lt; ~100 ms</td><td>It's one of several things the page waits on; keep your slice small.</td></tr>
+    <tr><td>Cache hit</td><td>a few ms</td><td>Most reads should never touch Postgres at all.</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    Running the availability calculation (threshold + prediction) inside the request. That couples every product-page view to your heaviest logic and to the write-side database. Pre-compute availability when stock changes (write path), store the <em>result</em>, and let the read path serve a simple lookup. Reads and writes have opposite shapes — many fast reads, fewer heavy writes — so you optimise them separately.
+  </div>
+
+  <h2>4. Caching — the technique that makes it fast</h2>
+  <p>The same popular product in the same city is queried thousands of times. Cache the answer.</p>
+
+  <div class="note">
+    <span class="label">Start simple — what the Redis cache even is</span>
+    Picture two places the answer can live. <b>Postgres</b> is a big filing cabinet: it holds the truth, but opening it and searching takes ~30 ms. <b>Redis</b> is a sticky note on your desk — a plain <b>key → value</b> store kept in memory (RAM), so reading it takes ~1 ms. The cache is just this: <em>before</em> doing the slow filing-cabinet work, check the sticky note. If the answer is already there, hand it back; if not, do the work once and write it on the note for next time.
+  </div>
+  <div class="diagram">shopper: "stores near postcode 2026 with SKU 1001?"
+                    │
+                    ▼
+        ┌─────────────────────────────────┐
+        │ Redis — is this key saved yet?   │
+        │ key = avail:1001:postcode:2026   │
+        └───────────────┬─────────────────┘
+                        │
+          ┌─────────────┴──────────────┐
+        HIT (~1ms)                    MISS  (first time, or after expiry)
+          │                             │
+          ▼                             ▼
+   return the saved            ask Postgres (~30ms),
+   answer instantly            SAVE it in Redis, then return
+                               (every later shopper now HITs)</div>
+  <p class="small"><b>HIT</b> = the answer was on the note (fast). <b>MISS</b> = it wasn't, so one request rebuilds it. That is the whole idea. Everything below is just detail: <em>which</em> answer to save (the key), how long to keep it (the TTL), and when to tear the note up (invalidation).</p>
+
+  <ul>
+    <li><b>What to cache:</b> the result of "(SKU, coarse area) → nearby stores + availability." Round the shopper's location to a coarse grid or use their postcode as the key, so nearby shoppers share one cache entry instead of each getting a unique lat/lng.</li>
+    <li><b>Where:</b> an in-memory cache (Redis) in front of Postgres, and an edge/CDN cache for the truly hot, coarse queries.</li>
+    <li><b>TTL:</b> short — seconds to a couple of minutes. Availability is already a hint (Lesson 3), so a slightly old hint is acceptable; the strict check happens at purchase, not on the product page.</li>
+    <li><b>Invalidation:</b> when the availability of a SKU at a store changes materially (crosses a threshold, or a reservation is taken), evict or update the entries that include it. A short TTL is the safety net for anything you miss.</li>
+  </ul>
+  <div class="note">
+    <span class="label">Worked example — the cache key</span>
+    A shopper at (−33.8908, 151.2743) searching SKU 1001 becomes key <code>avail:1001:postcode:2026</code> (or a geohash prefix). The next shopper in postcode 2026 asking for 1001 hits the same cached answer — a few milliseconds, no database. Only when that entry expires (say 60 s) or is invalidated does one request rebuild it and re-populate the cache for everyone.
+  </div>
+
+  <h2>5. Where the data lives (read/write split)</h2>
+  <p>Draw the two paths as separate flows meeting at one store of pre-computed availability.</p>
+  <div class="diagram">     WRITE PATH (Lesson 2 + 3)                 READ PATH (this lesson)
+
+  POS/ERP feeds ─► ingest ─► inventory_levels        product page
+                                   │                      │ widget
+                       availability engine (L3)           ▼
+                                   │                 ┌──────────┐   miss   ┌──────────┐
+                                   ▼                 │  Cache   │─────────►│ availability
+                            ┌──────────────┐  read   │ (Redis / │◄─────────│  + PostGIS
+                            │ availability │◄────────│  edge)   │  rebuild │  (read     │
+                            │  (state per  │         └────┬─────┘          │  replica)  │
+                            │  loc × sku)  │              │ hit (ms)       └────────────┘
+                            └──────────────┘              ▼
+                                                    N nearest stores
+                                                    + availability state</div>
+  <ul>
+    <li><b>Pre-computed availability</b> is written by the engine when stock changes, and only read here.</li>
+    <li><b>Read replica:</b> serve the geospatial rebuild query from a read replica so heavy read traffic never competes with ingestion writes.</li>
+    <li><b>The widget never talks to the write side.</b> It only ever reads cache → replica. This isolation is what keeps a viral product page from stalling your stock sync.</li>
+  </ul>
+
+  <h2>6. The widget → your public API</h2>
+  <p>"Six lines of code" means a small script on the merchant's product page that calls your API with the SKU and the shopper's location. Because it runs in the shopper's browser on the merchant's domain, three things matter:</p>
+  <ul>
+    <li><b>It is a public, read-only endpoint</b> — no secret keys in the browser. Scope it to read availability only. Identify the merchant with a public, per-merchant key in the URL, not a secret.</li>
+    <li><b>CORS</b> must allow the merchant's storefront origin to call it from the browser.</li>
+    <li><b>Rate limiting / abuse protection</b> — a public endpoint is scrapeable, so throttle per key and per IP, and never return more store detail than the widget needs.</li>
+  </ul>
+  <pre><code>GET /v1/find-in-store?sku=1001&amp;lat=-33.89&amp;lng=151.27&amp;radius=50000&amp;limit=5
+    &amp;key=pub_merchant_abc            // public merchant key, not a secret
+
+200 OK   (served from cache in a few ms)
+{
+  "sku": "1001",
+  "stores": [
+    { "id": "bondi",     "name": "Bondi",     "distance_km": 1.2,
+      "state": "in_stock",    "qty_shown": 4, "updated_min_ago": 3 },
+    { "id": "randwick",  "name": "Randwick",  "distance_km": 3.8,
+      "state": "call_to_confirm" },
+    { "id": "city",      "name": "Sydney CBD", "distance_km": 6.1,
+      "state": "out_of_stock" }
+  ]
+}</code></pre>
+  <p>Notice the response carries the <b>state</b> and an <b>age</b> (<code>updated_min_ago</code>), not a bare number — so the widget can show "In stock (updated 3 min ago)" or "Call to confirm," honouring the honesty rule from Lesson 3.</p>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: the one query the widget asks, the two parts it joins, and the two techniques that keep it fast.</div>
+
+  <h2>7. Failure modes &amp; edges</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What happens</th><th>How you handle it</th></tr>
+    <tr><td><b>Shopper blocks geolocation</b></td><td>Fall back to a postcode/suburb text box; geocode it to lat/lng server-side. Never leave the widget blank.</td></tr>
+    <tr><td><b>A store has no coordinates</b></td><td>Exclude it from "near me" (it can't be ranked) but flag it for data cleanup. Don't crash the query on a NULL point.</td></tr>
+    <tr><td><b>Cache miss storm</b> (hot SKU expires)</td><td>Many requests rebuild the same key at once. Use a single-flight lock (one rebuild, others wait) or serve slightly stale while one refreshes.</td></tr>
+    <tr><td><b>Availability is a little stale</b></td><td>Acceptable by design — it's a hint with an age shown. The strict guarantee is the purchase-time reservation (Lesson 3 §6), not this page.</td></tr>
+    <tr><td><b>No stores in radius</b></td><td>Widen the radius once, then show "no nearby stock — ships from warehouse" rather than an empty result.</td></tr>
+    <tr><td><b>Scraping / traffic spike</b></td><td>Per-key + per-IP rate limits; edge cache absorbs the hot, coarse queries; read replica protects the write side.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the read path in 6 sentences)</span>
+    <p>"The widget asks one question — nearest N stores to a point that have this SKU, with each store's availability state. I answer it by joining a geospatial 'near me' query to a pre-computed availability table: the Lesson-3 engine does the threshold and prediction maths on the write side, so the read path only looks up a stored state. Proximity uses a spatial index — PostGIS with a GiST index and the KNN operator, or Redis GEO for the hot path — never a distance loop over every store. I keep it under about 100 milliseconds by caching '(SKU, coarse area) → result' in Redis with a short TTL and an edge cache for the hottest queries, invalidating when availability crosses a threshold. Reads run off a replica so a viral product page never competes with ingestion writes. The endpoint is public and read-only with a per-merchant public key, CORS for the storefront origin, and per-key rate limits, and it returns a state plus an age — not a bare number — so the widget stays honest about freshness."</p>
+  </div>
+
+  <h2>8. Deep-dive Q&amp;A — the read model, and the cache entry's life cycle</h2>
+  <p class="small">Two questions the read path always draws out. Cover each answer, say it out loud, then scroll.</p>
+
+  <h3>Q1. Is <code>availability</code> a separate table, and what's its key?</h3>
+  <p><b>Yes</b> — <code>availability</code> is its own table, and its primary key is <code>(location_id, sku)</code>, the same grain as <code>inventory_levels</code>. One row = "the answer for this product at this store." The two tables are a <b>read model / write model split</b> (CQRS-lite):</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th><code>inventory_levels</code> (WRITE model)</th><th><code>availability</code> (READ model)</th></tr>
+    <tr><td>Holds</td><td>raw feed truth: <code>on_hand, reserved, version, updated_at, source</code></td><td>computed answer: <code>state, qty_shown, computed_at</code></td></tr>
+    <tr><td>Written by</td><td>ingestion workers (feeds)</td><td>the availability engine (Lesson 3)</td></tr>
+    <tr><td>Read by</td><td>the engine, reconciliation</td><td>the hot read path (the widget)</td></tr>
+    <tr><td>Key</td><td>PK <code>(location_id, sku)</code></td><td>PK <code>(location_id, sku)</code> — 1:1 twin</td></tr>
+  </table>
+  </div>
+  <p>Why separate: computing <code>state</code> means combining <code>on_hand − reserved − buffer</code>, the per-SKU threshold, and the feed age (a stale feed → <code>call_to_confirm</code>) — the heavy write-side logic. Do it <em>once</em> when stock changes and store the finished <code>state</code>, so the hottest path (every product-page view, and geospatial) is a cheap indexed lookup, never a recomputation. The query returns a <code>state</code> enum (<code>in_stock | low | likely | out_of_stock | call_to_confirm</code>), not the raw number — hiding the count and encoding policy.</p>
+  <div class="diagram">                    retailers (retailer_id PK)
+                          │ 1
+              ┌───────────┴────────────┐
+              │ *                      │ *
+     ┌────────┴─────────┐    ┌─────────┴──────────────┐
+     │ locations        │    │ products               │
+     │ location_id  PK  │    │ (retailer_id, sku) PK  │
+     │ geog (POINT)     │    │ barcode, title         │
+     │ active, timezone │    └─────────┬──────────────┘
+     └────────┬─────────┘              │ 1 (by sku)
+              │ 1                      │
+              │      (location_id, sku)│
+              │ *                      │ *
+       ┌──────┴────────────────────────┴──────┐
+       │ inventory_levels     ── WRITE model   │
+       │ PK (location_id, sku)                 │
+       │ on_hand, reserved, version, updated_at│
+       └──────────────┬────────────────────────┘
+                      │ 1 : 1  (engine computes)
+                      ▼
+       ┌───────────────────────────────────────┐
+       │ availability         ── READ model     │
+       │ PK (location_id, sku)  ◄ query JOINs   │
+       │ state, qty_shown, computed_at          │
+       └───────────────────────────────────────┘</div>
+  <div class="note">
+    <span class="label">Two indexes, two jobs</span>
+    The query touches two indexes doing different things: the <b>GiST</b> index on <code>locations.geog</code> finds the <em>nearby</em> stores (via <code>ST_DWithin</code> + the <code>&lt;-&gt;</code> KNN order), and the <b>PK <code>(location_id, sku)</code></b> on <code>availability</code> resolves <em>this product's</em> answer at each of those stores. Neither can do the other's job. Column order matters: <code>(location_id, sku)</code> suits this query (look up per location after the spatial step); if your dominant access were "one SKU across all stores" you'd want a <code>(sku, location_id)</code> index — same uniqueness, different traversal.
+  </div>
+
+  <h3>Q2. "One request rebuilds it and re-populates the cache for everyone" — what does that mean?</h3>
+  <p>The coarse key (<code>avail:1001:postcode:2026</code>) makes every shopper in postcode 2026 asking for SKU 1001 share <b>one</b> cache entry. "Rebuild" = run the real PostGIS + availability lookup on the read replica (~tens of ms). After one rebuild you <code>SET</code> the result back, so the next thousand shoppers read it in a few ms and never touch the database. The DB cost is paid <b>once per key per TTL window</b>, amortised across everyone in that area.</p>
+  <div class="diagram">key = avail:1001:postcode:2026        TTL = 60s
+
+t=0.0s   shopper A -> GET -> MISS
+                  -> rebuild (PostGIS on replica, ~30ms)
+                  -> SET key = result, EX 60
+t=0.3s   shopper B -> GET -> HIT -> ~2ms, no DB
+t=12s    shopper C -> GET -> HIT -> ~2ms, no DB
+  ...    (hundreds in postcode 2026 served from this ONE entry)
+t=45s    reservation taken for 1001 nearby -> INVALIDATE -> DEL key   (event-based)
+t=45.1s  shopper D -> GET -> MISS -> one rebuild -> SET -> HITs resume
+t=105s   60s after the last rebuild -> entry EXPIRES on its own       (time-based safety net)</div>
+  <p>Two independent triggers remove the entry, and you want both: <b>TTL expiry</b> (time-based — the safety net; a hint can't be more than 60s stale) and <b>invalidation</b> (event-based — evict the moment availability materially changes: crosses a threshold, or a reservation is taken, so you never show sold-out stock as in-stock). Invalidation keeps it <em>correct</em>; TTL keeps it <em>bounded</em>.</p>
+  <div class="trap">
+    <span class="label">The word "one" is the trap — cache stampede</span>
+    By default it is <em>not</em> one rebuild. When a hot key expires, many shoppers miss in the same millisecond and <b>all</b> rebuild at once — a burst of identical expensive queries (the "cache miss storm" in §7). To make "one request rebuilds for everyone" literally true you add a <b>single-flight lock</b> (one rebuilds, the rest wait then read the fresh value) or <b>stale-while-revalidate</b> (serve the slightly-old value while one background request refreshes).
+  </div>
+  <pre><code>// single-flight: exactly one rebuild repopulates the shared entry
+async function getAvailability(key: string) {
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);                          // fast path (a few ms)
+
+  // MISS: only ONE request should rebuild. Take a short lock.
+  const gotLock = await redis.set(`${key}:lock`, '1', 'NX', 'PX', 5000);
+  if (!gotLock) { await sleep(50); return getAvailability(key); }  // wait -&gt; read fresh entry
+
+  try {
+    const result = await queryReplica(key);                 // the expensive rebuild, ONCE
+    await redis.set(key, JSON.stringify(result), 'EX', 60); // re-populate for everyone
+    return result;
+  } finally {
+    await redis.del(`${key}:lock`);
+  }
+}</code></pre>
+  <div class="tip">
+    <span class="label">Why the coarse key is the biggest lever</span>
+    "For everyone" only works because the key is a <b>postcode/geohash</b>, not exact lat/lng. Exact coordinates give every shopper a unique key → ~0% hit rate → you rebuild on every request. Rounding the key is the single biggest lever on hit rate — it's what turns one rebuild into thousands of cheap hits.
+  </div>
+
+  <h3>Q3. How do <code>locations</code> and <code>products</code> know each other?</h3>
+  <p>They <b>don't link directly</b> — the ERD in Q1 has no line between them. They meet only through <code>inventory_levels</code>, a <b>junction (bridge) table</b> that resolves a <b>many-to-many</b> relationship: one location stocks many products, one product sits in many locations. A relational DB can't store M:N directly, so you keep one row per <em>pair</em>.</p>
+  <div class="diagram">locations              inventory_levels               products
+────────────           ─────────────────────          ─────────────────────
+location_id PK ◄─────── location_id                    (retailer_id, sku) PK
+                        sku            ──────────────►  sku
+                        on_hand, reserved, ...          barcode, title
+                        PK = (location_id, sku)</div>
+  <p>The PK <code>(location_id, sku)</code> is literally <b>one id from each side glued together</b>: a <code>location_id</code> → every product that store stocks; a <code>sku</code> → every store carrying that product; both → the one row with its <code>on_hand</code>. Because it also carries data (<code>on_hand</code>, <code>reserved</code>) it's an <b>associative entity</b>, not just a pure link.</p>
+  <p><b>The precise detail — how <code>sku</code> reaches <code>products</code>:</b> <code>products</code>'s key is <code>(retailer_id, sku)</code>, but <code>inventory_levels</code> has no <code>retailer_id</code> column, so <code>sku</code> alone can't identify a product (it's only unique <em>within a retailer</em>). The missing <code>retailer_id</code> comes from the <b>location</b>:</p>
+  <pre><code>SELECT ...
+FROM   inventory_levels i
+JOIN   locations l ON l.location_id = i.location_id    -- borrow retailer_id from the store
+JOIN   products  p ON p.retailer_id = l.retailer_id    -- now the full product key matches
+                  AND p.sku         = i.sku;</code></pre>
+  <p>So the two sides connect <em>only</em> through <code>inventory_levels</code>, and the retailer scope flows via the location. (Strict schemas either add <code>retailer_id</code> onto <code>inventory_levels</code> for a clean composite FK, or make <code>sku</code> globally unique.)</p>
+  <div class="tip">
+    <span class="label">Where the link is actually created — ingestion</span>
+    The linking row is <em>born</em> in Lesson 2's mapping step: the normalise worker turns a store's own codes (<code>0092-RED</code> at store <code>MEL-03</code>) into a canonical <code>sku</code> + <code>location_id</code> via <code>id_map</code>, then writes one <code>inventory_levels</code> row. If the mapping fails there is no linking row — which is exactly why Find in Store shows "no stock" for a product that's really on the shelf.
+  </div>
+
+  <h3>Q4. Cache key: geohash vs postcode?</h3>
+  <p>Both do the same job — <b>coarsen</b> the shopper's location so nearby people share one entry (§4). They differ in how they draw the "area":</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Postcode</th><th>Geohash prefix</th></tr>
+    <tr><td>Key looks like</td><td><code>avail:1001:postcode:2026</code></td><td><code>avail:1001:geohash:r3gx2</code></td></tr>
+    <tr><td>How the area is drawn</td><td>the region's own postcode boundary</td><td>a grid cell; a longer prefix = a smaller cell (tunable)</td></tr>
+    <tr><td>Good when</td><td>the shopper <b>types</b> a postcode; matches delivery/pickup zones; human-readable</td><td>you have precise <b>lat/lng</b> (geolocation); want uniform, country-agnostic cells</td></tr>
+    <tr><td>Weakness</td><td>uneven sizes (dense city vs huge rural); boundaries don't match "within 50 km"</td><td>arbitrary squares; shoppers just across a cell edge get different keys (fragmentation)</td></tr>
+  </table>
+  </div>
+  <p>Both trade exact precision for hit rate, and both share the same <b>edge problem</b>: the truly-nearest store can sit just across a boundary, so neither zone perfectly matches "5 nearest within 50 km." That is acceptable because availability is a <em>hint</em> — and the query still runs a real <code>ST_DWithin</code> radius from a representative point.</p>
+  <div class="trap">
+    <span class="label">The key and the query point MUST match</span>
+    Whatever you key on, run the query from a <b>canonical point for that key</b> — the postcode centroid, or the geohash cell centre — <em>not</em> the shopper's exact lat/lng. If two shoppers share <code>postcode:2026</code> but you compute distances from each one's precise coordinates, they would serve each other slightly-wrong cached answers. One key = one query = one stored answer.
+  </div>
+
+  <h3>Q5. Why an edge/CDN cache in front of Redis?</h3>
+  <p>Redis is fast but lives in <b>one region</b> — your origin. A shopper on another continent still pays the network round-trip to that region for a Redis hit. An <b>edge/CDN cache</b> (Cloudflare, Fastly, CloudFront) stores the HTTP response at a PoP (point of presence) <em>near the shopper</em>, so the hottest, coarsest queries are answered ~10–30 ms away and your origin does <b>zero</b> work.</p>
+  <div class="diagram">browser ──→ CDN / edge PoP ──miss──→ your API ──→ Redis ──miss──→ Postgres
+  (near       (~10-30ms hit,           (region       (~1ms hit)    (replica,
+   shopper)    a coarse cacheable GET)  round-trip)                 ~30ms)
+       ▲                                    ▲
+   most viral, coarse                  per-region hot
+   queries stop HERE                   queries stop HERE</div>
+  <ul>
+    <li><b>What's cacheable at the edge:</b> only a stable, shareable GET. The URL must carry the <b>coarse key</b> (postcode/geohash + a rounded radius) and the public merchant key — never exact lat/lng, or every URL is unique and edge hit rate is ~0. Same coarsening idea as the Redis key, applied to the URL.</li>
+    <li><b>How it's controlled:</b> <code>Cache-Control: public, s-maxage=60</code> on the response tells the CDN to keep it 60 s. Layer the TTLs (edge ~30–60 s, Redis ~60 s) so staleness stays bounded top to bottom.</li>
+    <li><b>Invalidation is weaker here:</b> you <em>can</em> purge a CDN entry, but it is eventually consistent across PoPs — so at the edge you lean on the <b>short TTL</b>, and keep the precise threshold/reservation invalidation at the Redis layer.</li>
+    <li><b>Safe because it's public:</b> the endpoint is a public, read-only availability hint (§6), so there is nothing user-specific to leak. Never edge-cache anything keyed to a person, and don't cache errors for long.</li>
+  </ul>
+  <div class="tip">
+    <span class="label">One sentence for the interview</span>
+    "I layer caches by how coarse and hot the query is: the CDN absorbs the viral, coarse queries near the user; Redis absorbs the per-region hot ones; the read replica handles the rest — each layer has a short TTL so a stale hint is bounded, and the widget shows the age anyway."
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://www.stockinstore.com/solutions/find-in-store/">stockinstore — Find in Store</a> — the product-page "in stock near you" feature and the "six lines of code" widget framing.<br>
+  📖 <a href="https://www.stockinstore.com/solutions/store-locator/">stockinstore — Store Locator</a> — the nearby-stores map/list that shares this read path.<br>
+  📖 <a href="https://postgis.net/docs/ST_DWithin.html">PostGIS — ST_DWithin</a> and <a href="https://postgis.net/workshops/postgis-intro/knn.html">KNN with the &lt;-&gt; operator</a> — the geospatial mechanisms named above.</p>
+
+  <p class="small" id="c1">[1] Feature framing verified against stockinstore.com (checked 2026-07-16): Find in Store shows nearby in-store availability on the product page via a small widget; Store Locator lists nearby stores. Latency targets and cache TTLs here are standard read-path engineering guidance (illustrative numbers, not stockinstore's published figures). PostGIS <code>ST_DWithin</code> / <code>&lt;-&gt;</code> KNN and Redis <code>GEOSEARCH</code> are the documented geospatial mechanisms.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can state the one query, explain why availability is pre-computed on the write side and only read here, name the spatial index (PostGIS GiST + KNN, or Redis GEO), and describe the cache key, TTL, and the read-replica split — all against a stated latency budget.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> The Redis primer (§4) and the geohash-vs-postcode and edge/CDN deep-dives (§8) are now in the lesson. Want to see <b>Redis GEO (GEOSEARCH)</b> as an alternative to PostGIS for the hot path, or how a <b>cache warm-up</b> keeps the top SKUs pre-populated? Just ask. When you're ready, say <b>"next"</b> for <b>Lesson 5 — Click &amp; Collect / BOPIS order flow</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0003-stock-availability-engine.html">← Prev: Availability Engine</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0005-click-collect-order-flow.html">Next: Click &amp; Collect →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "Why does the read path read an 'availability' table instead of raw inventory_levels?",
+      options: [
+        "The threshold/prediction maths is pre-computed on the write side, so reads are a simple lookup",
+        "inventory_levels is encrypted",
+        "Shopify forbids reading inventory_levels",
+        "availability is stored on the shopper's device"
+      ],
+      answer: 0,
+      why: "Doing the Lesson-3 availability calculation inside every product-page request would couple reads to your heaviest logic and the write DB. You compute availability when stock changes and store the result; the read path just looks it up, keeping it fast."
+    },
+    {
+      q: "How do you find the nearest stores efficiently?",
+      options: [
+        "A spatial index — PostGIS GiST + KNN (<->), or Redis GEO",
+        "Loop over every store and compute distance each request",
+        "Ask the shopper to pick a store from a list",
+        "Sort all stores alphabetically"
+      ],
+      answer: 0,
+      why: "A distance loop over all stores doesn't scale. A spatial index answers nearest-neighbour queries directly: PostGIS with a GiST index and the <-> KNN operator (plus ST_DWithin for a radius), or Redis GEOSEARCH for an in-memory hot path."
+    },
+    {
+      q: "What is a good cache key for this read path?",
+      options: [
+        "(SKU, coarse area / postcode) so nearby shoppers share one entry",
+        "The shopper's exact lat/lng to 6 decimals",
+        "The current timestamp",
+        "The merchant's secret API key"
+      ],
+      answer: 0,
+      why: "Exact coordinates give every shopper a unique key and near-zero hit rate. Rounding to a postcode or geohash prefix lets all shoppers in an area share one cached answer, so most reads never touch the database."
+    },
+    {
+      q: "Why serve reads from a read replica?",
+      options: [
+        "So heavy product-page traffic never competes with ingestion writes",
+        "Because replicas are always newer than the primary",
+        "To avoid needing a cache",
+        "Because Shopify requires it"
+      ],
+      answer: 0,
+      why: "Reads and writes have opposite shapes. Serving the geospatial rebuild from a replica isolates a viral product page from the write side, so stock sync keeps running smoothly under read load."
+    },
+    {
+      q: "The widget runs in the shopper's browser. What must the endpoint be?",
+      options: [
+        "Public, read-only, with a per-merchant PUBLIC key, CORS, and rate limits",
+        "Authenticated with the merchant's SECRET key in the browser",
+        "Open with no limits so it's fast",
+        "A write endpoint so it can reserve stock"
+      ],
+      answer: 0,
+      why: "Browser code can't hold secrets. The endpoint is public and read-only, identified by a public per-merchant key, allows the storefront origin via CORS, and is rate-limited per key/IP because anything public is scrapeable."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Walk me through the Find in Store read path.",
+      answer: "The widget asks one query: <b>nearest N stores to (lat,lng) that have SKU X, with each store's availability state</b>. I join <b>proximity</b> (a spatial index — PostGIS GiST + the <code>&lt;-&gt;</code> KNN operator, or Redis GEO) to a <b>pre-computed availability</b> table (the Lesson-3 engine ran on the write side). I keep it under ~100 ms by <b>caching</b> '(SKU, coarse area) → result' in Redis with a short TTL, plus an edge cache, invalidating when availability crosses a threshold. Reads run off a <b>read replica</b> so they don't fight ingestion writes. The endpoint is <b>public, read-only</b> with a per-merchant public key, CORS, and rate limits, and returns a <b>state + age</b>, not a bare number."
+    },
+    {
+      prompt: "Q: Why is availability pre-computed instead of calculated per request?",
+      answer: "Reads vastly outnumber writes and must be fast; the availability maths (threshold, buffer, prediction) is the heavy part and depends on the write-side data. So I run it when stock <b>changes</b> and store the <b>result state</b> per (location, SKU). The product page then does a cheap lookup, not a calculation — decoupling every page view from my heaviest logic and from the ingestion database."
+    },
+    {
+      prompt: "Q: The shopper won't share their location. What does the widget do?",
+      answer: "Fall back to a <b>postcode/suburb text box</b> and geocode it to lat/lng server-side, then run the same query. Never leave the widget blank. If no stores fall in the radius, widen it once, then show 'no nearby stock — ships from warehouse' rather than an empty result — always give the shopper a next step."
+    },
+    {
+      prompt: "Q: Why is availability a separate table from inventory_levels, and what is its key?",
+      answer: "They're a <b>read model / write model split</b>. <code>inventory_levels</code> holds raw feed truth (<code>on_hand, reserved, …</code>); <code>availability</code> holds the computed answer (<code>state, qty_shown, computed_at</code>) that the Lesson-3 engine writes when stock changes. Both share the PK <code>(location_id, sku)</code> — availability is the 1:1 derived twin. Separating them keeps the hot, geospatial read path a cheap indexed lookup instead of recomputing thresholds/feed-age per request, and lets reads scale independently of writes."
+    },
+    {
+      prompt: "Q: A hot cache key expires and 500 requests hit it at once. What happens, and how do you make it 'one rebuild for everyone'?",
+      answer: "By default all 500 miss together and all rebuild — a <b>cache stampede</b>, a burst of identical DB queries. To make it one rebuild: a <b>single-flight lock</b> (the first miss takes a lock and rebuilds; the rest wait ~50ms then read the value it just SET) or <b>stale-while-revalidate</b> (serve the slightly-expired value while one background request refreshes). Either way the expensive query runs once and re-populates the shared entry for everyone. The coarse postcode/geohash key is what makes that sharing possible."
+    },
+    {
+      prompt: "Q: In the schema, how do locations and products relate — is there a direct link?",
+      answer: "No direct link. They're <b>many-to-many</b> (a store stocks many products; a product sits in many stores), resolved through the junction table <code>inventory_levels</code> with PK <code>(location_id, sku)</code> — one id from each side. It's an <b>associative entity</b> because it also carries <code>on_hand</code>/<code>reserved</code>. To reach a product you join <em>via the location</em>: <code>sku</code> isn't globally unique, so the location supplies the <code>retailer_id</code> that completes the <code>(retailer_id, sku)</code> product key. The link is first created at ingestion, when the mapping step turns source codes into a canonical <code>(location_id, sku)</code> row."
+    },
+    {
+      prompt: "Q: Postcode vs geohash for the cache key — how do you choose, and what's the one rule?",
+      answer: "Both <b>coarsen</b> location so nearby shoppers share an entry. <b>Postcode</b> when the shopper types one (human-readable, matches pickup zones); <b>geohash prefix</b> when you have precise lat/lng (uniform, tunable, country-agnostic). Both have the same edge problem (the nearest store can sit across a boundary) — fine, because availability is a hint. The one rule: the <b>key and the query point must match</b> — run the query from the postcode centroid or cell centre, never each shopper's exact lat/lng, or shoppers sharing a key serve each other wrong answers."
+    },
+    {
+      prompt: "Q: Why put an edge/CDN cache in front of Redis, and what must the URL look like?",
+      answer: "Redis lives in one region, so a far-away shopper still pays a round-trip for a Redis hit. A <b>CDN/edge</b> serves the response from a PoP near the shopper (~10-30ms) and the origin does zero work — it absorbs the viral, coarse queries. The URL must be a stable, shareable GET carrying the <b>coarse key</b> (postcode/geohash + rounded radius) and the public merchant key — never exact lat/lng, or edge hit rate is ~0. Control it with <code>Cache-Control: s-maxage</code>; lean on a short TTL at the edge (purge is eventually consistent) and keep precise invalidation at Redis."
+    }
+  ]);
+</script>

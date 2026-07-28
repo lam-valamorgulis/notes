@@ -1,0 +1,268 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — Data Model &amp; Consistency</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 8 · Reliable at scale · The data</p>
+  <h1>Data Model &amp; Consistency</h1>
+  <p class="subtitle">Now put all the tables on one page and answer the hard question: which parts of this system can be eventually consistent, and which parts must be strongly consistent — and why getting that split right is the whole game.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> lay out the full schema, decide the <em>source of truth</em> for each fact, place the one island of strong consistency (the reservation) inside a sea of eventual consistency, and explain the transactional outbox that stops a database write and an emitted event from drifting apart.
+  </div>
+
+  <p class="small">This gathers the tables introduced across Lessons 2–6 into one model, and answers the consistency questions an interviewer asks once they've seen the pieces.</p>
+
+  <h2>1. The schema on one page</h2>
+  <p>Everything the platform stores. <code>retailer_id</code> is on every row — this is a multi-tenant system serving many retailers (Lesson 9).</p>
+  <pre><code>retailers(retailer_id PK, name, plan)
+
+locations(location_id PK, retailer_id, name, geog POINT, timezone,
+          daily_capacity, active)                 -- geog: PostGIS point (L4)
+
+-- SKU is a VARIANT-level code in Shopify (may be null/duplicate), so it is
+-- unique only WITHIN a retailer, never globally.
+products(retailer_id, sku, title, barcode, active,
+         PRIMARY KEY (retailer_id, sku))
+
+-- canonical raw stock (write path, L2). reserved is the AUTHORITATIVE running
+-- counter (see §3); version guards against stale/out-of-order writes (§4).
+inventory_levels(location_id, sku, on_hand, reserved, version INT,
+                 updated_at TIMESTAMPTZ, source, PRIMARY KEY (location_id, sku))
+
+-- computed, read-optimised availability (L3 → L4 reads this)
+--   state: 'in_stock' | 'low' | 'likely' | 'out_of_stock' | 'call_to_confirm'
+--   qty_shown: the safe number to display = max(0, on_hand - reserved - buffer)
+availability(location_id, sku, state, qty_shown, computed_at TIMESTAMPTZ,
+             PRIMARY KEY (location_id, sku))
+
+-- the LEDGER of holds (L5): one row per hold, with a TTL. The sum of active
+-- rows must equal inventory_levels.reserved (reconciled periodically).
+--   status: 'active' | 'consumed' | 'expired' | 'cancelled'
+reservations(id PK, retailer_id, location_id, sku, qty, order_ref,
+             status, expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ)
+
+-- what we allocated / order lifecycle (L5, L6)
+allocations(id PK, order_ref, location_id, sku, qty, method, status)
+            -- method: PICK_UP | SHIPPING ; status: reserved..fulfilled
+
+-- identity mapping: each source's codes → canonical (L2)
+id_map(entity, source, source_code, canonical_id,
+       UNIQUE(entity, source, source_code))
+
+-- reliability tables (L2, L7) — both are append-heavy; see retention in §6
+event_dedupe(event_id PK, received_at TIMESTAMPTZ)       -- idempotency
+feeds(source PK, retailer_id, mode, kind, last_seen_at TIMESTAMPTZ) -- push/pull/file; delta/full
+outbox(id PK, aggregate, payload, published_at TIMESTAMPTZ NULL)    -- see §4</code></pre>
+  <div class="note">
+    <span class="label">Why <code>reserved</code> appears to live in two places (it doesn't)</span>
+    <code>inventory_levels.reserved</code> is an <b>authoritative running counter</b> — a single number so the concurrency guard can be one atomic row update (§3). The <code>reservations</code> table is the <b>ledger</b> — one row per hold, carrying the TTL, order reference, and status for audit and expiry. They are not two sources of truth for the same fact: the counter is the fast aggregate, the ledger is the detail, and both are written <em>in the same transaction</em>. A periodic reconciliation asserts <code>inventory_levels.reserved == SUM(qty of active reservations)</code> and repairs any drift.
+  </div>
+
+  <h2>2. Source of truth — decide it per fact</h2>
+  <p>The most important design statement in the whole system. Different facts are owned by different systems; naming the owner prevents fights and duplicates.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Fact</th><th>Source of truth</th><th>Why</th></tr>
+    <tr><td>Physical on-hand stock</td><td><b>The store's POS/ERP</b></td><td>You don't control the shelf; you receive its count and never invent it.</td></tr>
+    <tr><td>Reservations &amp; availability</td><td><b>Your platform</b></td><td>These are your computation; only you know what you've promised.</td></tr>
+    <tr><td>The order &amp; its fulfilment state</td><td><b>Shopify</b></td><td>Checkout, payment, and fulfillment orders live there (L5).</td></tr>
+    <tr><td>Product catalogue / price</td><td><b>Shopify</b> (usually)</td><td>The storefront owns what's for sale and at what price.</td></tr>
+  </table>
+  </div>
+  <div class="tip">
+    <span class="label">Say it like this</span>
+    "I declare a source of truth per fact: the POS owns physical stock, my platform owns reservations and computed availability, Shopify owns the order and the catalogue. Each system only <em>reads</em> the facts it doesn't own. That single rule kills most sync bugs before they happen."
+  </div>
+  <div class="note">
+    <span class="label">How the rule is enforced (not just declared)</span>
+    Two mechanics turn "source of truth" from a wish into a guarantee. <b>(1) Replace, don't add.</b> An inbound POS reading <em>sets</em> <code>on_hand</code> to the reported number — it never adds a delta — because the POS owns that field. So even after you write a fulfilment back to the store, the next feed that reflects it is a harmless no-op, not a second decrement. <b>(2) Version guard.</b> Each <code>inventory_levels</code> row carries a <code>version</code> (or you compare <code>updated_at</code>); a write with an older-or-equal version is ignored, so a slow <em>full</em> feed can't clobber a newer <em>delta</em>. When both sides change the same fact, the owner wins: the POS wins <code>on_hand</code>, the platform wins <code>reserved</code> — they don't fight because they own different fields.
+  </div>
+
+  <h2>3. Eventual consistency — with one strong-consistency island</h2>
+  <p>The platform is <b>eventually consistent</b> by nature: store feeds lag, so your availability is always a little behind the shelf, and that's acceptable (Lesson 3 made availability a hint with an age). But one operation cannot be eventually consistent:</p>
+  <div class="note">
+    <span class="label">The island: the reservation must be strongly consistent</span>
+    Two shoppers must never both reserve the last unit. The reservation is two writes — increment the counter and insert a ledger row — done in one transaction, and the guard is a single conditional update on the <code>(location_id, sku)</code> row:
+  </div>
+  <pre><code>BEGIN;
+  -- take the hold only if enough is really free; the row lock serialises buyers
+  UPDATE inventory_levels
+     SET reserved = reserved + :qty
+   WHERE location_id = :loc AND sku = :sku
+     AND (on_hand - reserved - :buffer) >= :qty;     -- 0 rows ⇒ sold out ⇒ ROLLBACK, refuse
+  INSERT INTO reservations(...);                      -- the ledger row, same transaction
+COMMIT;</code></pre>
+  <p>Zero rows updated means "not enough" — you roll back and refuse. Everything around this (display, sync, analytics) can be eventually consistent; the reservation is the one place you pay for strong consistency, and you pay it on a single row, so it stays cheap.</p>
+  <div class="trap">
+    <span class="label">Releasing a hold is just as atomic as taking one</span>
+    When a reservation is collected, cancelled, or hits its TTL, you must set its ledger status <em>and</em> decrement <code>inventory_levels.reserved</code> in the <b>same transaction</b>. Skip the decrement and the counter leaks upward forever — available stock silently shrinks (a phantom out-of-stock). Expiry is a guarded write, not a background afterthought.
+  </div>
+  <p>In CAP terms — which applies <em>during a network partition</em> — the <b>reservation chooses consistency</b> (refuse rather than risk a double-sell) while the <b>read path chooses availability</b> (serve a possibly-stale hint rather than fail). And in normal operation (PACELC's "else" branch) the read path also favours <b>latency over freshness</b>: it's a hint with an age, so a stale-but-fast answer beats a slow-but-fresh one. One consequence: availability reads may come from a <b>read replica</b>, but the reservation transaction must <b>always run on the primary</b> — a replica's lag would let two buyers take the last unit.</p>
+
+  <h2>4. The dual-write problem &amp; the outbox</h2>
+  <p>A worker often must do two things: write to the database <em>and</em> emit an event (Lesson 7). If it writes the row, then crashes before emitting, the event is lost and downstream never reacts (a reservation created but no cache invalidation, no notification). Two writes to two systems can't be made atomic directly — this is the <b>dual-write problem</b>.</p>
+  <div class="tip">
+    <span class="label">The fix: transactional outbox</span>
+    In the <em>same</em> database transaction as the business write, insert a row into an <code>outbox</code> table. A separate publisher polls <code>SELECT ... WHERE published_at IS NULL ORDER BY id</code> (backed by a partial index — §6), emits each event per <code>aggregate</code> in order, then sets <code>published_at</code>. Because the business row and the outbox row commit together, you never write one without the other. If the publisher crashes after emitting but before marking published, it re-emits on restart — at-least-once, which is fine because consumers are idempotent (Lesson 7). (Change-data-capture on the outbox table is an alternative to polling.)
+  </div>
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    "Write the row, then publish the event" in two steps. A crash between them silently drops the event, and the bug is invisible until a customer doesn't get their "ready to collect" message. The outbox makes the write-and-emit atomic; a plain two-step does not.
+  </div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: the source of truth for each of the four facts, the one strongly-consistent operation, and what the outbox fixes.</div>
+
+  <h2>5. Closing the loop: stock &amp; finance back to the POS/ERP</h2>
+  <p>When a Ship-from-Store or Click &amp; Collect order is fulfilled, the store just sold a unit through the <em>online</em> channel. The store's own POS/ERP must learn about it, or its stock count and its books will be wrong. stockinstore "integrates with your POS/ERP to keep accurate stock and finance records."</p>
+  <ul>
+    <li><b>Stock:</b> the fulfilment reduces the store's real on-hand; you write that movement back so the POS doesn't keep showing the sold unit. The next inbound feed then reports the already-reduced number, and because feeds <em>replace</em> <code>on_hand</code> (never add — §2), that feed is a no-op, not a second decrement. This is why you don't double-count the sale across the two directions.</li>
+    <li><b>Finance:</b> the sale (revenue, tax, the fulfilling store's credit) is recorded in the ERP so the store gets attribution and the books reconcile.</li>
+    <li><b>Idempotent write-back:</b> keyed on the order/allocation id, so a retried write-back doesn't double-count the sale.</li>
+  </ul>
+
+  <h2>6. Indexing &amp; storage choices</h2>
+  <ul>
+    <li><b><code>(location_id, sku)</code></b> primary key on <code>inventory_levels</code> and <code>availability</code> — the natural lookup and the upsert conflict target.</li>
+    <li><b>Spatial index</b> (GiST) on <code>locations.geog</code> for the Lesson-4 "near me" query.</li>
+    <li><b>Index on <code>reservations.expires_at</code></b> (partial, <code>WHERE status = 'active'</code>) so the TTL sweep (Lesson 5) finds expired holds cheaply.</li>
+    <li><b>Partial index <code>ON outbox (id) WHERE published_at IS NULL</code></b> so the publisher's poll only scans unpublished rows.</li>
+    <li><b>Multi-tenancy model:</b> this is the <b>shared-schema, row-discriminator</b> design (one <code>retailer_id</code> column on every row) — the simplest of the three options (vs schema-per-tenant, DB-per-tenant). Enforce it with Postgres <b>row-level security</b> so a forgotten <code>WHERE retailer_id</code> can't leak across tenants; trade-offs are in Lesson 9.</li>
+    <li><b>Retention:</b> <code>event_dedupe</code> and <code>outbox</code> are append-heavy. Keep <code>event_dedupe</code> for a bounded window (e.g. daily partitions dropped after the max replay window, ~24–48 h); delete or archive <code>outbox</code> rows soon after <code>published_at</code> is set. Left unbounded they bloat and slow the hot paths they protect.</li>
+    <li><b>SQL for the canonical model</b> (relational, transactional — reservations need ACID). A high-volume append-only <b>event log</b> can live in a store tuned for writes; the deeper SQL-vs-NoSQL trade-off is your round-1 lesson. Don't force everything into one engine.</li>
+  </ul>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the data &amp; consistency story in 6 sentences)</span>
+    <p>"I keep one canonical model — locations, products, raw inventory_levels, a computed availability table the read path serves, reservations with a TTL, allocations for the order lifecycle, plus id-mapping and reliability tables — all tagged with retailer_id for multi-tenancy. The key statement is source of truth per fact: the POS owns physical stock, my platform owns reservations and availability, Shopify owns the order and catalogue, and each system only reads what it doesn't own. The platform is eventually consistent because feeds lag, and that's fine for display, but the reservation is a strong-consistency island — one atomic guarded update on a single row so two buyers can't take the last unit. Where a worker must write and emit an event, I use a transactional outbox so the row and the event commit together and neither is lost. When an order is fulfilled I write the stock movement and the sale back to the store's POS/ERP, idempotently, so their stock and finance stay correct. In CAP terms the read path favours availability and the reservation favours consistency, and knowing which side each operation sits on is the whole design."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://www.stockinstore.com/faqs/">stockinstore FAQs</a> — "integrates with your POS/ERP to keep accurate stock and finance records."<br>
+  📖 <a href="https://microservices.io/patterns/data/transactional-outbox.html">Transactional outbox pattern</a> — commit the business write and the event atomically.<br>
+  📖 <a href="../../lessons/0009-databases-sql-vs-nosql.html">Main course L9 — SQL vs NoSQL</a> — the deeper storage-choice reasoning behind this model.</p>
+
+  <p class="small" id="c1">[1] POS/ERP finance-and-stock write-back verified against stockinstore.com/faqs (checked 2026-07-16). The transactional outbox and eventual-vs-strong-consistency reasoning are standard distributed-systems patterns; the schema is an illustrative model of the concepts taught in Lessons 2–6, not stockinstore's actual schema.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can sketch the schema, state the source of truth for each fact, explain why the reservation is the one strongly-consistent operation, and describe the outbox and the idempotent POS/ERP write-back without hesitating.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the outbox publisher written in Node, or a walk-through of a two-way-sync conflict (both POS and platform changed)? Just ask. When you're ready, say <b>"next"</b> for <b>Lesson 9 — Scale, multi-tenancy &amp; failure modes</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0007-event-driven-backbone.html">← Prev: Event Backbone</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0009-scale-multitenancy-failure-modes.html">Next: Scale &amp; Failure Modes →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "What is the source of truth for physical on-hand stock?",
+      options: [
+        "The store's POS/ERP — you receive it, never invent it",
+        "Your availability table",
+        "Shopify's order record",
+        "The shopper's browser"
+      ],
+      answer: 0,
+      why: "You don't control the shelf. The POS/ERP owns physical stock; your platform owns reservations and computed availability; Shopify owns the order and catalogue. Each system only reads facts it doesn't own — the rule that kills most sync bugs."
+    },
+    {
+      q: "Which operation must be strongly consistent, not eventually consistent?",
+      options: [
+        "The reservation (two buyers can't take the last unit)",
+        "The product-page availability display",
+        "The analytics feed",
+        "The nightly reconciliation"
+      ],
+      answer: 0,
+      why: "Feed lag makes display eventually consistent, which is fine (it's a hint with an age). The reservation is the one island of strong consistency — an atomic guarded update on a single (location, sku) row, so it stays cheap while preventing double-sell."
+    },
+    {
+      q: "What is the dual-write problem?",
+      options: [
+        "Writing to the DB and emitting an event can't be atomic; a crash between them loses the event",
+        "Two users writing the same row",
+        "Writing to two databases for speed",
+        "A typo written twice"
+      ],
+      answer: 0,
+      why: "A worker that writes a row then publishes an event can crash in between, silently dropping the event (e.g. a reservation with no notification). The two writes to two systems aren't atomic on their own — that's the dual-write problem."
+    },
+    {
+      q: "How does the transactional outbox fix it?",
+      options: [
+        "Insert the event into an outbox row in the SAME transaction; a publisher emits it later",
+        "Emit the event first, then write the row",
+        "Use a bigger database",
+        "Skip the event entirely"
+      ],
+      answer: 0,
+      why: "The business row and an outbox row commit together, so you never write one without the other. A separate publisher reads unpublished rows and emits them (at-least-once); idempotent consumers make re-emits safe."
+    },
+    {
+      q: "Why write the sale back to the store's POS/ERP after fulfilment?",
+      options: [
+        "So the store's stock count and finance/books stay correct and attributed",
+        "To slow down the system",
+        "Because Shopify deletes the order",
+        "It's optional and never needed"
+      ],
+      answer: 0,
+      why: "An online-channel sale reduced the store's real stock and earned revenue. Writing it back (idempotently, keyed on order/allocation id) keeps the POS stock accurate and the ERP books reconciled, with the fulfilling store credited."
+    },
+    {
+      q: "Why does reserved stock appear both as a counter on inventory_levels and as rows in a reservations table?",
+      options: [
+        "The counter is the fast atomic aggregate; the table is the ledger — written in one transaction and reconciled",
+        "It's a bug — pick one",
+        "The counter is a cache that can drift freely",
+        "Shopify requires two copies"
+      ],
+      answer: 0,
+      why: "They're not two sources of truth for the same fact. inventory_levels.reserved is the authoritative running counter so the concurrency guard is one atomic row update; the reservations table is the per-hold ledger (TTL, order_ref, status). Both are written in the same transaction, and reconciliation asserts the counter equals the sum of active holds."
+    },
+    {
+      q: "An inbound POS feed reports on_hand. How do you apply it, and why does that stop double-counting a fulfilment?",
+      options: [
+        "Replace on_hand (never add), guarded by a version — so a feed reflecting a write-back is a no-op",
+        "Add the reported number to the current value",
+        "Ignore all feeds after the first",
+        "Subtract it from reserved"
+      ],
+      answer: 0,
+      why: "The POS owns on_hand, so a feed SETS it, never adds a delta. After you write a fulfilment back to the store, the next feed reports the already-reduced number — and because it replaces rather than adds, it's a harmless no-op. A version (or updated_at) guard also stops a stale full feed clobbering a newer delta."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Give me the data model and the source-of-truth split.",
+      answer: "Core tables: <code>locations</code> (with a PostGIS point + capacity), <code>products</code>, raw <code>inventory_levels</code> <code>(location,sku)</code>, a computed <code>availability</code> table the read path serves, <code>reservations</code> (with <code>expires_at</code>), <code>allocations</code> for the order lifecycle, plus <code>id_map</code>, <code>event_dedupe</code>, <code>feeds</code>, and <code>outbox</code> — all tagged <code>retailer_id</code>. <b>Source of truth:</b> POS/ERP owns physical stock; my platform owns reservations + availability; Shopify owns the order + catalogue. Each system only reads what it doesn't own."
+    },
+    {
+      prompt: "Q: What's eventually consistent here, and what isn't?",
+      answer: "<b>Eventually consistent:</b> availability display (feeds lag, so it's a hint with an age), analytics, sync, POS/ERP write-back. <b>Strongly consistent:</b> the <b>reservation</b> — an atomic guarded update on one <code>(location,sku)</code> row so two buyers can't take the last unit. In CAP terms the read path favours <b>availability</b> and the reservation favours <b>consistency</b>; the skill is knowing which side each operation is on."
+    },
+    {
+      prompt: "Q: Why an outbox instead of write-then-publish?",
+      answer: "Because write-then-publish isn't atomic — a crash after the DB write but before the emit silently loses the event (a reservation with no cache-invalidation or notification). The <b>transactional outbox</b> inserts the event into an <code>outbox</code> row in the <b>same transaction</b> as the business write, so they commit together. A separate publisher emits unpublished rows at-least-once, and idempotent consumers make re-emits safe."
+    }
+  ]);
+</script>

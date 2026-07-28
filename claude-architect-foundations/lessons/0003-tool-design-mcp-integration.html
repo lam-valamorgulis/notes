@@ -1,0 +1,596 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 — Tool Design &amp; MCP Integration</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 3 · Domain 2 · 18% of the exam</p>
+  <h1>Tool Design &amp; MCP Integration</h1>
+  <p class="subtitle">The model can only be as good as the tools you hand it. This domain is about designing tools it can pick, use, and recover from — not about hosting servers.</p>
+
+  <div class="win">
+    <strong>Your win:</strong> confidently answer <em>"An agent keeps calling the wrong tool — what's your first fix, and why not a routing layer?"</em> — and know when to split one tool into three.
+  </div>
+
+  <div class="note">
+    <span class="label">Scope note</span>
+    This lesson is about tool <b>design</b> and <b>integration</b>. Hosting, deploying, and networking MCP servers are <b>out of scope</b> for the exam and for this lesson. We focus on how tools are described, chosen, and how errors flow back.
+  </div>
+
+  <h2>1. The mental model: descriptions are the interface</h2>
+  <p>A <b>tool</b> is a function the model can call — it has a name, a set of inputs, and a <b>tool description</b>: the plain-text explanation of what the tool does. The model does not read your code. It reads the description and the input schema, then decides which tool fits the user's request.</p>
+  <p>So the description <b>is</b> the interface. If two tools sound the same, the model guesses. If a description is vague, the model picks wrong. Most "the agent misbehaves" problems in this domain are really "the description was weak" problems.</p>
+  <div class="soundbite">
+    <span class="label">Crisp answer</span>
+    <p>"The tool description is the primary mechanism the model uses to select a tool. When selection is unreliable, I fix the descriptions before I add machinery around the model."</p>
+  </div>
+
+  <h2>2. Writing descriptions that route correctly</h2>
+  <p>A good tool description tells the model four things:</p>
+  <ul>
+    <li><b>Input formats</b> — what the inputs look like (an order ID like <code>#1024</code>, an email, a URL).</li>
+    <li><b>Example queries</b> — the kind of user request this tool answers.</li>
+    <li><b>Edge cases</b> — what happens with no match, bad input, or partial data.</li>
+    <li><b>Boundary vs alternatives</b> — when to use <em>this</em> tool instead of a similar one.</li>
+  </ul>
+  <p>The classic failure is two tools with near-identical minimal descriptions:</p>
+  <pre><code>// BAD — the model cannot tell these apart
+get_customer:  "Retrieves customer information."
+lookup_order:  "Retrieves order details."</code></pre>
+  <p>When a user asks "where is my order?", the model may call <code>get_customer</code> because both descriptions are one vague line. The fix is to <b>expand each description</b> so the boundary is obvious:</p>
+  <pre><code>// GOOD — inputs, examples, and a boundary line
+get_customer:
+  "Look up a customer profile by email or customer ID
+   (e.g. cust_8891). Returns name, contact, and account status.
+   Use for questions ABOUT a person. Do NOT use for order
+   status — use lookup_order for anything about a specific order."
+
+lookup_order:
+  "Look up one order by order number (e.g. #1024) or order ID.
+   Returns status, items, shipping, and totals. Use for
+   'where is my order', 'what did I buy'. Do NOT use to fetch
+   a customer profile — use get_customer for that."</code></pre>
+  <div class="trap">
+    <span class="label">WRONG first move</span>
+    Jumping straight to <b>a routing layer</b> (extra code that decides which tool to call before the model sees the request). That over-engineers the problem and throws away the model's own language understanding. The root cause was weak descriptions — fix those first.
+  </div>
+  <div class="trap">
+    <span class="label">Also WRONG as a first move</span>
+    Adding <b>few-shot examples</b> in the system prompt to patch the misrouting. It burns tokens on every call and does not fix the real problem: the tool itself still describes itself badly. Fix the description, which every caller sees for free.
+  </div>
+  <div class="tip">
+    <span class="label">Do this</span>
+    When descriptions overlap, also consider a <b>rename</b>. If <code>analyze_content</code> secretly means "extract results from a web page", rename it to <code>extract_web_results</code> and give it a web-specific description. A precise name is half the description.
+  </div>
+
+  <h2>3. When one tool is doing too much: split it</h2>
+  <p>A single generic tool with a fuzzy job is hard to select and hard to use well. If <code>analyze_document</code> can summarize, pull data points, <em>and</em> fact-check, the model never knows which behavior it is asking for.</p>
+  <p>The fix is to <b>split the generic tool into purpose-specific tools</b>, each with a clear input/output contract:</p>
+  <div class="diagram"><pre><code>analyze_document  (does everything, unclear)
+        │  split into
+        ▼
+extract_data_points      in: document → out: list of fields
+summarize_content        in: document → out: short summary
+verify_claim_against_source  in: claim + source → out: supported / not</code></pre></div>
+  <p>Now each tool has one job, one shape of input, one shape of output. Selection becomes reliable because the descriptions no longer overlap.</p>
+  <div class="note">
+    <span class="label">Rename vs split — which one?</span>
+    <b>Rename</b> when the tool does one thing but is labeled badly. <b>Split</b> when the tool genuinely does several different things. In the sample-question style: expanding descriptions is the cheapest first step; splitting is right when the tool really has multiple jobs.
+  </div>
+
+  <h2>4. Structured error responses (the <code>isError</code> flag)</h2>
+  <p>When an MCP tool fails, it signals that with the <b>isError</b> flag — a boolean the tool sets to tell the agent "this call did not succeed". But a bare <code>isError: true</code> with the message "Operation failed" is almost useless. The agent cannot decide what to do next.</p>
+  <p>Give the agent enough metadata to make a recovery decision. The four error kinds it must tell apart:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Error kind</th><th>Example</th><th>What the agent should do</th></tr>
+    <tr><td><b>Transient</b></td><td>Timeout, service unavailable</td><td>Retry (maybe after a short wait)</td></tr>
+    <tr><td><b>Validation</b></td><td>Bad input format, missing field</td><td>Fix the input, then retry</td></tr>
+    <tr><td><b>Business</b></td><td>Policy violation (e.g. refund window closed)</td><td>Do NOT retry — explain to the user</td></tr>
+    <tr><td><b>Permission</b></td><td>Not allowed / not authorized</td><td>Do NOT retry — escalate or stop</td></tr>
+  </table>
+  </div>
+  <p>Return that as structured fields: an <b>errorCategory</b> (transient / validation / permission / business), an <b>isRetryable</b> boolean, and a human-readable description. For a business-rule violation, set <code>isRetryable: false</code> and include a customer-friendly explanation.</p>
+  <pre><code>// A useful error object
+{
+  "isError": true,
+  "errorCategory": "business",
+  "isRetryable": false,
+  "message": "Refund window closed. Orders can be refunded
+              within 30 days; this order is 45 days old."
+}</code></pre>
+  <div class="note">
+    <span class="label">Which parts of that object are the protocol, and which are your design</span>
+    Worth separating, because only one part is fixed. <b>The flag is the protocol.</b> An MCP tool result carries <code>isError</code>; the equivalent on a Claude API <code>tool_result</code> block is spelled <code>is_error</code> — same meaning, different layer, and you will meet both spellings depending on which side you are writing. <b>Everything else in that object is your own convention.</b> <code>errorCategory</code> and <code>isRetryable</code> are not standard fields — they are a shape <em>you</em> choose and put inside the result content. That is the actual architectural lesson: the protocol gives you a single bit, <b>failed or not</b>, and one bit is not enough to decide what to do next. So you design the vocabulary that carries the recovery decision, and — this is the part that matters — you <b>use the same vocabulary across every tool</b>, so the agent learns one way to read failures instead of one per tool.
+  </div>
+
+  <div class="trap">
+    <span class="label">WRONG</span>
+    Returning a uniform <code>{"isError": true, "message": "Operation failed"}</code> for every failure. The agent cannot tell a timeout (retry) from a policy block (stop). It may retry forever on a business rule, or give up on a one-off timeout.
+  </div>
+  <div class="note">
+    <span class="label">You cannot prompt your way to information the tool never emitted</span>
+    When the fix is "the error responses are information-free", the answer is to <b>enrich the response at the source</b> — not to add few-shot examples that "interpret error patterns", and not to add a second <code>analyze_error</code> tool (an extra round-trip for something the failing tool already knew). If every failure returns <code>"Operation failed"</code>, there is <b>no signal to interpret</b>: few-shot teaches the model to read <b>present-but-ambiguous</b> data consistently, but it cannot conjure <b>absent</b> data. Before reaching for examples, ask: <i>is the information present-but-ambiguous, or missing entirely?</i> Present &rarr; prompting/few-shot can help. Missing &rarr; fix the source (emit <code>errorCategory</code> / <code>isRetryable</code> / cause). Blanket server-side retries are also wrong here — they retry permanent errors and <b>hide</b> the category the agent needs.
+  </div>
+  <div class="tip">
+    <span class="label">Do this — empty is not an error</span>
+    Distinguish an <b>access failure</b> (the query could not run — needs a retry decision) from a <b>valid empty result</b> (the query ran fine, there were simply no matches). "No orders found for this customer" is a <b>success</b> with an empty list, not an error. Marking it <code>isError</code> makes the agent retry a query that already worked.
+  </div>
+  <div class="note">
+    <span class="label">In multi-agent flows</span>
+    Handle transient errors <b>locally inside the subagent</b> (retry there). Only pass up to the coordinator the errors that cannot be fixed locally — and when you do, pass up any <b>partial results</b> you already have, so the coordinator can still make progress.
+  </div>
+
+  <h2>5. Distributing tools across agents</h2>
+  <p>More tools is not better. Giving one agent <b>18 tools instead of 4–5</b> makes selection worse: every extra tool adds decision complexity, and the model is more likely to pick the wrong one. Agents also <b>misuse tools outside their specialty</b> — a synthesis agent (whose job is writing the final answer) will try to run web searches badly if you hand it search tools.</p>
+  <div class="soundbite">
+    <span class="label">Crisp answer</span>
+    <p>"Scoped tool access: give each agent only the tools its role needs. Add a small number of limited cross-role tools for specific high-frequency needs, and route anything complex through the coordinator."</p>
+  </div>
+  <p>Example: a synthesis agent should not get a full web-search tool. Give it a narrow <code>verify_fact</code> tool for the one thing it actually needs (quick fact checks), and send genuinely complex research back through the coordinator.</p>
+
+  <h2>6. Forcing tool choice with <code>tool_choice</code></h2>
+  <p>You can control whether and which tool the model calls with <b>tool_choice</b>:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Value</th><th>Meaning</th><th>Use when</th></tr>
+    <tr><td><code>"auto"</code></td><td>Model decides: call a tool or just reply in text</td><td>Normal case — the model chooses</td></tr>
+    <tr><td><code>"any"</code></td><td>Must call <em>some</em> tool (no plain-text reply)</td><td>You need an action, not chatter</td></tr>
+    <tr><td><code>{"type":"tool","name":"..."}</code></td><td>Must call <em>this exact</em> tool</td><td>Guarantee a step runs first</td></tr>
+    <tr><td><code>"none"</code></td><td>Must <b>not</b> call any tool, though the tools stay defined</td><td>You want one prose turn — a summary, a clarifying question — without stripping the tools out of the request</td></tr>
+  </table>
+  </div>
+  <p class="small">Same field, same four values as Lesson 2 §3 — met here from the tool designer's side rather than the schema author's. The pairing worth remembering: <code>"any"</code> guarantees <b>that</b> a tool runs but not <b>which</b>; only the named form guarantees which.</p>
+  <p>Use the forced form to make sure a step happens in order — for example, force <code>extract_metadata</code> so it always runs before an enrichment step. Use <code>"any"</code> when you must guarantee the model performs an action rather than returning text.</p>
+  <div class="tip">
+    <span class="label">Do this — constrain the tool, not just the choice</span>
+    Replace a dangerous generic tool with a narrow one. Instead of <code>fetch_url</code> (which can hit anything), give a <code>load_document</code> tool that validates the URL is a real document first. A constrained tool is safer than trusting <code>tool_choice</code> alone.
+  </div>
+
+  <h2>7. Integrating MCP servers into Claude Code</h2>
+  <p><b>MCP (Model Context Protocol)</b> is an open standard for connecting a model to external tools and data. An MCP server exposes <b>tools</b> (actions), <b>resources</b> (content it can read), and prompts. Claude Code connects to these servers and, at connection time, <b>discovers the tools from every configured server at once</b> — they are all available to the agent together.</p>
+
+  <h3>Where servers are configured: scoping</h3>
+  <p>There are <b>three</b> scopes, not two, and the one people forget is the <b>default</b>. You choose with <code>claude mcp add --scope &lt;local|user|project&gt;</code>; omit the flag and you get <code>local</code>.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th><code>local</code> — the default</th><th><code>project</code></th><th><code>user</code></th></tr>
+    <tr><td><b>Where it lives</b></td><td>Your own settings, recorded <b>per project</b></td><td><code>.mcp.json</code> in the repo</td><td>Your global user config</td></tr>
+    <tr><td><b>Who gets it</b></td><td>Only you, only in <b>this</b> project</td><td><b>Everyone</b> who clones the repo</td><td>Only you, in <b>every</b> project</td></tr>
+    <tr><td><b>Committed?</b></td><td>No</td><td><b>Yes</b> — checked in with the code</td><td>No</td></tr>
+    <tr><td><b>Reach for it when</b></td><td>Trying a server out on one project</td><td>The whole team needs this tooling</td><td>A personal server you want everywhere</td></tr>
+  </table>
+  </div>
+  <p>The scope decision is really one question: <b>who should get this server, and where?</b> Team-wide and tied to this codebase &rarr; <code>project</code>, so it is version-controlled and arrives with a <code>git clone</code>. Just you, everywhere &rarr; <code>user</code>. Just you, just here &rarr; <code>local</code>, which is why it is the safe default: an experiment cannot leak into a teammate's setup or another project.</p>
+
+  <div class="note">
+    <span class="label">A project-scope server is not trusted automatically</span>
+    Because <code>.mcp.json</code> arrives from the repository, a server listed there is <b>not connected to on sight</b> — it sits as <b>pending approval</b> until you accept it. This is a deliberate security boundary, and it is worth being able to explain <em>why</em>: a committed config file is <b>executable configuration written by whoever last pushed</b>. Without the gate, cloning a repository would silently run whatever command its <code>.mcp.json</code> names. The trade-off to state out loud: project scope buys you <b>team consistency</b>, and pays for it with a <b>one-time approval step per person</b>.
+  </div>
+
+  <h3>Secrets: environment variable expansion</h3>
+  <p>Never commit a token into <code>.mcp.json</code>. Instead use <b>environment variable expansion</b> — write <code>${GITHUB_TOKEN}</code> and Claude Code fills in the real value from your environment at run time. The file stays safe to commit; the secret lives outside it.</p>
+  <pre><code>// .mcp.json — safe to commit, no secret inside
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}</code></pre>
+  <div class="trap">
+    <span class="label">WRONG</span>
+    Pasting the literal token (<code>"GITHUB_TOKEN": "ghp_abc123..."</code>) into <code>.mcp.json</code> and committing it. The secret is now in git history for everyone. Use <code>${GITHUB_TOKEN}</code> instead.
+  </div>
+
+  <h3>MCP resources reduce exploratory calls</h3>
+  <p><b>MCP resources</b> expose ready-made content catalogs — issue summaries, documentation hierarchies, database schemas — that the agent can read directly. This <b>cuts down exploratory tool calls</b>: instead of the agent making ten calls to figure out the shape of a database, it reads the schema resource once.</p>
+  <div class="tip">
+    <span class="label">Do this — help the agent prefer the better tool</span>
+    Enhance an MCP tool's description so the agent prefers it over a weaker built-in. If a Jira MCP server offers a real search tool, write its description so the agent uses it instead of falling back to <code>Grep</code> over local files that do not have the answer.
+  </div>
+  <div class="note">
+    <span class="label">Community vs custom servers</span>
+    For a standard integration (Jira, GitHub, Slack), use an existing <b>community MCP server</b> — do not build your own. Reserve a <b>custom server</b> for team-specific workflows that no community server covers.
+  </div>
+
+  <h2>8. Built-in tools: Read, Write, Edit, Bash, Grep, Glob</h2>
+  <p>Claude Code ships with built-in tools. Knowing which to reach for is a task statement in this domain:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Tool</th><th>Use it for</th></tr>
+    <tr><td><code>Grep</code></td><td>Content search inside files — function names, error messages, imports</td></tr>
+    <tr><td><code>Glob</code></td><td>File-path pattern matching — e.g. <code>**/*.test.tsx</code></td></tr>
+    <tr><td><code>Read</code> / <code>Write</code></td><td>Full-file read / full-file write</td></tr>
+    <tr><td><code>Edit</code></td><td>Targeted change by matching a <b>unique</b> piece of text in the file</td></tr>
+    <tr><td><code>Bash</code></td><td>Run a shell command</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <span class="label">Gotcha — Edit needs unique text</span>
+    <code>Edit</code> replaces text it can match <b>uniquely</b>. If the text you target appears several times, the edit fails because it does not know which one you mean. The fallback is <code>Read</code> the whole file, then <code>Write</code> it back with your change — it needs <b>no match at all</b>, so a repetitive file stops being a problem, and you can place the new code at the <b>exact spot</b> you want.
+  </div>
+  <div class="trap">
+    <span class="label">Two wrong escapes from a failed Edit</span>
+    When <code>Edit</code> can't find a unique anchor, two "fixes" are tempting and both are wrong. <b>A very long <code>old_string</code></b> (30+ lines) is <b>brittle</b> — one whitespace or format difference breaks the match. <b><code>replace_all</code></b> mutates <b>every</b> occurrence of the pattern and <b>corrupts the whole file</b> (it is for renaming a symbol everywhere, never for a single insertion). And <b>appending with <code>Bash</code></b> lands the code at the <b>end of the file</b> — wrong when the task says "insert <b>between</b> two functions." Check every option against <b>all</b> the stated constraints (here: <i>unique-match impossible</i> AND <i>must land in a specific location</i>); <code>Read</code>&nbsp;&rarr;&nbsp;<code>Write</code> is the only one that satisfies both.
+  </div>
+  <div class="tip">
+    <span class="label">Do this — understand a codebase incrementally</span>
+    Do not read every file up front. Start with <code>Grep</code> to find entry points, then <code>Read</code> to follow imports and trace the flow. To trace how a function is used across wrapper modules, first find its exported name, then <code>Grep</code> for that name everywhere it is called.
+  </div>
+
+  <div class="note">
+    <span class="label">Understanding a subsystem's architecture — top-down from the root</span>
+    When the goal is to <b>understand how a subsystem works</b> (before changing it), not just locate a symbol, navigate <b>top-down from the architectural root</b>: analyze <b>imports and class hierarchies</b> to find the <b>base class / interface</b>, <code>Read</code> that to grasp the design, then <b>trace only the specific implementations</b> you care about. Structured and cheap on context. Avoid the three traps: <b>(a) reading every file flat</b> — 8,000 lines floods context and buries the relevant logic; <b>(b) grepping keywords and reading bare line-ranges</b> — that strips the class/method context you need to know <i>what</i> the code guards and <i>how</i> it fits (keyword search is for <b>locating</b>, not <b>understanding</b>); <b>(c) prioritizing the largest files</b> — <b>size is a poor proxy for importance</b>; the strategic base class is often small. Navigate by <b>architecture</b>, not by line count or keyword hits.
+  </div>
+
+  <h3>Finding <i>all</i> callers before deleting a function</h3>
+  <p><code>Grep</code> is a <b>string</b> tool, not a <b>symbol</b> tool: it matches the exact name you give it, not the function's identity. A function has one definition but can be <b>re-exported or wrapped under a different name</b> — <code>calculateTax</code> in the library becomes <code>computeOrderTax</code> in the orders module. At the call site the code says <code>computeOrderTax(...)</code>, so the string <code>calculateTax</code> never appears there. Any search is only as complete as the <b>list of names</b> you feed it.</p>
+  <div class="tip">
+    <span class="label">Do this — enumerate every exposed name, then Grep each</span>
+    <b>Read</b> the library and its wrapper modules to gather <b>all</b> the names the function is exposed under, then <b>Grep</b> for each name across the codebase. This searches for the <b>call itself</b> — a call site is found no matter how its file imported the function.
+  </div>
+  <div class="trap">
+    <span class="label">Tempting but leakier — tracing imports instead of names</span>
+    "Grep for files that <b>import</b> the library/wrapper, then read each to check usage." This searches a <b>proxy</b> (the import statement) instead of the target (the call), and the proxy has holes: it misses <b>dynamic imports</b> (<code>await import(path)</code>), <b>re-export chains</b> (a file imports the wrapper second-hand through another module), and <b>indirect call chains</b> — and it forces you to read every importing file by eye. Grepping the <b>original name only</b> is worse still: it misses every renamed call site. Reliability order: <b>enumerate-all-names &gt; trace-imports &gt; original-name-only &gt; read-the-docs</b> (docs are stale and incomplete — never delete on documentation-level evidence).
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory.</p>
+  <div id="quiz"></div>
+  <div id="quiz-mock"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary sources</h2>
+  <p>📖 <a href="https://platform.claude.com/docs/en/build-with-claude/tool-use/overview">Tool use overview</a> — tool descriptions, selection, and <code>tool_choice</code>. Read the description and tool-choice sections.<br>
+  📖 <a href="https://code.claude.com/docs/en/mcp">MCP in Claude Code</a> — <code>.mcp.json</code>, project vs user scoping, environment variables.<br>
+  📖 <a href="https://modelcontextprotocol.io/introduction">What is MCP?</a> — the standard in one page.<br>
+  📖 <a href="https://modelcontextprotocol.io/docs/learn/architecture">MCP architecture</a> — client / server / transport, and tools / resources / prompts.</p>
+
+  <p class="small">The three MCP scopes (<code>local</code> — the default — <code>user</code>, <code>project</code>), the supported transports (<code>stdio</code>, <code>sse</code>, <code>http</code>), the pending-approval gate on <code>.mcp.json</code> servers, and the <code>tool_choice</code> value set re-checked against the installed <code>claude mcp</code> CLI on 2026-07-27.</p>
+
+  <p class="small">Links verified 2026-07-15. Focus of this domain is tool <b>design</b> and <b>integration</b>; hosting and deploying MCP servers are out of scope.</p>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want a worked example of splitting one messy tool into three, or a full structured-error object for each of the four categories? Just ask. When you're ready, say <b>"next lesson"</b> for Lesson 4 — Context Management &amp; Reliability.
+  </div>
+
+  <div class="footer-nav">
+    <a href="./0002-prompt-engineering-structured-output.html">← Lesson 2</a>
+    <a href="../reference/study-plan.html">Study Plan</a>
+    <a href="./0004-context-management-reliability.html">Next: Lesson 4 — Context &amp; Reliability →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "An agent keeps calling get_customer when users ask about order status. Both tools have one-line, near-identical descriptions. What is the best FIRST step?",
+      options: [
+        "Expand each tool's description with input formats, example queries, edge cases, and when-vs-similar boundaries",
+        "Add few-shot examples to the system prompt on every call",
+        "Build a routing layer that decides the tool before the model sees the request",
+        "Merge both tools into one generic tool"
+      ],
+      answer: 0,
+      why: "The tool description is the primary selection mechanism, and weak descriptions are the root cause. Few-shot adds tokens without fixing the root cause; a routing layer over-engineers and bypasses the model's language understanding; merging is more effort than a first step warrants when better descriptions would fix it."
+    },
+    {
+      q: "A tool named analyze_document can summarize, extract data points, AND fact-check. Selection is unreliable. What is the cleanest fix?",
+      options: [
+        "Split it into purpose-specific tools (extract_data_points, summarize_content, verify_claim_against_source) with clear I/O contracts",
+        "Leave one tool but write a very long description covering all three jobs",
+        "Force tool_choice to always call analyze_document",
+        "Remove the tool so the model answers from memory"
+      ],
+      answer: 0,
+      why: "A tool that genuinely does several jobs should be split into single-purpose tools with defined inputs and outputs. That removes the overlap that makes selection unreliable. A longer description does not fix a tool that truly has multiple jobs."
+    },
+    {
+      q: "An MCP tool times out because a downstream service is briefly unavailable. What error metadata best helps the agent recover?",
+      options: [
+        "errorCategory: transient, isRetryable: true, plus a readable message",
+        "errorCategory: business, isRetryable: false",
+        "A generic 'Operation failed' with isError only",
+        "A valid empty result with isError: false"
+      ],
+      answer: 0,
+      why: "A timeout is transient and safe to retry, so mark it transient and retryable. A generic error hides that. Business/not-retryable would wrongly stop the agent, and an empty result would hide that the call actually failed."
+    },
+    {
+      q: "A refund tool rejects a request because the 30-day refund window has passed. How should it respond?",
+      options: [
+        "isError: true, errorCategory: business, isRetryable: false, with a customer-friendly explanation",
+        "isError: true, errorCategory: transient, isRetryable: true",
+        "isError: false with an empty result",
+        "isError: true with the message 'Operation failed'"
+      ],
+      answer: 0,
+      why: "A policy violation is a business error that must NOT be retried. Set isRetryable false and include a clear explanation the agent can pass to the customer. Marking it transient would make the agent retry a rule it can never satisfy."
+    },
+    {
+      q: "A query for a customer's orders runs successfully but the customer has no orders. What should the tool return?",
+      options: [
+        "A successful result with an empty list (isError: false)",
+        "isError: true, errorCategory: validation",
+        "isError: true, isRetryable: true",
+        "A transient error so the agent retries"
+      ],
+      answer: 0,
+      why: "The query worked; there were simply no matches. A valid empty result is a success, not an error. Marking it isError would make the agent retry a query that already succeeded."
+    },
+    {
+      q: "A specialist agent is given 18 tools, including several outside its role. What is the likely effect?",
+      options: [
+        "Less reliable tool selection and misuse of out-of-role tools",
+        "Faster responses because it has more options",
+        "Perfect selection because more tools means more coverage",
+        "No effect — tool count does not matter"
+      ],
+      answer: 0,
+      why: "Too many tools increases decision complexity and hurts selection. Agents also misuse tools outside their specialty. Scope each agent to the 4-5 tools its role needs, plus a few limited cross-role tools."
+    },
+    {
+      q: "You must guarantee that extract_metadata runs BEFORE any enrichment step. Which tool_choice setting fits?",
+      options: [
+        "Force the specific tool: {\"type\":\"tool\",\"name\":\"extract_metadata\"}",
+        "\"auto\" — let the model decide",
+        "\"any\" — call some tool",
+        "Turn tools off entirely"
+      ],
+      answer: 0,
+      why: "Forcing a specific tool guarantees it is called first. 'auto' lets the model skip it; 'any' guarantees a tool call but not WHICH tool, so the order is not guaranteed."
+    },
+    {
+      q: "Your team's whole squad should share a GitHub MCP server, and the config must not leak the token. What do you do?",
+      options: [
+        "Add it to the project .mcp.json and reference the token as ${GITHUB_TOKEN}",
+        "Add it to personal ~/.claude.json with the literal token pasted in",
+        "Paste the literal token into .mcp.json and commit it",
+        "Email the token to teammates to paste locally"
+      ],
+      answer: 0,
+      why: "Shared, version-controlled tooling belongs in the project .mcp.json. Environment variable expansion (${GITHUB_TOKEN}) keeps the real secret out of the committed file. A literal token in a committed file leaks it into git history."
+    },
+    {
+      q: "An agent keeps making many exploratory calls to figure out a database's shape before it can query. What reduces this?",
+      options: [
+        "Expose the schema as an MCP resource the agent can read directly",
+        "Give the agent more search tools",
+        "Force tool_choice to 'any'",
+        "Increase the timeout on each call"
+      ],
+      answer: 0,
+      why: "MCP resources expose content catalogs like database schemas and documentation hierarchies, so the agent reads the shape once instead of discovering it through many calls."
+    },
+    {
+      q: "You need to change one line, but Edit fails because the target text appears several times in the file. What is the correct fallback?",
+      options: [
+        "Read the whole file, then Write it back with the change",
+        "Run the Edit again unchanged until it works",
+        "Use Glob to rewrite the file",
+        "Use Grep to apply the edit"
+      ],
+      answer: 0,
+      why: "Edit needs uniquely matching text. When the text is not unique, the documented fallback is Read the full file and Write it back with your change. Glob matches paths and Grep searches content; neither edits files."
+    }
+  ]);
+
+  renderQuiz('#quiz-mock', [
+    {
+      q: "An engineer asks the agent to find all callers of a function before removing it. The function is defined in a core library but is also exposed through wrapper modules that rename the function for domain-specific use (e.g., calculateTax in the library becomes computeOrderTax in the orders module).\n\nWhat exploration strategy will most reliably identify all callers?",
+      options: [
+        "Read the library and wrapper modules to identify all exposed names for the function, then Grep for each name across the codebase.",
+        "Use Grep to find all files that import from the library or wrapper modules, then read each file to check whether it uses the function.",
+        "Use Grep to search for the function's original name across the codebase.",
+        "Search for the function name in project documentation to understand intended usage patterns and navigate to documented integration points."
+      ],
+      answer: 0,
+      why: "You have to enumerate every name the function is exposed under — otherwise renamed wrappers hide callers. Read the relevant modules, gather all aliases, then grep for each.",
+      rationales: [
+        "",
+        "Misses dynamic imports, re-exports, and indirect call chains. Also scales poorly.",
+        "The original name won't appear anywhere a wrapper has renamed it — you'd miss a significant class of callers.",
+        "Docs are incomplete and often stale. You can't safely remove a function based on documentation-level evidence."
+      ]
+    },
+    {
+      q: "Your agent needs to insert a new helper function into the middle of a 150-line utility module, between two existing functions. The Edit tool fails because its old_string parameter cannot find unique text to match — the file has repetitive docstrings, variable names, and structural patterns.\n\nWhat's the most reliable way to complete this insertion?",
+      options: [
+        "Use Edit with an extremely long old_string capturing 30+ lines of context to guarantee uniqueness",
+        "Use Edit's replace_all parameter to target a common pattern and embed the new function in the replacement text",
+        "Use Bash to append the function definition to the end of the file using heredoc syntax",
+        "Use Read to load the file, add the function at the appropriate location, then Write the updated file"
+      ],
+      answer: 3,
+      why: "When Edit's unique-match contract can't be satisfied in a repetitive file, fall back to Read → modify in memory at the intended line → Write the full file back.",
+      rationales: [
+        "Long, brittle match strings frequently miss due to whitespace or minor edits and produce confusing failures.",
+        "replace_all would mutate every occurrence of the pattern — corrupting the whole file.",
+        "Appending puts the function at the wrong location. The requirement is to insert between two existing functions.",
+        ""
+      ]
+    },
+    {
+      q: "After adding an MCP server with specialized code refactoring tools (extract_function, rename_variable, inline_function), you notice the agent still uses basic text manipulation via Write and Bash sed commands for refactoring tasks. The MCP server is connected and healthy. Examining the configuration, you find each MCP tool has a minimal description like \"extract_function: extracts a function from code.\"\n\nWhat's the most effective way to improve adoption of the MCP refactoring tools?",
+      options: [
+        "Implement a request classifier that detects refactoring intent and automatically routes those requests to the MCP server before the agent processes them.",
+        "Remove the Write tool from the agent's configuration for refactoring sessions so it must use the MCP tools for code modifications.",
+        "Accept this as expected behavior since simpler tools like sed are more predictable than specialized refactoring tools.",
+        "Enhance the MCP tool descriptions to explain when each tool is preferable to text manipulation and clarify expected inputs and outputs."
+      ],
+      answer: 3,
+      why: "Tool selection is driven by the descriptions Claude sees. When the MCP tools say 'extracts a function from code' and Write/sed come with rich documentation, Claude picks Write/sed. Beef up the descriptions.",
+      rationales: [
+        "A pre-classifier is a separate system to maintain and can misroute. The cheaper fix is to make the tool descriptions strong enough that the agent picks them on its own.",
+        "Stripping general tools forces adoption by subtraction, and breaks legitimate Write use cases.",
+        "Capitulating defeats the purpose of integrating refactoring tools. The integration is fine — the descriptions are the problem.",
+        ""
+      ]
+    },
+    {
+      q: "Production logs reveal inconsistent error handling: when lookup_order fails, the agent sometimes retries 5+ times (wasteful when the order ID doesn't exist), sometimes escalates immediately (premature for temporary network issues), and sometimes asks users for clarification (inappropriate when the issue is a backend permission error). Investigation shows your MCP tool returns uniform error responses: {\"isError\": true, \"content\": [{\"type\": \"text\", \"text\": \"Operation failed\"}]}. The agent cannot distinguish between error types.\n\nWhat's the most effective improvement?",
+      options: [
+        "Enhance error responses with structured metadata: include errorCategory (transient/validation/permission), isRetryable boolean, and a description of what caused the failure.",
+        "Create an analyze_error MCP tool the agent calls after any failure to determine the error category and recommended action.",
+        "Implement retry logic with exponential backoff in your MCP server for all errors, returning to the agent only after retries are exhausted.",
+        "Add few-shot examples to the system prompt demonstrating how to interpret error message patterns and select appropriate responses for each."
+      ],
+      answer: 0,
+      why: "Give the agent the information it needs to make the right decision: category, retryability, and a human-readable cause. That replaces guessing with deterministic policy.",
+      rationales: [
+        "",
+        "Adds an extra round-trip for something the original tool already knows. Put the metadata in the original response.",
+        "Blanket retries hurt on permanent errors (order not found) and hide useful distinctions from the agent.",
+        "If the tool returns 'Operation failed' for every failure, no amount of few-shots can extract category info that isn't there."
+      ]
+    },
+    {
+      q: "An engineer who just joined the team asks the agent to help them understand the authentication and authorization architecture before making security improvements. The codebase has 800+ files across multiple services.\n\nWhat exploration strategy will most effectively build understanding, given Claude built-in tools and context limits?",
+      options: [
+        "Read any CLAUDE.md and README files first, then ask the engineer to specify which 10-15 files are most important for understanding the auth system.",
+        "Launch parallel subagents to explore different services simultaneously, then synthesize their findings into an architectural overview.",
+        "Use Grep to find authentication entry points, read those files, then follow imports and function calls to map the auth flow incrementally.",
+        "Read all files containing \"auth\", \"login\", \"permission\", or \"token\" in their content or filename."
+      ],
+      answer: 2,
+      why: "Start at entry points (login, token verify, middleware), then trace outward following real code edges. Incremental, grounded, fits within context limits.",
+      rationales: [
+        "The engineer just joined — they probably don't know which files matter. That's exactly what the agent is supposed to help with.",
+        "Without knowing where auth lives, fan-out explores too broadly and subagents duplicate and miss cross-service flows.",
+        "",
+        "Those keywords hit a huge amount of unrelated code across 800+ files and drown context in noise."
+      ]
+    },
+    {
+      q: "Your process_refund tool returns two types of errors: technical errors (\"503 Service Unavailable\", \"Connection timeout\") that are transient (5% of calls), and business errors (\"Order exceeds 30-day return window\", \"Item already refunded\") that are permanent (12% of calls). Monitoring shows the agent wastes 3-4 turns retrying business errors that can never succeed. Currently, both error types return only a plain text message to Claude.\n\nWhat's the most effective way to reduce wasted retries while improving customer-facing response quality?",
+      options: [
+        "Return structured error responses with retryable: false for business errors and a customer-friendly explanation for Claude to use.",
+        "Add few-shot examples showing how to distinguish retryable from non-retryable errors by parsing error message text.",
+        "Add a check_refund_eligibility tool that must be called before process_refund to prevent business rule violations.",
+        "Implement automatic retry logic at the tool level for technical errors only, passing business errors to Claude without retries."
+      ],
+      answer: 0,
+      why: "A retryable flag tells Claude deterministically 'don't retry,' and a ready-made customer-friendly message improves the outgoing reply. Fixes both problems at once.",
+      rationales: [
+        "",
+        "Relying on the model to text-parse error strings is fragile and exactly the instability you see today.",
+        "Useful in principle but adds a round-trip to every refund to guard against 12% of cases, and doesn't help when process_refund still fails for other business reasons.",
+        "Hiding transient retries inside the tool can mask latency and takes the model out of the loop on recovery decisions. Business errors also still arrive as a plain string, so the customer-facing response doesn't improve."
+      ]
+    },
+    {
+      q: "Your pipeline uses a tool called extract_metadata with a JSON schema for paper details. You've also defined lookup_citations and verify_doi tools for enrichment. During testing, you notice that when users include requests like \"extract the metadata and tell me how cited it is,\" Claude sometimes calls lookup_citations first, which fails because it needs the DOI that extract_metadata would provide.\n\nWhat's the most effective way to ensure structured metadata extraction happens first?",
+      options: [
+        "Set tool_choice to \"any\" so Claude must use a tool, combined with system prompt instructions prioritizing extract_metadata.",
+        "Set tool_choice to \"auto\" and reorder the tool definitions so extract_metadata appears first in the tools array, since Claude prioritizes earlier-listed tools.",
+        "Set tool_choice to {\"type\": \"tool\", \"name\": \"extract_metadata\"} and process the enrichment requests in subsequent turns after receiving the extracted metadata.",
+        "Set tool_choice to {\"type\": \"tool\", \"name\": \"extract_metadata\"} for every API call in the pipeline, ensuring Claude always extracts metadata before any enrichment can occur."
+      ],
+      answer: 2,
+      why: "tool_choice=specific-tool deterministically forces extract_metadata on the first turn. Then you hand control back to 'auto' to let the model use citations/DOI enrichment with the metadata in context.",
+      rationales: [
+        "'any' forces a tool call but doesn't force the right one. You'd still see lookup_citations picked first.",
+        "There's no documented ordering preference to rely on; this assumes behavior that isn't contractual.",
+        "",
+        "Pinning extract_metadata on every call prevents the enrichment tools from ever being used."
+      ]
+    },
+    {
+      q: "After integrating a local MCP server providing code analysis tools (analyze_dependencies, find_dead_code, calculate_complexity), you verify the server is healthy and tools appear in the tools/list response. However, you observe that the agent consistently uses Grep to search for import statements instead of calling analyze_dependencies—even when users explicitly ask about \"code dependencies.\" Examining tool definitions reveals:\n\nMCP: analyze_dependencies - \"Analyzes dependency graph\"\n\nBuilt-in: Grep - \"Search file contents for a pattern using regular expressions. Returns matching lines with line numbers and surrounding context.\"\n\nWhat's the most effective approach to improve the agent's selection of MCP tools?",
+      options: [
+        "Remove Grep from available tools when the MCP server is connected to eliminate functional overlap.",
+        "Add routing instructions to the system prompt specifying that dependency-related questions should use MCP tools rather than Grep.",
+        "Split analyze_dependencies into granular tools (list_imports, resolve_transitive_deps, detect_circular_deps) so each has a focused purpose less likely to overlap with Grep.",
+        "Expand MCP tool descriptions to detail capabilities and outputs—e.g., \"Builds dependency graph showing direct imports, transitive dependencies, and cycles.\""
+      ],
+      answer: 3,
+      why: "Tool selection is driven by the descriptions the model sees. A one-line description like 'Analyzes dependency graph' loses against Grep's rich description. Beef up the MCP tool's description.",
+      rationales: [
+        "Crippling a general tool to force adoption of a specialized one punishes other legitimate Grep use cases.",
+        "Prompt-level routing can help, but the root cause is that the MCP tool's description is thinner than Grep's. Fix the tool descriptions first.",
+        "Splitting is sometimes right, but here the sibling tools would still have weak descriptions. The same selection bug would reappear.",
+        ""
+      ]
+    },
+    {
+      q: "When implementing your lookup_order MCP tool, the backend sometimes returns errors (e.g., \"Order not found\" or temporary database failures).\n\nWhat is the correct pattern for communicating these errors back to the agent?",
+      options: [
+        "Log the error server-side and return an empty result to avoid confusing the model",
+        "Return the error message in the tool result content with the isError flag set to true",
+        "Throw an exception from the tool handler so the agent framework can catch and log it",
+        "Return a success response with a \"status\" field indicating the error type"
+      ],
+      answer: 1,
+      why: "MCP's designed pattern: put the error text in the content field and mark isError=true. Claude sees both the failure flag and a readable message to reason about.",
+      rationales: [
+        "Returning empty successes makes the agent think no data exists, rather than that something went wrong — a different and worse confusion.",
+        "",
+        "Uncaught exceptions break the tool protocol and don't give the model anything to reason with.",
+        "Ad-hoc 'status' fields vary across tools and the model has no standard way to interpret them. isError is the standard."
+      ]
+    },
+    {
+      q: "The document analysis agent has a single analyze_document tool that takes a document and a free-text instruction parameter. During evaluation, requests like \"extract the key financial metrics\" often return narrative summaries, while \"summarize the methodology\" sometimes returns raw data tables. The synthesis agent reports that 35% of analysis results require re-requests with clarified instructions.\n\nWhat's the most effective way to improve reliability?",
+      options: [
+        "Split the generic tool into purpose-specific tools—extract_data_points, summarize_content, verify_claim_against_source—each with defined input/output contracts.",
+        "Keep the single tool but add an analysis_type enum parameter requiring explicit selection between extraction, summarization, and verification modes.",
+        "Have the coordinator pre-classify each analysis request before passing instructions to the document analysis agent.",
+        "Enhance the tool description with detailed examples showing how different instruction phrasings should map to different output formats."
+      ],
+      answer: 0,
+      why: "Free-text instructions put the semantics in prose, which the model interprets inconsistently. Purpose-specific tools give the model an explicit, well-typed contract to pick between.",
+      rationales: [
+        "",
+        "Better than free text, but still a single tool with a single output shape. Output still has to be a generic string, and the model can mode-mismatch. Separate tools enforce distinct I/O contracts.",
+        "Moves the ambiguity upstream without fixing it. The tool contract is still fuzzy; the coordinator's classification is one more error surface.",
+        "Examples help, but tool-use reliability comes first from clear tool boundaries and output schemas, not from heroic prompt engineering on one generic tool."
+      ]
+    },
+    {
+      q: "An engineer asks the agent to understand how the caching layer works before adding a new cache invalidation trigger. After initial Grep searches, the agent has identified that caching logic spans 15 files including decorators, middleware, and service classes (~8,000 lines total).\n\nWhat's the most effective next step for building understanding while managing context constraints?",
+      options: [
+        "Use the Read tool to sequentially load all 15 files, building complete understanding across the full caching implementation.",
+        "Analyze imports and class hierarchies to identify the base cache class, Read that file to understand the interface, then trace specific invalidation implementations.",
+        "Use Grep to search for \"invalidate\" and \"expire\" patterns across all files, then Read only those specific line ranges with minimal surrounding context.",
+        "Use Glob to find files matching common caching patterns (cache.py, caching/), prioritize the largest files by reading them first, then check smaller files for gaps."
+      ],
+      answer: 1,
+      why: "Start from the architectural root (the interface), then navigate only the specific implementations that matter for invalidation — focused reading, low context cost.",
+      rationales: [
+        "Loading 8,000 lines without structure floods the context and buries the invalidation logic in unrelated code.",
+        "",
+        "Keyword-only reading strips the class/method context that tells you what the invalidation actually guards.",
+        "Size is a poor proxy for importance. You'd waste context on big utility files and miss the small strategic ones."
+      ]
+    }
+  ], {
+    title: "Mock exam drill — Domain 2 · Tool Design & MCP Integration",
+    sub: "11 full scenarios from the CyberSkill mock exam, scored separately. Read the whole scenario, then pick the MOST effective fix — after you answer, the note under each wrong option tells you why it is worse."
+  });
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Why is the tool description the first thing to fix when an agent misroutes, and what makes a good one?",
+      answer: "The <b>tool description</b> is the primary mechanism the model uses to select a tool — it reads the description and input schema, not the code. Vague or overlapping descriptions cause misrouting. A good description gives <b>input formats</b>, <b>example queries</b>, <b>edge cases</b>, and a <b>boundary line</b> saying when to use this tool instead of a similar one. Fix the description before reaching for few-shot prompts or a routing layer, which add cost or over-engineer while ignoring the real cause. Rename a mislabeled tool; split a tool that genuinely does several jobs."
+    },
+    {
+      prompt: "Q: What structured metadata should an MCP tool return on failure, and what are the four error kinds?",
+      answer: "Set the <b>isError</b> flag, plus an <b>errorCategory</b> (transient / validation / business / permission), an <b>isRetryable</b> boolean, and a human-readable message. <b>Transient</b> (timeout) = retry. <b>Validation</b> (bad input) = fix input then retry. <b>Business</b> (policy violation) = isRetryable false, explain to the user. <b>Permission</b> = do not retry, escalate. Never return a generic 'Operation failed'. And do not confuse an access failure with a valid <b>empty result</b> — no matches is a success, not an error."
+    },
+    {
+      prompt: "Q: How do you scope tools across agents, and what does tool_choice control?",
+      answer: "Give each agent only the tools its role needs (4-5, not 18) — too many tools hurts selection and agents misuse out-of-role tools. Add a few limited cross-role tools for high-frequency needs and route complex cases through the coordinator. <code>tool_choice</code>: <code>\"auto\"</code> lets the model choose; <code>\"any\"</code> forces some tool call (guarantee an action, not text); <code>{\"type\":\"tool\",\"name\":\"...\"}</code> forces one specific tool so a step runs first."
+    },
+    {
+      prompt: "Q: How do you integrate MCP servers safely in Claude Code, and when do resources help?",
+      answer: "Put shared team servers in the project <code>.mcp.json</code> (version-controlled); keep personal/experimental ones in <code>~/.claude.json</code>. Keep secrets out of the file with <b>environment variable expansion</b> like <code>${GITHUB_TOKEN}</code>. Tools from all configured servers are discovered at connection time and available together. <b>MCP resources</b> expose catalogs (schemas, docs, issue summaries) so the agent reads them directly and makes fewer exploratory calls. Use a community server for standard integrations; build a custom one only for team-specific workflows."
+    }
+  ]);
+</script>

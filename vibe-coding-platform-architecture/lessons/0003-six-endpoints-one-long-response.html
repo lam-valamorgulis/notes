@@ -1,0 +1,418 @@
+<title>Lesson 3 — Six endpoints and one very long response</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+
+  <p class="kicker">Week 1 · Days 4–5 · Next.js foundations</p>
+  <h1>Six endpoints and one very long response</h1>
+  <p class="subtitle">Lesson 1 said the logs "stream". This is what that actually means — and
+  it is not a WebSocket.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> explain how a log panel updates live over plain HTTP,
+    and why the browser needs a leftover buffer to read it. That buffer is the detail most
+    engineers get wrong.
+  </div>
+
+  <h2>A file named <code>route.ts</code> is an endpoint</h2>
+
+  <p>No router file, no <code>app.get(...)</code>. In the App Router you create a folder, put
+  a <code>route.ts</code> inside it, and export a function named after the HTTP verb. The
+  folder path <em>is</em> the URL.</p>
+
+  <p>This entire product has six of them. That is the whole back end.</p>
+
+  <div class="table-scroll">
+    <table>
+      <tr><th>URL</th><th>Verb</th><th>Returns</th><th>Validates input?</th></tr>
+      <tr>
+        <td><code>/api/chat</code></td><td>POST</td>
+        <td>Chat stream</td><td>Yes — model id checked against a list</td>
+      </tr>
+      <tr>
+        <td><code>/api/errors</code></td><td>POST</td>
+        <td>JSON decision</td><td>Yes — <code>linesSchema.safeParse</code></td>
+      </tr>
+      <tr>
+        <td><code>/api/models</code></td><td>GET</td>
+        <td>JSON, cached 300s</td><td>No input to validate</td>
+      </tr>
+      <tr>
+        <td><code>/api/sandboxes/[sandboxId]</code></td><td>GET</td>
+        <td>JSON status</td><td class="small">No</td>
+      </tr>
+      <tr>
+        <td><code>…/[sandboxId]/files?path=</code></td><td>GET</td>
+        <td>Raw bytes</td><td>Yes — <code>FileParamsSchema.safeParse</code></td>
+      </tr>
+      <tr>
+        <td><code>…/cmds/[cmdId]/logs</code></td><td>GET</td>
+        <td>NDJSON stream</td><td class="small">No</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">An honest inconsistency</span>
+    Look down that last column. The <b>files</b> route carefully validates with Zod before
+    touching the sandbox. The <b>logs</b> and <b>status</b> routes take the path parameter and
+    pass it straight into <code>Sandbox.get()</code>. Reading the code, my read is that this is
+    drift, not a decision — the routes were written at different times. It is a good, specific
+    answer to "what would you tighten up?"
+  </div>
+
+  <h2>Dynamic segments, and the change that catches everyone</h2>
+
+  <p>A folder named <code>[sandboxId]</code> makes that piece of the path a variable. The
+  thing to know: <b><code>params</code> is a Promise now</b>. You must await it.</p>
+
+  <span class="filepath">app/api/sandboxes/[sandboxId]/files/route.ts</span>
+<pre><code>export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise&lt;{ sandboxId: string }&gt; }   <span class="cmt">// ← a Promise</span>
+) {
+  const { sandboxId } = await params
+  const fileParams = FileParamsSchema.safeParse({
+    path: request.nextUrl.searchParams.get('path'),   <span class="cmt">// query string</span>
+    sandboxId,                                        <span class="cmt">// path segment</span>
+  })
+  if (fileParams.success === false) {
+    return NextResponse.json({ error: 'Invalid parameters…' }, { status: 400 })
+  }
+  <span class="cmt">// …only now touch the sandbox</span>
+}</code></pre>
+
+  <p>Two different sources of user input — the path and the query string — are validated
+  together in one schema. That is the pattern worth copying.</p>
+
+  <h2>Three shapes of response</h2>
+
+  <p>Every endpoint here is one of three shapes. Knowing which shape you need is most of the
+  design work.</p>
+
+  <div class="table-scroll">
+    <table>
+      <tr><th>Shape</th><th>Built with</th><th>Used for</th></tr>
+      <tr>
+        <td>Whole JSON, at once</td>
+        <td><code>NextResponse.json(...)</code></td>
+        <td>Model list, sandbox status, error decision</td>
+      </tr>
+      <tr>
+        <td>Raw bytes, streamed</td>
+        <td><code>ReadableStream</code>, no content type set</td>
+        <td>Reading one file out of the sandbox</td>
+      </tr>
+      <tr>
+        <td>Many small objects, streamed</td>
+        <td><code>ReadableStream</code> + <code>application/x-ndjson</code></td>
+        <td>Live command logs</td>
+      </tr>
+    </table>
+  </div>
+
+  <h2>Streaming, on the server side</h2>
+
+  <p>Here is the whole log endpoint. It is shorter than you would expect.</p>
+
+  <span class="filepath">app/api/sandboxes/[sandboxId]/cmds/[cmdId]/logs/route.ts</span>
+<pre><code>return new NextResponse(
+  new ReadableStream({
+    async pull(controller) {
+      for await (const logline of command.logs()) {      <span class="cmt">// async generator</span>
+        controller.enqueue(
+          encoder.encode(JSON.stringify({
+            data: logline.data,
+            stream: logline.stream,       <span class="cmt">// 'stdout' or 'stderr'</span>
+            timestamp: Date.now(),
+          }) + '\n')                      <span class="cmt">// ← the newline is the protocol</span>
+        )
+      }
+      controller.close()
+    },
+  }),
+  { headers: { 'Content-Type': 'application/x-ndjson' } }
+)</code></pre>
+
+  <p>Two things to notice.</p>
+
+  <p><b><code>for await ... of</code></b> means <code>command.logs()</code> is an
+  <em>async generator</em> — a source that produces values over time, which you can loop over
+  as if it were a normal list. You will meet this again in the file generator.</p>
+
+  <p><b>That <code>+ '\n'</code> is the entire protocol.</b> One JSON object, then a newline.
+  This is called <b>NDJSON</b>, and it exists so a reader can act on each object the moment it
+  arrives instead of waiting for a closing bracket at the end.</p>
+
+  <h2>Streaming, on the browser side — the hard part</h2>
+
+  <p>Now the detail that trips up experienced engineers. The network does <b>not</b> hand you
+  neat lines. It hands you arbitrary blocks of bytes, and a block can end in the middle of a
+  JSON object.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 700 300" role="img" aria-label="Diagram showing network chunks splitting JSON objects mid-way, a line buffer reassembling them, and complete JSON objects coming out">
+      <text x="350" y="16" text-anchor="middle" font-family="var(--font-sans)" font-size="9.5"
+            font-weight="700" fill="var(--warn)" letter-spacing="1">WHAT THE NETWORK DELIVERS</text>
+
+      <rect x="25" y="26" width="205" height="42" rx="5" fill="var(--card-bg)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="127" y="43" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink)">{"data":"Ready","st</text>
+      <text x="127" y="60" text-anchor="middle" font-family="var(--font-sans)" font-size="8" fill="var(--ink-faint)">chunk 1 — cut mid-key!</text>
+
+      <rect x="245" y="26" width="205" height="42" rx="5" fill="var(--card-bg)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="347" y="43" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink)">ream":"stdout"}\n{"data":"co</text>
+      <text x="347" y="60" text-anchor="middle" font-family="var(--font-sans)" font-size="8" fill="var(--ink-faint)">chunk 2 — ends mid-object</text>
+
+      <rect x="465" y="26" width="205" height="42" rx="5" fill="var(--card-bg)" stroke="var(--warn)" stroke-width="1.5"/>
+      <text x="567" y="43" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink)">mpiled"}\n</text>
+      <text x="567" y="60" text-anchor="middle" font-family="var(--font-sans)" font-size="8" fill="var(--ink-faint)">chunk 3</text>
+
+      <line x1="127" y1="70" x2="127" y2="104" stroke="var(--ink-faint)" stroke-width="1.3"/>
+      <line x1="347" y1="70" x2="347" y2="104" stroke="var(--ink-faint)" stroke-width="1.3"/>
+      <line x1="567" y1="70" x2="567" y2="104" stroke="var(--ink-faint)" stroke-width="1.3"/>
+      <line x1="127" y1="104" x2="567" y2="104" stroke="var(--ink-faint)" stroke-width="1.3"/>
+      <line x1="347" y1="104" x2="347" y2="126" stroke="var(--ink-faint)" stroke-width="1.5" marker-end="url(#ar3)"/>
+      <defs>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-faint)"/>
+        </marker>
+      </defs>
+
+      <rect x="25" y="128" width="645" height="46" rx="6" fill="var(--card-bg)" stroke="var(--accent)" stroke-width="2"/>
+      <text x="347" y="147" text-anchor="middle" font-family="var(--font-sans)" font-size="10.5" font-weight="700" fill="var(--accent)">the line buffer</text>
+      <text x="347" y="164" text-anchor="middle" font-family="var(--font-mono)" font-size="8.5" fill="var(--ink-soft)">append bytes · split on \n · parse all but the last · keep the tail</text>
+
+      <line x1="347" y1="176" x2="347" y2="200" stroke="var(--ink-faint)" stroke-width="1.5" marker-end="url(#ar3)"/>
+
+      <text x="350" y="196" text-anchor="middle" font-family="var(--font-sans)" font-size="9.5"
+            font-weight="700" fill="var(--good)" letter-spacing="1"> </text>
+
+      <rect x="25" y="204" width="320" height="38" rx="5" fill="var(--card-bg)" stroke="var(--good)" stroke-width="1.5"/>
+      <text x="185" y="227" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink)">{"data":"Ready","stream":"stdout"}</text>
+
+      <rect x="360" y="204" width="310" height="38" rx="5" fill="var(--card-bg)" stroke="var(--good)" stroke-width="1.5"/>
+      <text x="515" y="227" text-anchor="middle" font-family="var(--font-mono)" font-size="8" fill="var(--ink)">{"data":"compiled"}</text>
+
+      <text x="350" y="264" text-anchor="middle" font-family="var(--font-sans)" font-size="9.5"
+            font-weight="700" fill="var(--good)" letter-spacing="1">COMPLETE OBJECTS, SAFE TO PARSE</text>
+      <text x="350" y="284" text-anchor="middle" font-family="var(--font-sans)" font-size="8.5"
+            font-style="italic" fill="var(--ink-faint)">anything after the final \n stays in the buffer until more bytes arrive</text>
+    </svg>
+    <figcaption>Chunk boundaries and line boundaries are unrelated. The buffer is what turns
+    one into the other. Skip it and you get random <code>JSON.parse</code> crashes under load.</figcaption>
+  </figure>
+
+  <p>And here is the repo doing exactly that:</p>
+
+  <span class="filepath">components/commands-logs/commands-logs-stream.tsx</span>
+<pre><code>const reader = response.body!.getReader()
+const decoder = new TextDecoder()
+let line = ''                                   <span class="cmt">// the leftover buffer</span>
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+
+  line += decoder.decode(value, { stream: true })
+  const lines = line.split('\n')
+  for (let i = 0; i &lt; lines.length - 1; i++) {  <span class="cmt">// note: length - 1</span>
+    if (lines[i]) {
+      const parsed = logSchema.parse(JSON.parse(lines[i]))
+      yield { data: stripAnsi(parsed.data), ... }
+    }
+  }
+  line = lines[lines.length - 1]                <span class="cmt">// keep the tail</span>
+}</code></pre>
+
+  <p>Three details, each doing real work:</p>
+
+  <ul>
+    <li><code>length - 1</code> — never parse the final piece. Without a trailing newline it
+    might be half an object.</li>
+    <li><code>{ stream: true }</code> — tells the decoder a multi-byte character may be split
+    across chunks too, so it should wait rather than produce a broken character.</li>
+    <li><code>stripAnsi(...)</code> — terminal output contains colour codes. They would render
+    as garbage, so they are removed.</li>
+  </ul>
+
+  <div class="soundbite">
+    <span class="label">Say it like this</span>
+    <p>"Chunk boundaries and record boundaries are independent. So the reader accumulates into
+    a buffer, splits on the newline, processes everything except the last piece, and carries
+    that last piece forward. Getting this wrong gives you parse errors that only appear under
+    load, which makes them horrible to debug."</p>
+  </div>
+
+  <h2>Why not a WebSocket?</h2>
+
+  <div class="tradeoff">
+    <div class="t-title">Streaming over plain HTTP instead of WebSockets</div>
+    <div class="t-row t-win">
+      <span class="t-tag">What it buys</span>
+      <p>No socket server to run, no connection state to manage, and it works on ordinary
+      serverless functions. Every proxy and firewall already understands it. The data flows one
+      way — server to browser — so a two-way channel would be unused capability.</p>
+    </div>
+    <div class="t-row t-cost">
+      <span class="t-tag">What it costs</span>
+      <p>The browser cannot send anything back on the same connection. Reconnecting after a
+      drop is your problem — and this repo does not attempt it. If the log stream breaks, the
+      panel just stops updating silently.</p>
+    </div>
+    <div class="t-row t-alt">
+      <span class="t-tag">What I would consider</span>
+      <p>Server-Sent Events would give automatic reconnection almost free, at the cost of a
+      slightly stricter message format. For logs, that trade looks favourable. Worth saying —
+      it shows you weighed it rather than accepted it.</p>
+    </div>
+  </div>
+
+  <h2>Bonus: a hack the authors admitted to</h2>
+
+  <p>The status endpoint has no real status call available, so it runs a pointless command and
+  watches for a specific failure:</p>
+
+  <span class="filepath">app/api/sandboxes/[sandboxId]/route.tsx</span>
+<pre><code><span class="cmt">/**
+ * We must change the SDK to add data to the instance and then
+ * use it to retrieve the status of the Sandbox.
+ */</span>
+const sandbox = await Sandbox.get({ sandboxId })
+await sandbox.runCommand({ cmd: 'echo', args: ['Sandbox status check'] })
+return NextResponse.json({ status: 'running' })
+<span class="cmt">// …catch: if error.json.error.code === 'sandbox_stopped' → { status: 'stopped' }</span></code></pre>
+
+  <p>"Is it alive?" is answered by "try to talk to it and see if that fails." The comment is
+  the maintainers' own note that the SDK should expose this properly.</p>
+
+  <div class="tip">
+    <span class="label">Why this is gold in an interview</span>
+    A trade-off <em>the authors already acknowledged in a code comment</em> is far safer to
+    raise than one you invented. You are agreeing with the maintainers, not second-guessing
+    them. Quote the comment and say what you would do instead.
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="interview">
+    <span class="label">Interview focus</span>
+    <p class="level">Asked at: AI Engineer and full-stack, mid to senior</p>
+    <ol>
+      <li>"How would you stream live output from a long-running process to a browser?"</li>
+      <li>"Why NDJSON rather than one big JSON array?"</li>
+      <li>"What goes wrong if you parse each network chunk as it arrives?"</li>
+      <li>"When would you pick WebSockets, Server-Sent Events, or plain HTTP streaming?"</li>
+      <li>"Where would you validate input in a route handler, and why there?"</li>
+    </ol>
+  </div>
+
+  <div class="note">
+    <span class="label">Primary source — read this next</span>
+    <a href="https://developer.mozilla.org/en-US/docs/Web/API/Streams_API/Using_readable_streams">MDN
+    — Using readable streams</a>. The authoritative explanation of readers, chunks, and
+    <code>pull</code>. Read the section on reading chunks; it is the exact problem the buffer
+    above solves.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this</span>
+    <ul>
+      <li>A folder plus <code>route.ts</code> is an endpoint. The folder path is the URL. There are <b>six</b>.</li>
+      <li><code>params</code> is a <b>Promise</b> — always <code>await</code> it.</li>
+      <li>Three response shapes: whole JSON, raw byte stream, NDJSON stream.</li>
+      <li><b>NDJSON</b> = one JSON object per line. The <code>\n</code> is the whole protocol.</li>
+      <li>Chunk boundaries ≠ record boundaries. Keep a <b>leftover buffer</b> and never parse the last piece.</li>
+      <li>No WebSockets anywhere. Live updates are long-lived HTTP responses, one way only.</li>
+      <li>Only the <b>files</b> route validates its path input with Zod. Logs and status do not.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing:
+    <b>the network gives you bytes, not lines — the buffer is what turns bytes into
+    records.</b></p>
+  </div>
+
+  <div class="ask">
+    Curious what breaks without the buffer? <b>Ask your teacher</b> to walk you through a
+    failing case byte by byte. It is the fastest way to make this permanent.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0002-server-or-browser.html">← Lesson 2</a></span>
+    <span><a href="../reference/nextjs-in-this-repo.html">Next.js reference →</a></span>
+  </div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'How does the log panel receive live updates?',
+    options: [
+      'One long HTTP response',
+      'A WebSocket per command',
+      'Repeated short polling requests',
+      'Server sent events channel'
+    ],
+    answer: 0,
+    why: 'A single GET to the logs route returns a ReadableStream that stays open, writing one JSON object per line as the command produces output. There is no WebSocket anywhere in this repo.'
+  },
+  {
+    q: 'In a dynamic route handler, what is params?',
+    options: [
+      'A promise to await',
+      'A plain object always',
+      'A string key only',
+      'A search params instance'
+    ],
+    answer: 0,
+    why: 'Typed as Promise<{ sandboxId: string }> and awaited in every route handler in the repo. This changed in recent Next.js versions and is a very common source of bugs when upgrading.'
+  },
+  {
+    q: 'Why must the browser reader keep a leftover buffer?',
+    options: [
+      'Chunks split JSON objects',
+      'Lines arrive out of order',
+      'Decoder drops trailing bytes',
+      'Streams repeat the last line'
+    ],
+    answer: 0,
+    why: 'Network chunk boundaries have nothing to do with newline boundaries, so a chunk can end mid-object. The code splits on newline, parses everything except the final piece, and carries that piece into the next iteration.'
+  },
+  {
+    q: 'Which sandbox route validates its input with Zod?',
+    options: [
+      'The file reading route',
+      'The command logs route',
+      'The sandbox status route',
+      'Every sandbox route does'
+    ],
+    answer: 0,
+    why: 'Only the files route uses FileParamsSchema.safeParse before touching the sandbox. The logs and status routes pass the awaited path parameters straight into Sandbox.get(). Reading the code, that looks like drift rather than a decision — and it is a good concrete answer to "what would you tighten?"'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: 'How would you stream live output from a long-running process to a browser?',
+    answer: 'Return a <code>ReadableStream</code> from a route handler and keep it open, writing one JSON object per line with the content type <code>application/x-ndjson</code>. On the server you loop the process output with <code>for await…of</code> over an async generator and enqueue encoded bytes plus a newline. In the browser you take <code>response.body.getReader()</code>, decode with <code>{ stream: true }</code>, accumulate into a buffer, split on newline, parse everything except the last piece, and keep that piece for the next read. No WebSocket needed, because the data only travels one way.'
+  },
+  {
+    prompt: 'Why NDJSON rather than one big JSON array?',
+    answer: 'A JSON array is only valid once the closing bracket arrives, so a reader cannot safely parse anything until the process finishes — which defeats the point of streaming. With newline-delimited JSON every line is independently complete and parseable the moment it lands, so the log panel can render output while the command is still running. The cost is that it is not standard JSON, so the client needs a small custom reader rather than <code>response.json()</code>.'
+  },
+  {
+    prompt: 'What goes wrong if you parse each network chunk as it arrives?',
+    answer: 'You get intermittent <code>JSON.parse</code> failures, because a chunk can end in the middle of an object — or even in the middle of a multi-byte character. The bug is load-dependent: with small, fast output every chunk happens to be a whole line and it looks fine, then it breaks in production under real volume. The fix is a leftover buffer, plus passing <code>{ stream: true }</code> to the <code>TextDecoder</code> so it holds back partial characters.'
+  },
+  {
+    prompt: 'This app has a sandbox status endpoint. How does it work, and what would you change?',
+    answer: 'It has no real status API to call, so it runs <code>echo</code> inside the sandbox and returns "running" if that succeeds. If the call throws an <code>APIError</code> with code <code>sandbox_stopped</code> it returns "stopped", otherwise it rethrows. The maintainers left a comment saying the SDK should expose this directly. So the health check is "try to talk to it and see if it fails" — which costs a real round trip and a real command execution per poll. I would want a status field on the sandbox object, which is exactly what that comment asks for.'
+  }
+]);
+</script>

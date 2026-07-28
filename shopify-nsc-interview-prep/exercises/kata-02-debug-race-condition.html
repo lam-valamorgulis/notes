@@ -1,0 +1,94 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 02 — Debug the Double-Charge (find &amp; fix)</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Kata 02 · Debug &amp; fix · ~20 min</p>
+  <h1>Debug the Double-Charge</h1>
+  <p class="subtitle">The other live-coding format: they show broken code and ask you to find the bug and fix it, thinking out loud. This one hides a real async race condition — the kind that actually ships.</p>
+
+  <div class="win">
+    <strong>Do this first:</strong> read the broken code below. Cover the answer. Say out loud what you think is wrong and how you'd prove it, then fix it. Debugging out loud is the skill being scored — narrate your hunt, not just the fix.
+  </div>
+
+  <h2>The scenario (what the client tells you)</h2>
+  <div class="note">
+    <span class="label">Bug report</span>
+    "Our sync worker sometimes creates the <b>same order twice</b> in the ERP, but only under load on sale days. Under light traffic it never happens. Here's the worker — can you find it?"
+  </div>
+  <p class="small">"Only under load" and "only sometimes" is the classic fingerprint of a <b>race condition</b>. Say that out loud — naming the bug class before reading every line is a senior move.</p>
+
+  <h2>The broken code</h2>
+  <div class="diagram">async function handleOrder(order) {
+  // Has this Shopify order already been synced to the ERP?
+  const existing = await db.mappings.findByShopifyId(order.id);
+
+  if (!existing) {
+    // Not seen before -> create it in the ERP, then record the mapping.
+    const erpId = await erp.createOrder(order);
+    await db.mappings.insert({ shopifyId: order.id, erpId });
+  } else {
+    await erp.updateOrder(existing.erpId, order);
+  }
+}
+
+// Many events for the same order can be in flight at once.
+queue.process('orders', handleOrder);</div>
+
+  <h2>Step 1 — Say the hunt out loud</h2>
+  <ul>
+    <li>"It only happens <b>under load</b> → concurrency, not logic. Two runs of <code>handleOrder</code> for the same order overlap."</li>
+    <li>"There's a <b>check-then-act</b> gap: both read <code>findByShopifyId</code>, both see <code>null</code>, both call <code>erp.createOrder</code>. That's the classic <b>read-then-write race</b> (a TOCTOU bug)."</li>
+    <li>"So the same order gets created twice before either mapping row is written."</li>
+  </ul>
+
+  <h2>Step 2 — How would you prove it?</h2>
+  <p>Say this — it shows you fix by evidence, not by guessing:</p>
+  <ul>
+    <li>Add a log with the order id and a worker id around the check and the create; under load you'll see two creates for one order id with no mapping in between.</li>
+    <li>Or reproduce: fire the same order event twice concurrently in a test and assert <code>erp.createOrder</code> was called once.</li>
+  </ul>
+
+  <h2>Step 3 — Fix it (try before revealing)</h2>
+  <p class="small">There are a few valid fixes. Say the trade-offs. Then reveal the model answer.</p>
+  <div id="recall"></div>
+
+  <h2>Why each fix works — the ranking to say out loud</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Fix</th><th>Strength</th><th>What to say</th></tr>
+    <tr><td><b>Unique constraint</b> on <code>shopifyId</code> + upsert / catch duplicate</td><td>Strongest — the database enforces it no matter how many workers race.</td><td>"I make the mapping's <code>shopifyId</code> unique. The second insert fails, I catch it and switch to update. The DB is the source of truth, so this holds even across multiple worker machines."</td></tr>
+    <tr><td><b>Idempotency key</b> sent to the ERP</td><td>Strong — the ERP itself refuses the duplicate create.</td><td>"If the ERP accepts an idempotency key, two creates with the same key produce one order. Best when you don't fully trust your own dedupe."</td></tr>
+    <tr><td><b>Per-order lock</b> (advisory lock / mutex on order id)</td><td>Works, but adds coordination and can bottleneck.</td><td>"A lock keyed on the order id serializes same-order events. Correct, but I'd prefer the DB constraint — less to go wrong."</td></tr>
+    <tr><td>In-memory <code>Set</code> of seen ids</td><td>Weak — the trap answer.</td><td>"Tempting, but it dies with the process and doesn't work across multiple workers. Not safe for production."</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <b>Trap:</b> "just add an in-memory cache of processed ids." It looks like a fix and works on one machine in light testing — exactly why it's dangerous. It fails the moment you scale to more than one worker or restart the process. Name it, then reject it out loud.
+  </div>
+
+  <div class="soundbite">
+    "It only breaks under load, so it's a concurrency bug — a check-then-act race. Two workers both see no mapping and both create. I fix it at the database with a unique constraint on the Shopify id and an upsert, because that's the one place the guarantee holds across every worker."
+  </div>
+
+  <nav class="footer-nav">
+    <a href="kata-01-webhook-handler.html">← Kata 01 · Webhook handler</a>
+    <a href="README.md">Back to the katas →</a>
+  </nav>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderRecall('#recall', [
+    {
+      prompt: "MODEL FIX — reveal after your own attempt. TypeScript. DB unique constraint + upsert.",
+      answer: "<pre style='white-space:pre-wrap'>// Migration: make the mapping unique per Shopify order.\n//   ALTER TABLE mappings ADD CONSTRAINT uq_shopify UNIQUE (shopify_id);\n\ninterface ShopifyOrder { id: string; /* ...other fields */ }\ninterface Mapping { shopifyId: string; erpId: string; }\n\nasync function handleOrder(order: ShopifyOrder): Promise&lt;void&gt; {\n  // Try to claim this order by inserting the mapping FIRST.\n  // If a concurrent worker already created it, the unique\n  // constraint makes this insert fail -> we know it exists.\n  try {\n    const erpId = await erp.createOrder(order, {\n      idempotencyKey: order.id,          // belt-and-braces at the ERP too\n    });\n    await db.mappings.insert({ shopifyId: order.id, erpId });\n  } catch (err) {\n    if (isUniqueViolation(err)) {\n      // Lost the race -> the other worker created it. Update instead.\n      const existing = await db.mappings.findByShopifyId(order.id);\n      if (existing) await erp.updateOrder(existing.erpId, order);\n    } else {\n      throw err;   // real error -> let the queue retry\n    }\n  }\n}</pre><b>Why:</b> the check-then-act gap is gone. The database enforces one mapping per Shopify id no matter how many workers race, so at most one <code>createOrder</code> wins. The idempotency key is a second line of defence at the ERP. Everything else falls back to update. Typing <code>findByShopifyId</code> as <code>Mapping | null</code> forces the <code>if (existing)</code> guard — the compiler makes you handle the missing case."
+    },
+    {
+      prompt: "Q: Why is an in-memory Set of processed order ids NOT an acceptable fix?",
+      answer: "Because it only protects <b>one process</b>. On a sale day I'm running <b>many worker instances</b>, and the Set in worker A can't see what worker B is doing — so two machines still both create the order. It also <b>resets on restart/deploy</b>. The guarantee has to live somewhere <b>shared and durable</b> — the database (unique constraint) or the ERP (idempotency key)."
+    }
+  ]);
+</script>

@@ -1,0 +1,296 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 — The Stock Availability Engine</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 3 · The signature problem</p>
+  <h1>The Stock Availability Engine</h1>
+  <p class="subtitle">You have a raw number from a store's POS. It may be stale, may not count what's reserved, may be wrong. The question is not "how many are there?" It is "what do I dare tell the customer?"</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> explain the difference between <em>on-hand</em> and <em>available-to-promise</em>, and describe the four levers that turn an untrusted raw count into a safe availability signal — <b>thresholds, safety buffers, prediction, and a "call to confirm" fallback</b> — so you never send a customer to an empty shelf.
+  </div>
+
+  <p class="small">This is the lesson that makes you sound like you know the domain, not just the platform. It builds on <a href="0002-inventory-ingestion-multi-source-sync.html">Lesson 2</a>'s canonical <code>inventory_levels</code> and feeds the read path in <a href="0004-find-in-store-read-path.html">Lesson 4</a>.</p>
+
+  <h2>1. On-hand is not available</h2>
+  <p>The number the POS reports is <b>quantity on hand</b> — what the system thinks is physically there. It is not what you can safely sell. The value you actually publish is <b>available-to-promise (ATP)</b>:</p>
+  <div class="note">
+    <span class="label">The core equation</span>
+    <b>available = on_hand − reserved − safety_buffer</b>, then gated by a <b>threshold</b> and adjusted for <b>staleness</b>. Everything in this lesson is one of those terms. If any term is missing, you will oversell.
+  </div>
+  <ul>
+    <li><b>on_hand</b> — the raw count from ingestion (Lesson 2).</li>
+    <li><b>reserved</b> — units promised to Click &amp; Collect / Ship-from-Store orders that are not yet picked (Lesson 5). If you don't subtract these, two customers claim the same unit. A reservation must <b>expire</b> (a hold with a TTL) — otherwise a customer who never collects leaves the unit reserved forever, hiding real stock as a phantom out-of-stock.</li>
+    <li><b>safety_buffer</b> — a cushion you hold back because you don't fully trust the count.</li>
+    <li><b>threshold</b> — a floor below which you say "not available here" even if the raw number is 1 or 2.</li>
+  </ul>
+  <div class="tip">
+    <span class="label">This is Shopify's real model — use its words</span>
+    Shopify's own inventory splits <code>on_hand</code> into named states: <code>on_hand = available + committed + reserved + damaged + safety_stock + quality_control</code>. So your "ATP" is Shopify's <code>available</code>, your "reserved" maps to Shopify's <code>reserved</code>/<code>committed</code>, and your "safety_buffer" maps to Shopify's <code>safety_stock</code>. Saying "I compute an available-to-promise number — Shopify's <code>available</code> state — by holding back <code>safety_stock</code> and subtracting <code>reserved</code> and <code>committed</code>" tells the interviewer you know the platform, not just the theory.
+  </div>
+
+  <h2>2. Lever 1 — Thresholds (per store, per SKU)</h2>
+  <p>A raw "1 in stock" is the most dangerous number in retail. It is exactly the case most likely to be wrong (the last one was sold, misplaced, or is a display model). So you set a <b>threshold</b>: only show "available" when the count is at or above it.</p>
+  <p>stockinstore makes this configurable <b>by store and by individual SKU</b>, and that granularity matters:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Situation</th><th>Threshold choice</th><th>Why</th></tr>
+    <tr><td>High-theft small item, busy store</td><td>Higher (e.g. show available only at ≥ 3)</td><td>Counts drift fast; 1–2 is unreliable.</td></tr>
+    <tr><td>Big, tracked item (fridge)</td><td>Lower (even 1 is fine)</td><td>Hard to lose; count is trustworthy.</td></tr>
+    <tr><td>Store with a flaky nightly feed</td><td>Higher across the board</td><td>Data is old, so demand more headroom.</td></tr>
+  </table>
+  </div>
+  <div class="tip">
+    <span class="label">Say it like this</span>
+    "Thresholds are per store and per SKU because trust in the number isn't uniform — a well-tracked appliance in a quiet store can show available at 1, but a small high-theft item in a busy store shouldn't show available until there are several, because the raw count there is the least reliable."
+  </div>
+
+  <h2>3. Lever 2 — Safety buffer</h2>
+  <p>Even above the threshold, hold a little back. If on-hand is 10 and your buffer is 2, you promise 8. The buffer absorbs the sales that happened <em>since the last feed</em> but haven't reached you yet. It trades a few "sorry, sold out" moments for far fewer "drove to the shop and it wasn't there" moments — and the second failure is the one that loses a customer for good.</p>
+
+  <h2>4. Lever 3 — Prediction (the "close to real-time" trick)</h2>
+  <p>Feeds are periodic; sales are continuous. Between two feed updates the true count moves — usually <em>down</em> from walk-in sales, but it can also go <em>up</em> (customer returns, a delivery received, an inter-store transfer, a cancelled layby). stockinstore names "an algorithm that predicts stock availability" for exactly this gap. Because you cannot see the up-moves until the next feed, the safe design is a <b>one-directional</b> one: the prediction may only ever <em>lower</em> the shown number, never raise it. That is a deliberate safety choice, not a claim that stock physically only falls — the real guarantee comes from the strict reservation at purchase (§6).</p>
+  <p>So you decay a stale count toward zero, using how fast that store/SKU normally sells and how many <b>trading hours</b> have passed since the reading:</p>
+  <pre><code>// predicted available between feed updates (illustrative, explainable model)
+function predictedAvailable(level, now, salesRatePerTradingHour, buffer, threshold) {
+  // Count only hours the store was OPEN — a feed from 6pm close read at 8am is
+  // 14h old on the clock but sold ZERO overnight. Use locations.timezone + hours.
+  const openHours  = tradingHoursBetween(level.updated_at, now, level.location);
+  const likelySold = Math.round(salesRatePerTradingHour * openHours); // not ceil — see note
+  const predicted  = level.on_hand - level.reserved - likelySold - buffer;
+  return predicted >= threshold ? predicted : 0;                       // gate on threshold
+}
+// salesRatePerTradingHour = a rolling per-store, per-SKU velocity you keep from
+// history (e.g. avg units sold per open hour over the last N weeks).</code></pre>
+  <div class="tip">
+    <span class="label">Worked example (trace it out loud)</span>
+    on_hand = 10, reserved = 0, buffer = 2, threshold = 3, sells 2 per <b>trading</b> hour, reading is 4 trading hours old.<br>
+    likelySold = round(2 × 4) = 8 → predicted = 10 − 0 − 8 − 2 = <b>0</b> → 0 &lt; threshold 3 → the widget shows <b>"Out of stock"</b>. The same feed at 1 trading hour old: likelySold = 2 → predicted = 6 → shows <b>"In stock (6)"</b>. Older reading, more conservative — automatically.
+  </div>
+  <div class="trap">
+    <span class="label">Three traps in this small function</span>
+    (1) <b>Wall-clock age.</b> Using real elapsed time zeroes overnight-stale feeds that actually sold nothing — decay against <em>trading</em> hours (needs <code>locations.timezone</code> + opening hours). (2) <b>Math.ceil.</b> Ceil is over-aggressive — a 30-minute-old feed at 0.1 sales/hour would "predict" 1 sold and wrongly drop the count; use <code>round</code> (or <code>floor</code>). (3) <b>Magic sell rate.</b> The rate isn't a guess — it's a rolling velocity computed per store and SKU from sales history, and it degrades to "call to confirm" when you have no history.
+  </div>
+
+  <h2>5. Lever 4 — The honest fallback</h2>
+  <p>Some stores simply cannot give reliable (or any) data. Do not fake it. stockinstore shows customisable text like <b>"call store to confirm"</b> for these. Being honest about uncertainty is better than a confident lie that ends at an empty shelf. The availability signal is therefore not just a number — it is a <em>state</em>:</p>
+  <div class="diagram">   AVAILABILITY STATE (what the widget actually shows)
+
+   feed fresh + count ≥ threshold ............► "In stock"        (green)
+   feed fresh + count in low band ............► "Low stock"       (amber)
+   feed stale but predicted ≥ threshold ......► "Likely in stock" (amber)
+   count &lt; threshold OR predicted 0 ..........► "Out of stock"    (grey)
+   no reliable feed for this store ...........► "Call to confirm" (neutral)</div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: write the ATP equation, and name the four levers that turn a raw count into a safe signal.</div>
+
+  <h2>6. Preventing oversell at the moment of truth</h2>
+  <p>Availability display is a <em>hint</em>. The guarantee happens at purchase. When a customer actually chooses Click &amp; Collect at a store, you re-check and <b>reserve</b> against the live count. "Atomic" is not hand-waving — it is one <b>conditional</b> write that both checks and reserves, so two buyers can never both claim the last unit:</p>
+  <pre><code>-- reserve N only if enough is really available; returns 0 rows if not (→ refuse)
+UPDATE inventory_levels
+   SET reserved = reserved + $qty
+ WHERE location_id = $loc AND sku = $sku
+   AND (on_hand - reserved - $buffer) >= $qty      -- the check and the write, together
+RETURNING reserved;</code></pre>
+  <p>The <code>WHERE</code> and the <code>SET</code> execute as one atomic row update, so concurrent checkouts are serialised on that row — no "check-then-write" race. (Equivalently: <code>SELECT … FOR UPDATE</code> to lock the row, verify, then update.) If it returns no row, there isn't enough — you refuse and offer another store.</p>
+  <div class="note">
+    <span class="label">Two different jobs, two different strictness levels</span>
+    <b>Browse-time availability</b> (Find in Store): fast, cached, approximate — a threshold-and-prediction hint across many stores. <b>Buy-time availability</b> (checkout reservation): slow-path, strict, atomic — the guarded update above for <em>one</em> store, or refuse. Confusing these two is the classic mistake.
+  </div>
+  <div class="trap">
+    <span class="label">Watch the pickup handoff — don't subtract twice</span>
+    When the store picks the order, two things happen: the POS <code>on_hand</code> drops (the item physically leaves) <em>and</em> your <code>reserved</code> must be released. If you drop <code>on_hand</code> (via the next feed) but forget to clear <code>reserved</code>, you subtract the same unit twice and hide stock. Release the reservation the moment the pick is confirmed, and treat the short window between "picked" and "next feed" as expected. Reservations that are never picked up hit their <b>TTL</b> and release automatically (§1).
+  </div>
+
+  <h2>7. How you'd defend the design</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>They ask…</th><th>You answer…</th></tr>
+    <tr><td>"Why not just show the POS number?"</td><td>Because it's on-hand, not available: it ignores reservations, staleness, and count error. Showing it oversells and sends customers to empty shelves.</td></tr>
+    <tr><td>"Isn't a buffer just lost sales?"</td><td>It's a trade. A few 'sold out online' moments cost far less than a wasted trip to the store, which loses trust and the customer. I tune the buffer per store/SKU to balance it.</td></tr>
+    <tr><td>"Your prediction could be wrong."</td><td>Yes — so it only ever reduces the count, never inflates it, and it degrades gracefully to 'call to confirm.' It's a conservative hint, backed by a strict reservation at purchase.</td></tr>
+    <tr><td>"A store's feed died. Now what?"</td><td>Feed age crosses a limit → I stop trusting the number: widen buffer, then fall back to 'call to confirm,' and alert ops. I never keep showing a frozen count as if it's live.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the availability engine in 5 sentences)</span>
+    <p>"The number from the POS is on-hand, not available-to-promise, so I compute available = on_hand − reserved − buffer — in Shopify's own words, its <code>available</code> state after holding back <code>safety_stock</code> and <code>reserved</code> — gated by a per-store, per-SKU threshold. The threshold protects me from the least trustworthy numbers, a raw 1 or 2 in a busy store, while a well-tracked item can show available at 1. Because feeds are periodic and sales continuous, I decay a stale count downward by the store's rolling sell rate times the trading hours since the reading — one-directional, as a safety choice, since I can't see returns or restock until the next feed. Where a store can't give reliable data I show 'call to confirm' rather than guess. And I keep browse-time availability (fast, cached, approximate) separate from buy-time availability (a strict, atomic guarded update that reserves or refuses), because display is a hint and the reservation is the guarantee."</p>
+  </div>
+
+  <h2>8. Deep-dive Q&amp;A — how the engine is triggered (not push/poll/file)</h2>
+  <p class="small">A common mix-up worth nailing. Cover each answer, say it out loud, then scroll.</p>
+
+  <h3>Q1. Does the availability engine read stock via push, poll, or file?</h3>
+  <p><b>No.</b> Push / poll / file are the <b>ingestion transports</b> (Lesson 2) — how <em>external</em> POS/ERP data reaches your <code>inventory_levels</code> table. The availability engine sits one step <em>after</em> that, entirely inside your system: it reads <code>inventory_levels</code>, computes the state, and writes the <code>availability</code> row. It never calls a POS.</p>
+  <div class="diagram">   EXTERNAL (POS / ERP)              INSIDE YOUR SYSTEM
+ ┌──────────────────────┐
+ │ push / poll / file   │ ── feed the WRITE model ──►
+ └──────────┬───────────┘
+            ▼
+   ingestion worker ──► inventory_levels (on_hand, reserved)   ← WRITE model (L2)
+                                 │  engine reacts to THIS changing
+                                 ▼
+                    availability engine (compute state)         ← THIS lesson
+                                 │
+                                 ▼
+                       availability (state, qty_shown)          ← READ model → widget (L4)</div>
+  <p>So whether a reading arrived by push, poll, or file, once it lands in <code>inventory_levels</code> the <b>same</b> internal trigger drives the engine — the transport is invisible to it. Push/poll/file only decide <em>when</em> <code>on_hand</code> changes and <em>how fresh</em> it is; the engine reacts to the result, not the pipe it came through.</p>
+
+  <h3>Q2. So what actually triggers the engine to rewrite an <code>availability</code> row?</h3>
+  <p>"When stock changes" is slightly loose. The engine fires when any <b>input to the availability formula</b> (<code>on_hand − reserved − buffer</code>, gated by threshold, adjusted for staleness) changes:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trigger</th><th>Where it comes from</th></tr>
+    <tr><td><code>on_hand</code> changed</td><td>a new reading was applied — the one that came via push/poll/file</td></tr>
+    <tr><td><code>reserved</code> changed</td><td>a reservation was taken / released / expired (Lesson 5) — a <em>customer</em> action, no external feed</td></tr>
+    <tr><td>config changed</td><td>a threshold or safety <code>buffer</code> was retuned</td></tr>
+    <tr><td><b>time passed</b></td><td>the feed <b>aged</b> → decay / flip to <code>call_to_confirm</code> — <em>no data arrived at all</em></td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <span class="label">Two triggers have no external feed — that's the proof it's internal</span>
+    A reservation change and the time-based staleness decay both rewrite availability with <b>nothing coming in from a POS</b>. If the engine "worked via push/poll/file", neither could ever happen — yet they're the two that most often prevent an oversell. The time one needs a <b>scheduled sweep / TTL</b> that re-evaluates aging entries, because you can't be event-triggered by "a reading that never arrived".
+  </div>
+  <div class="tip">
+    <span class="label">How the trigger is delivered reliably</span>
+    Two designs: <b>inline</b> — recompute <code>availability</code> in the same transaction that writes <code>inventory_levels</code> (simple, always consistent, but coupled); or <b>event-driven</b> — write <code>inventory_levels</code> + an event to the <b>transactional outbox</b> in one transaction, a relay publishes it, the engine consumes it (Lesson 7). The outbox avoids the <b>dual-write problem</b>: emit the "changed" event <em>separately</em> from the DB write and a crash between them leaves <code>availability</code> silently stale forever.
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://www.stockinstore.com/faqs/">stockinstore FAQs</a> — confirms availability uses a threshold "by store and by individual SKU," "an algorithm that predicts stock availability," and a "call store to confirm" fallback for stores that can't supply data.<br>
+  📖 <a href="https://www.stockinstore.com/solutions/find-in-store/">stockinstore — Find in Store</a> — "sync real-time inventory data from physical stores" for the product page. (Read "real-time" as the marketing promise; the engineering reality is <em>near</em>-real-time with a per-store freshness you surface and design around — which is the whole point of this lesson.)</p>
+
+  <p class="small" id="c1">[1] Availability mechanisms verified against stockinstore.com/faqs (checked 2026-07-16): customisable threshold by store and by SKU; a predictive stock-availability algorithm; customisable "call store to confirm" messaging where data is unavailable. On-hand vs available-to-promise (ATP) is standard inventory terminology; the decay function here is an illustrative, explainable model, not stockinstore's exact algorithm.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can write the ATP equation from memory, explain why per-store/per-SKU thresholds exist, reason out loud about decaying a stale count, and cleanly separate browse-time hinting from buy-time reservation.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the reservation + TTL release worked as real Node/SQL, or to trace the double-subtract-on-pickup window? Just ask. When you're ready, say <b>"next"</b> for <b>Lesson 4 — Find in Store: the read path</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0002-inventory-ingestion-multi-source-sync.html">← Prev: Ingestion</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0004-find-in-store-read-path.html">Next: Find in Store →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "What is available-to-promise (ATP)?",
+      options: [
+        "on_hand − reserved − safety_buffer, gated by a threshold and staleness",
+        "The exact number the POS reports",
+        "The total across every store added up",
+        "The number of orders placed today"
+      ],
+      answer: 0,
+      why: "On-hand is what the POS thinks is physically there; ATP is what you can safely sell after subtracting reservations and a buffer, gating on a threshold, and accounting for how stale the reading is."
+    },
+    {
+      q: "Why are thresholds set per store AND per SKU?",
+      options: [
+        "Trust in the raw count isn't uniform across items or stores",
+        "To make the database larger",
+        "Because Shopify requires per-SKU config",
+        "So every product shows the same status"
+      ],
+      answer: 0,
+      why: "A well-tracked appliance in a quiet store can safely show available at 1; a small high-theft item in a busy store shouldn't, because its raw count drifts fastest. Granular thresholds match caution to how reliable each number is."
+    },
+    {
+      q: "How should a prediction adjust a stale count?",
+      options: [
+        "Decay it downward only, by sell rate × trading hours since the reading",
+        "Increase it to encourage sales",
+        "Freeze it until the next feed",
+        "Set it to a fixed default of 5"
+      ],
+      answer: 0,
+      why: "True stock can move up (returns, restock, transfers) or down between feeds, but you can't see up-moves until the next feed — so as a SAFETY choice the prediction only ever lowers the number. Decay against TRADING hours (not wall-clock, or an overnight-stale feed wrongly reads as sold out). The strict reservation at purchase is the real guarantee."
+    },
+    {
+      q: "How do you reserve the last unit for one buyer without a race?",
+      options: [
+        "One conditional UPDATE that checks availability and reserves in the same statement",
+        "SELECT the count, then a separate UPDATE a moment later",
+        "Trust the cached browse-time number",
+        "Ask the store to phone you"
+      ],
+      answer: 0,
+      why: "A single guarded UPDATE (SET reserved = reserved + qty WHERE on_hand - reserved - buffer >= qty) checks and writes atomically on one row, so concurrent checkouts serialise and can't both claim the last unit. A separate SELECT-then-UPDATE has a check-then-write race that oversells."
+    },
+    {
+      q: "Why must a reservation have a TTL (expiry)?",
+      options: [
+        "A customer who never collects would otherwise hide the unit forever",
+        "To make the database smaller",
+        "Because Shopify deletes old orders",
+        "TTLs make queries faster"
+      ],
+      answer: 0,
+      why: "reserved is subtracted from available. If a hold never expires, an abandoned Click & Collect order keeps a real unit invisible — a phantom out-of-stock. A TTL releases the hold back to available; pickup and cancellation release it too."
+    },
+    {
+      q: "A store can't provide reliable stock data. What do you show?",
+      options: [
+        "'Call store to confirm' — honest about the uncertainty",
+        "A random guess so the page looks complete",
+        "Always 'in stock'",
+        "Nothing — hide the store"
+      ],
+      answer: 0,
+      why: "stockinstore uses customisable 'call to confirm' text for stores that can't supply data. An honest uncertainty beats a confident lie that ends at an empty shelf."
+    },
+    {
+      q: "How do browse-time and buy-time availability differ?",
+      options: [
+        "Browse is fast/approximate/cached; buy is strict/atomic reservation",
+        "They are identical",
+        "Browse is stricter than buy",
+        "Buy-time never checks stock"
+      ],
+      answer: 0,
+      why: "Display across many stores is a cached hint (threshold + prediction). The purchase must reserve or decrement the real count for one store atomically, or refuse. Display is a hint; the reservation is the guarantee."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Turn a raw POS count into a safe availability signal — walk me through it.",
+      answer: "Start from <b>on_hand</b> (ingested count). Subtract <b>reserved</b> (unpicked orders, with a TTL) and a <b>safety_buffer</b> to get available-to-promise — Shopify's <code>available</code> state. Gate on a <b>per-store, per-SKU threshold</b> so unreliable low counts don't show as available. If the feed is <b>stale</b>, decay the count downward by the store's rolling sell rate × the <b>trading hours</b> since the reading (one-directional, as a safety choice). If the store has <b>no reliable feed</b>, show <b>'call to confirm.'</b> The result is a state — in stock / low / likely / out / call — not a bare number. Purchase then confirms it with a strict atomic reservation."
+    },
+    {
+      prompt: "Q: Why isn't a safety buffer just throwing away sales?",
+      answer: "It's a deliberate trade. The buffer absorbs sales that happened since the last feed but haven't reached you, so it prevents the worst failure: a customer drives to the store and the item isn't there. A few 'sold out online' moments cost far less than a wasted trip, which loses trust and the customer. I tune the buffer per store/SKU to balance conversion against that risk."
+    },
+    {
+      prompt: "Q: A store's feed goes stale. How does availability change?",
+      answer: "As <b>feed age</b> grows I trust the number less: the <b>prediction</b> decays the count toward zero using the sell rate, and I effectively <b>widen the buffer</b>. Past a limit I fall back to <b>'call to confirm'</b> and <b>alert ops</b>. I never keep showing a frozen count as if it were live — staleness is a first-class input to the signal, not an afterthought."
+    },
+    {
+      prompt: "Q: Is the availability engine fed by push, poll, or file?",
+      answer: "No — those are <b>ingestion transports</b> (Lesson 2): how external POS/ERP data reaches <code>inventory_levels</code>. The engine is <b>internal</b> and sits after ingestion — it reads <code>inventory_levels</code>, computes the state, and writes <code>availability</code>. It never calls a POS. The transport is invisible to it: however a reading arrived, once it's in <code>inventory_levels</code> the same internal trigger drives the engine."
+    },
+    {
+      prompt: "Q: What triggers the engine to rewrite an availability row — and which triggers have no external feed?",
+      answer: "Any input to <code>on_hand − reserved − buffer</code> (gated by threshold, adjusted for staleness) changing: (1) <code>on_hand</code> changed (a new reading, via push/poll/file); (2) <code>reserved</code> changed (reservation taken/released/expired — a customer action); (3) threshold/buffer config changed; (4) <b>time passed</b> (the feed aged → decay / 'call to confirm'). Triggers 2 and 4 have <b>no external feed</b> — proof the engine is internal — and (4) needs a <b>scheduled sweep</b>, since nothing arrives to event off. Deliver the trigger reliably inline (same transaction) or via a <b>transactional outbox</b> to avoid the dual-write problem."
+    }
+  ]);
+</script>

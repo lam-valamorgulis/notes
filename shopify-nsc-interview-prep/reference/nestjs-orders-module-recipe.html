@@ -1,0 +1,195 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NestJS OrdersModule — Guard + DI + Unit Test — Code Recipe</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .step { font-family: var(--font-sans); font-weight: 700; color: var(--accent); margin: 1.6rem 0 .3rem; }
+  .fname { font-family: var(--font-mono); font-size: .78rem; color: var(--accent-2); font-weight: 700; margin: 1.3rem 0 .2rem; }
+</style>
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · Code Recipe</p>
+  <h1>NestJS OrdersModule: Guard + DI + Unit Test</h1>
+  <p class="subtitle">One realistic feature that ties three lessons together: a NestJS module that receives Shopify order webhooks, verifies them with a guard, and a unit test that injects a mock Shopify service.</p>
+
+  <div class="win">
+    <strong>Why this one example is worth studying:</strong> it shows <a href="../lessons/0007-nestjs-architecture.html">NestJS DI &amp; guards (L7)</a>, <a href="../lessons/0002-webhooks-done-right.html">webhook HMAC (L2)</a>, and <a href="../lessons/0014-testing-and-quality.html">mock-injection testing (L14)</a> working together — the exact shape of real NSC work.
+  </div>
+
+  <h2>The files</h2>
+  <div class="diagram">orders/
+├── orders.module.ts          // wires the feature together
+├── orders.controller.ts      // the webhook route (guarded)
+├── shopify-webhook.guard.ts  // verifies HMAC before the handler runs
+├── orders.service.ts         // business logic — depends on ShopifyService
+├── shopify.service.ts        // calls the Shopify Admin API (mocked in tests)
+└── orders.service.spec.ts    // unit test: injects a MOCK ShopifyService</div>
+
+  <h2>1. The module — wiring by dependency injection</h2>
+  <p>A <b>module</b> groups a feature. <code>providers</code> are the injectable classes; Nest builds them and hands them to whoever asks in a constructor.</p>
+  <div class="fname">orders.module.ts</div>
+  <pre><code>import { Module } from '@nestjs/common';
+import { OrdersController } from './orders.controller';
+import { OrdersService } from './orders.service';
+import { ShopifyService } from './shopify.service';
+
+@Module({
+  controllers: [OrdersController],
+  providers: [OrdersService, ShopifyService],   // injectable classes
+})
+export class OrdersModule {}</code></pre>
+
+  <h2>2. The guard — verify the HMAC before the handler runs</h2>
+  <p>A <a href="./glossary.html#nest-lifecycle">guard</a> is a reusable gate that runs <b>before</b> the route handler. This one rejects any webhook whose HMAC does not match. Needs <code>rawBody: true</code> in <code>main.ts</code> (HMAC must hash the raw bytes — see the <a href="./webhook-erp-worker.html">Webhook → ERP recipe</a>).</p>
+  <div class="fname">shopify-webhook.guard.ts</div>
+  <pre><code>import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import * as crypto from 'crypto';
+
+@Injectable()
+export class ShopifyWebhookGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    const hmacHeader = req.headers['x-shopify-hmac-sha256'] as string;
+    const rawBody: Buffer = req.rawBody;                 // requires rawBody: true in main.ts
+    if (!hmacHeader || !rawBody) throw new UnauthorizedException();
+
+    const digest = crypto
+      .createHmac('sha256', process.env.SHOPIFY_API_SECRET)  // the client secret
+      .update(rawBody)                                        // the RAW bytes
+      .digest('base64');
+
+    const ok = crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+    if (!ok) throw new UnauthorizedException('invalid hmac');
+    return true;                                             // pass → handler runs
+  }
+}</code></pre>
+
+  <h2>3. The controller — ack fast, hand off to the service</h2>
+  <p>The controller injects <code>OrdersService</code> (DI), returns <b>200 quickly</b>, and lets the service do the real work. The guard is attached with <code>@UseGuards</code>.</p>
+  <div class="fname">orders.controller.ts</div>
+  <pre><code>import { Controller, Post, Req, UseGuards, HttpCode } from '@nestjs/common';
+import { ShopifyWebhookGuard } from './shopify-webhook.guard';
+import { OrdersService } from './orders.service';
+
+@Controller('webhooks/shopify')
+export class OrdersController {
+  constructor(private readonly orders: OrdersService) {}   // DI: Nest injects OrdersService
+
+  @Post('orders-create')
+  @HttpCode(200)                     // ack fast, within Shopify's 5s window
+  @UseGuards(ShopifyWebhookGuard)    // guard runs BEFORE this handler
+  async handleOrderCreate(@Req() req) {
+    const event = JSON.parse(req.rawBody.toString('utf8'));
+    const webhookId = req.headers['x-shopify-webhook-id'];
+    await this.orders.enqueue(webhookId, event);   // heavy work happens on a worker
+  }
+}</code></pre>
+
+  <h2>4. The services — one depends on the other</h2>
+  <p><code>OrdersService</code> holds business logic and <b>depends on</b> <code>ShopifyService</code> (which calls the real Admin API). Nest injects it through the constructor — and that is exactly what makes the test easy.</p>
+  <div class="fname">shopify.service.ts  (the dependency we will mock)</div>
+  <pre><code>import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class ShopifyService {
+  // real GraphQL call to the Shopify Admin API. In tests we swap this for a fake.
+  async getOrder(orderId: string): Promise&lt;any&gt; {
+    // ...call Shopify Admin API, return the order...
+  }
+}</code></pre>
+  <div class="fname">orders.service.ts</div>
+  <pre><code>import { Injectable } from '@nestjs/common';
+import { ShopifyService } from './shopify.service';
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly shopify: ShopifyService) {}   // DI: injected dependency
+
+  async enqueue(webhookId: string, event: any): Promise&lt;void&gt; {
+    // (idempotency + queue omitted here — see the Webhook → ERP recipe)
+  }
+
+  // pure-ish logic that USES the dependency — the part we unit test
+  async buildErpPayload(orderId: string) {
+    const order = await this.shopify.getOrder(orderId);   // ← dependency call
+    return {
+      externalId: order.id,
+      total: Number(order.total_price),
+      lineCount: order.line_items.length,
+    };
+  }
+}</code></pre>
+
+  <h2>5. The unit test — inject a MOCK ShopifyService</h2>
+  <p>This is the payoff of dependency injection: in the test we replace the real <code>ShopifyService</code> with a fake, so <b>no network call happens</b>. We control what it returns and assert what <code>OrdersService</code> does with it.</p>
+  <div class="fname">orders.service.spec.ts</div>
+  <pre><code>import { Test } from '@nestjs/testing';
+import { OrdersService } from './orders.service';
+import { ShopifyService } from './shopify.service';
+
+describe('OrdersService', () =&gt; {
+  let service: OrdersService;
+
+  // a fake ShopifyService — no real Shopify call
+  const mockShopify = { getOrder: jest.fn() };
+
+  beforeEach(async () =&gt; {
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        OrdersService,
+        { provide: ShopifyService, useValue: mockShopify },   // ⭐ inject the MOCK
+      ],
+    }).compile();
+
+    service = moduleRef.get(OrdersService);
+    jest.clearAllMocks();
+  });
+
+  it('builds an ERP payload from a Shopify order', async () =&gt; {
+    // arrange: the mock returns a fixture instead of calling Shopify
+    mockShopify.getOrder.mockResolvedValue({
+      id: 'gid://shopify/Order/1001',
+      total_price: '129.90',
+      line_items: [{ id: 1 }, { id: 2 }],
+    });
+
+    // act
+    const payload = await service.buildErpPayload('gid://shopify/Order/1001');
+
+    // assert
+    expect(mockShopify.getOrder).toHaveBeenCalledWith('gid://shopify/Order/1001');
+    expect(payload).toEqual({
+      externalId: 'gid://shopify/Order/1001',
+      total: 129.90,
+      lineCount: 2,
+    });
+  });
+});</code></pre>
+
+  <div class="tip">
+    <span class="label">Why DI makes this test trivial</span>
+    <code>OrdersService</code> never creates its own <code>ShopifyService</code> — it <b>receives</b> one. So the test hands it a fake via <code>{ provide: ShopifyService, useValue: mockShopify }</code>. No network, fast, deterministic. That is the whole point of dependency injection: swap real for fake at the boundary.
+  </div>
+
+  <h2>Say-it checklist</h2>
+  <ul>
+    <li><b>Module</b> groups the feature; <b>providers</b> are injectable; Nest wires them by constructor.</li>
+    <li><b>Guard</b> runs before the handler — here it verifies the webhook <b>HMAC on the raw body</b> and rejects if it fails.</li>
+    <li><b>Controller</b> returns <b>200 fast</b>, hands the event to the service (which queues the heavy work).</li>
+    <li><b>OrdersService depends on ShopifyService</b> via DI — so the <b>unit test injects a mock</b> and never hits the network.</li>
+    <li>Test shape: <code>Test.createTestingModule</code> → <code>{ provide, useValue }</code> → arrange (mock returns a fixture) → act → assert.</li>
+  </ul>
+
+  <p class="small">Shopify facts verified against shopify.dev (2026-07-09): webhook HMAC = HMAC-SHA256 of the raw body with the app client secret vs the <code>X-Shopify-Hmac-SHA256</code> header; respond 200 within ~5s; dedupe via <code>X-Shopify-Webhook-Id</code>.</p>
+
+  <div class="ask">
+    <b>This is your teacher.</b> Want the <b>guard's own unit test</b> (valid vs invalid HMAC), or this wired to a <b>BullMQ queue</b> so <code>enqueue</code> really pushes a job? Ask.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../lessons/0007-nestjs-architecture.html">← L7 · NestJS</a>
+    <a href="./glossary.html">Glossary</a>
+    <a href="./webhook-erp-worker.html">Webhook → ERP Worker →</a>
+  </div>
+</div>

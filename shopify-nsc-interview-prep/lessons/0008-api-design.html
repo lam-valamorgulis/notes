@@ -1,0 +1,233 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — API Design &amp; Architecture</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 8 · Day 2 · Backend engineering</p>
+  <h1>API Design &amp; Architecture</h1>
+  <p class="subtitle">You spent years calling other people's APIs. Now you design one that other people — and machines — must trust.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> confidently answer <em>"How do you design a clean, scalable API?"</em> — with real terms, in under two minutes.
+  </div>
+
+  <p class="small">Ties to your <a href="../MISSION.md">mission</a>: at NSC you sit in the middle. You <b>consume</b> Shopify's GraphQL Admin API, and you <b>expose</b> your own API to an ERP and a frontend. Both sides judge you by the API you design.</p>
+
+  <h2>1. Where your API lives</h2>
+  <p>Picture the shape of the job. Data flows through your server. You are not just a client and not just a store — you are the bridge.</p>
+  <div class="diagram">  ERP / Frontend  ───▶  YOUR API  ───▶  Shopify <a href="../reference/glossary.html#admin-api">Admin API</a> (GraphQL)
+   (they consume        (you design         (you consume
+    your endpoints)      this layer)          their schema)</div>
+  <p>So you make two kinds of choices at once: how you <b>call</b> Shopify, and how you <b>publish</b> your own endpoints. Good design on both sides is what "scalable" really means here.</p>
+
+  <div class="note">
+    <span class="label">If you remember one thing</span>
+    <b>Validate at the edge, use one error shape, and version so you never break clients.</b> Every other rule in this lesson hangs off those three habits.
+  </div>
+
+  <p>To keep it concrete, we carry <b>one endpoint through the whole lesson</b>: <code>POST /v1/orders</code>, which creates an order. Watch its <b>version</b>, its <b>DTO</b>, its <b>201</b>, its <b>error shape</b>, and its <b>idempotency key</b> show up in each bucket below.</p>
+
+  <p>The rest of the lesson is three buckets. Each answers one job: <b>shape the contract</b>, <b>guard the edge</b>, then <b>survive scale &amp; change</b>.</p>
+
+  <h2>Bucket 1 — Shape the contract</h2>
+  <p class="small">REST vs GraphQL · status codes · DTOs · one error shape. This is the promise your API makes to every caller.</p>
+
+  <h3>REST vs GraphQL — when to choose each</h3>
+  <p>You already know <a href="../reference/glossary.html#rest-vs-graphql">REST vs GraphQL</a> from Lesson 1. The senior move is picking on purpose, not by habit.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Pick REST when</th><th>Pick GraphQL when</th></tr>
+    <tr><td>Simple resource CRUD (orders, products)</td><td>Clients need many shapes of the same data</td></tr>
+    <tr><td>Easy caching by URL, wide tooling</td><td>You want one round trip for nested data</td></tr>
+    <tr><td>An ERP that expects plain endpoints</td><td>A rich frontend that over-fetches on REST</td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <span class="label">The honest answer</span>
+    You <b>consume</b> Shopify as GraphQL (their choice). For the API you <b>expose</b>, REST is the safe default for an ERP integration — predictable, cacheable, easy to secure. So our carried example is a plain REST endpoint, <code>POST /v1/orders</code>. Offer GraphQL only if a client truly needs flexible queries.
+  </div>
+
+  <h3>Resources and status codes</h3>
+  <p>Design URLs around <b>nouns</b>, not verbs: <code>GET /v1/orders/123</code>, not <code>/getOrder</code>. Let the HTTP method be the verb. Then return the <b>right status code</b> — clients branch on it. Our <code>POST /v1/orders</code> returns <code>201 Created</code> on success.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Code</th><th>Meaning</th><th>Use it for</th></tr>
+    <tr><td><code>200</code></td><td>OK</td><td>A read or update that worked</td></tr>
+    <tr><td><code>201</code></td><td>Created</td><td>A POST that made a new resource — e.g. <code>POST /v1/orders</code></td></tr>
+    <tr><td><code>400</code></td><td>Bad Request</td><td>Input failed validation</td></tr>
+    <tr><td><code>401 / 403</code></td><td>Unauthorized / Forbidden</td><td>Not logged in / not allowed</td></tr>
+    <tr><td><code>429</code></td><td>Too Many Requests</td><td>Client hit your rate limit</td></tr>
+    <tr><td><code>500</code></td><td>Server Error</td><td>Your bug, not the client's</td></tr>
+  </table>
+  </div>
+
+  <h3>Validate input with DTOs</h3>
+  <p>Never trust the request body. A <b>DTO</b> (Data Transfer Object) is a typed, validated shape for input. In NestJS you use a class plus <code>class-validator</code> and a validation pipe, so a bad field is rejected with a <code>400</code> before it ever reaches your business logic. This keeps garbage out of your database and your Shopify calls. Here is the DTO for our carried endpoint:</p>
+  <pre><code>export class CreateOrderDto {          // the shape of POST /v1/orders
+  @IsString()  customerId: string;
+  @IsInt() @Min(1)  quantity: number;
+  @IsString()  sku: string;
+}</code></pre>
+  <div class="tip">
+    <span class="label">Say this</span>
+    "Validation lives at the edge. A DTO defines what a valid request looks like; the pipe enforces it. My services only ever see clean, typed data."
+  </div>
+
+  <h3>One error shape, everywhere</h3>
+  <p>The fastest way to look junior is a different error format on every endpoint. Pick <b>one</b> JSON shape and return it for every failure. Include a machine code, a human message, per-field details, and a request id for tracing. When <code>POST /v1/orders</code> gets a bad body, it returns a <code>400</code> in exactly this shape:</p>
+  <pre><code>{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "The request could not be validated.",
+    "details": [
+      { "field": "quantity", "issue": "must be at least 1" }
+    ],
+    "requestId": "req_01HZY8..."
+  }
+}</code></pre>
+  <p>Now every client writes one error handler, and every log line has a <code>requestId</code> you can grep. That is scalability of <em>people</em>, not just servers.</p>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: what three things go into your one error shape, and which status code does <code>POST /v1/orders</code> return on success?</div>
+
+  <h2>Bucket 2 — Guard the edge</h2>
+  <p class="small">Validation, authentication vs authorization, idempotency, rate limiting. This is how you keep bad, unauthorised, and duplicate calls out — before they touch your logic.</p>
+
+  <h3>Authentication vs authorization</h3>
+  <p>Two words, often confused. <b>Authentication</b> = <em>who are you?</em> (prove identity, e.g. an API key or JWT). <b>Authorization</b> = <em>what are you allowed to do?</em> (check permissions/scopes). You always do both: first confirm the caller, then confirm the caller may perform this exact action. Before <code>POST /v1/orders</code> runs, you authenticate the caller, then check it holds the "orders:write" scope.</p>
+
+  <h3>Idempotency for writes</h3>
+  <p>Networks fail. A client sends <code>POST /v1/orders</code>, times out, and retries — did it create one order or two? Make writes <a href="../reference/glossary.html#idempotency">idempotent</a>. The client sends an <a href="../reference/glossary.html#idempotency-key">idempotency key</a> (a unique id). You store it; if you see the same key again, you return the first result instead of doing the work twice. Now a retry is <b>safe</b>. This is the same discipline that makes duplicate Shopify webhooks harmless.</p>
+  <p>Step through the retry on our carried endpoint:</p>
+  <div class="diagram">  POST /v1/orders   Idempotency-Key: key_abc
+     │
+     ▼  server creates order #5001, stores  key_abc → order #5001,  returns 201
+     │
+     ✗  the 201 response is lost — client's network times out
+     │
+     ▼  client RETRIES the same POST with the SAME  Idempotency-Key: key_abc
+     │
+     ▼  server sees key_abc already used → returns the STORED 201 (order #5001)
+     │
+  RESULT: one order, not two. The retry is safe.</div>
+
+  <h3>Rate-limit your own API</h3>
+  <p>Shopify limits you; you should limit your callers too. A <a href="../reference/glossary.html#cache">shared store like Redis</a> counts requests per client and returns <code>429 Too Many Requests</code> with a <code>Retry-After</code> header when they go over. This protects your server and, indirectly, protects the Shopify quota you all share.</p>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: a client's <code>POST /v1/orders</code> times out and it retries — how does the idempotency key stop a double order?</div>
+
+  <h2>Bucket 3 — Survive scale &amp; change</h2>
+  <p class="small">Versioning, pagination, OpenAPI. This is how the API grows and changes without breaking anyone who already depends on it.</p>
+
+  <h3>Versioning</h3>
+  <p>Once someone depends on your API, you cannot change it freely. Put a version in the path (<code>/v1/…</code> — that is the <code>v1</code> in <code>POST /v1/orders</code>) or a header. Add fields freely; never change or remove one inside a version. This is exactly how Shopify ships <b>dated</b> API versions so your app does not break overnight.</p>
+
+  <h3>Pagination — cursor vs offset</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Offset (<code>?page=5</code>)</th><th>Cursor (<code>?after=abc</code>)</th></tr>
+    <tr><td>How</td><td>Skip N rows, take M</td><td>"Give me rows after this marker"</td></tr>
+    <tr><td>Big lists</td><td>Slow; skips/repeats on inserts</td><td>Stable and fast</td></tr>
+    <tr><td>Used by</td><td>Small admin tables</td><td><b>Shopify</b>, and you should too</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <span class="label">Why cursors win</span>
+    With offset, if a row is inserted while you page, you can see a row twice or miss one. A <b>cursor</b> points at a stable position, so paging a changing list stays correct. Shopify's GraphQL uses cursor pagination for this reason.
+  </div>
+
+  <h3>Document with OpenAPI</h3>
+  <p>Write the contract as an <b>OpenAPI</b> spec. NestJS can generate it from your DTOs and decorators — including our <code>CreateOrderDto</code>. It gives you live docs (Swagger UI), typed client SDKs, and a shared source of truth so the ERP team and frontend team stop guessing.</p>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: why put <code>/v1</code> in the path, and why does Shopify (and your API) use cursor pagination for big lists?</div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (memorise the shape)</span>
+    <p>"I design resource-based endpoints with correct status codes and one consistent error shape. Input is validated at the edge with DTOs. I version the API so I never break existing clients, paginate with cursors like Shopify does, and make writes idempotent with an idempotency key so retries are safe. Auth is two layers — authenticate the caller, then authorize the action — and I rate-limit callers with a 429. I document everything with OpenAPI."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Instant feedback. Then move to Lesson 9.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source</h2>
+  <p>📖 <a href="https://learn.microsoft.com/en-us/azure/architecture/best-practices/api-design">Microsoft — RESTful web API design</a>. A clear, vendor-neutral checklist: resources, status codes, versioning, pagination, and error handling. Read it once end to end.<sup><a href="#c1">[1]</a></sup></p>
+
+  <p class="small" id="c1">[1] Verified against learn.microsoft.com (checked 2026-07-09): covers resource naming, HTTP methods/status codes, filtering and pagination, versioning strategies, and standard error responses.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can talk through <code>POST /v1/orders</code> end to end — its DTO, its <code>201</code>, its one error shape, its idempotency key on retry, and its <code>/v1</code> version — sorting each detail into the right bucket (shape the contract, guard the edge, survive scale &amp; change) in under two minutes.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want a NestJS DTO + validation pipe example, or a real idempotency-key middleware sketch? Just ask. When you're ready, say <b>"next lesson"</b> and I'll open <b>Lesson 9 — Databases: SQL vs NoSQL</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../lessons/0007-nestjs-architecture.html">← Lesson 7: NestJS Architecture</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="../lessons/0009-databases-sql-vs-nosql.html">Next: Lesson 9 — Databases →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "For an ERP pulling large lists from your API, which pagination style scales best?",
+      options: ["Cursor pagination", "Offset pagination", "Random pagination", "Manual pagination"],
+      answer: 0,
+      why: "A cursor points at a stable position, so paging a large, changing list stays fast and never skips or repeats rows. Offset (?page=N) slows down and drifts on inserts. Shopify uses cursors for this reason."
+    },
+    {
+      q: "An idempotency key on a POST endpoint mainly makes which situation safe?",
+      options: ["Safe network retries", "Faster database reads", "Larger response bodies", "Shorter access tokens"],
+      answer: 0,
+      why: "The key lets the server spot a duplicate request and return the first result, so a client can retry a timed-out POST without creating two orders. It does not change read speed, body size, or tokens."
+    },
+    {
+      q: "A request fails your DTO validation rules. Which status code do you return?",
+      options: ["400 Bad Request", "404 Not Found", "201 Created OK", "500 Server Down"],
+      answer: 0,
+      why: "A validation failure is the client's fault, so return 400 with details of which fields are wrong. 404 is a missing resource, 201 is success, and 500 means your own server broke."
+    },
+    {
+      q: "In your API, authorization is the step that decides:",
+      options: ["Which actions allowed", "Which region deploys", "Which client connects", "Which server restarts"],
+      answer: 0,
+      why: "Authentication proves who the caller is; authorization decides what that caller is allowed to do (permissions/scopes). The other options are unrelated infrastructure concerns."
+    },
+    {
+      q: "One consistent error response shape helps every client because it:",
+      options: ["Parses errors reliably", "Removes network latency", "Encrypts stored secrets", "Balances server traffic"],
+      answer: 0,
+      why: "A single documented shape (code, message, details, requestId) lets every client write one error handler instead of guessing per endpoint. It does not touch latency, encryption, or load balancing."
+    },
+    {
+      q: "Putting a version in your API path (/v1) mainly protects:",
+      options: ["Existing client apps", "Internal build speed", "Database disk usage", "Outgoing email quota"],
+      answer: 0,
+      why: "Versioning lets you change or remove fields without breaking apps already calling the old version — the same way Shopify ships dated API versions. It is not about builds, disk, or email."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: How do you decide between REST and GraphQL when you design an API?",
+      answer: "I pick on purpose. I <b>consume</b> Shopify as GraphQL because that is their primary Admin API. For the API I <b>expose</b> to an ERP, I default to <b>REST</b> — resource endpoints, cacheable by URL, easy to secure and reason about. I only reach for GraphQL when a client genuinely needs many different shapes of the same data in one round trip, so it is worth the extra complexity."
+    },
+    {
+      prompt: "Q: How do you make a write endpoint safe to retry?",
+      answer: "I make it <b>idempotent</b>. The client sends an <code>idempotency key</code> (a unique id) with the <code>POST</code>. I store that key with the result of the first successful call. If the same key arrives again — because the client retried after a timeout — I return the stored result instead of doing the work twice. So a network retry never creates two orders. It is the same idea that makes duplicate Shopify webhooks harmless."
+    },
+    {
+      prompt: "Q: Walk me through what a clean, scalable API includes.",
+      answer: "Resource-based URLs with correct HTTP status codes, and <b>one</b> consistent JSON error shape with a request id. Input validated at the edge with <b>DTOs</b>. A <b>version</b> in the path so I never break existing clients. <b>Cursor</b> pagination for large lists. <b>Idempotency keys</b> on writes. Two auth layers — authenticate the caller, then authorize the action. A <code>429</code> rate limit on my own callers. And an <b>OpenAPI</b> spec so the contract is documented and typed."
+    }
+  ]);
+</script>

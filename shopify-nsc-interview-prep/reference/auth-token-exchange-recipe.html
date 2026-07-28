@@ -1,0 +1,130 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App Auth: Session Token → Token Exchange — Code Recipe</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .step { font-family: var(--font-sans); font-weight: 700; color: var(--accent); margin: 1.6rem 0 .3rem; }
+</style>
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · Code Recipe</p>
+  <h1>App Auth: Session Token → Token Exchange</h1>
+  <p class="subtitle">The three code pieces of modern embedded-app auth: App Bridge attaches the session token, your server verifies the JWT, then exchanges it for an access token.</p>
+
+  <div class="win">
+    <strong>Use this for:</strong> the app-auth deep-dive (<a href="../lessons/0003-app-auth-session-tokens-token-exchange.html">L3</a>). The one sentence that wins it: <em>"session token authenticates browser→my backend; access token authenticates my backend→the Admin API."</em>
+  </div>
+
+  <div class="diagram">Browser (embedded app + App Bridge)
+   │  fetch('/api/...')  →  Authorization: Bearer &lt;session-token JWT&gt;
+   ▼
+Your backend
+   │  1. verify the session-token JWT   (client secret, HS256, aud = your client id)
+   │  2. token exchange: session token  →  access token
+   ▼
+Shopify Admin API   (call it with the access token)</div>
+
+  <h2>1. App Bridge attaches the session token</h2>
+  <p>Load App Bridge with your API key. Modern App Bridge patches <code>fetch</code> so relative-URL calls to your backend automatically carry the session token.</p>
+  <pre><code>&lt;meta name="shopify-api-key" content="%SHOPIFY_API_KEY%" /&gt;
+&lt;script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"&gt;&lt;/script&gt;</code></pre>
+  <pre><code>// App Bridge auto-adds  Authorization: Bearer &lt;session token&gt;  to relative-URL fetches:
+const res = await fetch('/api/products');     // header attached for you
+
+// Or get the token yourself (needed for absolute / external URLs):
+const token = await shopify.idToken();
+await fetch('https://my-app.example.com/api/products', {
+  headers: { Authorization: `Bearer ${token}` },
+});</code></pre>
+  <div class="note">
+    <span class="label">Key point</span>
+    The session token is a <b>short-lived JWT</b> (about 1 minute). App Bridge mints a fresh one per request — you never store it.
+  </div>
+
+  <h2>2. Verify the session-token JWT on the server</h2>
+  <p>The token arrives as <code>Authorization: Bearer &lt;jwt&gt;</code>. Verify the <b>signature</b> (HS256, signed with your <b>client secret</b>) and the <b>claims</b>.</p>
+  <pre><code>const jwt = require('jsonwebtoken');
+
+function verifySessionToken(req) {
+  const token = (req.get('Authorization') || '').replace(/^Bearer /, '');
+
+  // jwt.verify checks the signature + exp + nbf + audience for you:
+  const payload = jwt.verify(token, process.env.SHOPIFY_API_SECRET, {
+    algorithms: ['HS256'],
+    audience: process.env.SHOPIFY_API_KEY,   // `aud` MUST equal your app's client id
+  });
+
+  const shop = new URL(payload.dest).host;   // `dest` = the shop this request is for
+  return { shop, userId: payload.sub, token, payload };
+}</code></pre>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Claim</th><th>Meaning</th><th>You check</th></tr>
+    <tr><td><code>aud</code></td><td>your app's <b>client id</b></td><td>must equal your API key</td></tr>
+    <tr><td><code>dest</code></td><td>the <b>shop</b> domain</td><td>who the request is for</td></tr>
+    <tr><td><code>iss</code></td><td>the shop's admin domain</td><td>matches <code>dest</code>'s shop</td></tr>
+    <tr><td><code>sub</code></td><td>the <b>user</b> id</td><td>who is using the app</td></tr>
+    <tr><td><code>exp</code> / <code>nbf</code></td><td>expiry / not-before</td><td>not expired (auto)</td></tr>
+    <tr><td><code>jti</code> / <code>sid</code></td><td>unique id / session id</td><td>replay / session tracking</td></tr>
+  </table>
+  </div>
+  <div class="tip">
+    <span class="label">In production</span>
+    Usually you let <code>@shopify/shopify-api</code> (<code>decodeSessionToken</code>) or the framework middleware do this. Knowing the manual version is what the deep-dive tests.
+  </div>
+
+  <h2>3. Exchange the session token for an access token</h2>
+  <p>The backend swaps the <b>verified</b> session token for an <b>access token</b> it can use on the Admin API — no redirects.</p>
+  <pre><code>async function tokenExchange(shop, sessionToken, { online = false } = {}) {
+  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_API_KEY,
+      client_secret: process.env.SHOPIFY_API_SECRET,
+      grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+      subject_token: sessionToken,                                  // the session-token JWT
+      subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
+      requested_token_type: online
+        ? 'urn:shopify:params:oauth:token-type:online-access-token'
+        : 'urn:shopify:params:oauth:token-type:offline-access-token',
+    }),
+  });
+  if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
+  return res.json();
+  // online  → { access_token, scope, expires_in, associated_user, ... }
+  // offline → { access_token, scope, ... }
+}</code></pre>
+  <p class="step">Put it together</p>
+  <pre><code>app.get('/api/products', async (req, res) => {
+  const { shop, token } = verifySessionToken(req);                 // step 2
+  const { access_token } = await tokenExchange(shop, token);       // step 3 (offline)
+  // ...now call the Admin GraphQL API with access_token
+});</code></pre>
+  <div class="note">
+    <span class="label">Store the token</span>
+    Save the <b>offline</b> access token per shop (encrypted) and reuse it for Admin API calls + background jobs. Don't exchange on every request — cache it.
+  </div>
+
+  <h2>Say-it checklist</h2>
+  <ul>
+    <li><b>Session token</b> = browser → backend auth. Short-lived JWT from App Bridge, sent as <code>Authorization: Bearer</code>.</li>
+    <li>Verify it: <b>HS256 with the client secret</b>, <code>aud</code> = your client id, check <code>dest</code>/<code>exp</code>.</li>
+    <li><b>Token exchange</b>: POST to <code>/admin/oauth/access_token</code> with <code>grant_type=…:token-exchange</code>, <code>subject_token</code> = the session token.</li>
+    <li><b>Access token</b> = backend → Admin API auth. Offline (long-lived) for jobs/webhooks; online (per user) for user actions.</li>
+    <li>The <b>client secret</b> does double duty: verify the JWT <em>and</em> authenticate the exchange. Server-side only.</li>
+  </ul>
+
+  <p class="small" id="c1">Verified against shopify.dev (checked 2026-07-09): token-exchange endpoint <code>POST /admin/oauth/access_token</code> with <code>grant_type=urn:ietf:params:oauth:grant-type:token-exchange</code>, <code>subject_token_type=urn:ietf:params:oauth:token-type:id_token</code>, requested type <code>…online-access-token</code>/<code>…offline-access-token</code>; session-token JWT uses HS256 with claims <code>iss, dest, aud, sub, exp, nbf, iat, jti, sid</code>.</p>
+
+  <div class="ask">
+    <b>This is your teacher.</b> Want this as a <b>NestJS guard</b> (verify + attach the shop/token to the request), or how to <b>cache and refresh</b> the access token safely? Ask.
+  </div>
+
+  <div class="footer-nav">
+    <a href="./shopify-backend-cheatsheet.html">← Shopify Cheat Sheet</a>
+    <a href="./glossary.html">Glossary</a>
+    <a href="../lessons/0003-app-auth-session-tokens-token-exchange.html">L3 · App auth →</a>
+  </div>
+</div>

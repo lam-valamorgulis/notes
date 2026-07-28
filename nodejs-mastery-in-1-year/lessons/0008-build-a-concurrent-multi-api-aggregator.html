@@ -1,0 +1,318 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build a concurrent multi-API aggregator — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 2 · Lesson 8 · The Build</p>
+  <h1>Build it — a concurrent multi-API aggregator</h1>
+  <p class="subtitle">Everything from Month 2 in one real tool: fetch hundreds of URLs with a concurrency limit, retries with backoff, and per-request timeouts.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll build the tool that shows up in real backends everywhere — a function that takes a big list of URLs and returns their data <b>fast, safely, and resiliently</b>: capped concurrency so you don't flood, a <b>timeout</b> so one dead endpoint can't hang forever, and <b>retries with exponential backoff</b> so a blip doesn't lose data. This is the Month 2 real build.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Lesson 5 (the ladder) + Lesson 6 (errors &amp; rejections) + Lesson 7 (combinators &amp; the pool) all point here. Today you assemble them into one production-shaped tool. Every piece below is something you've already met — now they click together.
+  </div>
+
+  <h2>What we're building, and why each piece exists</h2>
+  <p>An <b>aggregator</b> fans out to many sources and collects their answers — a price checker hitting 200 suppliers, a dashboard pulling 50 microservices, a link checker verifying 1,000 URLs. The naïve version is one line and three latent production incidents:</p>
+  <pre><code>const data = await Promise.all(urls.map((u) =&gt; fetch(u).then((r) =&gt; r.json())));</code></pre>
+  <p>Three things go wrong the moment this meets the real world — and each maps to one tool from this month:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What breaks in production</th><th>The fix</th><th>From</th></tr></thead>
+    <tbody>
+      <tr><td>500 requests fire at once → rate-limited, socket exhaustion</td><td><b>concurrency limit</b> (the pool)</td><td>Lesson 7</td></tr>
+      <tr><td>One endpoint hangs → the whole batch waits forever</td><td><b>per-request timeout</b> (AbortSignal)</td><td>new below</td></tr>
+      <tr><td>A transient blip fails a URL → data lost</td><td><b>retry with backoff</b></td><td>new below</td></tr>
+      <tr><td>One 404 rejects everything (fail-fast)</td><td><b>collect outcomes</b> (allSettled-style)</td><td>Lesson 7</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Piece 1 — a timeout you can actually cancel</h2>
+  <p>A slow endpoint is worse than a failing one: it holds a connection open and blocks a pool slot forever. You need to <b>give up after N milliseconds</b>. The modern, correct tool is <code>AbortController</code> — a standard way to cancel an in-flight operation. <code>fetch</code> accepts an <code>AbortSignal</code>; when the signal fires, the fetch rejects and the underlying connection is torn down.</p>
+
+  <p>Node gives you a one-liner for the common case, <code>AbortSignal.timeout(ms)</code>, which aborts automatically after the delay:</p>
+  <pre><code>async function fetchJson(url, timeoutMs = 3000) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);   <span class="cmt">// treat 4xx/5xx as failures</span>
+  return res.json();
+}</code></pre>
+
+  <div class="trap">
+    <span class="label">Why not just <code>Promise.race</code> a timer?</span>
+    You <em>can</em> race the fetch against a <code>setTimeout</code> reject (Lesson 7) — but that only makes <em>your</em> promise reject; the real request <b>keeps running</b> in the background, still holding a socket. <code>AbortController</code> actually <b>cancels the work</b>. Racing hides the slow call; aborting stops it.
+  </div>
+
+  <h2>Piece 2 — retry with exponential backoff (and jitter)</h2>
+  <p>Networks blip. A retry turns a transient failure into a success. But retrying <em>immediately</em> and <em>constantly</em> just adds load to a struggling server — so you wait longer after each failure (<b>exponential backoff</b>: 200ms, 400ms, 800ms…) and add a little randomness (<b>jitter</b>) so a thousand clients don't all retry in lockstep and create a synchronized stampede.</p>
+
+  <pre><code>const sleep = (ms) =&gt; new Promise((r) =&gt; setTimeout(r, ms));
+
+async function withRetry(fn, { retries = 3, baseMs = 200 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();                       <span class="cmt">// success → return immediately</span>
+    } catch (err) {
+      if (attempt &gt;= retries) throw err;        <span class="cmt">// out of tries → give up, propagate</span>
+      const backoff = baseMs * 2 ** attempt;    <span class="cmt">// 200, 400, 800, ...</span>
+      const jitter  = Math.random() * backoff;  <span class="cmt">// spread the herd</span>
+      await sleep(backoff + jitter);            <span class="cmt">// wait, then loop to retry</span>
+    }
+  }
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">Only retry what's worth retrying</span>
+    Retrying a <b>404 Not Found</b> or a <b>400 Bad Request</b> is pointless — the answer won't change, and you've tripled the load for nothing. Retry <b>transient</b> failures: timeouts, connection resets, <code>429 Too Many Requests</code>, and <code>5xx</code>. A production <code>withRetry</code> inspects the error and only retries the retryable ones. Keep that nuance in your pocket for the interview.
+  </div>
+
+  <h2>Piece 3 — the pool that never discards a result</h2>
+  <p>The runner from Lesson 7, with one deliberate change: the worker <b>catches its own error</b> and returns a result object instead of throwing. That gives us <code>allSettled</code> behaviour — the pool never fails-fast, and we keep every outcome, success or failure.</p>
+
+  <h2>Build it for real — the full aggregator</h2>
+  <p>One file. Modern Node (<code>node -v</code> ≥ 18 for <code>fetch</code>; ≥ 17.3 for <code>AbortSignal.timeout</code>).</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>aggregator.js</b></p>
+  <pre><code>const sleep = (ms) =&gt; new Promise((r) =&gt; setTimeout(r, ms));
+
+<span class="cmt">// --- Piece 1: fetch with a real, cancellable timeout ---</span>
+async function fetchJson(url, timeoutMs = 3000) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+<span class="cmt">// --- Piece 2: retry with exponential backoff + jitter ---</span>
+async function withRetry(fn, { retries = 3, baseMs = 200 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt &gt;= retries) throw err;
+      const backoff = baseMs * 2 ** attempt;
+      await sleep(backoff + Math.random() * backoff);
+    }
+  }
+}
+
+<span class="cmt">// --- Piece 3: the concurrency pool (never fail-fast) ---</span>
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function runner() {
+    while (next &lt; items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);   <span class="cmt">// worker never throws (see below)</span>
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results;
+}
+
+<span class="cmt">// --- Put it together: fetch many URLs, resiliently ---</span>
+async function aggregate(urls, { concurrency = 10, timeoutMs = 3000, retries = 3 } = {}) {
+  return mapWithConcurrency(urls, concurrency, async (url) =&gt; {
+    try {
+      const data = await withRetry(() =&gt; fetchJson(url, timeoutMs), { retries });
+      return { url, ok: true, data };
+    } catch (err) {
+      return { url, ok: false, error: err.message };   <span class="cmt">// caught → allSettled-style</span>
+    }
+  });
+}
+
+<span class="cmt">// --- Run it ---</span>
+(async () =&gt; {
+  const urls = [
+    'https://httpbin.org/json',
+    'https://httpbin.org/delay/1',
+    'https://httpbin.org/status/500',    <span class="cmt">// will fail → retried → reported</span>
+    'https://httpbin.org/delay/10',       <span class="cmt">// will hit the 3s timeout</span>
+  ];
+
+  const start = Date.now();
+  const results = await aggregate(urls, { concurrency: 2, timeoutMs: 3000, retries: 2 });
+  const ok  = results.filter((r) =&gt; r.ok);
+  const bad = results.filter((r) =&gt; !r.ok);
+
+  console.log(`done in ${Date.now() - start}ms — ${ok.length} ok, ${bad.length} failed`);
+  bad.forEach((r) =&gt; console.log('  failed:', r.url, '→', r.error));
+})();</code></pre>
+
+  <p>Run <code>node aggregator.js</code>. You'll see the good URLs return data, the <code>500</code> get retried (with growing pauses) and then reported as failed, and the <code>delay/10</code> URL give up at the 3-second timeout — all while <b>at most 2 requests run at once</b>, and the program <b>never crashes</b> on a failure. That is the shape of resilient real-world fetching.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig8-title" width="640" height="250">
+      <title id="fig8-title">One URL's journey through timeout, retry-with-backoff, and result collection</title>
+
+      <rect x="30" y="30" width="120" height="34" rx="7" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="90" y="51" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">pool slot (≤ N)</text>
+
+      <line x1="150" y1="47" x2="196" y2="47" style="stroke: var(--ink-faint); stroke-width:1.5;" marker-end="url(#a8)"></line>
+
+      <rect x="200" y="30" width="130" height="34" rx="7" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="265" y="45" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight:700;">fetch + timeout</text>
+      <text x="265" y="58" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">AbortSignal 3s</text>
+
+      <!-- success path -->
+      <line x1="330" y1="40" x2="470" y2="40" style="stroke: var(--accent); stroke-width:1.8;" marker-end="url(#a8g)"></line>
+      <text x="400" y="33" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px;">ok</text>
+      <rect x="470" y="26" width="140" height="28" rx="7" style="fill: var(--accent); opacity:.85;"></rect>
+      <text x="540" y="44" text-anchor="middle" style="fill:#fff; font-family: sans-serif; font-size: 10px; font-weight:700;">{ ok:true, data }</text>
+
+      <!-- fail → retry loop -->
+      <line x1="265" y1="64" x2="265" y2="110" style="stroke: var(--warn); stroke-width:1.8;" marker-end="url(#a8w)"></line>
+      <text x="278" y="90" style="fill: var(--warn); font-family: sans-serif; font-size: 9px;">fail (5xx / timeout)</text>
+      <rect x="185" y="112" width="160" height="34" rx="7" style="fill: var(--card-bg); stroke: var(--warn);"></rect>
+      <text x="265" y="127" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight:700;">backoff: 200·2^n</text>
+      <text x="265" y="140" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">+ jitter, then retry</text>
+      <path d="M185 129 C 120 129, 120 47, 200 47" style="fill:none; stroke: var(--warn); stroke-width:1.5; stroke-dasharray:4 3;" marker-end="url(#a8w)"></path>
+      <text x="95" y="100" style="fill: var(--warn); font-family: sans-serif; font-size: 9px;">retry ≤ 3×</text>
+
+      <!-- give up -->
+      <line x1="345" y1="129" x2="470" y2="129" style="stroke: var(--ink-faint); stroke-width:1.8;" marker-end="url(#a8)"></line>
+      <text x="405" y="122" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">out of tries</text>
+      <rect x="470" y="115" width="150" height="28" rx="7" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="545" y="133" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight:700;">{ ok:false, error }</text>
+
+      <text x="30" y="190" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-style: italic;">The worker catches its own failure and returns a result object — so the pool never fails-fast,</text>
+      <text x="30" y="206" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-style: italic;">and you keep every success plus a clear list of what went wrong.</text>
+
+      <defs>
+        <marker id="a8" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+        <marker id="a8g" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a8w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--warn);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Each URL runs in a capped pool slot; it either succeeds, retries with growing backoff, or gives up cleanly — never crashing the batch.</figcaption>
+  </div>
+
+  <h2>The habits this build bakes in</h2>
+  <ul>
+    <li><b>Bound everything.</b> Concurrency is bounded (the pool), waiting is bounded (the timeout), retries are bounded (max attempts). Unbounded anything is a production incident waiting to happen.</li>
+    <li><b>Fail soft on items, loud on bugs.</b> A single URL failing is expected data, so it's caught and reported. A programming mistake still throws — you don't swallow those (Lesson 6).</li>
+    <li><b>Cancel, don't just ignore.</b> <code>AbortController</code> stops the real work; a raced timer only hides it.</li>
+    <li><b>Be a polite client.</b> Backoff + jitter means that when a server is struggling, you ease off instead of piling on.</li>
+  </ul>
+
+  <div class="tip">
+    <span class="label">One real habit (full version later)</span>
+    Production aggregators often add a <b>circuit breaker</b>: if one endpoint fails repeatedly, stop calling it for a while instead of retrying every time. Same spirit as backoff, one level up. Know the term; we'll use it when we harden the spine API in Phase 3.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">Your aggregator hits 300 URLs with <code>concurrency: 20, retries: 3</code>. One endpoint is completely down and always times out. A teammate notices the whole job now takes far longer than before and asks you to "just remove the retries to speed it up."</p>
+    What's actually happening, and what's the better fix than deleting retries?
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: MDN — <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortController">AbortController</a>, <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static">AbortSignal.timeout()</a>; Node docs — <a href="https://nodejs.org/api/globals.html#class-abortcontroller">AbortController</a>; AWS — <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">Timeouts, retries and backoff with jitter</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — ask me to add "only retry retryable errors," turn the timeout into a per-attempt vs whole-request budget, or wrap this as a reusable module. This aggregator is a genuinely useful tool; make it yours.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li>An <b>aggregator</b> fans out to many sources and collects results. The naïve <code>Promise.all(urls.map(fetch))</code> breaks four ways in production.</li>
+      <li><b>Timeout:</b> use <code>AbortController</code> / <code>AbortSignal.timeout(ms)</code> to actually <b>cancel</b> a slow request — a raced timer only hides it while the socket stays open.</li>
+      <li><b>Retry with exponential backoff + jitter:</b> wait longer after each failure (200·2ⁿ) plus randomness, so a blip recovers without stampeding a struggling server. Only retry <b>transient</b> errors (timeouts, 429, 5xx), not 4xx.</li>
+      <li><b>Concurrency pool:</b> cap in-flight requests to N so you don't flood. Make the worker <b>catch its own error</b> and return a result object → <code>allSettled</code>-style, so one failure never discards the batch.</li>
+      <li><b>The mindset:</b> bound everything (concurrency, waiting, retries); fail soft on data, loud on bugs; cancel don't ignore; be a polite client.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>resilient fetching = a bounded pool + a real timeout + backoff retries, collecting every outcome instead of failing fast.</b></p>
+  </div>
+
+  <div class="tip">
+    <span class="label">🎉 Month 2 complete</span>
+    You can now move fluently across callbacks, promises, and <code>async/await</code>; handle async errors and avoid process-killing rejections; run many tasks with the right combinator and a concurrency limit; and you've built a real, resilient multi-API aggregator. Next up on <a href="../index.html">The Map</a>: <b>Month 3 — Modules, packages &amp; a real CLI</b>, where you ship a command-line tool as an npm package.
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> MDN — AbortController, AbortSignal.timeout(); Node.js docs — global AbortController, <code>fetch</code>; AWS Builders' Library — "Timeouts, retries and backoff with jitter". <code>AbortSignal.timeout()</code> requires Node ≥ 17.3; built-in <code>fetch</code> requires Node ≥ 18.</p>
+
+  <div class="footer-nav">
+    <a href="./0007-many-things-at-once-promise-combinators-and-concurrency.html">← Lesson 7</a>
+    <span class="small">Next: Month 3 — Modules &amp; a real CLI <em>(planned)</em></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "With retries:3, one always-down endpoint makes the whole 300-URL job much slower. A teammate says 'remove retries'. Best call?",
+      options: [
+        "The dead endpoint burns its pool slot through 3 backoff waits each time; keep retries but only retry transient errors, cap total time, and add a circuit breaker for the dead one",
+        "Yes, delete all retries — they're never worth it",
+        "Increase concurrency to 300 so the slow one doesn't matter",
+        "Remove the timeout so it fails faster"
+      ],
+      answer: 0,
+      why: "The down endpoint times out, then waits out the backoff, then retries — repeatedly holding a pool slot and dragging the batch. Deleting retries also removes resilience for the flaky-but-alive endpoints. Better: only retry retryable errors, bound the total attempt time, and short-circuit an endpoint that keeps failing (circuit breaker) so you stop paying for it."
+    },
+    {
+      q: "Why prefer AbortSignal.timeout over racing fetch against a setTimeout that rejects?",
+      options: [
+        "AbortController actually cancels the request and frees the socket; a raced timer only rejects your promise while the real request keeps running",
+        "setTimeout doesn't work in Node",
+        "AbortSignal makes the request faster",
+        "There's no difference; both cancel the request"
+      ],
+      answer: 0,
+      why: "Racing a timer settles YOUR promise, but the underlying fetch is still in flight, holding a connection and consuming a pool slot until it finishes on its own. AbortController signals the fetch to stop, tearing down the connection. For a real timeout you must cancel the work, not just stop waiting for it."
+    },
+    {
+      q: "Why add jitter (randomness) to exponential backoff?",
+      options: [
+        "So many clients that failed together don't all retry at the exact same moment and re-stampede the server",
+        "To make the delays shorter",
+        "Because Math.random is required by fetch",
+        "Jitter disables retries after the first attempt"
+      ],
+      answer: 0,
+      why: "Pure exponential backoff still has every client retrying at the same instants (t=200, 400, 800...). If a shared server hiccuped, they all come back in synchronized waves and knock it over again. Jitter spreads the retries across a window so the load smooths out — a 'thundering herd' fix."
+    },
+    {
+      q: "Why does the pool's worker catch its own error and return {ok:false,...} instead of throwing?",
+      options: [
+        "So the pool behaves like allSettled — one failed URL doesn't fail-fast the whole batch, and you keep every success plus a list of failures",
+        "Because throwing isn't allowed inside async functions",
+        "To make failed requests retry forever",
+        "So the process crashes on the first failure"
+      ],
+      answer: 0,
+      why: "If the worker threw, the runner's await would reject, Promise.all would fail-fast, and you'd lose all the successful results — exactly the Promise.all trap from Lesson 7. Catching inside the worker and returning a result object gives allSettled semantics: the batch always completes, and you separate ok from failed afterwards."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Fetch data from hundreds of APIs reliably — walk me through your design.”",
+      answer: "I fan out through a <b>concurrency pool</b> so at most N requests are in flight — never an unbounded <code>Promise.all</code>, which would flood the target and exhaust sockets. Each request gets a <b>timeout via <code>AbortController</code></b> (<code>AbortSignal.timeout</code>), so a hung endpoint is actually cancelled, not just ignored. I wrap the call in <b>retry with exponential backoff and jitter</b>, but only for <b>transient</b> errors — timeouts, 429s, 5xx — not 4xx, which won't change. The pool's worker <b>catches its own error</b> and returns a result object, giving me <code>allSettled</code> behaviour: the batch always finishes and I get every success plus a clear list of failures. The theme is <b>bound everything</b> — concurrency, waiting, and retries all have limits."
+    },
+    {
+      prompt: "Interviewer: “How do you implement a timeout for a fetch, and why that way?”",
+      answer: "I pass an <code>AbortSignal</code> to fetch: <code>fetch(url, { signal: AbortSignal.timeout(3000) })</code>. When the 3 seconds elapse, the signal aborts the request, fetch rejects, and the connection is torn down. I prefer this to racing the fetch against a <code>setTimeout</code> that rejects, because racing only settles <em>my</em> promise — the real request keeps running in the background, still holding a socket and a pool slot. A timeout should <b>cancel the work</b>, and <code>AbortController</code> is the standard way to do that. It's also composable — the same signal can cancel a whole group of operations."
+    },
+    {
+      prompt: "Interviewer: “Retries sound simple — what are the traps?”",
+      answer: "Three big ones. First, <b>retrying non-retryable errors</b>: a 404 or 400 won't change, so retrying just triples load for nothing — I only retry transient failures (timeouts, connection resets, 429, 5xx). Second, <b>retrying too aggressively</b>: immediate constant retries hammer a server that's already struggling, so I use <b>exponential backoff</b> — wait longer after each failure. Third, the <b>thundering herd</b>: if many clients failed together and all back off on the same schedule, they retry in synchronized waves; I add <b>jitter</b> to spread them out. And I always <b>bound</b> the attempts and ideally the total time budget. One level up, a <b>circuit breaker</b> stops calling an endpoint that keeps failing."
+    }
+  ]);
+</script>

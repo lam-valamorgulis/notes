@@ -1,0 +1,83 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 01 — Idempotent Inventory Upsert (build from blank)</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Kata 01 · Build from blank · ~25 min</p>
+  <h1>Idempotent Inventory Upsert</h1>
+  <p class="subtitle">The write-path heart of the platform: a normalise worker that takes one stock reading from any source and writes it safely — duplicates, out-of-order arrivals, and full-vs-delta feeds all handled.</p>
+
+  <div class="win">
+    <strong>Do this first:</strong> cover the model answer. 25-minute timer. Clarify out loud, say your plan, then type it from a blank file while narrating the reliability decisions. Maps to <a href="../lessons/0002-inventory-ingestion-multi-source-sync.html">Lesson 2</a>.
+  </div>
+
+  <h2>The prompt</h2>
+  <div class="note">
+    <span class="label">Task</span>
+    "Write the worker that applies one normalised stock reading <code>{ eventId, source, locationId, sku, onHand, measuredAt, feedKind }</code> to the <code>inventory_levels</code> table. The feed delivers <b>at-least-once</b>, readings can arrive <b>out of order</b>, and <code>feedKind</code> is <code>'delta'</code> or <code>'full'</code>."
+  </div>
+
+  <h2>Step 1 — Clarify out loud</h2>
+  <ul>
+    <li>"At-least-once → I <b>dedupe</b> on <code>eventId</code> for exactly-once <em>application</em>."</li>
+    <li>"Out of order → a <b>staleness guard</b>: only accept a reading whose <code>measuredAt</code> is newer than what I hold, so an old poll can't overwrite a fresh webhook."</li>
+    <li>"The POS owns <code>on_hand</code>, so I <b>replace</b> the value, never add a delta."</li>
+    <li>"For a <b>full</b> snapshot I must zero SKUs that dropped off; for a <b>delta</b> I must not. So I need the feed kind."</li>
+  </ul>
+
+  <h2>Step 2 — Say the plan</h2>
+  <div class="diagram">
+  1. Seen this eventId?  -> yes: return (dedupe, no-op).
+  2. Upsert on (locationId, sku): SET on_hand = new  WHERE new.measuredAt > stored.
+  3. Record eventId as processed (same transaction as the upsert).
+  4. (full-snapshot batch only, separately) zero any SKU not seen in this batch.
+  </div>
+
+  <h2>Step 3 — Build it (open your editor)</h2>
+  <div id="recall"></div>
+
+  <h2>The traps this kata tests</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>Why it fails</th></tr>
+    <tr><td>Blind <code>INSERT</code> or add-a-delta</td><td>Duplicates create phantom stock, and adding deltas drifts from the POS truth. The POS owns on_hand — replace it.</td></tr>
+    <tr><td>No staleness guard</td><td>A slow poll landing after a fresh webhook moves stock <em>backwards in time</em>. Guard on <code>measuredAt</code>.</td></tr>
+    <tr><td>Treating a full feed like a delta</td><td>A SKU that dropped off a full snapshot means "0 left." Leave it and you show a sold-out item as in stock.</td></tr>
+    <tr><td>Dedupe row and upsert in separate transactions</td><td>Crash between them and you either lose the write or re-process. Commit both together.</td></tr>
+    <tr><td>Strict <code>&gt;</code> on equal timestamps</td><td>Second-granularity feeds emit same-second readings; a strict <code>&gt;</code> drops the legit later one. Use <code>&gt;=</code> and rely on dedupe for true duplicates.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    "Duplicates are killed by the eventId dedupe; ordering is handled by a measuredAt staleness guard; POS truth is respected by replacing on_hand rather than adding; and full-vs-delta is the one flag that decides whether an absent SKU means zero or unchanged. Miss any one and you either oversell or wipe stock."
+  </div>
+
+  <h2>Say how you'd test it</h2>
+  <ul>
+    <li>Same <code>eventId</code> twice → one effect (dedupe).</li>
+    <li>Older <code>measuredAt</code> after a newer one → ignored (no backwards move).</li>
+    <li>Full snapshot missing a previously-present SKU → that SKU goes to 0.</li>
+    <li>Delta feed missing a SKU → that SKU is unchanged.</li>
+  </ul>
+
+  <nav class="footer-nav">
+    <a href="../lessons/0010-design-stockinstore-interview.html">← Back to L10</a>
+    <a href="kata-02-find-in-store-query.html">Next → Kata 02 · Find-in-Store query</a>
+  </nav>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderRecall('#recall', [
+    {
+      prompt: "MODEL ANSWER — reveal after your own attempt. TypeScript + PostgreSQL.",
+      answer: "<pre style='white-space:pre-wrap'>interface StockReading {\n  eventId: string; source: string; locationId: string; sku: string;\n  onHand: number; measuredAt: Date; feedKind: 'delta' | 'full';\n}\n\nasync function applyReading(db: Db, r: StockReading): Promise&lt;void&gt; {\n  await db.tx(async (t) =&gt; {\n    // 1. Dedupe: exactly-once APPLICATION for an at-least-once feed.\n    const fresh = await t.query(\n      `INSERT INTO event_dedupe(event_id) VALUES ($1)\n         ON CONFLICT DO NOTHING RETURNING event_id`, [r.eventId]);\n    if (fresh.rowCount === 0) return;              // already applied -> no-op\n\n    // 2. Upsert. REPLACE on_hand (POS owns it). Staleness guard on measuredAt\n    //    makes an out-of-order older reading a no-op. >= keeps same-second reads.\n    await t.query(\n      `INSERT INTO inventory_levels(location_id, sku, on_hand, updated_at, source)\n       VALUES ($1,$2,$3,$4,$5)\n       ON CONFLICT (location_id, sku) DO UPDATE\n         SET on_hand = EXCLUDED.on_hand,\n             updated_at = EXCLUDED.updated_at,\n             source = EXCLUDED.source\n       WHERE EXCLUDED.updated_at &gt;= inventory_levels.updated_at`,\n      [r.locationId, r.sku, r.onHand, r.measuredAt, r.source]);\n  });\n}\n\n// 4. Full-snapshot only: after loading a whole batch, zero the SKUs that\n//    dropped off (they sold out). Delta feeds NEVER call this.\nasync function zeroMissingAfterFullSnapshot(\n  db: Db, source: string, locationId: string, batchId: string,\n): Promise&lt;void&gt; {\n  await db.query(\n    `UPDATE inventory_levels SET on_hand = 0\n      WHERE location_id = $1 AND source = $2\n        AND last_batch_id &lt;&gt; $3`,           // rows not touched by this snapshot\n    [locationId, source, batchId]);\n}</pre><b>Why it wins:</b> four independent defences — <b>dedupe</b> (idempotency) + <b>staleness guard</b> (ordering) + <b>replace not add</b> (POS is source of truth) + <b>full-vs-delta zeroing</b> (no phantom stock) — and the dedupe and upsert commit in <b>one transaction</b> so a crash can't split them. The <code>&gt;=</code> (not <code>&gt;</code>) lets a legitimate same-second reading through while dedupe still blocks true duplicates."
+    },
+    {
+      prompt: "Q: 'Why >= and not > in the staleness guard?'",
+      answer: "Many POS feeds stamp time to the <b>second</b>, so two genuine readings for the same SKU can share a <code>measuredAt</code>. A strict <code>&gt;</code> would drop the legitimate later one. Using <code>&gt;=</code> lets a same-timestamp reading through, and the <b>eventId dedupe</b> is what stops a true duplicate — so the two mechanisms cover different problems (ordering vs duplication) and I keep both."
+    }
+  ]);
+</script>

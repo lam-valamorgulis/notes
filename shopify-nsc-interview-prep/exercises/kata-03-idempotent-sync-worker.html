@@ -1,0 +1,79 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 03 — Idempotent ERP Sync Worker (build from blank)</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Kata 03 · Build from blank · ~25 min</p>
+  <h1>Idempotent ERP Sync Worker</h1>
+  <p class="subtitle">Kata 01's webhook handler pushed a job on the queue. This is the other half — the worker that pulls the job and writes it to the ERP <em>exactly once in effect</em>, even though the same job can arrive twice.</p>
+
+  <div class="win">
+    <strong>Do this first:</strong> cover the model answer. 25-minute timer. Clarify out loud, say your 3-step plan, then type it from blank while narrating the reliability decisions. This is the heart of the whole role.
+  </div>
+
+  <h2>The prompt</h2>
+  <div class="note">
+    <span class="label">Task</span>
+    "Write the worker that consumes <code>orders-create</code> jobs and writes each order into the ERP. Assume the queue delivers <b>at-least-once</b> — the same job can arrive more than once."
+  </div>
+
+  <h2>Step 1 — Clarify out loud</h2>
+  <ul>
+    <li>"Delivery is <b>at-least-once</b>, so I must make the write safe to run twice. Two defences: <b>dedupe</b> on the webhook id, and an <b>idempotent create-or-update</b> keyed on a mapping."</li>
+    <li>"Does the order already exist in the ERP? I keep a <b>mapping table</b> — Shopify id → ERP id — to decide create vs update."</li>
+    <li>"What if the ERP write fails? I <b>throw</b> so the queue retries; I do not swallow the error."</li>
+  </ul>
+
+  <h2>Step 2 — Say the plan</h2>
+  <div class="diagram">
+  1. Seen this webhookId before? -> yes: ack and stop (dedupe).
+  2. Look up the mapping (shopifyId -> erpId).
+  3. No mapping -> create in ERP, save mapping.  Mapping exists -> update.
+     (Record the webhookId as processed. Let failures throw -> queue retries.)
+  </div>
+
+  <h2>Step 3 — Build it (open your editor)</h2>
+  <div id="recall"></div>
+
+  <h2>The traps this kata tests</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>Why it fails</th></tr>
+    <tr><td>Only dedupe, no idempotent write</td><td>The dedupe row and the ERP write are two steps. If you crash between them, the retry is deduped away and the order is <b>never written</b>. You need the write itself to be safe, not just a dedupe gate.</td></tr>
+    <tr><td>Only idempotent write, no dedupe</td><td>Works, but every duplicate does a full ERP round-trip. Dedupe is the cheap fast-path; idempotency is the correctness guarantee. Use both.</td></tr>
+    <tr><td>Catching the ERP error and acking anyway</td><td>Swallowing the error means a failed write is marked done — the order is silently lost. Let it throw so the queue retries.</td></tr>
+    <tr><td>Check-then-act on the mapping</td><td>Two workers can both see "no mapping" and both create (Kata 02's race). Rely on a DB unique constraint, not an if-check.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    "At-least-once delivery plus an idempotent consumer gives an exactly-once <em>effect</em>. I dedupe on the webhook id as a cheap fast-path, but the real guarantee is the idempotent create-or-update on the mapped id — so a retry updates the same ERP record instead of making a second one."
+  </div>
+
+  <h2>Say how you'd test it</h2>
+  <ul>
+    <li>Process the same job twice → ERP create called once, one mapping row, second call is a no-op or an update.</li>
+    <li>ERP throws on first attempt → job is retried, not acked; second attempt succeeds.</li>
+  </ul>
+
+  <nav class="footer-nav">
+    <a href="kata-02-debug-race-condition.html">← Kata 02 · Debug the double-charge</a>
+    <a href="kata-04-nestjs-orders-module.html">Next → Kata 04 · NestJS orders module</a>
+  </nav>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderRecall('#recall', [
+    {
+      prompt: "MODEL ANSWER — reveal after your own attempt. TypeScript + NestJS (@nestjs/bullmq).",
+      answer: "<pre style='white-space:pre-wrap'>interface OrderCreateJob { webhookId: string; order: ShopifyOrder; }\ninterface ShopifyOrder { id: string; /* ... */ }\n\n// The processor is the queue boundary. Keep it thin — delegate to a service.\n@Processor('orders')\nexport class OrdersProcessor extends WorkerHost {\n  constructor(private readonly sync: ErpSyncService) { super(); }\n\n  // BullMQ calls this per job. Throwing marks it failed -> BullMQ retries (Kata 05).\n  async process(job: Job&lt;OrderCreateJob&gt;): Promise&lt;void&gt; {\n    await this.sync.handleOrderCreate(job.data);\n  }\n}\n\n// The real logic lives in an injectable service — testable without the queue.\n@Injectable()\nexport class ErpSyncService {\n  constructor(\n    private readonly db: DbService,\n    private readonly erp: ErpClient,\n  ) {}\n\n  async handleOrderCreate({ webhookId, order }: OrderCreateJob): Promise&lt;void&gt; {\n    // 1. Dedupe fast-path: have we already processed THIS delivery?\n    if (await this.db.processed.exists(webhookId)) return;\n\n    // 2 + 3. Idempotent create-or-update keyed on the mapping.\n    //        mappings.shopifyId has a UNIQUE constraint, so a concurrent\n    //        create loses the race and falls back to update.\n    try {\n      const erpId = await this.erp.createOrder(order, { idempotencyKey: order.id });\n      await this.db.mappings.insert({ shopifyId: order.id, erpId });\n    } catch (err) {\n      if (isUniqueViolation(err)) {\n        const existing = await this.db.mappings.findByShopifyId(order.id);\n        if (existing) await this.erp.updateOrder(existing.erpId, order);\n      } else {\n        throw err;   // real failure -> throw so BullMQ retries the job\n      }\n    }\n\n    // 4. Record this delivery as processed (dedupe for future retries).\n    await this.db.processed.insert(webhookId);\n  }\n}</pre><b>Why it wins (NestJS idioms):</b> the <code>@Processor</code> is the thin queue boundary; the real work is in an <b>injected service</b> you can unit-test with fakes. Two safety layers — cheap dedupe on <code>webhookId</code> plus a correct idempotent write on the mapped id. On failure you <b>throw</b>, and BullMQ retries the job (Kata 05 tunes that). The DB unique constraint — not an if-check — defends against the concurrent-create race from Kata 02."
+    },
+    {
+      prompt: "Q: 'You already dedupe on the webhook id — why also make the ERP write idempotent?'",
+      answer: "Because the dedupe row and the ERP write are <b>two separate steps</b>. If the process crashes after the ERP write but before I record the webhook as processed, the retry runs the write <b>again</b> — so the write itself must be safe to repeat. And if I recorded 'processed' <em>first</em> and then crashed before writing, the retry would be deduped away and the order would be <b>lost</b>. Dedupe is the fast-path optimization; the <b>idempotent write is the actual correctness guarantee</b>. I want both."
+    }
+  ]);
+</script>

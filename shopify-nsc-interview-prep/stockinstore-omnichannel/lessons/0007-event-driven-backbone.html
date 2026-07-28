@@ -1,0 +1,217 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 7 — Event-Driven Backbone: Webhooks &amp; Queues</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 7 · Reliable at scale · The backbone</p>
+  <h1>Event-Driven Backbone: Webhooks &amp; Queues</h1>
+  <p class="subtitle">Everything so far — ingestion, availability, orders, allocation — is glued together by events. This lesson is the nervous system: how work moves through the platform without any two parts blocking each other.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> draw the whole event flow — the sources that emit events, the queues that absorb them, the workers that act, and the internal events that fan out — and explain the four reliability rules (ack fast, idempotency, retries with a dead-letter queue, and per-resource ordering) that keep it correct under load and failure.
+  </div>
+
+  <p class="small">This applies your round-1 event-driven-messaging lesson to the omnichannel domain. The general Kafka-vs-RabbitMQ-vs-SQS comparison lives there; here we wire the specific events of this system together.</p>
+
+  <h2>1. Why event-driven, not request/response</h2>
+  <p>The platform has fast producers (a Shopify order webhook, a burst of POS stock updates) and slow consumers (writing to a database, reserving stock, calling a POS back). If the producer waited for the consumer, a slow ERP or a sale-day spike would stall the storefront. Events <b>decouple</b> them: the producer drops an event and moves on; the consumer works at its own pace.</p>
+  <div class="note">
+    <span class="label">The one rule that shapes everything</span>
+    <b>Acknowledge fast, process asynchronously.</b> A webhook endpoint verifies the sender, drops the event on a queue, and returns 200 immediately — it never does the slow work (DB write, POS call) inside the request. The queue is the shock absorber between the spiky outside world and your steady workers.
+  </div>
+
+  <h2>2. The events in this system</h2>
+  <p>Name the three families of events. An interviewer wants to see you know what triggers what.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Family</th><th>Examples</th><th>Triggers</th></tr>
+    <tr><td><b>Inbound from Shopify</b> (webhooks)</td><td><code>orders/create</code>, <code>fulfillment_orders/order_routing_complete</code>, <code>fulfillment_orders/line_items_prepared_for_pickup</code>, <code>fulfillment_orders/moved</code>, <code>inventory_levels/update</code></td><td>Allocation (L6), pick tasks &amp; notify (L5), stock reconciliation.</td></tr>
+    <tr><td><b>Inbound from stores</b> (POS push feeds)</td><td>stock changed at a location (L2)</td><td>Normalise → upsert → recompute availability (L3).</td></tr>
+    <tr><td><b>Internal events</b> (your own bus)</td><td><code>availability.changed</code>, <code>reservation.created</code>, <code>reservation.expired</code>, <code>order.allocated</code></td><td>Invalidate the read cache (L4), release stock (L5), fan out to notifications &amp; analytics.</td></tr>
+  </table>
+  </div>
+
+  <h2>3. The whole flow in one picture</h2>
+  <div class="diagram">   PRODUCERS                 QUEUES (buffer + decouple)          CONSUMERS
+
+  Shopify webhooks ─►┐                                    ┌─► allocation worker (L6)
+                     │   ┌──────────────────────────┐     │
+  POS push feeds  ──►┼──►│  ingress queue(s)         │─────┼─► normalise/upsert worker (L2)
+                     │   │  (partitioned; DLQ behind)│     │
+  scheduled jobs  ──►┘   └──────────────────────────┘     └─► order/reservation worker (L5)
+   (reconcile,                                                    │ emits
+    TTL sweep)                                                    ▼
+                       ┌──────────────────────────┐   internal events (pub/sub)
+                       │  internal event bus       │◄──── availability.changed,
+                       │  (fan-out to N consumers) │      reservation.expired, ...
+                       └────────────┬──────────────┘
+                        ┌───────────┼───────────────┐
+                        ▼           ▼               ▼
+                  cache invalidate  notifications   analytics
+                   (L4 read path)   (email/SMS)     (reporting)</div>
+  <p>Two kinds of messaging appear, and naming both is a senior signal:</p>
+  <ul>
+    <li><b>Work queues</b> (point-to-point) — one event, one worker does it (reserve this order). Competing consumers pull for throughput, <em>bounded by the number of partitions when you need per-resource ordering</em> (see rule 4).</li>
+    <li><b>Pub/sub</b> (fan-out) — one event, many independent reactions (an order was allocated → notify the customer <em>and</em> update analytics <em>and</em> invalidate a cache). Each subscriber gets its own copy.</li>
+  </ul>
+
+  <h2>4. The four reliability rules</h2>
+  <p>These are the same rules from ingestion (Lesson 2), now stated as the platform-wide contract. Delivery is <b>at-least-once</b>, so you design for duplicates, failures, and disorder.</p>
+  <ol>
+    <li><b>Ack fast — but there are two acks.</b> (a) Return <b>200 to Shopify</b> inside the timeout (~5 s), before processing. (b) <b>Ack the internal queue message only after</b> the handler finishes and its write commits — acking early on the internal bus silently turns at-least-once into <em>lost</em> messages. Verify HMAC (Shopify) or signature (POS) before either. Note HMAC proves the payload is <em>genuine</em>, not <em>fresh</em> — replay protection comes from the dedupe in rule 2, not from HMAC.</li>
+    <li><b>Idempotency.</b> Dedupe on a stable event id — <code>X-Shopify-Webhook-Id</code> for Shopify, a source event id for POS — so the same event twice is a no-op (no double reservation, no double notification). Store processed ids in a fast keyed store (a Redis set or a <code>processed_events</code> table) with a <b>TTL longer than the retry window</b> — keep ~24–48 h, because a retried or delayed webhook can arrive long after the first, and a too-short TTL lets a late duplicate re-process.</li>
+    <li><b>Retries + dead-letter.</b> A failed handler retries with exponential backoff. A message that keeps failing (a "poison" event) moves to a <b>dead-letter queue (DLQ)</b> after N attempts so it stops blocking the line; an alert + dashboard lets a human inspect and replay it. Because a replayed message arrives <em>late</em>, the version/timestamp guard in rule 4 is what stops a stale replay from overwriting newer state.</li>
+    <li><b>Per-resource ordering — and its cost.</b> Global ordering is hard and usually unnecessary. Keep order <em>within</em> a resource — all events for order #1001 in sequence, all stock events for one (location, SKU) in sequence — by partitioning on that key. This trades off against parallelism: to keep a key ordered, only <b>one worker processes that partition at a time</b>, so you scale by adding <em>partitions</em> (Kafka) or message groups (SQS FIFO), not unbounded workers — parallelism is capped by the number of keys. Where order truly doesn't matter, don't pay this cost; instead make writes commutative with a guard: compare <code>X-Shopify-Triggered-At</code> (or a payload <code>updated_at</code>/version) and drop anything older than what you've applied.</li>
+  </ol>
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    Chasing "exactly-once delivery." You can't guarantee it. You <b>accept at-least-once delivery and build idempotent consumers</b>, which gives an exactly-once <em>effect</em>. Say that sentence and you sound senior. The dedupe key is where exactly-once actually lives — not the transport.
+  </div>
+
+  <h2>5. Fan-out: one event, many reactions</h2>
+  <p>The internal event bus is what keeps features decoupled. When the order/reservation worker finishes, it does not <em>call</em> the notification service and the analytics service and the cache — it <b>emits</b> one <code>order.allocated</code> event, and each of those subscribes independently.</p>
+  <div class="note">
+    <span class="label">Why fan-out instead of direct calls</span>
+    If the worker called each service directly, adding a new reaction (say, a loyalty-points service) would mean editing the worker, and one slow service would slow the order. With pub/sub, the worker emits once and is done; new consumers subscribe without touching the producer; a slow or failing consumer only delays its own reaction, not the order. This is how <code>availability.changed</code> cleanly invalidates the Lesson-4 cache without the availability engine knowing the cache exists.
+  </div>
+  <div class="trap">
+    <span class="label">The dual-write trap — write and emit can't be atomic</span>
+    A worker that <b>writes a row then publishes an event</b> in two steps has a hidden bug: commit-then-crash loses the event (a reservation with no notification); publish-then-fail-to-commit emits a phantom event. Two systems can't be committed atomically. The fix is the <b>transactional outbox</b>: write the event into an <code>outbox</code> table <em>in the same DB transaction</em> as the business change, and a separate relay publishes it (at-least-once; idempotent consumers absorb re-emits). Full treatment in <a href="0008-data-model-and-consistency.html">Lesson 8 §4</a>.
+  </div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: the three event families, work-queue vs pub/sub, and the four reliability rules.</div>
+
+  <h2>6. Scheduled jobs are events too</h2>
+  <p>Not every event comes from outside. Time-based jobs emit work on a schedule, and they are the safety nets under the whole system:</p>
+  <ul>
+    <li><b>Reconciliation</b> (L2) — periodically re-read each source's full stock to repair missed events.</li>
+    <li><b>Reservation TTL sweep</b> (L5) — release holds that expired so abandoned orders don't lock stock.</li>
+    <li><b>Adaptive polling</b> (L2) — pull from POS systems that can't push, at a per-source cadence.</li>
+    <li><b>Stale-feed alerts</b> (L3) — flag a store whose feed has gone silent.</li>
+  </ul>
+
+  <h2>7. Failure modes</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What breaks</th><th>How you handle it</th></tr>
+    <tr><td><b>A consumer (e.g. notifier) is down</b></td><td>Its events stay queued and retry; other consumers (reserve, analytics) are unaffected because they're separate subscriptions. Nothing lost.</td></tr>
+    <tr><td><b>Duplicate webhook</b></td><td>Dedupe on the event id → no-op. No double reservation or double "ready" text.</td></tr>
+    <tr><td><b>Poison event</b> (bad payload)</td><td>Retries fail → DLQ after N attempts → alert. The queue keeps moving; a human replays after a fix.</td></tr>
+    <tr><td><b>Events out of order</b></td><td>Per-resource partitioning keeps a resource's events in sequence; timestamp/version guards make stale ones no-ops.</td></tr>
+    <tr><td><b>Spike (sale day)</b></td><td>The queue absorbs the spike (depth grows); scale stateless workers up to a safe limit. <b>Backpressure</b> = capping worker concurrency and rate-limiting calls to the DB and POS so they aren't overwhelmed — you can't backpressure Shopify (it just keeps retrying), so the queue depth is your buffer.</td></tr>
+    <tr><td><b>Our ingress endpoint is down</b></td><td>Shopify retries (~8× over ~4 h). <b>But after ~8 consecutive failures Shopify removes the webhook subscription</b> (for Admin-API-created ones) and emails the app's emergency address — the stream stops, it doesn't just wait. So on recovery you must detect the removal and re-subscribe (or use app-specific subscriptions, which aren't auto-removed), then reconcile the gap. Three safety nets: retries, re-subscribe, reconciliation.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the backbone in 6 sentences)</span>
+    <p>"The platform is event-driven so fast producers never block slow consumers: a webhook or feed is verified, enqueued, and acknowledged in milliseconds, then processed asynchronously by workers. Events come in three families — inbound Shopify webhooks, inbound POS feeds, and my own internal events — and I use work queues where one worker should act and pub/sub where one event fans out to many reactions. Because delivery is at-least-once, I ack fast, dedupe on a stable event id for idempotency, retry with backoff into a dead-letter queue, and keep per-resource ordering by partitioning on the order or the (location, SKU). Fan-out keeps features decoupled: the order worker emits 'order.allocated' and the notifier, analytics, and cache-invalidator each subscribe without the worker knowing they exist. Scheduled jobs — reconciliation, TTL sweeps, adaptive polling — are events too, and they're the safety nets that repair whatever the live stream misses. If a consumer dies its events just wait and retry, a spike is absorbed by the queue and more stateless workers, and a poison message lands in the DLQ instead of blocking the line."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://shopify.dev/docs/apps/build/webhooks">Shopify — Webhooks</a> — at-least-once delivery, HMAC, the ~5 s timeout, ~8 retries over ~4 h, and <code>X-Shopify-Webhook-Id</code> for dedupe.<br>
+  📖 <a href="../../lessons/0012-event-driven-messaging.html">Main course L12 — Event-Driven &amp; Messaging</a> — the deeper Kafka vs RabbitMQ vs SQS comparison behind the queues here.<br>
+  📖 <a href="https://aws.amazon.com/blogs/compute/understanding-how-aws-lambda-scales-with-amazon-sqs/">Queues + workers scaling</a> — how a queue absorbs spikes and workers scale horizontally.</p>
+
+  <p class="small" id="c1">[1] Webhook facts verified against shopify.dev (checked 2026-07-16): at-least-once delivery, HMAC-SHA256 verification, ~5-second timeout, ~8 retries over ~4 hours, <code>X-Shopify-Webhook-Id</code> for dedupe, <code>X-Shopify-Triggered-At</code> for ordering, and — for Admin-API-created subscriptions — automatic removal of the subscription after ~8 consecutive delivery failures (with an email to the app's emergency address). The dual-write/outbox, two-acks, work-queue vs pub/sub, and DLQ/backoff patterns are standard messaging engineering. The internal event names are illustrative.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can draw producers → queues → consumers with the internal fan-out bus, name the three event families, and recite the four reliability rules — then explain why "exactly-once effect" comes from idempotent consumers, not the transport.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the SQS-vs-Kafka choice argued for this specific system, or the ack-fast handler typed in Node? Just ask. When you're ready, say <b>"next"</b> for <b>Lesson 8 — Data model &amp; consistency</b>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0006-ship-from-store-allocation.html">← Prev: Ship from Store</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0008-data-model-and-consistency.html">Next: Data Model →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "What is the one rule that shapes an event-driven webhook handler?",
+      options: [
+        "Acknowledge fast, process asynchronously",
+        "Do all work inside the request",
+        "Never return 200",
+        "Call the ERP before replying"
+      ],
+      answer: 0,
+      why: "The handler verifies the sender, enqueues the event, and returns 200 inside the timeout — the slow work (DB write, POS call) happens off the queue. This keeps the spiky outside world from stalling your steady workers."
+    },
+    {
+      q: "Work queue vs pub/sub — what's the difference?",
+      options: [
+        "Work queue = one worker acts; pub/sub = one event, many independent reactions",
+        "They are the same thing",
+        "Pub/sub is only for databases",
+        "Work queues can't retry"
+      ],
+      answer: 0,
+      why: "A work queue routes an event to one competing consumer (reserve this order). Pub/sub fans one event out to many subscribers (notify + analytics + cache-invalidate), each getting its own copy and failing independently."
+    },
+    {
+      q: "How do you get an 'exactly-once effect' when delivery is at-least-once?",
+      options: [
+        "Idempotent consumers keyed on a stable event id",
+        "A faster network",
+        "A second queue",
+        "Turning off retries"
+      ],
+      answer: 0,
+      why: "You can't guarantee exactly-once delivery. You dedupe on a stable event id (X-Shopify-Webhook-Id or a source event id) so a repeat is a no-op — at-least-once delivery plus idempotent consumers gives an exactly-once effect."
+    },
+    {
+      q: "Why emit an internal 'order.allocated' event instead of calling each service directly?",
+      options: [
+        "Decoupling — new consumers subscribe without editing the producer, and a slow one doesn't slow the order",
+        "It's slower but looks nicer",
+        "Shopify requires it",
+        "To avoid using a database"
+      ],
+      answer: 0,
+      why: "Direct calls couple the worker to every downstream service and let one slow service delay the order. Emitting once lets notifier, analytics, and cache-invalidator subscribe independently; adding a new reaction never touches the producer."
+    },
+    {
+      q: "A poison event keeps failing. What happens?",
+      options: [
+        "After N retries it moves to a dead-letter queue with an alert",
+        "It blocks the queue forever",
+        "It is silently deleted",
+        "The whole system restarts"
+      ],
+      answer: 0,
+      why: "Exponential-backoff retries handle transient failures; a message that keeps failing moves to a DLQ after N attempts so it stops blocking the line. An alert and dashboard let a human inspect and replay it after a fix."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Draw the event backbone and name what flows through it.",
+      answer: "<b>Producers</b> (Shopify webhooks, POS push feeds, scheduled jobs) drop events on <b>queues</b> that buffer and decouple; <b>consumers</b> (allocation, normalise/upsert, order/reservation workers) pull and act. Workers <b>emit internal events</b> onto a <b>pub/sub bus</b> — <code>availability.changed</code>, <code>reservation.expired</code>, <code>order.allocated</code> — which fans out to cache-invalidation (L4), notifications, and analytics. Everything obeys ack-fast, idempotency, retry+DLQ, and per-resource ordering."
+    },
+    {
+      prompt: "Q: Name the four reliability rules and why each exists.",
+      answer: "<b>Ack fast</b> — reply inside the timeout so the producer isn't blocked. <b>Idempotency</b> — dedupe on a stable event id so at-least-once duplicates are no-ops. <b>Retries + DLQ</b> — backoff handles transient failures; poison messages move aside so they don't block the line. <b>Per-resource ordering</b> — partition on order id or (location, SKU) so a resource's events stay in sequence, since global ordering is hard and unnecessary."
+    },
+    {
+      prompt: "Q: A downstream service (the SMS notifier) is down for an hour. What happens?",
+      answer: "Only the notifier's reaction is delayed. Because it's a separate <b>pub/sub subscription</b>, its events stay queued and <b>retry with backoff</b> until it recovers; the reserve worker, analytics, and cache-invalidation all keep running on their own subscriptions. Nothing is lost, and the order itself completed the moment its own worker finished — the notification just catches up."
+    }
+  ]);
+</script>

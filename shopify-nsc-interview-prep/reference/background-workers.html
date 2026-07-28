@@ -1,0 +1,148 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Background Workers in a Node.js Backend — Reference</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · Pattern Deep-Dive</p>
+  <h1>Background Workers</h1>
+  <p class="subtitle">How a Node backend does slow, heavy, or deferred work without blocking web requests — the backbone of webhooks, bulk processing, and the ERP sync.</p>
+
+  <div class="win">
+    <strong>The core idea:</strong> the web server does only the <em>fast</em> part of a request and hands the slow work to a <b>separate worker process</b> via a <b>durable queue</b>.
+  </div>
+
+  <h2>The problem it solves</h2>
+  <p>A Node web server's one job is to answer HTTP requests fast. But much real work is slow or heavy: processing a webhook (call the ERP + DB), parsing a giant <a href="./glossary.html#bulk-ops">bulk-operations</a> JSONL file, sending emails, generating reports, the nightly sync.</p>
+  <ul>
+    <li>Do it inside the HTTP handler → the request hangs; a <a href="../lessons/0002-webhooks-done-right.html">Shopify webhook times out at 5s</a>.</li>
+    <li>Heavy work also <a href="../lessons/0006-nodejs-async-event-loop.html">blocks the single-threaded event loop</a>, so other requests stall too.</li>
+  </ul>
+  <p>A background worker moves that work <b>out of the request/response cycle</b>.</p>
+
+  <h2>The architecture: producer → queue → worker</h2>
+  <div class="diagram">  Web app (producer)                 Worker (consumer)
+  ┌─────────────────┐   enqueue job   ┌──────────────┐   ┌───────────────┐
+  │ webhook handler  │ ─────────────► │   QUEUE      │ ► │ worker.js     │ ► DB / ERP
+  │ returns 200 fast │                │ (Redis/SQS)  │   │ (separate proc)│
+  └─────────────────┘                 └──────────────┘   └───────────────┘</div>
+  <ol>
+    <li><b>Producer</b> — the web app. Does the fast bit (verify, return 200), then <b>puts a job on a queue</b>.</li>
+    <li><b><a href="./glossary.html#queue">Queue</a></b> — a <b>durable</b> store between them (Redis via BullMQ, or <a href="./glossary.html#sqs">SQS</a>/<a href="./glossary.html#rabbitmq">RabbitMQ</a>). Durable = jobs survive a crash.</li>
+    <li><b>Worker</b> — a <b>separate process</b> (<code>node worker.js</code>, own container) that pulls jobs and does the slow work.</li>
+  </ol>
+
+  <h2>Code (BullMQ — common Node choice)</h2>
+  <pre><code>// ---- producer: in the web app, after verifying the webhook & sending 200 ----
+const { Queue } = require('bullmq');
+const orderQueue = new Queue('order-sync', { connection: { host: 'localhost', port: 6379 } });
+
+await orderQueue.add('process-order',
+  { webhookId, payload },                                   // job data
+  { attempts: 5, backoff: { type: 'exponential', delay: 1000 } });  // retry 1s,2s,4s...
+
+// ---- worker.js: a SEPARATE process you run on its own ----
+const { Worker } = require('bullmq');
+new Worker('order-sync', async (job) =&gt; {
+  await processOrderEvent(job.data);                        // transform + idempotent ERP upsert
+}, { connection: { host: 'localhost', port: 6379 }, concurrency: 5 });  // 5 at a time
+// jobs that fail all 5 attempts → the "failed" set = your dead-letter queue</code></pre>
+
+  <h2>Production must-haves</h2>
+  <ul>
+    <li><b>Retries with <a href="./glossary.html#backoff">backoff</a></b> — transient failures (ERP briefly down) retry with growing delays.</li>
+    <li><b><a href="./glossary.html#dlq">Dead-letter queue</a></b> — jobs that keep failing go there for inspection, not lost.</li>
+    <li><b><a href="./glossary.html#idempotency">Idempotency</a></b> — queues are <b>at-least-once</b>, so the same job can run twice. Dedupe / upsert.</li>
+    <li><b>Concurrency cap</b> — process N at a time so you don't overload the ERP or DB.</li>
+    <li><b>Independent scaling</b> — add worker processes when the queue backs up, without touching the API.</li>
+  </ul>
+
+  <h2>Two flavors</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Type</th><th>Triggered by</th><th>Example</th></tr>
+    <tr><td>Queue / job worker</td><td>an event (a job is added)</td><td>process a webhook, send an email, parse a bulk file</td></tr>
+    <tr><td>Scheduled / cron worker</td><td>a clock</td><td>hourly <a href="./glossary.html#reconciliation">reconciliation</a>, nightly bulk export</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Two traps to avoid</span>
+    <b>(1)</b> A <code>setTimeout</code> inside the web process is NOT a real background worker — that work is lost on restart and still shares the event loop. Use a durable queue + separate process. <b>(2)</b> A queue worker is for <b>I/O-heavy, deferrable</b> work. For <b>CPU-heavy</b> work (parsing, crypto, image math) use Node <code>worker_threads</code> or a separate service, so the event loop never blocks.
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this</span>
+    <p>"I keep the web server fast by doing only the quick part in the request — verify and return 200 — then push a job to a durable queue. A separate worker process consumes it and does the slow work: calling the ERP, parsing bulk files, sending email. It retries with backoff, sends poison jobs to a DLQ, processes idempotently because queues are at-least-once, and scales independently of the API. For CPU-heavy work I'd use worker threads so the event loop never blocks."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <p class="small">Related: <a href="../lessons/0012-event-driven-messaging.html">L12 · Messaging (Kafka/RabbitMQ/SQS)</a> · <a href="./webhook-erp-worker.html">Webhook → ERP Worker recipe</a> · <a href="../lessons/0011-system-design-shopify-erp-sync.html">L11 · The sync design</a>.</p>
+
+  <div class="ask">
+    <b>This is your teacher.</b> Want the same worker as a <b>NestJS provider</b> (with <code>@nestjs/bullmq</code>), or how to add a <b>cron/repeatable</b> reconciliation job? Ask.
+  </div>
+
+  <div class="footer-nav">
+    <a href="./webhook-erp-worker.html">← Webhook → ERP Worker</a>
+    <a href="./glossary.html">Glossary</a>
+    <a href="../lessons/0012-event-driven-messaging.html">L12 · Messaging →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "What is the main job of a background worker?",
+      options: ["Do slow work off-request", "Answer HTTP requests directly", "Render the frontend pages", "Store the user sessions"],
+      answer: 0,
+      why: "It moves slow/heavy work out of the request/response cycle so the web server stays fast and the event loop isn't blocked."
+    },
+    {
+      q: "What sits between the web app and the worker?",
+      options: ["A durable queue", "A shared variable", "A direct call", "A single thread"],
+      answer: 0,
+      why: "A durable queue (Redis/SQS/RabbitMQ). Durable = jobs survive a crash or restart, unlike an in-memory variable."
+    },
+    {
+      q: "Queues are at-least-once, so your worker must be:",
+      options: ["Idempotent", "Synchronous", "Recursive", "Encrypted"],
+      answer: 0,
+      why: "At-least-once means the same job can run twice, so the handler must be idempotent — running it again produces the same result."
+    },
+    {
+      q: "For CPU-heavy work inside Node you should use:",
+      options: ["Worker threads", "More middleware", "A cron", "Bigger buckets"],
+      answer: 0,
+      why: "worker_threads run CPU-heavy work off the main thread. Queue workers are for I/O-heavy, deferrable work, not CPU crunching."
+    },
+    {
+      q: "A durable queue matters because jobs must:",
+      options: ["Survive a crash or restart", "Run inside the web process", "Block the main event loop", "Finish before the response"],
+      answer: 0,
+      why: "Durability means an enqueued job isn't lost if a process crashes or restarts — it's still there for a worker to pick up."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Why not process a webhook inside the HTTP handler?",
+      answer: "Because the real work is slow — it would blow Shopify's <b>5-second timeout</b> and <b>block the event loop</b>, stalling other requests. Instead I verify, return <b>200 fast</b>, and push the work to a queue for a <b>worker</b> to process."
+    },
+    {
+      prompt: "Q: Difference between a background (queue) worker and Node worker_threads?",
+      answer: "A <b>queue worker</b> is a <b>separate process</b> that handles <b>I/O-heavy, deferrable</b> jobs (ERP calls, emails, bulk parsing). <b>worker_threads</b> are threads <em>inside</em> a process for <b>CPU-heavy</b> work (parsing, crypto) that would otherwise block the event loop. Different tools for different bottlenecks."
+    },
+    {
+      prompt: "Q: Name three production must-haves for a worker.",
+      answer: "<b>Retries with backoff</b> (handle transient failures), a <b>dead-letter queue</b> (isolate poison jobs), and <b>idempotency</b> (queues are at-least-once, so a job may run twice). Also: a <b>concurrency cap</b> and <b>independent scaling</b>."
+    }
+  ]);
+</script>
