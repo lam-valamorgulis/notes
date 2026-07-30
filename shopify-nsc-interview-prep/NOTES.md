@@ -44,3 +44,38 @@
   rate (docs show both 50/s and 100/s), single query capped at 1000 points — not one number;
   (c) 0024 code bug FIXED: Payment Customization Function uses `paymentMethodHide` +
   export `cartPaymentMethodsTransformRun`, not `hide`/`run`.
+- 2026-07-29: new **`theme-architecture/` sub-course** added (3 lessons): Dawn architecture,
+  Horizon & theme blocks, Cart AJAX API. Structured as a sub-course, not as lessons 0030+,
+  because `MISSION.md` puts theme/Liquid **out of scope** for the main course ("already a
+  strength"). The sub-course says up front that it does not re-teach Liquid syntax — it covers
+  only what is new (Horizon, announced 2025-05-21) or easy to get wrong (`update.js` overselling,
+  `line` vs line item `key`, `sections_url` needing a leading `/`). Linked from the parent
+  `index.html` next to the stockinstore card, and from the root `../index.html` (counts bumped:
+  sub-courses 2→3, pages 122→126, lessons 71→74). Facts verified 2026-07-29 against shopify.dev
+  and help.shopify.com for the documented contract, plus real source for implementation detail:
+  a local copy of **Dawn 15.3.0** (`assets/cart.js`, `product-form.js`, `global.js`,
+  `layout/theme.liquid`) and the public `Shopify/horizon` repo (112 files in `blocks/`,
+  `component.js`, `morph.js`, single `base.css`). File counts are version-specific and will
+  drift; each lesson's "verified" line says so. One claim is flagged as engineering judgement
+  rather than documented: sending cart writes sequentially — Shopify publishes no explicit
+  concurrency warning. Only public/open-source theme source was used; no client theme code.
+- 2026-07-29 (same session): **lesson 4 added — "Discounts on the Storefront"**, so the sub-course
+  is now 4 lessons / 5 pages and the Map gained a Ch 4. Scoped to the storefront on purpose:
+  discount **Functions** stay in main-course L24 and the lesson links there rather than repeating
+  it. The spine of the lesson is "the theme displays discounts, it never decides them." Highest-
+  value facts, all verified: (a) an **invalid discount code still returns 200** with a normal cart —
+  you must check `data.discount_codes[]` for `applicable === false`; (b) `line_item.price`,
+  `line_price`, `total_discount`, `discounts`, and `cart.discounts` are **deprecated because they
+  only ever held Shopify Scripts discounts**, so post-Scripts-sunset they miss codes and automatic
+  discounts entirely — this is the "line prices don't add up to the total" bug; (c) the `discount`
+  param on `/cart/update.js` replaces the whole set, so there is **no remove-one call**; (d) max
+  **5 product/order codes + 1 shipping code** per order, classes calculate product→order→shipping,
+  and discounts do **not** combine unless configured; (e) shareable `/discount/CODE?redirect=`
+  needs zero theme code. Best Dawn↔Horizon contrast in the sub-course: **Dawn 15.3.0 ships no
+  discount input at all** (verified by grep — display only), while Horizon has `cart-discount.js`
+  with pills and error states. Second flagged non-documented claim: the `discount_codes` array
+  with `code`/`applicable` is **absent from the Cart AJAX reference** but used and typed in
+  Horizon's production source — taught as real-but-unspecified, with advice to code defensively.
+  Subtle real detail worth keeping: a **shipping** code can return `applicable: true` and still
+  render nothing (no address until checkout); Horizon detects it by diffing the rendered pills
+  against the cart payload. Root index counts bumped again: pages 126→127, lessons 74→75.

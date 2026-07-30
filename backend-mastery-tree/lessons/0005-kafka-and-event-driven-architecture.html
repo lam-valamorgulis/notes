@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0005 · Kafka &amp; event-driven architecture — Backend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Domain 6 · Architecture · Communication · Lesson 0005</p>
+<h1>Kafka &amp; event-driven architecture</h1>
+<p class="subtitle">A mailbox empties when read. A log doesn't. Nearly every Kafka guarantee falls out of that one difference.</p>
+
+<div class="win">
+  <strong>The win:</strong> after ~45 minutes you can answer the two senior questions cold:
+  <em>"Kafka writes everything to disk — why is it fast?"</em> and
+  <em>"a service must update its database AND publish an event — how do you make that reliable?"</em>
+  — plus the pattern names interviewers listen for: consumer groups, ISR, idempotent consumers,
+  and the transactional outbox.
+</div>
+
+<h2>1. It is a log, not a queue</h2>
+<p>
+  Kafka stores messages in <strong>topics</strong>, each split into <strong>partitions</strong>.
+  A partition is an <strong>append-only log</strong>: an ordered, immutable sequence of records,
+  each with an <strong>offset</strong> — a position number, unique <em>within that partition</em>.
+  New records are only ever added at the end.
+</p>
+<p>
+  Here is the inversion that defines everything. In a classic queue (RabbitMQ, SQS), the
+  <b>broker</b> tracks what each consumer received and <b>deletes on acknowledgment</b> — reading
+  is destructive. In Kafka, the <b>consumer</b> owns its own position: it just says "give me
+  records from offset N". The broker keeps no per-message, per-consumer state; a consumer's entire
+  progress is <em>one integer per partition</em>. Data is deleted only by <b>retention</b> rules
+  (age or size — default 7 days), never because someone read it.
+</p>
+
+<div class="soundbite">
+  <span class="label">Feynman version — the newspaper archive</span>
+  <p>Kafka is a <b>newspaper archive with numbered pages</b>, not a mailbox. The publisher keeps
+  printing pages into a bound archive. Every reader keeps their own bookmark: "I'm up to page
+  4,812." Readers can re-read old pages (replay), a hundred readers can share one archive without
+  extra copies (fan-out for free), and pages are shredded only when they get <em>old</em> — never
+  because somebody read them.</p>
+</div>
+
+<p>
+  That one picture buys the three things queues can't do: <b>replay</b> (rewind the offset,
+  reprocess history after a bug), <b>cheap fan-out</b> (analytics, search-indexing, and billing all
+  read the same topic independently), and <b>slow consumers that hurt nobody</b> (a lagging reader
+  is just a bookmark far from the end — the broker does no extra bookkeeping).
+</p>
+
+<h2>2. Why it's fast, though everything hits disk</h2>
+<ul>
+  <li><b>Sequential I/O only.</b> Appends and range reads — never seeks into the middle to mutate.
+      Sequential disk access is orders of magnitude faster than random access.</li>
+  <li><b>The OS page cache is the cache.</b> Kafka writes to the filesystem and does <em>not</em>
+      force a disk flush per message. Durability comes from <b>replication across machines</b>
+      (section 5), not from one machine's disk platter.</li>
+  <li><b>Zero-copy.</b> For plaintext connections, bytes move from page cache straight to the
+      network socket (<code>sendfile()</code>), never entering the application. (TLS disables this
+      — data must pass through user space to be encrypted. A nice interview footnote.)</li>
+  <li><b>Opaque batches, end to end.</b> Producers ship compressed batches; the broker stores and
+      serves them <em>without deserializing anything</em>. Work per record is tiny and constant.</li>
+</ul>
+<p>
+  And the deep reason, again: <strong>no per-message consumer state</strong>. A broker that tracks
+  ack status per message per consumer (RabbitMQ) carries a data structure that grows with traffic.
+  Kafka carries an integer.
+</p>
+
+<h2>3. Partitions: where ordering lives — and dies</h2>
+<p>
+  <strong>Ordering is guaranteed only within one partition.</strong> Across partitions there is no
+  order at all. This is a deliberate trade: partitions are the unit of parallelism, and total order
+  and parallelism are fundamentally at odds.
+</p>
+<p>
+  The <b>partition key</b> decides placement: records with the same key go to the same partition —
+  <code>hash(key) % partitions</code>. So the key is a design decision:
+  <strong>the key names the thing whose events must stay in order</strong>. Key by
+  <code>order_id</code> and every order's lifecycle (<code>placed → paid → shipped</code>) stays in
+  sequence; different orders don't need mutual ordering, and shouldn't pay for it.
+</p>
+<div class="soundbite">
+  <span class="label">Feynman version — checkout lanes</span>
+  <p>A topic is a supermarket with several checkout lanes (partitions). Within one lane, strict
+  order. Between lanes, no promise. The key is the rule "one family, one lane" — each family's
+  items stay in order. A <b>hot partition</b> is one family arriving with 40 carts: their lane
+  crawls, other lanes idle — and <em>opening more lanes doesn't help, because the family must stay
+  together</em>.</p>
+</div>
+<div class="trap">
+  <span class="label">Trap — "we use Kafka, so events are ordered"</span>
+  Anyone who says this without naming the partition key has a design bug. Two more edges: adding
+  partitions later changes <code>hash(key) % N</code>, so a key's <em>new</em> records land in a
+  different partition than its history — cross-boundary order is lost (and you can never
+  <em>reduce</em> partition count). Plan partitions generously up front for keyed topics.
+</div>
+
+<h2>4. Consumer groups: parallelism with a ceiling</h2>
+<p>
+  Consumers sharing a <code>group.id</code> form a <strong>consumer group</strong>: each partition
+  is assigned to <b>exactly one consumer in the group</b>. Two different groups are fully
+  independent (that's the pub/sub part). Two rules follow:
+</p>
+<ul>
+  <li><b>Max useful parallelism = partition count.</b> A 13th consumer on a 12-partition topic
+      stands idle. Partition count is a capacity decision, not a detail.</li>
+  <li><b>Progress = committed offsets.</b> The group records "next offset to read" per partition.
+      Commit <em>after</em> processing → a crash between processing and commit means reprocessing:
+      <b>at-least-once</b> (the default posture). Commit <em>before</em> processing → a crash loses
+      records: <b>at-most-once</b>. The commit's position in your loop <em>is</em> your delivery
+      semantics.</li>
+</ul>
+<p>
+  When membership changes (deploy, crash, scale-out), the group <b>rebalances</b> —
+  partitions are reassigned. Under the classic protocol this was stop-the-world: every consumer
+  paused, and everything processed-but-uncommitted got reprocessed after. Mitigations worth naming:
+  <b>static membership</b> (a restarted pod reclaims its old partitions — no rebalance on rolling
+  deploys), cooperative assignment, and the modern broker-side protocol (Kafka 4.x, KIP-848) that
+  moves only the partitions that must move, with no global pause.
+</p>
+
+<h2>5. The guarantees: ISR, acks, and the trap inside "all"</h2>
+<p>
+  Each partition is replicated: one <b>leader</b> (takes all reads/writes), N−1 <b>followers</b>
+  that copy from it. The <strong>ISR</strong> — in-sync replicas — is the set currently caught up
+  with the leader. It is a <em>dynamic</em> set, and that dynamism hides the best trap in Kafka:
+</p>
+<div class="trap">
+  <span class="label">Trap — <code>acks=all</code> does not mean all replicas</span>
+  <code>acks=all</code> means "all <b>in-sync</b> replicas have it" — and the ISR can shrink to
+  <b>just the leader</b> when followers lag. Then <code>acks=all</code> silently behaves like
+  <code>acks=1</code>, still returning success. The missing piece is
+  <code>min.insync.replicas=2</code>: with fewer than 2 replicas in sync, the broker <em>rejects
+  writes</em> instead of lying. The canonical no-data-loss recipe:
+  <b>replication factor 3 + <code>acks=all</code> + <code>min.insync.replicas=2</code></b> —
+  survives one broker; refuses writes rather than lose data when two are down. That refusal is the
+  durability-vs-availability dial, set per topic.
+</div>
+<p>
+  Producer retries create duplicates (send → broker appends → the <em>ack</em> is lost → retry
+  appends again — lesson 0002's ambiguous timeout, on the produce side). The
+  <b>idempotent producer</b> (default since Kafka 3.0) fixes exactly this with sequence numbers
+  the broker checks. <b>Transactions</b> go further: atomic writes across partitions <em>plus</em>
+  the consumer's offsets — "exactly-once" for pipelines where <b>both ends are Kafka</b>.
+</p>
+<p>
+  What exactly-once does <em>not</em> cover — say this in the interview: <strong>any side effect
+  outside Kafka</strong>. A database write, an HTTP call, an email inside your handler is neither
+  rolled back on abort nor deduplicated on replay. So the senior posture is:
+  <strong>every consumer is idempotent anyway</strong> — upserts keyed by entity id, or a unique
+  constraint on <code>event_id</code> in the sink. Exactly-once is an optimization, not a
+  foundation.
+</p>
+
+<h2>6. Event-driven architecture: the patterns</h2>
+<p>
+  <b>Event vs command.</b> An <em>event</em> is an immutable fact, past tense
+  (<code>OrderPlaced</code>), broadcast with no expectation about who reacts. A <em>command</em> is
+  an imperative addressed to one handler that may refuse (<code>ReserveInventory</code>). The test:
+  <strong>if the producer is broken when nobody handles it, it was a command</strong> — even if you
+  named it like an event.
+</p>
+<p>
+  <b>Three patterns people mix up</b> (a classic interview discriminator):
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th></th><th>Event notification</th><th>Event-carried state transfer</th><th>Event sourcing</th></tr>
+  <tr><td>Payload</td><td>thin: "customer 123 changed"</td><td>fat: the full new state</td><td>every domain event, forever</td></tr>
+  <tr><td>Consumer gets state by</td><td>calling back to the source API</td><td>its own local replica</td><td>replaying the log</td></tr>
+  <tr><td>Source of truth</td><td>source service's DB</td><td>source service's DB</td><td><b>the event log itself</b></td></tr>
+</table>
+</div>
+<p>
+  Publishing events <em>about</em> your database changes is notification / state transfer — a fine
+  pattern, but <strong>not event sourcing</strong>; claiming otherwise is a known red flag. (And
+  Kafka alone is usually not an event store: it can't read "all events for aggregate #123" or do
+  append-if-version-matches.)
+</p>
+
+<h3>The dual-write problem — and the outbox</h3>
+<p>
+  The single most useful pattern in this lesson. A service must update its database <em>and</em>
+  publish an event. Two systems, no shared transaction — <strong>any ordering is broken</strong>:
+  write DB then crash before publish = the event never happened, downstream diverges silently
+  forever; publish then crash before commit = an event about a change that doesn't exist.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 330" role="img" aria-label="Two timelines. Dual write: the service writes the database, crashes, and the event is never published — downstream never learns. Outbox: the event row commits atomically with the business change, and a relay publishes it after the crash.">
+  <style>
+    .lane5 { stroke: var(--ink-faint); stroke-width: 1.2; }
+    .actor5 { font: 600 11.5px var(--font-mono); fill: var(--ink); }
+    .ttl5 { font: 700 12px var(--font-sans); fill: var(--accent); }
+    .msg5 { stroke: var(--accent); stroke-width: 1.4; marker-end: url(#ah5); }
+    .msg5.dead { stroke: var(--warn, #c92a2a); stroke-dasharray: 4 3; }
+    .msg5.relay { stroke: var(--accent-2); }
+    .mlbl5 { font: italic 10.5px var(--font-sans); fill: var(--ink-soft); }
+    .bad5 { font: 700 11px var(--font-sans); fill: var(--warn, #c92a2a); }
+    .good5 { font: 700 11px var(--font-sans); fill: var(--accent-2); }
+  </style>
+  <defs>
+    <marker id="ah5" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="var(--ink-faint)"/>
+    </marker>
+  </defs>
+
+  <!-- left: dual write -->
+  <text class="ttl5" x="24" y="22">Dual write</text>
+  <text class="actor5" x="24" y="46">service</text>
+  <text class="actor5" x="150" y="46">DB</text>
+  <text class="actor5" x="248" y="46">Kafka</text>
+  <line class="lane5" x1="46"  y1="54" x2="46"  y2="300"/>
+  <line class="lane5" x1="160" y1="54" x2="160" y2="300"/>
+  <line class="lane5" x1="272" y1="54" x2="272" y2="300"/>
+  <line class="msg5" x1="46" y1="90" x2="158" y2="90"/>
+  <text class="mlbl5" x="58" y="82">UPDATE orders ✓</text>
+  <text class="bad5" x="20" y="140">✂ crash here</text>
+  <line class="msg5 dead" x1="46" y1="160" x2="268" y2="160"/>
+  <text class="mlbl5" x="90" y="152">publish — never happens</text>
+  <text class="bad5" x="120" y="230">DB changed, event lost:</text>
+  <text class="bad5" x="120" y="246">downstream diverges silently</text>
+
+  <!-- right: outbox -->
+  <text class="ttl5" x="400" y="22">Transactional outbox</text>
+  <text class="actor5" x="400" y="46">service</text>
+  <text class="actor5" x="508" y="46">DB</text>
+  <text class="actor5" x="600" y="46">relay→Kafka</text>
+  <line class="lane5" x1="422" y1="54" x2="422" y2="300"/>
+  <line class="lane5" x1="518" y1="54" x2="518" y2="300"/>
+  <line class="lane5" x1="638" y1="54" x2="638" y2="300"/>
+  <line class="msg5" x1="422" y1="90" x2="516" y2="90"/>
+  <text class="mlbl5" x="426" y="72">ONE transaction:</text>
+  <text class="mlbl5" x="426" y="84">UPDATE orders + INSERT outbox ✓</text>
+  <text class="bad5" x="396" y="140">✂ crash here — fine</text>
+  <line class="msg5 relay" x1="518" y1="190" x2="634" y2="190"/>
+  <text class="mlbl5" x="524" y="182">relay reads outbox, publishes</text>
+  <line class="msg5 relay" x1="518" y1="220" x2="634" y2="220"/>
+  <text class="mlbl5" x="524" y="212">(retries → duplicates possible)</text>
+  <text class="good5" x="524" y="262">event can be late,</text>
+  <text class="good5" x="524" y="278">but never lost</text>
+</svg>
+<figcaption>The outbox moves the atomicity problem to a place that has atomicity: one local DB transaction
+writes the business change and the event row together. A relay (a poller, or CDC like Debezium tailing the
+write-ahead log) publishes later — at-least-once, so consumers dedupe by event id.</figcaption>
+</figure>
+
+<p>
+  Two more names to recognize, one line each. <b>Saga</b>: a distributed workflow as a chain of
+  local transactions with <em>compensating actions</em> (refund, release) instead of rollback —
+  <em>choreography</em> (services react to each other's events; the flow exists nowhere) vs
+  <em>orchestration</em> (one coordinator owns the state machine; the flow is explicit).
+  <b>Dead-letter queue</b>: Kafka brokers have none built in — it's a consumer-side pattern (bounded
+  retries → retry topics → DLQ topic with error headers), and retry topics <em>break per-key
+  ordering</em>, which most teams discover in production.
+</p>
+
+<h2>7. Choosing: log vs queue vs signal</h2>
+<div class="table-scroll">
+<table>
+  <tr><th>Need</th><th>Pick</th><th>Because</th></tr>
+  <tr><td>Replay, many independent readers, per-key order at scale, stream processing</td><td><b>Kafka</b> (log)</td><td>retained log + consumer-owned offsets</td></tr>
+  <tr><td>Work queue: per-message ack/retry, priorities, delays, broker-side routing</td><td><b>RabbitMQ</b> (queue)</td><td>smart broker tracks and routes each message</td></tr>
+  <tr><td>Work queue on AWS with zero operations</td><td><b>SQS</b> (managed queue)</td><td>visibility timeout + built-in DLQ redrive</td></tr>
+  <tr><td>Ephemeral signal where a lost message is fine (cache invalidation, presence)</td><td><b>Redis pub/sub</b> (signal)</td><td>in-memory broadcast, no storage at all</td></tr>
+</table>
+</div>
+<p>
+  The fork is the <strong>storage model</strong> — retained log vs delete-on-ack vs nothing — not a
+  throughput benchmark. One currency note for interviews: since Kafka 4.0 (2025)
+  <b>ZooKeeper is gone</b> — cluster metadata is itself a Raft-replicated event log
+  (<b>KRaft</b>). Kafka's answer to "who manages the manager?" was the same answer it gives
+  everyone else: an ordered, replicated log.
+</p>
+
+<div class="drill">
+  <span class="label">Drill — the checkout event</span>
+  <p class="situation">Your checkout service saves the order to Postgres, then publishes
+  <code>OrderPlaced</code> to Kafka. A teammate wraps both in try/catch: "if the publish fails,
+  we roll back the DB transaction — problem solved."</p>
+  Find both crash windows that survive the try/catch. Then fix the design with the outbox — and say
+  why consumers must dedupe afterwards. Answer out loud before the quiz.
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">Lock it in — the blank-page rule</span>
+  Close the <b>Kafka: the event log</b> and <b>outbox &amp; delivery semantics</b> leaves in the
+  <a href="../reference/backend-mastery-tree.html">tree tracker</a> when you can, from a blank page:
+  draw a topic with partitions and two consumer groups, state the no-data-loss config with the
+  <code>acks=all</code> trap, and sketch the dual-write failure plus the outbox fix.
+</div>
+
+<div class="note">
+  <span class="label">Primary sources</span>
+  <a href="https://kafka.apache.org/documentation/#design">Kafka docs — Design</a> (the log,
+  the ISR, and the "why fast" arguments, from the authors). Then
+  <a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io — Transactional Outbox</a>
+  (10 min) and
+  <a href="https://martinfowler.com/articles/201701-event-driven.html">Fowler — What do you mean by "Event-Driven"?</a>
+  — the source of the notification / state-transfer / event-sourcing distinction.
+</div>
+
+<p class="ask">Anything unclear — where the offset actually lives, what a rebalance does to in-flight
+work, why the relay can't just be a second thread? <b>Ask your teacher</b> — open a session and say
+<code>/teach</code>.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li><b>Log, not queue:</b> the consumer owns its offset; the broker deletes by age, never by "read". Replay and fan-out fall out for free.</li>
+    <li>Fast-on-disk = sequential I/O + page cache + zero-copy + opaque batches + <b>no per-message consumer state</b>. Durability = replication, not fsync.</li>
+    <li><b>Order lives only inside a partition.</b> The key names the thing whose events must stay ordered; a hot key can't be fixed by adding partitions.</li>
+    <li>Group parallelism ceiling = partition count. Commit <em>after</em> processing = at-least-once; <em>before</em> = at-most-once.</li>
+    <li><code>acks=all</code> means all <b>in-sync</b> replicas — pair it with <code>min.insync.replicas=2</code> and RF=3 or it silently degrades to <code>acks=1</code>.</li>
+    <li>Exactly-once covers Kafka-in → Kafka-out only. Your DB write is not protected — <b>make every consumer idempotent</b> (lesson 0002, again).</li>
+    <li>DB + event = <b>dual write</b>, always broken. Fix: <b>transactional outbox</b> — event row commits with the business change; a relay publishes at-least-once; consumers dedupe by event id.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>Kafka is a numbered archive readers bookmark themselves — and anything that must be true in two systems at once (DB + event) needs the outbox, because two commits are never one.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="0004-mongodb-replica-sets-and-sharding.html">&larr; 0004 MongoDB</a>
+  <span class="small">Next: <a href="0006-websockets-at-scale.html">0006 — WebSockets at scale</a></span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Kafka writes every message to disk. Why is it still fast?',
+    options: [
+      'Sequential appends + the OS page cache (no per-message fsync) + zero-copy sends + opaque compressed batches — and no per-message consumer state on the broker',
+      'It keeps all messages in RAM and flushes to disk once per hour',
+      'It skips disk for acknowledged messages and only persists failures'
+    ],
+    answer: 0,
+    why: 'Kafka makes the disk look like tape: append-only writes land in the page cache (durability comes from replication, not fsync), reads of hot data go page-cache→socket via sendfile(), and the broker never inspects payloads or tracks per-message ack state.'
+  },
+  {
+    q: 'What ordering does Kafka actually guarantee?',
+    options: [
+      'Order within a single partition only — which is why the partition key must name the thing whose events need ordering',
+      'Total order across the whole topic',
+      'Order across topics that share a producer'
+    ],
+    answer: 0,
+    why: 'Partitions are the unit of parallelism, and total order and parallelism are at odds. Key by order_id and each order’s lifecycle stays sequential; there is no promise between different orders — and there shouldn’t be.'
+  },
+  {
+    q: 'You set acks=all. A leader crashes and acknowledged data is still lost. How?',
+    options: [
+      'The ISR had shrunk to just the leader — "all in-sync replicas" was one machine. min.insync.replicas=2 would have rejected the write instead',
+      'acks=all only applies to compressed batches',
+      'Impossible — acks=all guarantees all three replicas have every write'
+    ],
+    answer: 0,
+    why: 'The ISR is dynamic. When followers lag out of it, acks=all degenerates to acks=1 while still returning success. The no-data-loss recipe is RF=3 + acks=all + min.insync.replicas=2 — which chooses refusing writes over losing them.'
+  },
+  {
+    q: 'A topic has 12 partitions. Your consumer group has 16 consumers. What happens?',
+    options: [
+      '4 consumers sit idle — max useful parallelism in a group equals the partition count',
+      'Kafka splits partitions dynamically so all 16 share the load',
+      'The extra consumers each get a replica partition to read from'
+    ],
+    answer: 0,
+    why: 'Each partition is assigned to exactly one consumer within a group. Partition count is chosen up front precisely because it caps consumer parallelism — and it can be raised (breaking key affinity) but never lowered.'
+  },
+  {
+    q: 'A service updates Postgres and publishes to Kafka. Why is try/catch-with-rollback not enough, and what is?',
+    options: [
+      'Two systems can’t share one transaction: a crash after DB-commit loses the event; a crash after publish emits a lie. Fix: write the event to an outbox table in the SAME DB transaction; a relay publishes it later',
+      'It is enough, as long as you publish first and write the DB second',
+      'Use a Kafka transaction to wrap the Postgres write'
+    ],
+    answer: 0,
+    why: 'Every ordering of two independent commits has a crash window — and Kafka transactions never span external databases. The outbox moves atomicity into the one place that has it (the local DB transaction); the relay is at-least-once, so consumers dedupe by event id.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Design a no-data-loss topic configuration and justify each piece." (interview classic)',
+    answer: '<b>Replication factor 3</b> across failure domains, <b>acks=all</b>, <b>min.insync.replicas=2</b>, unclean leader election off, idempotent producer (default since 3.0). The reasoning that scores points: acks=all alone is a trap because the ISR can shrink to just the leader; min.insync.replicas=2 closes it by rejecting writes when under-replicated — deliberately trading availability for durability. Unclean election off means "partition offline" beats "elect a stale replica and truncate acknowledged data."'
+  },
+  {
+    prompt: '"What does Kafka’s exactly-once actually cover?" — the honest answer',
+    answer: 'The idempotent producer removes retry duplicates (exactly-once <b>append</b>). Transactions make "consume → transform → produce" atomic <b>when both ends are Kafka</b> — offsets and outputs commit together. Not covered: any side effect outside Kafka — DB writes, HTTP calls, emails are neither rolled back nor deduped. So the senior posture: <b>every consumer is idempotent anyway</b> (upsert by entity id, or unique constraint on event_id) — exactly-once is an optimization, not a foundation.'
+  },
+  {
+    prompt: 'The drill: both crash windows in "publish inside try/catch, rollback on failure"',
+    answer: 'Window 1 — <b>DB commits, then the process dies before publish</b>: nothing to catch, nothing to roll back; the event silently never exists and downstream diverges forever. Window 2 — <b>publish succeeds, then the DB commit itself fails</b>: you cannot un-publish a Kafka record; the world heard about a change that never happened. Fix: <b>outbox</b> — INSERT the event into an outbox table inside the same local transaction as the business write; a relay (poller or Debezium CDC) publishes it. The relay is at-least-once → consumers dedupe by event id → which is why idempotent consumers are non-negotiable.'
+  }
+]);
+</script>
+</body>
+</html>

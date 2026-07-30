@@ -1,0 +1,262 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSockets in React — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Special track · Lesson 5 · Real-time React</p>
+  <h1>WebSockets in React</h1>
+  <p class="subtitle">A socket is not data — it's a living object with a lifecycle. React has exactly two tools for things like that, and <code>useState</code> is not one of them.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll be able to <b>(1)</b> connect a React app to a WebSocket without leaks, double-connections, or stale UI, <b>(2)</b> explain why the socket lives <em>outside</em> React state while its <em>messages</em> flow into it, and <b>(3)</b> describe the production shape — one app-wide connection, a manager hook, and an event router — used by a real product (<b>a React 18 + TypeScript virtual-office app</b> — our case-study codebase — whose source this lesson is drawn from).
+  </div>
+
+  <p>Everything so far in this course renders <em>data</em>: numbers, strings, arrays. A WebSocket is a different kind of thing — a <b>live connection</b> that opens, emits events at random times, breaks, and must be closed. It doesn't render. It doesn't diff. Putting it in <code>useState</code> is a category error. The whole lesson is learning where it <em>does</em> go.</p>
+
+  <h2>First principle — the naive version, and its three bugs</h2>
+  <p>The obvious first attempt. Read it and find the bugs before I list them:</p>
+
+  <pre><code>function Chat() {
+  const socket = new WebSocket('wss://api.example.com/ws');   <span class="cmt">// ① in the component body</span>
+  const [messages, setMessages] = useState&lt;string[]&gt;([]);
+
+  socket.onmessage = (e) =&gt; {                                  <span class="cmt">// ② wired during render</span>
+    setMessages([...messages, e.data]);                        <span class="cmt">// ③ reads `messages`</span>
+  };
+
+  return &lt;ul&gt;{messages.map((m, i) =&gt; &lt;li key={i}&gt;{m}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+  <ol>
+    <li><b>① A new socket on every render.</b> The component body re-runs on every state change (Lesson 2). First message arrives → <code>setMessages</code> → re-render → <em>another</em> <code>new WebSocket(...)</code>. Each message spawns a connection; you DDoS your own server from one browser tab.</li>
+    <li><b>② No cleanup, ever.</b> Nothing closes the old sockets. Navigate away and they linger.</li>
+    <li><b>③ The stale closure.</b> <code>onmessage</code> captured <em>this render's</em> <code>messages</code> — a snapshot (Lesson 2, same trap, new costume). Every message computes <code>[...messages]</code> from that old snapshot, so the list keeps only the latest message.</li>
+  </ol>
+
+  <div class="soundbite">
+    <span class="label">The rule, in one line</span>
+    <p><b>The socket is a side effect; its messages are state.</b> The connection lives in an effect (or outside React entirely). Only what you want to <em>render</em> — messages, connection status — goes through <code>setState</code>.</p>
+  </div>
+
+  <h2>The correct small version — effect + cleanup + updater</h2>
+  <pre><code>function Chat() {
+  const [messages, setMessages] = useState&lt;string[]&gt;([]);
+  const [status, setStatus] = useState&lt;'connecting' | 'open' | 'closed'&gt;('connecting');
+
+  useEffect(() =&gt; {
+    const socket = new WebSocket('wss://api.example.com/ws'); <span class="cmt">// created in the effect</span>
+    socket.onopen = () =&gt; setStatus('open');
+    socket.onclose = () =&gt; setStatus('closed');
+    socket.onmessage = (e) =&gt; {
+      setMessages(prev =&gt; [...prev, e.data]);                 <span class="cmt">// updater form — no stale snapshot</span>
+    };
+    return () =&gt; socket.close();                              <span class="cmt">// cleanup: the connection dies with the component</span>
+  }, []);                                                     <span class="cmt">// connect once per mounted component</span>
+
+  return &lt;ul&gt;{messages.map(m =&gt; &lt;li key={m.id}&gt;{m.text}&lt;/li&gt;)}&lt;/ul&gt;;
+}</code></pre>
+
+  <p>Three fixes in one shape: the socket is created <b>inside</b> <code>useEffect</code> (once per mount, not per render), the <b>cleanup function closes it</b> (React runs cleanup when the component unmounts — and before re-running the effect), and <code>setMessages(prev =&gt; …)</code> uses the <b>updater form</b>, so the handler never depends on a snapshot.</p>
+
+  <div class="trap">
+    <span class="label">Trap — StrictMode connects twice, on purpose</span>
+    In development, React 18's <code>&lt;StrictMode&gt;</code> mounts, unmounts, and re-mounts every component — so your effect runs <b>connect → close → connect</b>. This is not a bug to silence; it is React <em>testing</em> that your cleanup actually works. If double-connect breaks your app (duplicate "user joined" events, two subscriptions), your cleanup is incomplete — fix the cleanup, don't remove StrictMode. The interview version: "StrictMode revealed that my effect wasn't symmetric."
+  </div>
+
+  <h2>The production shape — one connection, a manager, a router</h2>
+  <p>Now the real-world problem: chat, presence, notifications, and live data <b>all over the app</b>. One socket per component would mean dozens of connections. Every serious app converges on the same architecture — and the case-study app is a textbook example:</p>
+
+  <pre><code><span class="cmt">// ── network.ts — a MODULE SINGLETON, outside React entirely ──────────</span>
+<span class="cmt">// The case-study app does exactly this: one configured STOMP-over-WebSocket</span>
+<span class="cmt">// client, exported once, shared by chat, presence, calls, everything.</span>
+let socket: WebSocket | null = null;
+const listeners = new Set&lt;(msg: ServerMessage) =&gt; void&gt;();
+
+export function connect(token: string) {
+  socket = new WebSocket(`wss://api.example.com/ws?auth=${token}`);
+  socket.onmessage = (e) =&gt; {
+    const msg = JSON.parse(e.data) as ServerMessage;
+    listeners.forEach(fn =&gt; fn(msg));                <span class="cmt">// fan out to whoever subscribed</span>
+  };
+}
+export function subscribe(fn: (msg: ServerMessage) =&gt; void) {
+  listeners.add(fn);
+  return () =&gt; listeners.delete(fn);                 <span class="cmt">// unsubscribe = the return value</span>
+}
+export function send(msg: ClientMessage) { socket?.send(JSON.stringify(msg)); }</code></pre>
+
+  <pre><code><span class="cmt">// ── useConnection.ts — ONE hook owns the lifecycle (cf. useNetworkManager) ──</span>
+export function useConnection(token: string | null) {
+  const [status, setStatus] = useState&lt;Status&gt;('offline');
+  const attempt = useRef(0);
+
+  useEffect(() =&gt; {
+    if (!token) return;
+    let cancelled = false;
+
+    function open() {
+      setStatus('connecting');
+      connect(token, {
+        onOpen:  () =&gt; { attempt.current = 0; setStatus('open'); },
+        onClose: () =&gt; {                                  <span class="cmt">// reconnect with exponential backoff</span>
+          if (cancelled) return;
+          setStatus('reconnecting');
+          const delay = Math.min(30_000, 1000 * 2 ** attempt.current++);
+          setTimeout(() =&gt; { if (!cancelled &amp;&amp; navigator.onLine) open(); }, delay);
+        },
+      });
+    }
+    open();
+    return () =&gt; { cancelled = true; disconnect(); };     <span class="cmt">// symmetric — StrictMode-proof</span>
+  }, [token]);
+
+  return status;                                          <span class="cmt">// 'offline' | 'connecting' | 'open' | 'reconnecting'</span>
+}</code></pre>
+
+  <p>Three responsibilities, three homes — this is the architecture worth memorizing:</p>
+  <ul>
+    <li><b>The connection</b> is a <b>module singleton</b> — plain TypeScript, no React. It exists once per tab, survives every re-render, and components never touch it directly. (the case-study app: <code>network.ts</code> exports one STOMP client that carries chat, presence, call invites <em>and</em> all call signaling — one connection, four jobs.)</li>
+    <li><b>The lifecycle</b> — connect on login, reconnect with backoff — lives in <b>one hook, mounted once</b> near the app root (the case-study app: <code>useNetworkManager</code>, which doubles the delay on each failed attempt, caps it, and only retries when <code>navigator.onLine</code> says there's a network to try).</li>
+    <li><b>The data</b> flows through a <b>router</b>: one <code>onmessage</code> parses each message's <code>type</code> and hands it to the right store or provider (chat store, presence store, call provider). Components read from those stores and re-render on data — never on socket events directly.</li>
+  </ul>
+
+  <p>And the piece juniors forget: <b>the status is state too.</b> A <code>'reconnecting'</code> banner is just <code>UI = f(status)</code> — the same one rule from Lesson 1, applied to connection health.</p>
+
+  <div class="note">
+    <span class="label">Two production details from the case-study source</span>
+    <b>Heartbeats from a Worker:</b> browsers throttle timers in background tabs, so a <code>setInterval</code> heartbeat silently stops and the server thinks you died. The case-study app configures its heartbeats to run on a <b>Web Worker</b> (workers aren't throttled), keeping the connection alive while the tab is hidden. <b>Filter your own echo:</b> when you broadcast to a room you're in, the server may send your message back to you — the case-study app stamps each frame with a client id and drops its own. If your chat shows every sent message twice, this is why.
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the context that reconnects everyone</span>
+    A tempting refactor: <code>&lt;SocketContext.Provider value={{ socket, status }}&gt;</code>. That object literal is <b>recreated on every render</b> of the provider, so every consumer re-renders every time <em>anything</em> changes — and if consumers key effects on it, they resubscribe constantly. Provide stable things: the singleton's functions (stable by module), plus status as plain state. The socket object itself almost never needs to be in context at all.
+  </div>
+
+  <h2>Rendering a live feed — the last mile</h2>
+  <pre><code>function useChannel(channel: string) {
+  const [items, setItems] = useState&lt;Message[]&gt;([]);
+  useEffect(() =&gt; {
+    return subscribe((msg) =&gt; {                       <span class="cmt">// subscribe returns unsubscribe — perfect cleanup</span>
+      if (msg.channel !== channel) return;
+      setItems(prev =&gt; [...prev.slice(-199), msg]);   <span class="cmt">// cap the list — unbounded state is a leak too</span>
+    });
+  }, [channel]);
+  return items;
+}</code></pre>
+  <p>Note the two small production habits: the subscription's <b>unsubscribe function is the effect cleanup</b> (change channels → old subscription is removed before the new one starts), and the list is <b>capped</b> — a socket that delivers 10 messages/second grows an uncapped array to 36,000 items an hour, and every one of them re-renders.</p>
+
+  <div class="drill">
+    <span class="label">Drill — the reconnect banner</span>
+    <p class="situation">Product asks: "when the connection drops, show a yellow 'reconnecting…' bar; when it's back, flash a green 'connected' bar for 2 seconds, then hide it."</p>
+    Build it as a component consuming <code>useConnection</code>'s status. The 2-second "then hide" is the interesting part — which tool runs that timer, and what must its cleanup do if the connection drops <em>again</em> during the 2 seconds? Sketch it before the quiz.
+  </div>
+
+  <h2>Prove it</h2>
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Where the other half of this story lives</span>
+    Everything server-side — why one server can't hold every socket, the Redis backplane, fan-out
+    amplification, heartbeat sweeps, resume-from-sequence — is
+    <a href="../../backend-mastery-tree/lessons/0006-websockets-at-scale.html">Backend Mastery Tree · 0006 WebSockets at scale</a>.
+    This lesson is the client half of that architecture.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this</span>
+    <ul>
+      <li><b>The socket is a side effect; its messages are state.</b> Connections never go in <code>useState</code> — what renders does.</li>
+      <li>Small version: create in <code>useEffect</code>, <b>close in cleanup</b>, <code>setX(prev =&gt; …)</code> in handlers so no snapshot goes stale.</li>
+      <li><b>StrictMode's double-mount is a test of your cleanup</b>, not a bug. Connect → close → connect must be harmless.</li>
+      <li>Production shape: <b>module singleton</b> (the connection) + <b>one lifecycle hook</b> (connect, backoff, online gating) + <b>event router → stores</b> (components read data, never the socket).</li>
+      <li>Connection <b>status is state too</b> — the reconnect banner is just <code>UI = f(status)</code>.</li>
+      <li>Details that bite in production: heartbeats from a <b>Worker</b> (background-tab throttling), filter your own echo, <b>cap</b> live lists, provide stable values in context.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>React renders data — a WebSocket is not data. Keep the connection outside the render world, and let only its messages and its status cross the border, as state.</b></p>
+  </div>
+
+  <div class="footer-nav">
+    <a href="../index.html">← The Map</a>
+    <a href="0004-build-an-interactive-dashboard-card.html">← 4 · The dashboard card</a>
+    <span class="small">Next: <a href="0006-webrtc-and-media-in-react.html">6 · WebRTC &amp; media in React</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why must the WebSocket be created inside useEffect instead of the component body?",
+      options: [
+        "The body re-runs on every render, so each state update would open another connection; the effect runs once per mount and its cleanup closes the socket",
+        "WebSockets are only allowed inside hooks by browser security rules",
+        "It's a style preference — both work identically",
+        "useEffect makes the connection faster by batching frames"
+      ],
+      answer: 0,
+      why: "A component body is called again on every render (Lesson 2). new WebSocket(...) there means: message arrives → setState → re-render → ANOTHER connection. Effects exist precisely for lifecycles like this: create once per mount, destroy in cleanup."
+    },
+    {
+      q: "socket.onmessage = (e) => setMessages([...messages, e.data]) keeps only the latest message. Why?",
+      options: [
+        "The handler closed over one render's `messages` snapshot, so every call spreads the same stale array — the fix is the updater form setMessages(prev => [...prev, e.data])",
+        "WebSocket messages overwrite each other at the protocol level",
+        "setMessages can only be called once per render",
+        "The spread operator mutates the original array"
+      ],
+      answer: 0,
+      why: "State is a snapshot per render (Lesson 2). The handler was wired once, capturing that render's `messages`. The updater form asks React for the latest value at update time, so it never goes stale — the same fix as the triple-setCount problem, in a new costume."
+    },
+    {
+      q: "In development, your effect connects, disconnects, and reconnects immediately on mount. What is happening?",
+      options: [
+        "StrictMode deliberately mounts → unmounts → remounts to verify your cleanup is symmetric; if that breaks your app, the cleanup is incomplete",
+        "The server is rejecting the first connection, so React retries",
+        "A memory leak in React 18 that production fixes automatically",
+        "The dependency array is missing, causing infinite reconnects"
+      ],
+      answer: 0,
+      why: "React 18 StrictMode runs the mount/cleanup cycle twice in dev as a stress test. A correct effect (cleanup closes the socket, cancels timers, clears flags) makes the double-run invisible. Silencing StrictMode hides the bug; symmetric cleanup fixes it."
+    },
+    {
+      q: "Twelve components across the app need live data. The production architecture is:",
+      options: [
+        "One module-singleton connection outside React + one lifecycle hook (connect/backoff) + a message router into stores; components read from stores",
+        "Each component opens its own WebSocket in its own effect",
+        "One socket stored in useState at the app root, passed down as a prop",
+        "A new context provider per channel, each owning a connection"
+      ],
+      answer: 0,
+      why: "Twelve sockets is eleven too many. The connection is app-level infrastructure — a plain TS module — with exactly one hook owning its lifecycle, and a router fanning typed messages into stores. Components subscribe to DATA, never to the socket. This is precisely the case-study app's network.ts + useNetworkManager shape."
+    },
+    {
+      q: "Your reconnect logic retries at 1s, 2s, 4s… but only when navigator.onLine is true. Why the online check?",
+      options: [
+        "Retrying while the device has no network wastes attempts and burns the backoff schedule; wait for the browser's online signal, then try",
+        "Browsers block WebSocket constructors while offline, throwing uncatchable errors",
+        "navigator.onLine must be polled to keep the socket alive",
+        "It prevents StrictMode from double-connecting"
+      ],
+      answer: 0,
+      why: "If the laptop lid just opened and Wi-Fi isn't up yet, every retry is guaranteed to fail — and by the time the network exists, your backoff has climbed to 30s. Gating on online (as the case-study app's useNetworkManager does) makes reconnection feel instant when connectivity returns."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you integrate a WebSocket into a React app?”",
+      answer: "The socket is a <b>side effect, not state</b> — I never put the connection in <code>useState</code>. For one component: create it in <code>useEffect</code>, close it in the cleanup, and push incoming messages into state with the <b>updater form</b> so handlers don't capture stale snapshots. For an app: <b>one module-singleton connection</b> outside React, <b>one hook</b> near the root owning the lifecycle (connect on auth, exponential backoff gated on <code>navigator.onLine</code>), and a <b>message router</b> that fans typed events into stores — components read data and connection <em>status</em> from state, never the socket itself."
+    },
+    {
+      prompt: "Interviewer: “Your app opens two WebSocket connections in development. Production is fine. What's going on?”",
+      answer: "That's <b>StrictMode</b> — React 18 deliberately runs mount → cleanup → mount in dev to test that effects are symmetric. Two live connections means my cleanup wasn't actually closing the first one (or a reconnect timer survived unmount). The fix is in the cleanup: close the socket, cancel pending timers, and set a <code>cancelled</code> flag the reconnect logic checks. StrictMode didn't create the bug — it exposed that my effect couldn't safely run twice."
+    },
+    {
+      prompt: "The drill: the 'reconnecting…' banner with the 2-second green flash",
+      answer: "Status comes from the connection hook — the banner is <code>UI = f(status)</code>. The flash needs a small local state machine: when status transitions to <code>'open'</code>, set <code>showConnected</code> and start a 2s <code>setTimeout</code> in an effect keyed on status; the cleanup <b>clears the timer</b> — that's the trick part, because if the connection drops again inside the 2 seconds, the effect re-runs and a stale timer must not hide the new yellow banner. Timer in effect + clearTimeout in cleanup = the same symmetry rule as the socket itself."
+    }
+  ]);
+</script>

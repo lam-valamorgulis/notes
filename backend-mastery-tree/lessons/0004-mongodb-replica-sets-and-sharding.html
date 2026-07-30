@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0004 · MongoDB: replica sets &amp; sharding — Backend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Domain 4 · Data · NoSQL · Lesson 0004</p>
+<h1>MongoDB: replica sets &amp; sharding</h1>
+<p class="subtitle">One database becomes many machines — first so it survives, then so it scales. Two different problems, two different machines.</p>
+
+<div class="win">
+  <strong>The win:</strong> after ~40 minutes you can answer the two senior MongoDB questions cold:
+  <em>"an acknowledged write disappeared after a failover — how?"</em> and
+  <em>"why is a timestamp a terrible shard key?"</em> — plus the mechanism underneath each:
+  elections by majority, and routing by key.
+</div>
+
+<h2>1. First, the unit: the document</h2>
+<p>
+  Everything in MongoDB follows from one design decision: <strong>the document is both the read
+  unit and the atomic unit</strong>. In SQL you model the data's <em>shape</em> (normalize, then
+  join at read time). In MongoDB you model the application's <em>queries</em> — store together
+  what is read together, so the hot path is one read instead of a 4-way join.
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>Signal</th><th>Embed</th><th>Reference</th></tr>
+  <tr><td>Read together in the same query?</td><td>✅</td><td></td></tr>
+  <tr><td>Child meaningless without parent (user's address)?</td><td>✅</td><td></td></tr>
+  <tr><td>1-to-few, bounded (shipping addresses)?</td><td>✅</td><td></td></tr>
+  <tr><td>"Many" side is unbounded (comments on a viral post)?</td><td></td><td>✅</td></tr>
+  <tr><td>Genuine many-to-many, queried from both sides?</td><td></td><td>✅</td></tr>
+  <tr><td>Child updated often, on its own?</td><td></td><td>✅</td></tr>
+</table>
+</div>
+<p>
+  Three hard limits shape the choice: a document caps at <b>16&nbsp;MiB</b>; an
+  <b>unbounded embedded array</b> is a slow-motion bug (every append rewrites a growing document,
+  until the cap kills it in production); and a write to <b>one</b> document is always atomic —
+  even across 20 fields — while a write to two documents never is, unless you pay for a
+  multi-document transaction. Embedding <em>buys</em> atomicity for free; referencing spends it.
+</p>
+
+<div class="soundbite">
+  <span class="label">Feynman version — the pre-packed kit</span>
+  <p>SQL is a warehouse: every part in its own labeled bin, assembled at pickup time. MongoDB is a
+  pre-packed kit: everything one job needs, in one box. Kits are fast to grab — but a kit that must
+  hold "every part we might ever need" overflows the box. That overflow is your unbounded array.</p>
+</div>
+
+<div class="note">
+  <span class="label">The "transactions everywhere" smell</span>
+  MongoDB has real multi-document ACID transactions (since 4.0, sharded since 4.2, 60-second
+  lifetime by default). But the docs themselves say transactions
+  <em>"should not be a replacement for effective schema design."</em> If most operations need one,
+  the document boundaries were drawn wrong — you rebuilt a relational schema inside a document
+  store and now pay document-store prices for relational semantics.
+</div>
+
+<h2>2. Replica sets — copies, for survival</h2>
+<p>
+  A <strong>replica set</strong> is a group of servers holding identical copies of the data.
+  Exactly one member is the <b>primary</b> — it takes <em>all</em> writes. The others are
+  <b>secondaries</b>: they copy the primary's changes and can take over if it dies.
+  This is a <strong>high-availability machine, not a scaling machine</strong> — all writes still
+  land on one node.
+</p>
+<p>
+  The copying mechanism is the <strong>oplog</strong>: a capped (fixed-size, ring-buffer-like)
+  collection on every member, recording every change <em>in idempotent form</em> — an
+  <code>$inc</code> is logged as "set field to the resulting value", so replaying an entry twice
+  is harmless (lesson 0002's set-vs-add lens, living inside the database engine).
+  Secondaries tail this log and apply it. Default size: 5% of free disk, clamped between
+  990&nbsp;MB and 50&nbsp;GB.
+</p>
+<div class="soundbite">
+  <span class="label">Feynman version — the newsroom</span>
+  <p>One editor-in-chief (primary) approves every story. Deputy editors (secondaries) keep their own
+  complete copy of the paper by reading the chief's change log (oplog). If the chief collapses, the
+  deputies vote and one takes over. The paper survives — but for a few seconds, nobody can approve
+  new stories. And a deputy who was on holiday longer than the change log is long must re-copy the
+  whole archive from scratch (initial sync): the oplog's length is the catch-up budget.</p>
+</div>
+
+<h2>3. Elections — and the write that vanished</h2>
+<p>
+  Members heartbeat each other every <b>2 seconds</b>. When secondaries haven't heard from the
+  primary for <code>electionTimeoutMillis</code> (default <b>10&nbsp;s</b>), they call an election —
+  a Raft-style vote with terms and a simple rule: <strong>a candidate needs a majority of voting
+  members</strong>, and voters refuse candidates whose copy of the data is behind their own.
+  Median failover with defaults: <b>≤&nbsp;12 seconds</b>, during which <em>no writes are accepted
+  anywhere</em>.
+</p>
+<p>
+  The majority rule is also the split-brain defense: a primary that can only reach a
+  <em>minority</em> of voters steps down on its own. Better no editor than two editors.
+  And it explains the famous "why 3 nodes minimum": with 2 nodes, majority = 2, so losing
+  <em>either</em> node means no primary — two nodes give <em>worse</em> write availability than one.
+  With 3, any single failure is survivable.
+</p>
+<p>
+  Now the interview classic. <strong>Write concern</strong> is how many members must acknowledge a
+  write before the driver returns "success":
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>Write concern</th><th>Meaning</th><th>Survives failover?</th></tr>
+  <tr><td><code>w: 0</code></td><td>fire-and-forget, no acknowledgment</td><td>❌ no promise at all</td></tr>
+  <tr><td><code>w: 1</code></td><td>the primary has it</td><td>❌ <b>can be rolled back</b></td></tr>
+  <tr><td><code>w: "majority"</code></td><td>a majority have it, journaled on disk</td><td>✅ never rolled back</td></tr>
+</table>
+</div>
+
+<div class="trap">
+  <span class="label">Trap — acknowledged is not durable</span>
+  A <code>w:1</code> write is acknowledged the moment the <b>primary alone</b> has it. If the primary
+  crashes before any secondary copies that write, a new primary is elected <em>without it</em>. When
+  the old primary rejoins, it sees history has moved on — and <b>rolls the write back</b>, dumping it
+  to a file on disk. The client was told "success"; the database no longer contains the data. This is
+  not a bug — it is exactly what <code>w:1</code> promises. Anything you can't lose goes
+  <code>w:"majority"</code> (the server default since MongoDB 5.0).
+</div>
+
+<h2>4. The read side: two dials, not one</h2>
+<p>
+  Reads have <em>two independent settings</em>, and confusing them is a favorite interview probe:
+</p>
+<ul>
+  <li><strong>Read preference</strong> picks the <b>node</b>: <code>primary</code> (default),
+      <code>secondary</code>, <code>nearest</code>… A secondary read can be <b>stale</b> —
+      replication is asynchronous, lag is usually milliseconds but unbounded under load.</li>
+  <li><strong>Read concern</strong> picks the <b>quality</b>: <code>local</code> (default — may
+      return data that is later rolled back!), <code>majority</code> (only majority-committed data,
+      never rolled back), <code>linearizable</code> (primary double-checks it is <em>still</em>
+      primary before answering — one document, one extra round trip).</li>
+</ul>
+<p>
+  So <code>secondary</code>&nbsp;+&nbsp;<code>majority</code> is a valid combination (a stale but
+  durable read), and the <em>default</em> combination — <code>primary</code>&nbsp;+&nbsp;<code>local</code> —
+  can return data that later vanishes. For "read my own write" across nodes, the tool is a
+  <b>causal consistency session</b>: the driver threads a cluster timestamp through your operations,
+  and a lagging secondary <em>waits</em> until it has caught up to your write before answering.
+</p>
+<div class="note">
+  <span class="label">Pointer back up the tree</span>
+  "Point reads at secondaries to scale reads" is mostly a trap: secondaries already replay the full
+  write load, and if your read capacity <em>depends</em> on them, you have silently spent your
+  failover headroom. Read scaling is <b>sharding's</b> job. Secondary reads are for geography
+  (<code>nearest</code>) and isolation (analytics on a hidden member).
+</div>
+
+<h2>5. Retryable writes — lesson 0002, built into the driver</h2>
+<p>
+  During those ~10 seconds of election, what does your application see? In-flight writes fail with
+  an ambiguous network error — the same ambiguity as lesson 0002: did it land or not?
+  MongoDB's answer is the same answer too: <strong>an idempotency key, built in</strong>.
+  Every single-document write carries a session ID + a counter (<code>txnNumber</code>). The driver
+  retries once against the new primary; the new primary checks the ID against replicated history —
+  if the first attempt already committed, it <b>does not re-execute</b>, it returns the stored
+  result. Exactly-once effect, transparent to your code, on by default in all modern drivers.
+</p>
+
+<h2>6. Sharding — slices, for capacity</h2>
+<p>
+  A replica set hits two walls that copies cannot fix: <b>RAM</b> (when the working set — hot data +
+  indexes — outgrows memory, every read risks a disk fetch and latency falls off a cliff) and
+  <b>write throughput</b> (all writes hit one primary, always). <strong>Sharding</strong> splits the
+  data itself across many replica sets (<b>shards</b>), each owning a slice. Three moving parts:
+</p>
+<ul>
+  <li><b>Shards</b> — each a full replica set, owning a range of the data.</li>
+  <li><b>Config servers</b> — a replica set holding the map: <em>which shard owns which range</em>.
+      The balancer runs on its primary, moving ranges (default size 128&nbsp;MB) when shards differ
+      by ≥ 3 range-sizes (~384&nbsp;MB). Back these up like data — they hold the only map.</li>
+  <li><b>mongos</b> — a stateless router your app talks to. It caches the map and forwards each
+      query to the right shard(s).</li>
+</ul>
+<p>
+  Order of operations in real life: fix schema and indexes first, scale vertically second,
+  shard third — every shard multiplies the operational surface.
+</p>
+
+<h2>7. The shard key — the highest-stakes schema decision</h2>
+<p>
+  The <strong>shard key</strong> is the field whose values decide where every document lives and
+  how every query routes. Three properties decide whether a key is good:
+</p>
+<ol>
+  <li><b>Cardinality</b> — many distinct values (a <code>country</code> key caps you at ~200 slices, some giant).</li>
+  <li><b>Frequency</b> — evenly used values (if 30% of documents share one value, that value is an unsplittable <em>jumbo</em> range pinned to one shard).</li>
+  <li><b>Monotonicity — the killer.</b> If the key only ever grows (timestamp, auto-increment,
+      <code>ObjectId</code> — which is timestamp-prefixed), <strong>every insert lands in the
+      last range, on one shard</strong>. You bought a 10-shard cluster with the write throughput
+      of 1 shard.</li>
+</ol>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 300" role="img" aria-label="Two panels. Left: ranged sharding on a timestamp sends every insert to the last shard — a hot shard. Right: hashed sharding spreads the same inserts evenly across all three shards.">
+  <style>
+    .shard { fill: none; stroke: var(--ink-faint); stroke-width: 1.4; rx: 6; }
+    .shard.hot { stroke: var(--warn, #c92a2a); stroke-width: 2; }
+    .slbl { font: 600 12px var(--font-mono); fill: var(--ink); }
+    .ttl3 { font: 700 12px var(--font-sans); fill: var(--accent); }
+    .ins { stroke: var(--accent); stroke-width: 1.4; marker-end: url(#ah4); }
+    .ins.hot { stroke: var(--warn, #c92a2a); }
+    .cap3 { font: italic 10.5px var(--font-sans); fill: var(--ink-soft); }
+    .bad4 { font: 700 11px var(--font-sans); fill: var(--warn, #c92a2a); }
+    .good4 { font: 700 11px var(--font-sans); fill: var(--accent-2); }
+  </style>
+  <defs>
+    <marker id="ah4" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="var(--ink-faint)"/>
+    </marker>
+  </defs>
+
+  <!-- left: ranged on timestamp -->
+  <text class="ttl3" x="30" y="24">Ranged key: timestamp</text>
+  <text class="cap3" x="30" y="42">inserts (always "now") →</text>
+  <rect class="shard" x="30"  y="70" width="90" height="46"/>
+  <rect class="shard" x="135" y="70" width="90" height="46"/>
+  <rect class="shard hot" x="240" y="70" width="90" height="46"/>
+  <text class="slbl" x="46"  y="97">Jan–Apr</text>
+  <text class="slbl" x="150" y="97">May–Aug</text>
+  <text class="slbl" x="253" y="97">Sep–now</text>
+  <line class="ins hot" x1="150" y1="160" x2="275" y2="122"/>
+  <line class="ins hot" x1="180" y1="180" x2="283" y2="122"/>
+  <line class="ins hot" x1="210" y1="200" x2="291" y2="122"/>
+  <text class="cap3" x="90" y="190">every new write</text>
+  <text class="bad4" x="240" y="150">HOT SHARD</text>
+  <text class="cap3" x="30" y="240">cluster write throughput = 1 shard;</text>
+  <text class="cap3" x="30" y="256">balancer forever drags fresh data away</text>
+
+  <!-- right: hashed -->
+  <text class="ttl3" x="400" y="24">Hashed key: hash(field)</text>
+  <text class="cap3" x="400" y="42">same inserts →</text>
+  <rect class="shard" x="400" y="70" width="90" height="46"/>
+  <rect class="shard" x="505" y="70" width="90" height="46"/>
+  <rect class="shard" x="610" y="70" width="90" height="46"/>
+  <text class="slbl" x="424" y="97">h: 0–5</text>
+  <text class="slbl" x="529" y="97">h: 6–a</text>
+  <text class="slbl" x="634" y="97">h: b–f</text>
+  <line class="ins" x1="520" y1="170" x2="442" y2="122"/>
+  <line class="ins" x1="548" y1="185" x2="548" y2="122"/>
+  <line class="ins" x1="575" y1="170" x2="652" y2="122"/>
+  <text class="good4" x="505" y="215">even spread</text>
+  <text class="cap3" x="400" y="240">…but range queries on the key now hit</text>
+  <text class="cap3" x="400" y="256">every shard (scatter-gather)</text>
+</svg>
+<figcaption>Monotonic keys concentrate all inserts on the last range. Hashing spreads them — and destroys
+order, so "all of March" becomes a broadcast. There is no free lunch, only a fit to your query mix.</figcaption>
+</figure>
+
+<p>
+  The choice is a query-mix decision. <b>Ranged</b> keys keep order: range queries
+  (<code>ts</code> between…) route to few shards — but monotonic/skewed keys hotspot.
+  <b>Hashed</b> keys spread writes perfectly — but only equality queries route; ranges broadcast.
+  The senior answer is often a <b>compound key</b>: <code>{tenant_id: 1, ts: 1}</code> — a coarse
+  routing field first (targets real queries), the fine/monotonic field second (splits big tenants
+  into multiple ranges).
+</p>
+
+<div class="trap">
+  <span class="label">Trap — the default <code>_id</code></span>
+  "We'll just shard on <code>_id</code>." The default <code>ObjectId</code> begins with a
+  timestamp — it is monotonic — so this is precisely the hot-shard trap with a different name.
+  Hashed <code>_id</code> fixes the hotspot and sacrifices range routing. Interviewers plant this
+  on purpose.
+</div>
+
+<p>
+  And why is this the highest-stakes decision? Because changing it means re-placing every document
+  while writes continue. The escalation ladder: <code>refineCollectionShardKey</code> (4.4 — add
+  suffix fields; can't fix a wrong first field), <code>reshardCollection</code> (5.0 — full live
+  resharding: needs ~2× the collection's storage free, days of background work on big collections,
+  and a ~2-second write-block at cutover). Possible now — but a <em>project</em>, not a command.
+  Choose right the first time.
+</p>
+
+<h2>8. Targeted vs scatter-gather</h2>
+<p>
+  If a query's filter contains the shard key (or a prefix of a compound key), mongos routes it to
+  <strong>only the owning shard(s)</strong> — <em>targeted</em>. If not, mongos must
+  <strong>broadcast to every shard</strong> and merge — <em>scatter-gather</em>. Its latency is the
+  <em>slowest</em> shard's latency, and its total cost grows with shard count — so a
+  scatter-gather-heavy workload gets <b>worse</b> as you scale out.
+</p>
+<div class="trap">
+  <span class="label">Trap — "a secondary index will fix it"</span>
+  Each shard indexes only its own data; there is <b>no global secondary index</b>. A non-shard-key
+  query still visits every shard — the index only makes each shard's local search fast. The only
+  routing field is the shard key. This is why the key is chosen from the <em>real</em> query
+  filters, not from the data model diagram.
+</div>
+
+<div class="drill">
+  <span class="label">Drill — the multi-tenant order system</span>
+  <p class="situation">You are sharding an <code>orders</code> collection for a B2B SaaS: 2,000 tenants,
+  a few of them huge; hot queries are "orders for tenant X in a date range" and "order by id".
+  A teammate proposes sharding on <code>{created_at: 1}</code>.</p>
+  What breaks with that key? Propose a better one and defend it against all three properties
+  (cardinality, frequency, monotonicity) — and say what happens to the giant tenants. Answer out
+  loud before the quiz.
+</div>
+
+<h2>9. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">Lock it in — the blank-page rule</span>
+  Close the <b>replica sets &amp; elections</b> and <b>sharding &amp; shard keys</b> leaves in the
+  <a href="../reference/backend-mastery-tree.html">tree tracker</a> when you can, from a blank page:
+  sketch a 3-node failover timeline with the w:1 rollback, explain w:majority via the majority rule,
+  and design a compound shard key while naming the hot-shard trap.
+</div>
+
+<div class="note">
+  <span class="label">Primary sources</span>
+  <a href="https://www.mongodb.com/docs/manual/core/replica-set-elections/">MongoDB — Replica Set Elections</a> and
+  <a href="https://www.mongodb.com/docs/manual/core/sharding-choose-a-shard-key/">MongoDB — Choose a Shard Key</a>
+  are the two pages of ground truth. Then skim
+  <a href="https://www.mongodb.com/docs/manual/core/retryable-writes/">Retryable Writes</a> (10 min)
+  and notice it is lesson 0002's idempotency-key pattern, verbatim.
+</div>
+
+<p class="ask">Anything unclear — why the rollback isn't a bug, how mongos knows the map, what a jumbo
+chunk is? <b>Ask your teacher</b> — open a session and say <code>/teach</code>.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li><b>Replication is for survival, sharding is for capacity.</b> Replicas never add write throughput; shards never add durability.</li>
+    <li>The document is the read unit <em>and</em> the atomic unit — model for access patterns; unbounded arrays are the classic modeling bug.</li>
+    <li>Elections need a <b>majority of voters</b> — that's why 3 nodes minimum, why a minority primary steps down, and why 2 nodes are worse than 1.</li>
+    <li><b><code>w:1</code> writes can be rolled back</b> after failover; <code>w:"majority"</code> writes never are. "Acknowledged" is only as strong as the concern you asked for.</li>
+    <li>Read <b>preference</b> picks the node; read <b>concern</b> picks the quality. The defaults (<code>primary</code> + <code>local</code>) can read data that later vanishes.</li>
+    <li>Shard keys live or die on <b>cardinality, frequency, monotonicity</b> — timestamps and <code>ObjectId</code> hotspot; hashed keys spread writes but broadcast range queries; compound keys are the senior answer.</li>
+    <li>No shard key in the filter → <b>scatter-gather</b>: every shard, slowest one sets the latency, worse as you grow.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>majorities decide what survives a failover; the shard key decides where every byte lives — both are chosen up front, and both are brutal to change later.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="0003-paging-and-versioning.html">&larr; 0003 paging &amp; versioning</a>
+  <span class="small">Next: <a href="0005-kafka-and-event-driven-architecture.html">0005 — Kafka &amp; event-driven architecture</a></span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'A write was acknowledged, the primary crashed, and the data is gone. What happened?',
+    options: [
+      'It was a w:1 write — the primary acknowledged it, died before any secondary copied it, and the rejoining old primary rolled it back',
+      'The oplog overflowed and deleted it',
+      'Impossible — acknowledged writes are always durable in a replica set'
+    ],
+    answer: 0,
+    why: 'w:1 promises only "the primary has it". A new primary elected without the write becomes the truth; the old primary rolls back its divergent history on rejoin. w:"majority" is the fix — a majority-committed write can never lose an election.'
+  },
+  {
+    q: 'Why is 3 the minimum sensible replica set size?',
+    options: [
+      'Elections and majority writes need a strict majority — with 2 nodes, majority is 2, so losing either node means no primary at all',
+      'MongoDB refuses to start with fewer than 3 nodes',
+      'Three nodes triple the write throughput'
+    ],
+    answer: 0,
+    why: 'With 2 nodes you have redundant storage but WORSE write availability than 1 node. With 3, majority = 2, so any single failure is survivable. Replicas never add write throughput — all writes hit one primary.'
+  },
+  {
+    q: 'What exactly goes wrong when you shard on a timestamp (or default ObjectId)?',
+    options: [
+      'The key is monotonic — every insert targets the last range on one shard, so the cluster writes at the speed of a single shard',
+      'Timestamps have too many distinct values for the config servers to track',
+      'Nothing — MongoDB rebalances automatically so any key works'
+    ],
+    answer: 0,
+    why: 'Monotonic keys concentrate all new writes in the maxKey range: one hot shard does 100% of inserts while the balancer perpetually drags fresh data off it. The balancer redistributes data, but it cannot redistribute the insertion point.'
+  },
+  {
+    q: 'What does a hashed shard key buy, and what does it cost?',
+    options: [
+      'Buys: even write distribution, immune to monotonic hotspots. Costs: range queries on the key become scatter-gather — only equality routes',
+      'Buys: faster individual queries. Costs: slower writes',
+      'Buys: global secondary indexes. Costs: more RAM'
+    ],
+    answer: 0,
+    why: 'The hash destroys order. "user_id = 42" routes to one shard; "March orders" now visits every shard. Choose hashed for equality-dominated access with monotonic raw values; choose ranged (often compound) when ranges dominate.'
+  },
+  {
+    q: 'Read preference "secondary" with read concern "majority" gives you…',
+    options: [
+      'A possibly stale read of data that can never be rolled back — the two settings are independent dials',
+      'An error — secondaries cannot serve majority reads',
+      'A fresh, linearizable read'
+    ],
+    answer: 0,
+    why: 'Preference picks the NODE (a secondary — asynchronous, so possibly stale). Concern picks the QUALITY (majority-committed — durable, never rolled back). Stale-but-durable is a perfectly valid, and common, combination.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Walk me through a primary failover — timeline and what the application sees." (interview classic)',
+    answer: 'Heartbeats every 2s; after <b>electionTimeoutMillis (10s default)</b> secondaries call a Raft-style election — majority vote, most-up-to-date candidate wins; median total failover <b>≤ 12s</b>, during which no writes are accepted cluster-wide. The app: reads can continue on secondaries if allowed; single-document writes carry a <b>session + txnNumber</b> (retryable writes), the driver retries once against the new primary, and the server dedupes by that ID — the app sees a latency blip, not a duplicate. Afterwards, any <b>w:1</b> writes the old primary never replicated are rolled back.'
+  },
+  {
+    prompt: '"How do you choose a shard key?" — the three-property answer',
+    answer: 'Judge every candidate on <b>cardinality</b> (enough distinct values to split), <b>frequency</b> (no value so common it forms an unsplittable jumbo range), <b>monotonicity</b> (never a key that only grows — timestamp/ObjectId → one hot shard takes every insert). Then match the query mix: <b>ranged</b> keys route range queries but can hotspot; <b>hashed</b> keys spread writes but broadcast ranges; the senior default is a <b>compound key</b> — coarse routing field first (tenant_id), fine field second (ts) — so real queries stay targeted AND big tenants split across ranges. And say it: changing the key later is live resharding — possible since 5.0, but ~2× storage and a real project.'
+  },
+  {
+    prompt: 'The drill: what is wrong with sharding orders on {created_at: 1}, and what is better?',
+    answer: 'created_at is <b>monotonic</b> — all inserts hit the newest range: one hot shard, cluster writes at single-shard speed, balancer thrashing behind it. Better: <b>{tenant_id: 1, created_at: 1}</b> — the hot query "tenant X in date range" is targeted by prefix; created_at as suffix splits the giant tenants into many ranges so no single tenant becomes a jumbo chunk. Check the properties: cardinality high (2,000 tenants × time), frequency — watch the biggest tenants (the suffix handles them), monotonicity — broken by the tenant prefix. "Order by id" stays targeted if id lookups include tenant_id, or accept a rare scatter-gather for it.'
+  }
+]);
+</script>
+</body>
+</html>

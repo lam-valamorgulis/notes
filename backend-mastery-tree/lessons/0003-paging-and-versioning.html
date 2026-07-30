@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0003 · Paging &amp; versioning — Backend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Domain 3 · API design · REST · Lesson 0003</p>
+<h1>Paging &amp; versioning</h1>
+<p class="subtitle">Collections grow and clients multiply. Two ideas, one fear: things you don't control, attached to your API.</p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you never ship an unbounded collection endpoint again,
+  you can choose offset vs cursor paging with reasons, and you can evolve a live API without
+  breaking clients you cannot see.
+</div>
+
+<h2>1. The time bomb: an unbounded collection</h2>
+<p>
+  <code>GET /orders</code> returns "all orders." On launch day that is 50 rows — fine. Two years later it
+  is 4 million rows, and that one endpoint now builds a 2&nbsp;GB response, holds a database connection
+  for a minute, and crashes the mobile app that tries to parse it. Nothing "broke" — the data just grew.
+</p>
+<p>
+  So the rule is absolute: <strong>every collection endpoint is bounded from day one.</strong>
+  The only question is <em>how you slice</em>. There are two ways.
+</p>
+
+<h2>2. Slice 1 — offset paging</h2>
+<pre><code>GET /orders?limit=20&amp;offset=40        <span class="cmt">→ SQL: ... LIMIT 20 OFFSET 40</span></code></pre>
+<p>
+  "Skip 40 rows, give me the next 20." Dead simple, maps straight onto SQL, and the client can jump
+  to any page number. Two real flaws:
+</p>
+<ul>
+  <li><strong>The window drifts.</strong> Offset counts positions in <em>whatever the list is right now</em>.
+      If rows are inserted or deleted while a user pages through, the window shifts under them —
+      items repeat or silently disappear.</li>
+  <li><strong>Deep pages are slow.</strong> <code>OFFSET 100000</code> does not teleport: the database must
+      walk and <em>throw away</em> 100,000 rows to find row 100,001. The cost grows with depth —
+      page 5,000 can take seconds while page 1 is instant.</li>
+</ul>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 300" role="img" aria-label="Offset drift: a new row inserted at the top shifts the whole list down, so page 2 repeats an item the user already saw on page 1">
+  <style>
+    .row { fill: var(--card-bg); stroke: var(--rule, #999); stroke-width: 1; }
+    .row.seen { stroke: var(--accent); stroke-width: 1.5; }
+    .row.new  { fill: color-mix(in srgb, var(--accent-2) 22%, var(--card-bg)); stroke: var(--accent-2); stroke-width: 1.5; }
+    .rl { font: 500 11.5px var(--font-mono); fill: var(--ink); }
+    .ttl3 { font: 700 12px var(--font-sans); fill: var(--accent); }
+    .cap { font: italic 11px var(--font-sans); fill: var(--ink-faint); }
+    .win2 { fill: none; stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 5 3; }
+    .dup { font: 700 11.5px var(--font-sans); fill: var(--warn, #c92a2a); }
+  </style>
+
+  <!-- left: page 1 request -->
+  <text class="ttl3" x="40" y="24">t1 · page 1 (offset 0, limit 3)</text>
+  <rect class="row seen" x="40" y="40"  width="180" height="30"/><text class="rl" x="52" y="60">order #907</text>
+  <rect class="row seen" x="40" y="74"  width="180" height="30"/><text class="rl" x="52" y="94">order #906</text>
+  <rect class="row seen" x="40" y="108" width="180" height="30"/><text class="rl" x="52" y="128">order #905</text>
+  <rect class="row" x="40" y="142" width="180" height="30"/><text class="rl" x="52" y="162">order #904</text>
+  <rect class="row" x="40" y="176" width="180" height="30"/><text class="rl" x="52" y="196">order #903</text>
+  <rect class="win2" x="34" y="35" width="192" height="108"/>
+  <text class="cap" x="40" y="230">user sees #907 #906 #905</text>
+
+  <!-- right: page 2 request after an insert -->
+  <text class="ttl3" x="440" y="24">t2 · page 2 (offset 3) — but #908 arrived</text>
+  <rect class="row new" x="440" y="40"  width="180" height="30"/><text class="rl" x="452" y="60">order #908 ← new</text>
+  <rect class="row" x="440" y="74"  width="180" height="30"/><text class="rl" x="452" y="94">order #907</text>
+  <rect class="row" x="440" y="108" width="180" height="30"/><text class="rl" x="452" y="128">order #906</text>
+  <rect class="row seen" x="440" y="142" width="180" height="30"/><text class="rl" x="452" y="162">order #905 ← again!</text>
+  <rect class="row" x="440" y="176" width="180" height="30"/><text class="rl" x="452" y="196">order #904</text>
+  <rect class="win2" x="434" y="137" width="192" height="108"/>
+  <text class="dup" x="440" y="270">offset 3 now starts at #905 —</text>
+  <text class="dup" x="440" y="285">the user sees it twice</text>
+
+  <!-- middle arrow -->
+  <text class="cap" x="272" y="128">insert happens</text>
+  <text class="cap" x="285" y="143">between pages →</text>
+</svg>
+<figcaption>Offset counts <em>positions</em>, and positions move. One insert between two page requests
+and the window lands on a row the user already saw. This is why feeds built on offsets show duplicates.</figcaption>
+</figure>
+
+<h2>3. Slice 2 — cursor (keyset) paging</h2>
+<pre><code>GET /orders?limit=20&amp;after=eyJpZCI6OTA1fQ   <span class="cmt">→ SQL: WHERE (created_at, id) &lt; (…) ORDER BY created_at DESC, id DESC LIMIT 20</span></code></pre>
+<p>
+  Instead of a position number, the server returns an opaque <strong>cursor</strong> with each page —
+  a bookmark that encodes the <em>last item you saw</em> (its sort key, for example
+  <code>created_at + id</code>). The next request says: "the 20 that come <em>after this bookmark</em>."
+</p>
+<ul>
+  <li><strong>No drift.</strong> The bookmark points at an <em>item</em>, not a position. Inserts above it
+      cannot shift your window — you continue exactly after what you saw.</li>
+  <li><strong>No deep-page penalty.</strong> The database jumps to the bookmark through an index instead of
+      counting rows — as fast on page 5,000 as on page 1. (The machinery behind that jump is the
+      <b>B-tree</b> — a ★ leaf waiting in Domain 4.)</li>
+  <li><strong>The trade:</strong> no "jump to page 7", and you need a stable, unique sort key
+      (that is why the cursor carries <code>id</code> as a tie-breaker, not just the timestamp).</li>
+</ul>
+
+<div class="soundbite">
+  <span class="label">Rule of thumb</span>
+  <p>Admin table with page numbers and modest data → offset is fine. Infinite scroll, feeds, anything
+  big or hot → cursor. This is why the big public APIs — GitHub, Stripe, Slack — are cursor-based.</p>
+</div>
+
+<h2>4. Versioning: an API is a promise to strangers</h2>
+<p>
+  The moment one stranger's code calls your API, every field name and behavior becomes a promise you
+  cannot take back. You cannot see your callers. You cannot fix their code. Anything you change breaks
+  someone, silently. Versioning is how you evolve anyway — but the best version is the one you never ship:
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>Safe forever (additive)</th><th>Breaks someone (needs a version)</th></tr>
+  <tr><td>add a new <em>optional</em> response field</td><td>rename or remove a field</td></tr>
+  <tr><td>add a new endpoint</td><td>change a field's type or meaning</td></tr>
+  <tr><td>add an optional query parameter</td><td>make an optional thing required</td></tr>
+</table>
+</div>
+<p>
+  Teams that stay in the left column ship for years on <code>v1</code>. The matching client-side habit is
+  called the <strong>tolerant reader</strong>: ignore fields you do not recognize, never depend on field
+  order. Both sides bend so neither breaks.
+</p>
+
+<h2>5. When you must break: three places to put the version</h2>
+<div class="table-scroll">
+<table>
+  <tr><th>Style</th><th>Looks like</th><th>Trade-off</th></tr>
+  <tr>
+    <td><b>URL</b></td>
+    <td><code>GET /v2/orders</code></td>
+    <td>Visible, easy to test in a browser, cache-friendly. "Impure" (the version is not part of the
+        resource's identity) — nobody cares; it is the most common choice.</td>
+  </tr>
+  <tr>
+    <td><b>Header</b></td>
+    <td><code>Accept: application/vnd.myapi.v2+json</code></td>
+    <td>Clean URLs; but invisible, harder to test, easy to forget in one client out of five.</td>
+  </tr>
+  <tr>
+    <td><b>Date pin</b></td>
+    <td><code>Stripe-Version: 2024-06-20</code></td>
+    <td>Each account pins the behavior-date it was built against; the server keeps translation layers
+        from every old date. Best client experience, most server work.</td>
+  </tr>
+</table>
+</div>
+<p>
+  <strong>Rule of thumb:</strong> stay additive on <code>/v1</code> for as long as humanly possible; take URL
+  versioning when you truly must break; admire Stripe's date-pinning from a distance until you have
+  Stripe's problems.
+</p>
+
+<div class="drill">
+  <span class="label">Drill — the duplicate feed</span>
+  <p class="situation">Users report that the activity feed sometimes shows the same entry twice while
+  they scroll. The feed is busy — new entries arrive every few seconds. The endpoint is
+  <code>GET /feed?limit=20&amp;offset=N</code>.</p>
+  Diagnose the mechanism (why exactly does a duplicate appear?), then give the fix — including what
+  the new request and response look like, and which column(s) the cursor must encode. Answer out loud
+  before flipping the recall card.
+</div>
+
+<h2>6. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">Lock it in — the blank-page rule</span>
+  Close this leaf in the <a href="../reference/backend-mastery-tree.html">tree tracker</a> when you can,
+  from a blank page: name offset paging's two flaws with their mechanisms, sketch a cursor request/response,
+  list three additive vs three breaking changes, and place the three versioning styles.
+</div>
+
+<div class="note">
+  <span class="label">Primary sources</span>
+  <a href="https://use-the-index-luke.com/no-offset">Markus Winand — "No Offset"</a> (10 min) is the
+  canonical case for keyset paging, with the SQL. Then
+  <a href="https://stripe.com/blog/api-versioning">Stripe — APIs as infrastructure: API versioning</a>
+  (15 min): how date-pinning works in production and why they chose it.
+</div>
+
+<p class="ask">Anything unclear — how the cursor is encoded, why the id tie-breaker matters, when a
+breaking change is truly unavoidable? <b>Ask your teacher</b> — open a session and say <code>/teach</code>.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li><b>Bound every collection endpoint from day one</b> — unbounded lists fail by growth, not by bugs.</li>
+    <li>Offset paging counts <b>positions</b>: simple + page jumps, but the window <b>drifts</b> under inserts and deep offsets scan-and-discard.</li>
+    <li>Cursor paging bookmarks an <b>item</b>: no drift, index-fast at any depth; trade = no page jumps, needs a stable sort key + id tie-breaker.</li>
+    <li>An API field, once published, is a <b>promise to code you cannot see</b>.</li>
+    <li>Evolve <b>additively</b> (new optional fields, new endpoints) and you may never need v2; clients read tolerantly.</li>
+    <li>Must break? <b>URL version</b> is the pragmatic default; header is purist; date-pin is Stripe-grade.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>offset says "give me rows 41–60 of whatever the list is now"; a cursor says "give me what comes after this bookmark" — and only the bookmark survives a changing list.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="0002-idempotency.html">&larr; 0002 idempotency</a>
+  <span class="small">Next: 0004 — validation &amp; error shape (coming)</span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Why is GET /orders with no limit a "time bomb" rather than a bug?',
+    options: [
+      'It works fine until the data grows — then one endpoint returns unbounded responses that exhaust memory, connections, and clients',
+      'HTTP forbids responses over 1 MB, so it will start returning errors',
+      'Unpaged queries bypass the database index'
+    ],
+    answer: 0,
+    why: 'Nothing in the code is wrong on day one; the failure arrives with growth. That is why the bound must exist from the first version — it cannot be retrofitted onto clients already expecting everything.'
+  },
+  {
+    q: 'A busy feed on offset paging shows an item twice. The mechanism?',
+    options: [
+      'New rows inserted between page requests shift every position down, so the next offset window overlaps what was already seen',
+      'The browser cached page 2 and replayed it',
+      'The database returned rows in random order'
+    ],
+    answer: 0,
+    why: 'Offset counts positions in the list as it is NOW. An insert at the top pushes the old rows down one position, and the next window starts on a row the user already saw.'
+  },
+  {
+    q: 'Why is OFFSET 100000 slow even with an index on the sort column?',
+    options: [
+      'The database must still walk and discard 100,000 rows to find where the page starts',
+      'Large numbers take longer to parse in SQL',
+      'It is not slow — offset cost is constant at any depth'
+    ],
+    answer: 0,
+    why: 'OFFSET is scan-and-throw-away — cost grows linearly with depth. A cursor instead seeks the bookmark through the index (WHERE sort_key < …), which is fast at any depth.'
+  },
+  {
+    q: 'Which change can you ship on /v1 without breaking any client?',
+    options: [
+      'Adding a new optional field to the response',
+      'Renaming "created" to "created_at" for consistency',
+      'Changing "amount" from cents (integer) to dollars (decimal)'
+    ],
+    answer: 0,
+    why: 'Additive changes are invisible to tolerant readers. Renames remove a field someone reads; changing meaning is the worst break of all — the shape stays valid while every number is silently wrong.'
+  },
+  {
+    q: 'Why does a cursor typically encode created_at AND id, not just created_at?',
+    options: [
+      'Timestamps collide — id breaks the tie so the sort order is total and no row is skipped or repeated at the boundary',
+      'The id makes the cursor shorter',
+      'Databases cannot index timestamp columns'
+    ],
+    answer: 0,
+    why: 'Two rows created in the same millisecond have equal timestamps. Without a unique tie-breaker the boundary between pages is ambiguous — the exact bug cursors exist to prevent.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Offset vs cursor paging — when do you pick which?" (say the mechanisms, not just the names)',
+    answer: 'Offset counts <b>positions</b>: trivial to implement, allows page jumps, but positions move — inserts make the window <b>drift</b> (duplicates/skips), and deep offsets force the database to <b>scan and discard</b> N rows. A cursor bookmarks an <b>item</b> (its sort key + id): immune to drift and index-fast at any depth, but no random page access. Small admin tables → offset. Feeds, infinite scroll, big/hot data → cursor.'
+  },
+  {
+    prompt: '"How do you evolve an API without breaking clients?"',
+    answer: 'Treat every published field as a <b>promise to code I cannot see</b>. First strategy: never break — ship only <b>additive</b> changes (new optional fields, new endpoints) and rely on tolerant readers. When a break is unavoidable: put a version somewhere explicit — <b>URL</b> (<code>/v2/</code>, pragmatic default), <b>header</b> (cleaner, less visible), or <b>date-pin</b> per account like Stripe (best for clients, heavy for the server) — and keep v1 running while clients migrate.'
+  },
+  {
+    prompt: 'The drill: duplicate feed entries — diagnosis and fix.',
+    answer: 'Diagnosis: offset drift — entries inserted between two page requests shift positions down, so <code>offset=20</code> starts on a row page 1 already showed. Fix: switch to cursor paging. Response gains <code>next_cursor</code> (encoding the last row\'s <code>created_at</code> + <code>id</code> tie-breaker); the next request is <code>GET /feed?limit=20&amp;after=&lt;cursor&gt;</code> → SQL <code>WHERE (created_at, id) &lt; (…) ORDER BY created_at DESC, id DESC</code>. The bookmark points at an item, not a position, so inserts above it cannot cause repeats.'
+  }
+]);
+</script>
+</body>
+</html>

@@ -1,0 +1,245 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC &amp; media in React — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Special track · Lesson 6 · Real-time React</p>
+  <h1>WebRTC &amp; media in React</h1>
+  <p class="subtitle">A camera stream is a handle to hardware, not a value. React can't diff it, shouldn't own it — but has to display it. Here's the pattern.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll be able to <b>(1)</b> put a live camera or screen-share on screen in React without leaks (no camera LED left burning), <b>(2)</b> wrap an imperative call engine in a provider so React renders <em>its</em> truth instead of guessing, and <b>(3)</b> answer the video-call interview questions with patterns from a real product — <b>a virtual-office collaboration app</b>, our case-study codebase, whose React call stack this lesson is drawn from.
+  </div>
+
+  <p>Lesson 5's rule was: the socket is a side effect, its messages are state. Media pushes that rule further. A <code>MediaStream</code> is a <b>live handle to your camera and microphone</b> — it can't be serialized, can't be diffed, and "rendering" it means wiring it into a <code>&lt;video&gt;</code> element imperatively. React's two escape hatches — <b>refs</b> and <b>effects</b> — are the entire toolkit here.</p>
+
+  <h2>First principle — displaying a stream needs a ref</h2>
+  <p>There is no <code>&lt;video src={stream}&gt;</code>. A live stream attaches to a media element through a DOM property, <code>srcObject</code> — and reaching a DOM node from React is exactly what refs are for:</p>
+
+  <pre><code>function VideoTile({ stream, muted = false }: { stream: MediaStream; muted?: boolean }) {
+  const videoRef = useRef&lt;HTMLVideoElement&gt;(null);
+
+  useEffect(() =&gt; {
+    const el = videoRef.current;
+    if (!el) return;
+    el.srcObject = stream;                    <span class="cmt">// the imperative attach — no JSX prop exists for this</span>
+    return () =&gt; { el.srcObject = null; };    <span class="cmt">// detach on unmount / stream change</span>
+  }, [stream]);
+
+  return &lt;video ref={videoRef} autoPlay playsInline muted={muted} /&gt;;
+}</code></pre>
+
+  <p>Three attributes carry real meaning: <code>autoPlay</code> (a live call can't wait for a play button), <code>playsInline</code> (iOS otherwise hijacks the video into fullscreen), and <code>muted</code> for <b>your own preview</b> — you would hear yourself, and browsers only allow autoplay-with-audio on muted elements anyway. The case-study app's <code>createVideoElement</code> helper does these exact steps imperatively; in React, the ref + effect pair is the same code in its proper home.</p>
+
+  <h2>Acquiring hardware — the effect that must clean up</h2>
+  <pre><code>function CameraPreview({ deviceId }: { deviceId: string }) {
+  const [stream, setStream] = useState&lt;MediaStream | null&gt;(null);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    navigator.mediaDevices
+      .getUserMedia({ video: { deviceId: { exact: deviceId } } })  <span class="cmt">// exact: THIS camera (cf. the case-study app's settings modal)</span>
+      .then(s =&gt; {
+        if (cancelled) { s.getTracks().forEach(t =&gt; t.stop()); return; }  <span class="cmt">// arrived after unmount → release immediately</span>
+        setStream(s);
+      });
+    return () =&gt; {
+      cancelled = true;
+      setStream(prev =&gt; { prev?.getTracks().forEach(t =&gt; t.stop()); return null; });
+    };
+  }, [deviceId]);
+
+  return stream ? &lt;VideoTile stream={stream} muted /&gt; : &lt;p&gt;Starting camera…&lt;/p&gt;;
+}</code></pre>
+
+  <div class="trap">
+    <span class="label">Trap — the camera LED that never turns off</span>
+    <code>track.stop()</code> is what <b>physically releases the device</b> — the LED, the OS indicator, the hardware lock. Detaching <code>srcObject</code> or unmounting the component does <em>not</em> do it. Two classic leaks: forgetting cleanup entirely, and the subtler one handled above — <code>getUserMedia</code> is async, so the stream can <b>resolve after unmount</b>; without the <code>cancelled</code> check you stop nothing and the LED burns forever. Users notice this bug more than any other you will ever ship.
+  </div>
+
+  <p>Note the division of labor: <code>stream</code> <em>is</em> in <code>useState</code> here — but as an <b>opaque handle</b> whose <em>identity</em> triggers re-render ("we have a stream now"), never as data you map over or spread. The moment you're tempted to put it in a store, JSON-log it, or send it anywhere — stop; it's hardware, not data.</p>
+
+  <h2>The engine pattern — a call is a machine, React is its dashboard</h2>
+  <p>A real call involves signaling, transports, producers, consumers, reconnect timers — a stateful <em>machine</em> with a lifetime much longer than any component. The case-study app's engine is a <b>framework-free EventEmitter class</b> of 2,000+ lines (<code>xms_client.js</code>) that knows nothing about React; the React layer (<code>VoiceCallProvider</code>) wraps it. This separation is the single most important design decision in the whole domain:</p>
+
+  <pre><code><span class="cmt">// ── the engine: plain TypeScript, no React (simplified case-study shape) ──</span>
+class CallEngine extends EventTarget {
+  peers = new Map&lt;string, Peer&gt;();          <span class="cmt">// each Peer holds its MediaStream</span>
+  micPaused = false;
+
+  async join(roomId: string) { <span class="cmt">/* signaling handshake, transports, produce */</span> }
+  toggleMic() {
+    this.micPaused = !this.micPaused;        <span class="cmt">// pause the producer + tell the server —</span>
+    this.dispatchEvent(new Event('change')); <span class="cmt">// uplink actually stops (not track.enabled!)</span>
+  }
+  leave() { <span class="cmt">/* close producers, consumers, transports */</span> }
+}
+export const engine = new CallEngine();      <span class="cmt">// module singleton, like lesson 5's socket</span></code></pre>
+
+  <pre><code><span class="cmt">// ── the bridge: React subscribes to the machine ──────────────────────</span>
+function useCallState() {
+  return useSyncExternalStore(
+    (onChange) =&gt; {                                        <span class="cmt">// subscribe</span>
+      engine.addEventListener('change', onChange);
+      return () =&gt; engine.removeEventListener('change', onChange);
+    },
+    () =&gt; engine.snapshot()                                <span class="cmt">// read: { peers: [...], micPaused } — a plain object</span>
+  );
+}
+
+function MicButton() {
+  const { micPaused } = useCallState();                    <span class="cmt">// truth comes FROM the engine…</span>
+  return (
+    &lt;button onClick={() =&gt; engine.toggleMic()}&gt;           <span class="cmt">// …commands go TO the engine</span>
+      {micPaused ? '🔇 Unmute' : '🎙 Mute'}
+    &lt;/button&gt;
+  );
+}</code></pre>
+
+  <p>Commands flow down (<code>engine.toggleMic()</code>), state flows up (events → snapshot → render). The button holds <b>no state of its own</b> — and that's the point:</p>
+
+  <div class="trap">
+    <span class="label">Trap — the mute button that lies</span>
+    The junior version: <code>const [muted, setMuted] = useState(false)</code> in the button, toggled on click. Now there are <b>two copies of the truth</b> — the component's boolean and the engine's actual producer — and they drift: the engine can mute without you (server-side moderation, device unplugged, reconnect restoring state), and the button smiles "🎙 on" while the mic is dead. The case-study app reads mute state from <code>producer.paused</code> — the object that actually knows. UI state that mirrors an external system must be <b>derived from it, never duplicated</b>.
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The architecture, in one line</span>
+    <p><b>The engine owns the call; React renders a snapshot of it.</b> Same shape as lesson 5 — singleton + subscription + state — just with a bigger machine on the other side of the border.</p>
+  </div>
+
+  <h2>Rendering peers — Month 1's keys, with faces</h2>
+  <pre><code>function VideoGrid() {
+  const { peers } = useCallState();          <span class="cmt">// Peer[] from the engine's Map</span>
+  return (
+    &lt;div className="grid"&gt;
+      {peers.map(peer =&gt; (
+        &lt;VideoTile key={peer.userId} stream={peer.stream} /&gt;   <span class="cmt">// key = identity, NOT index</span>
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+  <p>Why the key matters more than usual here: in a real room the peer list <b>churns</b> — the case-study app shows video for only the <b>3 loudest speakers</b> and swaps who's in that window as the conversation moves. With <code>key={peer.userId}</code>, React <em>moves</em> the existing <code>&lt;video&gt;</code> elements and only mounts tiles for genuinely new speakers. With <code>key={index}</code>, a swap re-attaches every stream to the wrong element — a heavy, visible glitch (video flashes black) instead of a free reorder. Reconciliation (Lesson 3) stops being abstract the day each list item owns a hardware pipeline.</p>
+
+  <h2>Two UX details that separate real products</h2>
+  <ul>
+    <li><b>Screen share ends outside your UI.</b> <code>getDisplayMedia</code> shows a browser-owned "Stop sharing" bar, and users click <em>that</em>, not your button. The track fires <code>ended</code> — the engine listens (<code>track.onended</code>), runs the same cleanup as your stop button, and emits a change event so React updates. Miss it and your UI says "sharing" while nothing flows. (The case-study app wires exactly this on the producer's <code>trackended</code>.)</li>
+    <li><b>Devices come and go mid-call.</b> Headsets unplug; permissions change in browser settings. The case-study app's <code>useDeviceManager</code> subscribes to <code>navigator.mediaDevices.ondevicechange</code> and <code>navigator.permissions.query({ name: 'camera' }).onchange</code> — both are effects with cleanup, both end in <code>setState</code>, and the device dropdown is again just <code>UI = f(devices)</code>. When the active mic disappears, it auto-selects a replacement rather than leaving the call silent.</li>
+  </ul>
+
+  <div class="drill">
+    <span class="label">Drill — the settings preview</span>
+    <p class="situation">Build the camera-settings panel: a dropdown of cameras and a live preview of the selected one (the case-study app has exactly this modal). Requirements: switching cameras must release the old one (LED off), closing the panel must release everything, and the preview must be silent.</p>
+    Which pieces are state, which are refs, which are effects — and where exactly does <code>track.stop()</code> run? Sketch the component before the quiz; every part is already on this page.
+  </div>
+
+  <h2>Prove it</h2>
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Where the other half of this story lives</span>
+    Everything below the React layer — why media rides UDP, STUN/TURN/ICE, the mesh-vs-SFU math,
+    simulcast, and the full case-study join handshake — is
+    <a href="../../backend-mastery-tree/lessons/0007-webrtc-and-realtime-media.html">Backend Mastery Tree · 0007 WebRTC &amp; real-time media</a>.
+    This lesson is the client-integration half.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this</span>
+    <ul>
+      <li>A <code>MediaStream</code> is a <b>hardware handle, not data</b>: attach it with a ref via <code>el.srcObject</code>; hold it in state only as an opaque identity.</li>
+      <li><code>track.stop()</code> releases the device — unmounting does not. Guard the async gap: a stream that resolves <b>after unmount</b> must be stopped on arrival.</li>
+      <li>Local preview: <code>autoPlay playsInline muted</code> — each word load-bearing.</li>
+      <li><b>Engine pattern:</b> the call lives in a framework-free singleton class; React subscribes (<code>useSyncExternalStore</code> or events→state) and renders a snapshot. Commands down, events up.</li>
+      <li><b>Never duplicate external truth:</b> the mute button reads the engine's state (<code>producer.paused</code>), it doesn't keep its own boolean.</li>
+      <li>Peer grids churn — <code>key={userId}</code> makes reorders free; <code>key={index}</code> re-attaches every stream on every swap.</li>
+      <li>Handle the exits you don't own: the browser's "Stop sharing" bar (<code>track.onended</code>) and devices unplugging mid-call (<code>ondevicechange</code>).</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the engine owns the call and React renders its snapshot — refs to attach hardware to the DOM, effects to acquire and release it, and no component ever keeping a private copy of the truth.</b></p>
+  </div>
+
+  <div class="footer-nav">
+    <a href="../index.html">← The Map</a>
+    <a href="0005-websockets-in-react.html">← 5 · WebSockets in React</a>
+    <span class="small">Next: back to <a href="../index.html">the Map</a> — Month 2 continues the main road.</span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "How do you display a live MediaStream in React?",
+      options: [
+        "A ref on the <video> element + an effect that sets el.srcObject = stream (and detaches in cleanup) — no JSX prop exists for live streams",
+        "<video src={stream}> — React converts the stream to a URL automatically",
+        "Store the stream in context and render {stream} as a child",
+        "JSON.stringify the stream into a data: URL"
+      ],
+      answer: 0,
+      why: "srcObject is a DOM property with no attribute/JSX equivalent — the imperative escape hatch is exactly what refs are for. The effect pairs attach (srcObject = stream) with detach (srcObject = null), keyed on the stream identity."
+    },
+    {
+      q: "A user closes your camera settings panel, but the camera LED stays on. The most likely cause?",
+      options: [
+        "Nobody called track.stop() — either cleanup is missing, or getUserMedia resolved AFTER unmount and the late stream was never stopped",
+        "The browser keeps cameras on for 60 seconds as a warm-up cache",
+        "srcObject wasn't set to null, which keeps the hardware locked",
+        "The <video> element wasn't removed from the DOM"
+      ],
+      answer: 0,
+      why: "Only track.stop() releases hardware. The subtle version is the async gap: the component unmounts while getUserMedia is still pending, the stream arrives to nobody, and nothing stops it — hence the cancelled-flag pattern that stops late-arriving streams immediately."
+    },
+    {
+      q: "Why should the mute button NOT keep its own useState boolean?",
+      options: [
+        "The engine can change mute state without the button (moderation, reconnect, device loss) — two copies of the truth drift; the button must render the engine's state and only send commands",
+        "useState is too slow for audio controls",
+        "Booleans can't trigger re-renders reliably",
+        "It should — a local boolean is the standard pattern"
+      ],
+      answer: 0,
+      why: "UI state that mirrors an external system must be derived, never duplicated. The case-study app reads producer.paused — the object that actually knows. The React shape: commands flow down (engine.toggleMic()), truth flows up (change events → snapshot → render)."
+    },
+    {
+      q: "In a video grid where the '3 loudest speakers' window swaps constantly, key={index} causes…",
+      options: [
+        "every swap to re-attach streams to the wrong <video> elements — visible black flashes — while key={userId} lets React move existing elements for free",
+        "a compile error — index keys are forbidden on media elements",
+        "nothing different; keys only matter for form inputs",
+        "faster renders, since indexes are cheaper to compare than strings"
+      ],
+      answer: 0,
+      why: "Keys are identity (Lesson 3). With index keys, a reorder looks like 'every item changed', so React rewires srcObject on every tile — heavy and visibly glitchy when each item owns a hardware pipeline. Identity keys turn the same swap into a cheap DOM move."
+    },
+    {
+      q: "The user stops screen-sharing via the browser's own 'Stop sharing' bar. Your app still shows 'sharing'. What was missed?",
+      options: [
+        "The track's ended event — the engine must listen for it, run the same cleanup as the in-app stop button, and emit a change so React re-renders",
+        "Nothing can be done; the browser bar is invisible to JavaScript",
+        "A setInterval polling getDisplayMedia every second",
+        "The onbeforeunload handler"
+      ],
+      answer: 0,
+      why: "Exits you don't own still fire events you do: track.onended. The case-study app routes it into the exact stop-sharing cleanup path, so the UI can never say 'sharing' while nothing flows. The general rule: every external way a resource can die needs a listener that ends in setState."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How would you build the video-call UI in React? Walk me through the architecture.”",
+      answer: "The call itself lives in a <b>framework-free engine</b> — a singleton class owning signaling, producers/consumers, and reconnection (in the case-study app it's an EventEmitter the React app wraps). React is the <b>dashboard</b>: a provider or <code>useSyncExternalStore</code> subscribes to the engine's change events and renders a plain-object snapshot; components send <b>commands</b> to the engine and never keep private copies of its state. Streams attach to <code>&lt;video&gt;</code> via <b>refs + srcObject</b>; hardware is acquired and released in <b>effects</b> with <code>track.stop()</code> in cleanup; the peer grid uses <b>identity keys</b> because the speaker window churns."
+    },
+    {
+      prompt: "Interviewer: “What are the classic leaks in camera/mic features, and how do you prevent them?”",
+      answer: "Three. <b>(1) The unstopped track</b> — only <code>track.stop()</code> releases the device; every acquisition effect must stop all tracks in cleanup. <b>(2) The async gap</b> — <code>getUserMedia</code> can resolve after unmount, so the cleanup sets a <code>cancelled</code> flag and the then-handler stops late streams immediately. <b>(3) The stale attach</b> — when the stream prop changes, the effect keyed on <code>[stream]</code> must detach the old one (<code>srcObject = null</code>) before attaching the new. The test I'd mention: open and close the settings panel five times fast — the LED must be off and <code>navigator.mediaDevices.enumerateDevices()</code> must show no lingering use."
+    },
+    {
+      prompt: "The drill: the settings preview — what is state, what is ref, what is effect?",
+      answer: "<b>State:</b> the device list (from <code>enumerateDevices</code>), the selected <code>deviceId</code>, and the current preview stream as an opaque handle. <b>Ref:</b> the <code>&lt;video&gt;</code> element, for <code>srcObject</code>. <b>Effects:</b> one keyed on <code>[deviceId]</code> that calls <code>getUserMedia({ video: { deviceId: { exact } } })</code> — its cleanup runs <code>track.stop()</code> on the old stream, which handles both switching cameras AND closing the panel (unmount runs the same cleanup); one for <code>ondevicechange</code> to refresh the list. The preview <code>&lt;video&gt;</code> is <code>autoPlay playsInline muted</code> — muted both for autoplay policy and because nobody wants to hear themselves."
+    }
+  ]);
+</script>

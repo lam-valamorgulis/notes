@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0006 · WebSockets at scale — Backend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Domain 6 · Architecture · Real-time · Lesson 0006</p>
+<h1>WebSockets at scale</h1>
+<p class="subtitle">One open phone line per user. Cheap per message — and it quietly breaks every stateless scaling rule you know.</p>
+
+<div class="win">
+  <strong>The win:</strong> after ~45 minutes you can answer the two senior real-time questions cold:
+  <em>"design chat for 1M concurrent users"</em> and
+  <em>"deploy new code without dropping 100k live connections"</em> — with the load-bearing words:
+  backplane, fan-out amplification, heartbeat sweep, jittered backoff, and resume-from-sequence.
+</div>
+
+<h2>1. The protocol, in two minutes</h2>
+<p>
+  A WebSocket starts life as a normal HTTP GET with two special headers
+  (<code>Upgrade: websocket</code>, a random <code>Sec-WebSocket-Key</code>). The server answers
+  <code>101 Switching Protocols</code> — and from that moment <strong>HTTP is over</strong>. The
+  same TCP connection stops carrying request/response pairs and becomes a persistent,
+  <b>full-duplex</b> byte pipe: both sides send whenever they want, with 2–14 bytes of framing per
+  message instead of hundreds of bytes of HTTP headers.
+</p>
+<p>
+  Wire details worth owning: the unit you send is a <b>message</b>, possibly split into
+  <b>frames</b>; <b>ping/pong</b> control frames test liveness (browsers answer pings automatically
+  but give JavaScript no API to send them — so <em>the server</em> pings); a clean shutdown is a
+  <b>close-frame handshake</b> with a code. Two codes to know: <code>1000</code> (normal) and
+  <code>1006</code> (the TCP connection died with no close frame — what you see when networks just
+  drop; it is synthesized locally, never sent).
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th></th><th>Long-polling</th><th>SSE</th><th>WebSocket</th></tr>
+  <tr><td>Direction</td><td>server→client (re-request)</td><td>server→client only</td><td><b>full duplex</b></td></tr>
+  <tr><td>Overhead per message</td><td>full HTTP headers</td><td>tiny</td><td>2–14 bytes</td></tr>
+  <tr><td>Reconnect</td><td>you build it</td><td><b>built into the browser</b> (+resume)</td><td>you build it</td></tr>
+  <tr><td>Infrastructure</td><td>plain HTTP — friendliest</td><td>plain HTTP</td><td>needs Upgrade support on every hop</td></tr>
+</table>
+</div>
+<p>
+  The decision rule: client pushes frequent small messages (typing, cursors, game input, call
+  signaling) → <b>WebSocket</b>. One-way feed (notifications, tickers, LLM token streaming — this
+  is why AI products use SSE) → <b>SSE</b>, and "SSE down + normal POST up" is often the cheapest
+  correct design. "WebSocket is always the modern choice" is a junior tell — choose per feature.
+</p>
+
+<h2>2. Why this breaks the stateless playbook</h2>
+<p>
+  The whole HTTP scaling playbook assumes any request can go to any server. A WebSocket violates
+  that premise: the connection is a <strong>living object in the memory of exactly one process on
+  exactly one machine</strong> — a file descriptor, TCP buffers, TLS state, subscription lists.
+  You cannot serialize a TCP connection and move it elsewhere. Five consequences:
+</p>
+<ol>
+  <li><b>Routing:</b> to push to user X, something must know <em>which process holds X's socket</em>. HTTP never needed this.</li>
+  <li><b>Servers must talk to each other:</b> user A (node 1) messages user B (node 2). This forces the backplane of section 3.</li>
+  <li><b>Deploys disconnect users:</b> killing a process hangs up on everyone it holds.</li>
+  <li><b>Autoscaling half-works:</b> new nodes only catch <em>new</em> connections; scale-in kicks users off.</li>
+  <li><b>The capacity metric changes:</b> HTTP capacity is requests/second; WS capacity is
+      <em>connections held</em> (memory + file descriptors, even at zero traffic) <b>and, separately,</b>
+      messages/second (CPU). Systems die of fd exhaustion at 20% CPU, and of event-loop saturation
+      at 10% memory. Load-test both axes.</li>
+</ol>
+<div class="soundbite">
+  <span class="label">Feynman version — the hotel</span>
+  <p>An HTTP fleet is a bank-teller hall: any teller serves whoever is next; add tellers, the line
+  shortens instantly. A WebSocket fleet is a <b>hotel</b>: each guest occupies one room in one
+  building for the whole stay. A new tower doesn't help guests already checked in, you can't move a
+  sleeping guest without waking them (reconnect), and delivering a package means first finding out
+  <em>which building and room</em>. Capacity isn't customers-per-hour — it's <b>rooms</b>.</p>
+</div>
+
+<div class="trap">
+  <span class="label">Trap — "WebSockets require sticky sessions"</span>
+  Repeated in a hundred blog posts, and wrong as stated. A <b>pure WebSocket needs no stickiness</b>:
+  TCP pins the established connection to one backend by nature. Stickiness is needed only when
+  <em>multiple separate HTTP requests</em> must reach the same node — the classic case is
+  Socket.IO's long-polling fallback, where each poll is an independent request carrying a session
+  id that lives in one node's memory ("Session ID unknown" otherwise). What a load balancer
+  <em>actually</em> must do for WS: pass the <code>Upgrade</code> through on every hop, and have an
+  idle timeout <b>longer than your heartbeat interval</b> — the default 60s on nginx and AWS ALB
+  reaps quiet-but-healthy connections, and you will debug "mystery 1006 every 60 seconds" for a
+  week. Making this distinction crisply is a strong senior signal.
+</div>
+
+<h2>3. Scaling out: the pub/sub backplane</h2>
+<p>
+  With N nodes, the canonical pattern is: <strong>nodes never talk to each other directly — they
+  meet on a message bus</strong>.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 300" role="img" aria-label="Three WebSocket nodes each hold their own users' sockets. Node 1 receives a message from user A, publishes it to the Redis backplane channel for the room, and nodes 2 and 3 — subscribed to that channel — deliver it to their locally connected users.">
+  <style>
+    .node6 { fill: none; stroke: var(--ink-faint); stroke-width: 1.4; rx: 8; }
+    .bus6 { fill: none; stroke: var(--accent); stroke-width: 1.8; rx: 8; }
+    .nlbl6 { font: 600 12px var(--font-mono); fill: var(--ink); }
+    .ulbl6 { font: 11px var(--font-sans); fill: var(--ink-soft); }
+    .flow6 { stroke: var(--accent); stroke-width: 1.4; marker-end: url(#ah6); }
+    .flow6.out { stroke: var(--accent-2); }
+    .cap6 { font: italic 10.5px var(--font-sans); fill: var(--ink-soft); }
+  </style>
+  <defs>
+    <marker id="ah6" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="var(--ink-faint)"/>
+    </marker>
+  </defs>
+
+  <text class="ulbl6" x="30" y="58">user A</text>
+  <line class="flow6" x1="66" y1="54" x2="128" y2="54"/>
+  <rect class="node6" x="132" y="30" width="120" height="48"/>
+  <text class="nlbl6" x="152" y="58">node 1</text>
+
+  <rect class="node6" x="132" y="122" width="120" height="48"/>
+  <text class="nlbl6" x="152" y="150">node 2</text>
+  <line class="flow6 out" x1="132" y1="146" x2="70" y2="146"/>
+  <text class="ulbl6" x="16" y="150">user B ✓</text>
+
+  <rect class="node6" x="132" y="214" width="120" height="48"/>
+  <text class="nlbl6" x="152" y="242">node 3</text>
+  <line class="flow6 out" x1="132" y1="238" x2="70" y2="238"/>
+  <text class="ulbl6" x="16" y="242">user D ✓</text>
+
+  <rect class="bus6" x="420" y="118" width="180" height="56"/>
+  <text class="nlbl6" x="446" y="142">backplane</text>
+  <text class="cap6" x="446" y="160">PUBLISH room:42</text>
+
+  <line class="flow6" x1="252" y1="54"  x2="418" y2="130"/>
+  <line class="flow6 out" x1="420" y1="150" x2="254" y2="146"/>
+  <line class="flow6 out" x1="420" y1="162" x2="254" y2="230"/>
+
+  <text class="cap6" x="270" y="40">1 · A's message arrives at node 1</text>
+  <text class="cap6" x="440" y="102">2 · node 1 publishes to the room's channel</text>
+  <text class="cap6" x="290" y="288">3 · subscribed nodes deliver to their local sockets</text>
+</svg>
+<figcaption>The backplane (Redis pub/sub, NATS, Kafka) decouples the nodes. This is exactly what
+Socket.IO's Redis adapter does under <code>io.to('room42').emit(…)</code>. Lesson 0005's log-vs-signal
+distinction applies: Redis pub/sub is a fire-and-forget <em>signal</em> — fine, because durability
+lives in the database write, not the socket path.</figcaption>
+</figure>
+
+<p>
+  Around the backplane sit two registries. <b>Connection registry</b> ("which node holds user X?"):
+  either don't track it (all nodes subscribe, each filters for local recipients) or a Redis set per
+  user — with a TTL, because <em>a crashed node never runs its disconnect handlers</em>; stale
+  entries are the classic bug. <b>Presence</b> ("is X online?"): deceptively hard because it is
+  fan-out-heavy — debounce the flapping (mobile networks disconnect constantly; wait a few seconds
+  before broadcasting "offline"), batch updates, and only push presence for users actually visible
+  on screen.
+</p>
+
+<h2>4. Fan-out amplification — the actual hard part</h2>
+<p>
+  Receiving a message is O(1). Delivering it is O(room size):
+</p>
+<pre><code>outbound msgs/sec  =  msgs published/sec  ×  room size
+10 senders/sec × 100,000 members × 1 KB  ≈  1,000,000 sends/sec, ~8 Gbps egress</code></pre>
+<p>
+  Ten people typing melt a server, while ingest sits at 10 msgs/sec. Worse: in real products,
+  activity grows with room size, so cost grows superlinearly. The toolbox, in the order you reach
+  for it:
+</p>
+<ul>
+  <li><b>Serialize once.</b> Encode the message one time and write the identical buffer to every socket — vs 50k <code>JSON.stringify</code> calls, often a 10–50× CPU difference.</li>
+  <li><b>Batch and conflate.</b> Ship digests every 50–100 ms; for keyed state (cursor position, presence) drop superseded values — only the latest matters.</li>
+  <li><b>Interest management.</b> Don't send what the client won't render (Discord's "lazy guilds": no member lists or presence for members not on screen).</li>
+  <li><b>Degrade by tier.</b> Big rooms lose typing indicators and receipts first, keep messages. Fewer features at scale, by design.</li>
+  <li><b>Relay trees.</b> Publisher → K relay processes → each serves a slice of subscribers. This is how Discord pushed one community past ~1M concurrent members.</li>
+</ul>
+
+<h2>5. The Node.js numbers</h2>
+<p>
+  One Node process = one event loop. That is architecturally <em>right</em> for holding sockets —
+  100k idle connections are just epoll entries and heap objects, no thread-per-connection cost.
+  It is <em>wrong</em> for anything synchronous: a broadcast loop over 100k sockets at ~10 µs each
+  is <strong>one full second of frozen event loop</strong> — no reads, no writes, heartbeats stall,
+  and your own liveness sweeper starts reaping healthy connections. Chunk big loops with
+  <code>setImmediate</code>, move heavy serialization to worker threads, and alert on
+  <b>event-loop lag</b> — it is <em>the</em> health metric for a Node WS tier.
+</p>
+<p>
+  Three budgets cap a process: <b>file descriptors</b> (1 per connection — raise
+  <code>ulimit</code>; remember the proxy in front needs 2 per connection and can exhaust ephemeral
+  ports first), <b>memory</b> (~50–100 KB per connection all-in with TLS → 100k ≈ 5–10 GB; the
+  famous trap is <code>permessage-deflate</code>, whose per-connection zlib contexts and heap
+  fragmentation are why Socket.IO disables it by default), and the <b>event loop</b> (the real
+  limit once users are active). Planning figures: <b>10k–50k active connections per process</b>;
+  600k+ idle has been demonstrated on tuned boxes, but that's a parking-garage benchmark, not
+  production capacity. <code>ws</code> is the bare, fast protocol library;
+  <b>Socket.IO</b> adds the things you'd otherwise rebuild badly on a deadline — reconnection with
+  jittered backoff, heartbeats, rooms, and the Redis adapter. Node's <code>cluster</code> module
+  doesn't change the story: workers are separate processes, so cross-worker delivery needs the
+  same backplane pattern — "another process" is another process, across a socketpair or a
+  datacenter.
+</p>
+
+<h2>6. Operational hardening — where seniors are separated</h2>
+<p>
+  <b>Heartbeats, because TCP lies by silence.</b> If a peer vanishes without a close — laptop lid,
+  tunnel, NAT expiry — the socket stays ESTABLISHED forever; you learn the truth only when you
+  next write. (TCP keepalive defaults to <em>two hours</em>.) So the server sweeps:
+</p>
+<pre><code>ws.isAlive = true; ws.on('pong', () =&gt; ws.isAlive = true);
+setInterval(() =&gt; wss.clients.forEach(ws =&gt; {
+  if (!ws.isAlive) return ws.terminate();   // peer is gone — no polite close
+  ws.isAlive = false; ws.ping();
+}), 30_000);</code></pre>
+<p>
+  The interval must be shorter than every idle timeout on the path (that 60-second load-balancer
+  default again) — heartbeats are liveness detection <em>and</em> keepalive traffic at once.
+</p>
+<p>
+  <b>Reconnection, with jitter.</b> A restart disconnects 100k clients in the same instant; if they
+  all retry at t+1s, t+2s, t+4s, they arrive as synchronized waves that re-kill the recovering
+  server. Backoff <em>without jitter</em> schedules the herd; it doesn't disperse it:
+</p>
+<pre><code>delay = Math.random() * Math.min(30_000, 1000 * 2 ** attempt)   // "full jitter"</code></pre>
+<p>
+  A full reconnect also re-authenticates (the token may have expired), resubscribes, and — the part
+  juniors forget — <b>resyncs missed state</b>.
+</p>
+<p>
+  <b>Delivery across reconnects.</b> TCP's guarantees end at the disconnect boundary — exactly
+  where real-time systems live. The standard stack: one writer per channel assigns a
+  <b>per-channel sequence number</b>; the client tracks <code>last_seq</code>; on reconnect it sends
+  <code>RESUME(session, last_seq)</code> and the server replays from a bounded buffer — or, if the
+  gap is too old, the client does a full refetch from the database. Must-deliver messages get acks
+  plus client-generated IDs so receivers <b>dedupe</b>: at-least-once delivery + idempotent
+  processing (lesson 0002's answer, again — "exactly-once delivery" over a network is not a thing).
+  Durability lives in the DB; the socket path is a best-effort accelerator over it.
+</p>
+<p>
+  <b>Backpressure.</b> <code>send()</code> never blocks — it queues in your process's memory, and
+  <code>bufferedAmount</code> grows without bound; a handful of 2G phones in a big room can OOM the
+  node serving everyone else. The senior insight is that the policy is <em>per message class</em>:
+  conflate superseded state (cursors, presence — only the latest matters), shed niceties first
+  (typing, receipts), and for must-deliver messages keep a <em>bounded</em> queue then
+  <b>disconnect</b> — the client resumes from its sequence number, which converts an unbounded
+  memory problem into the already-solved resume problem. A client 30 seconds behind a live feed is
+  reading fiction; cutting it is honesty, not cruelty.
+</p>
+<p>
+  <b>Deploys.</b> "Zero-drop" really means <em>paced, cheap, invisible reconnects</em>: pull the
+  node from the balancer, tell small random batches of clients "reconnect" (close code 1012) over
+  minutes, let jitter and resume do the rest. The big architectural lever: <b>split the connection
+  tier from the logic tier</b> — a thin gateway holds sockets and rarely deploys; business logic
+  behind it deploys twenty times a day without touching a socket (Slack and Discord both do
+  exactly this). Slack's marquee scaling move, Flannel, was an edge cache making <em>reconnect
+  cheap</em> — because reconnects, not connections, were what crushed the backend. The numbers that
+  make it real: Slack holds millions of sockets with ~16M channels served per host; Discord runs
+  12M+ concurrent users pushing 26M+ events/sec; WhatsApp famously held 2M+ TCP connections on one
+  tuned Erlang box — density is a runtime story, which is why Node's answer is horizontal.
+</p>
+
+<div class="drill">
+  <span class="label">Drill — the Friday deploy</span>
+  <p class="situation">Your WS tier holds 100k live connections across 4 nodes. A critical fix must
+  ship now. A teammate proposes the normal rolling deploy: kill node 1, wait for health check,
+  next node.</p>
+  Narrate what the users experience, what the reconnect storm does to nodes 2–4 and to your auth
+  service, and then give the grown-up runbook — pacing, jitter, resume, and what close code you
+  send. Answer out loud before the quiz.
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">Lock it in — the blank-page rule</span>
+  Close the <b>WebSockets at scale</b> leaf in the
+  <a href="../reference/backend-mastery-tree.html">tree tracker</a> when you can, from a blank page:
+  draw the backplane diagram, do the fan-out math for a 100k room, write the heartbeat sweep from
+  memory, and give the deploy runbook.
+</div>
+
+<div class="note">
+  <span class="label">Primary sources</span>
+  <a href="https://slack.engineering/real-time-messaging/">Slack Engineering — Real-time messaging</a> and
+  <a href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users">Discord — Scaling Elixir to 5M concurrent users</a>
+  are the two architectures this lesson is built on. For the wire protocol,
+  <a href="https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers">MDN — Writing WebSocket servers</a>
+  covers the handshake and framing in one page.
+</div>
+
+<p class="ask">Anything unclear — why the browser can't send pings, what exactly Socket.IO's fallback
+changes, how the resume buffer is bounded? <b>Ask your teacher</b> — open a session and say
+<code>/teach</code>.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>After the <code>101</code>, HTTP is over: one persistent full-duplex TCP pipe, 2–14 bytes of framing. One-way feeds usually belong on <b>SSE</b> instead.</li>
+    <li>A connection is <b>pinned state in one process</b> — that single fact forces the registry, the backplane, the deploy dance, and the new capacity metric (rooms, not customers-per-hour).</li>
+    <li>Pure WS needs <b>no sticky sessions</b>; polling fallbacks do. What WS needs from the infrastructure: Upgrade passthrough and idle timeouts longer than the heartbeat.</li>
+    <li>Cross-node delivery = <b>pub/sub backplane</b>; it is a signal, not a source of truth — durability lives in the DB write.</li>
+    <li>The hard part is <b>fan-out amplification</b>: outbound = rate × room size. Serialize once, conflate, degrade niceties, relay trees.</li>
+    <li><b>Heartbeat sweep</b> or half-open zombies accumulate; <b>full-jitter backoff</b> or reconnect waves re-kill the server; <b>seq + resume + dedupe</b> or messages silently vanish at every disconnect.</li>
+    <li>Slow client? Policy per message class: conflate state, shed niceties, bounded-queue-then-kick for must-deliver — resume makes the kick safe.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>scaling WebSockets is not about holding connections — it's about surviving their loss: cheap reconnects, resumable state, and fan-out you did the math on.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="0005-kafka-and-event-driven-architecture.html">&larr; 0005 Kafka &amp; EDA</a>
+  <span class="small">Next: <a href="0007-webrtc-and-realtime-media.html">0007 — WebRTC &amp; real-time media</a></span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Do WebSockets need sticky sessions?',
+    options: [
+      'Not for the connection itself — TCP pins it to one backend inherently. Stickiness is needed only when multiple separate HTTP requests must hit the same node, e.g. Socket.IO’s long-polling fallback',
+      'Yes, always — the LB must route every frame to the same server',
+      'No, never — modern load balancers replicate connection state between backends'
+    ],
+    answer: 0,
+    why: 'The established connection IS pinned — that is TCP. The famous "WS needs stickiness" claim comes from polling fallbacks, where each poll is an independent request carrying a session id that lives in one node’s memory. Distinguish handshake, connection, and fallback precisely — that is the senior answer.'
+  },
+  {
+    q: 'A user’s laptop lid closes mid-session. What does the server see, and why do heartbeats exist?',
+    options: [
+      'Nothing — the socket stays ESTABLISHED indefinitely (half-open). The server discovers the death only on its next write, so it must ping and reap connections that miss pongs',
+      'TCP sends a FIN automatically, and the close event fires within a second',
+      'The load balancer notifies the server with a special close code'
+    ],
+    answer: 0,
+    why: 'TCP is silent when idle — no traffic, no detection, and TCP keepalive defaults to two hours. The isAlive ping/pong sweep detects zombies within two intervals AND generates the keepalive traffic that stops 60s LB idle timeouts from reaping healthy connections.'
+  },
+  {
+    q: '10 users/sec send 1 KB messages into a 100,000-member room. What is the actual load?',
+    options: [
+      '~1,000,000 outbound sends/sec and ~8 Gbps egress — delivery is O(room size); ingest (10 msg/s) is the easy part',
+      '10 messages/sec — Kafka-style fan-out is free',
+      '~100,000 sends/sec — one per member per second'
+    ],
+    answer: 0,
+    why: 'Fan-out amplification: outbound = publish rate × room size. Sizing a realtime system by its inbound rate misses the multiplication that is 3–5 orders of magnitude larger. Mitigations: serialize once, conflate, interest management, relay trees.'
+  },
+  {
+    q: 'A synchronous loop sends a broadcast to 100k sockets in one Node process. What breaks?',
+    options: [
+      'The event loop freezes for ~a full second — no reads or writes anywhere, heartbeats stall, and the liveness sweeper starts reaping healthy connections',
+      'Nothing — Node is async, so the sends happen in parallel',
+      'The kernel rejects the writes with EAGAIN and drops the messages'
+    ],
+    answer: 0,
+    why: 'Async I/O does not parallelize CPU: the loop, the stringify, the frame-encoding all run on the one JS thread. Chunk big loops with setImmediate, serialize the payload once, and alert on event-loop lag — the health metric for a Node WS tier.'
+  },
+  {
+    q: 'A client on 2G can’t keep up; bufferedAmount keeps growing. The right policy is…',
+    options: [
+      'Per message class: conflate superseded state, shed niceties first, and for must-deliver messages keep a bounded queue then disconnect — the client resumes from its sequence number',
+      'Buffer everything — messages must never be dropped',
+      'Drop everything equally until the buffer drains'
+    ],
+    answer: 0,
+    why: 'send() only means "queued". One policy for all message types is the junior mistake: dropping stale cursor positions IMPROVES correctness, while chat messages are protected by the DB + resume path, not by an unbounded socket buffer that OOMs the node.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Design a chat system for 1M concurrent users." (the interview classic — structure your answer)',
+    answer: '(1) <b>Capacity</b>: ~1M ÷ 10–50k per Node process → 20+ processes with headroom; L4 or Upgrade-clean L7 LB. (2) <b>Backplane</b>: Redis pub/sub per room; nodes deliver locally. (3) <b>Truth</b>: persist to DB first, per-channel seq from a single writer; the socket path is best-effort acceleration. (4) <b>Presence</b>: TTL keys + debounce, scoped to what’s on screen. (5) <b>Client protocol</b>: server heartbeats, full-jitter backoff, RESUME(last_seq), acks + dedupe. (6) <b>Ops</b>: gateway tier split from logic tier, paced drains. Unprompted bonus that marks a senior: idle-connection capacity and fan-out capacity are different axes — test both.'
+  },
+  {
+    prompt: '"Deploy new code without dropping 100k live connections."',
+    answer: 'Accept that reconnects happen; make them <b>paced, cheap, and invisible</b>. Pull the node from the LB (no new connections), then drain in small random batches — close code 1012 "service restart" — over minutes, not at once. Clients reconnect with full-jitter backoff, re-auth, and <b>resume from last_seq</b>, so users lose nothing. Structural fix: a thin gateway tier that rarely deploys, stateless logic behind it that deploys daily. Steady-state version: max-lifetime connection rotation, so reconnect code is exercised constantly and deploys become a non-event.'
+  },
+  {
+    prompt: '"What guarantees do messages have across a disconnect, and how?" ',
+    answer: 'TCP’s ordering and delivery end at the disconnect boundary — data written to a dying socket is unconfirmed, and messages sent while the client was away never existed for it. Build the guarantee: one writer per channel assigns a <b>monotonic sequence number</b>; the client tracks last_seq; on reconnect, <b>RESUME</b> replays from a bounded buffer, or falls back to a full refetch from the DB. Must-deliver messages carry client-generated IDs, get acked, are retransmitted if unacked — so receivers <b>dedupe</b>: at-least-once delivery + idempotent processing. Exactly-once <em>delivery</em> does not exist; exactly-once <em>effect</em> via dedupe does (lesson 0002).'
+  }
+]);
+</script>
+</body>
+</html>
