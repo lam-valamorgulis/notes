@@ -2,11 +2,6 @@
 
 Working notes for how to teach Lam. Update as preferences emerge.
 
-## Learner profile (set 2026-07-21)
-- Senior IC engineer, TypeScript (frontend + backend), no direct reports yet.
-- Target: broad front-line EM foundations, ready within 12 months, startup **or** big-company.
-- Time budget: **6–10 hours/week**. Aggressive pace is fine — can go deep or finish core early.
-- Build cadence chosen: **skeleton + Month 1 in depth**, then fill month by month.
 
 ## How Lam likes to learn (from the sibling courses in ../)
 - **Judgment-first.** Prefers "read a real scenario → pick the best move → know why the

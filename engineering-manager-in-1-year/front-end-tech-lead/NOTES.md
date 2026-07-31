@@ -2,11 +2,6 @@
 
 Working notes for how to teach Lam this course. Update as preferences emerge.
 
-## Learner profile (set 2026-07-21)
-- Senior IC engineer, TypeScript (frontend + backend), no direct reports.
-- Target: broad Front-End Tech Lead foundations, ready within 12 months, startup **or** big-company.
-- Leads by **influence**, not authority — so drills should almost never assume Lam can "just decide".
-- Time budget: **6–10 hours/week**. Aggressive pace is fine — can go deep or finish core early.
 
 ## How Lam likes to learn (carried over from the sibling courses)
 - **Judgment-first.** Prefers "read a real scenario → pick the best move → know why the other
