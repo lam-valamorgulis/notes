@@ -1,0 +1,562 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The 24-Hour Plan — Game Locker Shopify Engineer</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · The schedule · Read this first</p>
+  <h1>The 24-Hour Plan</h1>
+  <p class="subtitle">24 blocks of one hour. Every block has one job, one page to read, and one thing you must be able to say out loud at the end of it. Nothing here is optional reading "if there is time" — the plan already assumes there is not.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> walk into the call able to say, in your own words, <em>what Game Locker is, where Shopify sits inside it, and how you would stop a card selling twice</em> — and able to say it out loud without freezing.
+  </div>
+
+  <h2>1. What you are actually preparing for</h2>
+
+  <p>Read this before the schedule, because it changes what "preparing" means.</p>
+
+  <p><b>Game Locker is not a Shopify store.</b> It is an Australian SaaS platform that game stores buy. It holds their card inventory (their site says <b>145,012,624 cards</b> across <b>18+ games</b>), it reprices those cards daily from global price feeds, it runs a <b>POS kiosk</b> at the counter, and it offers <b>integrations with Shopify</b> and an eBay connector.</p>
+
+  <p>So the job is not "make a Shopify site". The job is: <b>Game Locker is the system of record, and you own the Shopify side of it.</b> Three surfaces:</p>
+
+  <div class="diagram">                       WHERE THIS JOB SITS
+
+   ┌────────────────────────────────────────────────────────────┐
+   │                      GAME LOCKER                           │
+   │   card catalogue · daily repricing · POS kiosk · stock      │
+   │              (the system of record)                        │
+   └───────────┬───────────────────┬────────────────────────────┘
+               │                   │
+        (1) SYNC                (2) POS
+        products, stock,        the counter takes
+        orders, customers       money — stock must
+               │               move everywhere
+               ▼                   ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │                        SHOPIFY                             │
+   │   the game store's storefront — theme, cart, checkout       │
+   └───────────┬────────────────────────────────────────────────┘
+               │
+        (3) THEMES + the new TCG MARKETPLACE
+        built for their customers (game stores)
+        and for collectors buying singles
+
+        YOU OWN ALL THREE ARROWS. That is the whole role.</div>
+
+  <div class="tip">
+    <span class="label">Why this matters more than any Liquid trivia</span>
+    Most candidates will prepare "Shopify facts". You are going to arrive having already understood <em>their architecture</em> — that they are the ERP, that their POS owns the transaction, that 145 million cards cannot live in one Shopify store. That is a different conversation, and it is the one that gets offers.
+  </div>
+
+  <h2>2. The good news about your own prep</h2>
+
+  <p>You have already written 52 lessons that aim at this. The plan below mostly <b>routes you through what you own</b> rather than teaching new things. Specifically:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>What Game Locker is</th><th>What you already wrote about it</th></tr>
+    <tr><td>An ERP that Shopify must sync with</td><td><a href="../../lessons/0011-system-design-shopify-erp-sync.html">L0011 Shopify ↔ ERP sync</a> — the exact design</td></tr>
+    <tr><td>Stock in physical shops, sold online</td><td>The whole <a href="../../stockinstore-omnichannel/index.html">stockinstore-omnichannel</a> sub-course, 11 lessons</td></tr>
+    <tr><td>A POS kiosk at the counter</td><td>The whole <a href="../../pos-in-store/index.html">pos-in-store</a> sub-course, 8 lessons</td></tr>
+    <tr><td>Daily repricing of millions of cards</td><td><a href="../../lessons/0018-shopify-bulk-operations.html">L0018 bulk operations</a></td></tr>
+    <tr><td>Themes for their customers</td><td><a href="../../theme-architecture/index.html">theme-architecture</a>, 4 lessons</td></tr>
+    <tr><td>Custom app doing the integration</td><td><a href="../../lessons/0001-shopify-two-apis-and-rate-limits.html">L0001</a>, <a href="../../lessons/0002-webhooks-done-right.html">L0002</a>, <a href="../../lessons/0003-app-auth-session-tokens-token-exchange.html">L0003</a>, <a href="../../lessons/0004-anatomy-of-a-shopify-app.html">L0004</a></td></tr>
+  </table>
+  </div>
+
+  <p><b>You are not starting from zero. You are starting from "written but not drilled."</b> That is why this plan is heavy on saying things out loud and light on new reading.</p>
+
+  <h2>3. How the 24 hours are split</h2>
+
+  <div class="diagram">   BLOCKS  1–2    Their system. What Game Locker is. (new)
+   BLOCKS  3–8    YOUR WEAK SPOT #1: POS + inventory sync
+   BLOCKS  9–11   Card data at TCG scale (new)
+   BLOCKS 12–14   Themes + performance — the JD's #1 bullet
+   BLOCKS 15–16   The integration layer: APIs, webhooks, the app
+   BLOCKS 17–18   The marketplace they are building (new)
+   BLOCKS 19–22   YOUR WEAK SPOT #2: saying it out loud in English
+   BLOCKS 23–24   Full mock + the one-pager. Then stop.
+
+   Weak spots get 10 of the 24 blocks. That is deliberate.</div>
+
+  <div class="trap">
+    <span class="label">The trap in a 24-hour plan</span>
+    The temptation is to spend all 24 hours reading, because reading feels safe and talking feels bad. You already know the material well enough to have written it. <b>The gap is retrieval and speech, not knowledge.</b> If you fall behind, cut reading blocks — never cut blocks 19–24.
+  </div>
+
+  <h2>4. The schedule</h2>
+
+  <p>Each block: <b>40 minutes in, 15 minutes out loud, 5 minutes break.</b> The "out loud" part is not optional — it is the only part that transfers to a live call.</p>
+
+  <h3>Part 1 — Their system (blocks 1–2)</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>1</b></td>
+      <td><a href="../lessons/0001-what-game-locker-actually-is.html">GL L01 — What Game Locker actually is</a></td>
+      <td>"Game Locker is the system of record; Shopify is a sales channel hanging off it. My job is the three arrows between them." Then draw the diagram from memory on paper.</td>
+    </tr>
+    <tr>
+      <td><b>2</b></td>
+      <td><a href="../reference/company-brief.html">Company brief</a> + <a href="https://www.gamelocker.co">gamelocker.co</a> for real, click every page</td>
+      <td>Name their 3 pricing tiers, 5 of the 18 games, and the one number you will quote back (145M cards). Write your 5 questions for them.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 2 — Weak spot #1: POS + inventory sync (blocks 3–8)</h3>
+
+  <p class="small">Six blocks. This is the biggest single investment in the plan because it is both your weakest area <em>and</em> the centre of their business. Read in this order — it is first-principles first.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>3</b></td>
+      <td><a href="../../pos-in-store/lessons/0001-what-a-pos-actually-is.html">POS L01 — What a POS actually is</a></td>
+      <td>The one-sentence definition (order · inventory at a location · payment) and "who owns the transaction?" applied to Game Locker. <b>Answer: their kiosk does.</b></td>
+    </tr>
+    <tr>
+      <td><b>4</b></td>
+      <td><a href="../../pos-in-store/lessons/0003-locations-and-multi-location-inventory.html">POS L03 — Locations &amp; multi-location inventory</a></td>
+      <td>The 8 inventory states. The InventoryItem–Location–InventoryLevel triangle. <b>Absolute vs delta writes</b> and which one a nightly sync must use.</td>
+    </tr>
+    <tr>
+      <td><b>5</b></td>
+      <td><a href="../lessons/0003-the-sync-engine.html">GL L03 — The sync engine</a> (new — the core lesson)</td>
+      <td>All four sync directions and which way each one flows. Then the oversell minute, minute by minute, with no notes.</td>
+    </tr>
+    <tr>
+      <td><b>6</b></td>
+      <td><a href="../lessons/0004-pos-and-the-counter.html">GL L04 — POS and the counter</a> (new)</td>
+      <td>Why their kiosk is <em>not</em> Shopify POS, what that costs them, and the honest recommendation you would make.</td>
+    </tr>
+    <tr>
+      <td><b>7</b></td>
+      <td><a href="../../stockinstore-omnichannel/lessons/0002-inventory-ingestion-multi-source-sync.html">SIS L02 — Inventory ingestion</a> + <a href="../../stockinstore-omnichannel/lessons/0003-stock-availability-engine.html">SIS L03 — Availability engine</a></td>
+      <td>Buffer / safety stock, why "available" is a decision not a number, and how you would set a buffer for a $400 card vs a $0.20 common.</td>
+    </tr>
+    <tr>
+      <td><b>8</b></td>
+      <td><a href="../../stockinstore-omnichannel/lessons/0005-click-collect-order-flow.html">SIS L05 — Click &amp; collect</a> + <a href="../../pos-in-store/lessons/0004-shopify-pos-lite-pro-and-the-retail-order.html">POS L04 — Lite/Pro &amp; the retail order</a></td>
+      <td>The click-and-collect flow end to end. <b>Pickup in store is POS Pro only, billed per location</b> — that is a cost answer their customers will ask about.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">After block 8, this must be automatic</span>
+    <p>"There is always a window where the till and Shopify disagree. I do not try to remove it — I make sure Shopify never <em>promises</em> the unit I might not have. Buffer the last unit, re-verify at checkout, push on an event instead of a batch, and decide the apology in advance."</p>
+  </div>
+
+  <h3>Part 3 — Card data at their scale (blocks 9–11)</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>9</b></td>
+      <td><a href="../lessons/0002-tcg-card-data-on-shopify.html">GL L02 — TCG card data on Shopify</a> (new)</td>
+      <td>Why <b>3 options per product</b> is the constraint that decides the whole model, and what your three options are.</td>
+    </tr>
+    <tr>
+      <td><b>10</b></td>
+      <td>Same lesson, second half — scale and repricing</td>
+      <td>Why 145M cards cannot live in one Shopify store, and what you put in Shopify instead.</td>
+    </tr>
+    <tr>
+      <td><b>11</b></td>
+      <td><a href="../../lessons/0018-shopify-bulk-operations.html">L0018 — Bulk operations</a></td>
+      <td>How you reprice 200,000 variants overnight without burning the API budget. Name the mutation and the file-based flow.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 4 — Themes and performance (blocks 12–14)</h3>
+
+  <p class="small">The JD's <b>first</b> bullet under "What We're Looking For" is theming. Do not skip these because theming is your comfort zone — you will be asked precise questions.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>12</b></td>
+      <td><a href="../../theme-architecture/lessons/0001-dawn-theme-architecture.html">TA L01 — Dawn</a> + <a href="../../theme-architecture/lessons/0002-horizon-and-theme-blocks.html">TA L02 — Horizon &amp; theme blocks</a></td>
+      <td>Sections vs blocks vs <b>theme blocks</b>, JSON templates, and what Horizon changed. Being current here dates you or does not.</td>
+    </tr>
+    <tr>
+      <td><b>13</b></td>
+      <td><a href="../lessons/0005-themes-for-game-stores.html">GL L05 — Themes for game stores</a> (new) — one theme, many stores + performance</td>
+      <td>How you serve 50 game stores without maintaining 50 forks. And the three Core Web Vitals with their thresholds.</td>
+    </tr>
+    <tr>
+      <td><b>14</b></td>
+      <td><a href="../../theme-architecture/lessons/0003-cart-ajax-api.html">TA L03 — Cart AJAX API</a></td>
+      <td><b>update.js does not check stock</b> — say why that matters enormously for a card shop selling one-of-one stock.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 5 — The integration layer (blocks 15–16)</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>15</b></td>
+      <td><a href="../../lessons/0001-shopify-two-apis-and-rate-limits.html">L0001 — Two APIs &amp; rate limits</a> + <a href="../../lessons/0002-webhooks-done-right.html">L0002 — Webhooks done right</a></td>
+      <td>Admin API cost-based limits vs <b>Storefront API having no request rate limit</b>. Webhook retry: 8 failures over ~4 hours, then removal. Why webhooks are at-least-once and what that forces you to build.</td>
+    </tr>
+    <tr>
+      <td><b>16</b></td>
+      <td><a href="../../lessons/0011-system-design-shopify-erp-sync.html">L0011 — Shopify ↔ ERP sync</a>, whiteboard it</td>
+      <td>Draw the full Game Locker ↔ Shopify design on paper in 8 minutes, out loud, as if to an interviewer. This is the most likely system-design question you will get.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 6 — The marketplace they are building (blocks 17–18)</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Read</th><th>Say out loud at the end</th></tr>
+    <tr>
+      <td><b>17</b></td>
+      <td><a href="../lessons/0006-storefront-api-and-the-marketplace.html">GL L06 — Storefront API &amp; the marketplace</a> (new)</td>
+      <td>Why a real multi-seller marketplace is <b>not</b> a Shopify feature, and the three architectures with their trade-offs.</td>
+    </tr>
+    <tr>
+      <td><b>18</b></td>
+      <td>Same lesson, second half + <a href="../../lessons/0027-payments-and-fulfillment-integrations.html">L0027 — Payments &amp; fulfilment</a></td>
+      <td>How money reaches a seller, and why that is the hard part rather than the product listing.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 7 — Weak spot #2: saying it in English (blocks 19–22)</h3>
+
+  <p class="small">Four blocks, all spoken, no new material. Record yourself on your phone. Listening back is unpleasant and it is the fastest fix available.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Do</th><th>Target</th></tr>
+    <tr>
+      <td><b>19</b></td>
+      <td><a href="../reference/speaking-drills.html">Speaking drills</a> — sections 1–3: the structure, the buying-time phrases, the 60-second opener</td>
+      <td>Deliver your opener three times, under 70 seconds each, without reading.</td>
+    </tr>
+    <tr>
+      <td><b>20</b></td>
+      <td>Speaking drills — section 4: the 12 skeleton answers</td>
+      <td>Answer all 12 out loud. Each one: Point → Because → Example → So. Under 90 seconds each.</td>
+    </tr>
+    <tr>
+      <td><b>21</b></td>
+      <td><a href="../reference/rapid-fire.html">Rapid fire</a> — 50 questions, 20 seconds each, spoken</td>
+      <td>Get 40+ right. Mark the misses and re-run only those.</td>
+    </tr>
+    <tr>
+      <td><b>22</b></td>
+      <td>Speaking drills — section 5: the four hard ones (don't know / disagree / gap in CV / salary)</td>
+      <td>Say the honesty line about the POS extension cleanly, with no apology in your voice.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Part 8 — Rehearsal, then stop (blocks 23–24)</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Do</th><th>Target</th></tr>
+    <tr>
+      <td><b>23</b></td>
+      <td><a href="../lessons/0007-the-game-locker-interview.html">GL L07 — The Game Locker interview</a>, then say <b>"mock me on Game Locker"</b> to Claude and do it live</td>
+      <td>Get through a full mock. Note every question that made you stall — those go on the one-pager.</td>
+    </tr>
+    <tr>
+      <td><b>24</b></td>
+      <td><a href="../reference/onepager.html">The one-pager</a> — fill in the blanks with your own words, print it or keep it open</td>
+      <td>One page. Then <b>stop studying.</b> Sleep beats one more lesson.</td>
+    </tr>
+  </table>
+  </div>
+
+  <h2>5. If you lose hours</h2>
+
+  <p>Plans slip. Cut in this order, and cut whole blocks rather than skimming everything:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>If you have…</th><th>Do only these blocks</th><th>Why</th></tr>
+    <tr><td><b>16 hours</b></td><td>1–9, 11–13, 16, 19–24</td><td>Drops the marketplace and the second theme block. You can reason about a marketplace live; you cannot fake the sync engine.</td></tr>
+    <tr><td><b>10 hours</b></td><td>1, 3, 4, 5, 6, 9, 16, 19, 20, 23</td><td>Their system, your weak spot, the data model, one whiteboard, and speech.</td></tr>
+    <tr><td><b>5 hours</b></td><td>1, 5, 6, 19, 23</td><td>What they are, how the sync works, how the counter works, then speak it and mock it.</td></tr>
+    <tr><td><b>2 hours</b></td><td>1, 5, then the <a href="../reference/onepager.html">one-pager</a></td><td>Understanding their architecture beats knowing more Shopify facts.</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">The rule for the last hour before the call</span>
+    Read the one-pager, say your opener once, drink water, close the laptop. Cramming in the final hour lowers recall — it fills working memory with the last thing you read instead of leaving room to listen to the question.
+  </div>
+
+  <h2>6. What to have open during the call</h2>
+
+  <ul>
+    <li><a href="../reference/onepager.html">The one-pager</a> — the only page you look at.</li>
+    <li>A blank sheet of paper and a pen, for when they ask you to design something. Say <em>"let me draw this"</em> and narrate as you draw. It slows your English down, which helps.</li>
+    <li>Your 5 questions for them, from <a href="../reference/company-brief.html">the company brief</a>. Asking nothing reads as not caring.</li>
+  </ul>
+
+  <div class="ask">
+    <span class="label">Say this to Claude when you are ready</span>
+    <p><b>"mock me on Game Locker"</b> — full interview, JD-shaped, with feedback after each answer.</p>
+    <p><b>"drill me on the sync engine"</b> — weak-spot-only rapid fire.</p>
+    <p><b>"grade my opener"</b> — paste your 60-second opener, get it tightened.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="../index.html">← The Map</a></span>
+    <span><a href="../lessons/0001-what-game-locker-actually-is.html">Start: Lesson 1 — What Game Locker actually is →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'You have 10 hours instead of 24. What do you cut first?',
+    options: [
+      'Reading blocks — never the speaking and mock blocks',
+      'The speaking blocks, because the technical content matters more',
+      'The POS blocks, because they overlap with inventory sync',
+      'The mock interview, because it is only rehearsal'
+    ],
+    answer: 0,
+    why: 'You wrote 52 lessons on this material, so the knowledge is largely there. The gap named at the start was retrieval and speech under pressure. Reading more of what you already wrote has the lowest marginal value; speaking it has the highest.'
+  },
+  {
+    q: 'In one sentence, what is Game Locker’s relationship to Shopify?',
+    options: [
+      'Game Locker is the system of record and Shopify is a sales channel hanging off it',
+      'Game Locker is a Shopify theme vendor for game stores',
+      'Game Locker is a Shopify Plus store selling trading cards',
+      'Game Locker is a Shopify app that resells cards through Collective'
+    ],
+    answer: 0,
+    why: 'Their site shows inventory, daily repricing, a POS kiosk and "integrations with Shopify" — the shape of an ERP with Shopify as one channel. There are no Shopify signals on their own site. Getting this backwards would make every answer in the interview subtly wrong.'
+  },
+  {
+    q: 'Why does the plan give six blocks to POS and inventory sync?',
+    options: [
+      'It is both the self-declared weak spot and the centre of their business',
+      'It is the largest body of existing lessons, so it takes longest to read',
+      'POS questions are the most common in Shopify interviews generally',
+      'The other topics need less time because they are simpler'
+    ],
+    answer: 0,
+    why: 'Two things line up: it was named as the weakest area, and Game Locker’s product is literally inventory plus a POS kiosk. When a weak spot overlaps the employer’s core domain, that is where preparation pays the most.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Tell me what you understand about what we do at Game Locker."',
+    answer: 'You are a platform that game stores run their business on, rather than a shop yourselves. You hold the card catalogue and the stock — the site says over <b>145 million cards across 18-plus games</b> — you reprice daily from global price feeds, you run a <b>POS kiosk</b> at the counter, and you connect out to sales channels including <b>Shopify</b> and eBay.<br><br>Which means, from an engineering point of view, <b>you are the system of record and Shopify is a channel hanging off you</b>. So the Shopify work is really three things: keeping products, stock, orders and customers in agreement between the two systems; making sure a card sold at the counter cannot also sell online; and building the storefronts your customers actually put in front of collectors. And now a marketplace on top of that, which is a different problem again because it has many sellers rather than one.'
+  },
+  {
+    prompt: 'Draw the three arrows of this role from memory, and name what flows along each.',
+    answer: '<b>Arrow 1 — sync.</b> Game Locker → Shopify: products and card data, stock levels per location, price updates. Shopify → Game Locker: orders and customers. Mostly one direction each, which is what keeps it maintainable.<br><br><b>Arrow 2 — POS.</b> The counter takes money, so the kiosk creates the order and decrements stock at that shop. Shopify must learn about it fast enough not to sell the same card.<br><br><b>Arrow 3 — storefront.</b> Themes for their customers’ stores, plus the new TCG marketplace for collectors buying singles.<br><br>The reason to hold it as three arrows rather than one blob is that they fail differently and they are owned differently. Arrow 1 fails quietly as drift, arrow 2 fails loudly as an oversell, arrow 3 fails visibly as a slow or broken page.'
+  },
+  {
+    prompt: 'It is one hour before the call. What do you do?',
+    answer: 'Read the one-pager once. Say the 60-second opener out loud one time. Get water, get the paper and pen ready, check the 5 questions I want to ask them. Then close the laptop.<br><br>No new material. Cramming in the last hour fills working memory with whatever I just read, and what I actually need in the call is room to <b>listen to the question properly</b> before answering — which is the thing that goes first when I am rushed.'
+  }
+]);
+</script>
