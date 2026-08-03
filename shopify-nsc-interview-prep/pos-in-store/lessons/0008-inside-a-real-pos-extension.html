@@ -1,0 +1,728 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — Inside a Real POS Extension</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 8 · POS &amp; In-Store · Reading real code</p>
+  <h1>Inside a Real POS Extension</h1>
+  <p class="subtitle"><a href="0005-pos-ui-extensions.html">Lesson 5</a> gave you the shape of a POS UI Extension from the documentation. This lesson opens a <em>shipped one</em> — an inventory-transfer app built by the team at the agency you work for — and reads it the way a reviewer would.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> explain <b>Direct API Access</b> — why this extension calls the Admin API 33 times and its own backend <b>zero</b> times — walk the <b>six-mutation write path</b> that ships a transfer, and name the <b>one bug</b> that makes a till say "Transfer received" when nothing was received.
+  </div>
+
+  <p class="small">Ties to your <a href="../index.html">mission</a>: Lesson 5 ended with an honesty script that said "no repo you work in is an app project." That sentence is now out of date, and this lesson is why. You still have not <em>written</em> a POS extension — but one exists at your agency, you have read it closely, and being able to critique real code is a stronger interview position than either vagueness or an overclaim.</p>
+
+  <div class="note">
+    <span class="label">About the source</span>
+    The app is a private client project, so the client, the repository, the app credentials and the developers are not named here. Every code sample below is real, quoted from the repository, and reduced only by removing logging and unrelated lines. Nothing has been invented to make a point.
+  </div>
+
+  <h2>1. What the app does</h2>
+
+  <p>A retailer with many shops needs to move stock between them. Historically that is a back-office job: someone opens Shopify admin on a laptop, builds a transfer, and a staff member in the shop finds out later. This app moves that job <b>onto the counter</b>. A staff member taps a tile on the POS home screen, picks a destination shop, scans the items into a list, and sends the transfer — standing at the till, holding the stock.</p>
+
+  <p>That is the whole product. It is worth holding onto, because every technical decision below follows from it: <em>the person using this is standing up, holding a scanner, and has a queue behind them.</em></p>
+
+  <h2>2. The repo has two projects in it</h2>
+
+  <p>The first thing to understand is the folder layout, because it maps exactly onto the "extensions live in an app, not a theme" rule from Lesson 5:</p>
+
+  <div class="diagram">   the-app/
+   ├── shopify.app.toml        ← the APP manifest: scopes, webhooks, [pos]
+   ├── app/                    ← a REMIX web app (Node server)
+   │   ├── shopify.server.js       OAuth, session storage
+   │   └── routes/                 embedded admin pages
+   ├── prisma/schema.prisma    ← one table: Session
+   ├── Dockerfile              ← deployed to Google Cloud Run
+   │
+   └── extensions/
+       └── inventory-transfer/ ← the POS UI EXTENSION (the real product)
+           ├── shopify.extension.toml
+           ├── api/            ← GraphQL calls
+           └── src/            ← Preact screens</div>
+
+  <p>Two deployable things, one repository. The <code>app/</code> directory is a Remix server that gets built into a Docker image and run on Cloud Run. The <code>extensions/</code> directory is compiled and shipped to Shopify, and runs <em>inside the POS app on the device</em>. They are joined by <code>shopify.app.toml</code>, which declares the scopes both of them rely on:</p>
+
+  <pre><code>[access_scopes]
+scopes = "read_locations,write_inventory_transfers,write_locations,
+          write_products,write_inventory_shipments,
+          write_inventory_shipments_received_items,read_inventory"
+
+[pos]
+embedded = true</code></pre>
+
+  <p>The <code>[pos] embedded = true</code> line is small and important: it is what makes this app eligible to render inside POS at all.</p>
+
+  <h2>3. The backend that isn't there</h2>
+
+  <p>Here is the finding that reframes the whole codebase. Search the extension for calls to the app's own Cloud Run backend and you find <b>none</b>. Search it for this instead:</p>
+
+  <pre><code>const response = await fetch("shopify:admin/api/graphql.json", {
+  method: "POST",
+  body: JSON.stringify({ query, variables }),
+});</code></pre>
+
+  <p>…and you find it <b>33 times</b>. That URL is not a real host. It is <b>Direct API Access</b>: a special scheme the extension runtime intercepts, attaches the merchant's credentials to, and forwards to the Shopify Admin GraphQL API. The extension talks to Shopify directly from the device.</p>
+
+  <div class="diagram">   WHAT YOU EXPECT                    WHAT THIS APP ACTUALLY DOES
+
+   ┌──────────────┐                   ┌──────────────┐
+   │ POS extension│                   │ POS extension│
+   └──────┬───────┘                   └──────┬───────┘
+          │ fetch                            │ fetch
+          ▼                                  │ "shopify:admin/api/graphql.json"
+   ┌──────────────┐                          │
+   │ your backend │  ← auth, rate            │   (runtime injects credentials)
+   │  (Cloud Run) │    limits, caching       │
+   └──────┬───────┘                          │
+          │ Admin API                        │
+          ▼                                  ▼
+   ┌──────────────┐                   ┌──────────────┐
+   │   Shopify    │                   │   Shopify    │
+   └──────────────┘                   └──────────────┘
+
+   The Cloud Run server still exists — but only to install the app.</div>
+
+  <p>So what is the Remix app <em>for</em>? Almost nothing. Its one substantive job is <b>OAuth and session storage</b> — an app must have a URL to be installed, and installation is what grants the access scopes that Direct API Access then uses. Open <code>app/routes/app._index.jsx</code> and you find the unmodified Shopify starter template, still containing the demo action that creates a product with a randomly chosen colour from <code>["Red", "Orange", "Yellow", "Green"]</code>. Nobody deleted it, because nobody ever needed that page.</p>
+
+  <div class="note">
+    <span class="label">Why this is the most useful thing in the repo</span>
+    It answers a question people get wrong in interviews: <b>"does a POS UI Extension need a backend?"</b> The instinctive answer is yes — extensions are clients, clients need servers. The real answer is that for anything expressible as Admin API calls, <b>no backend is needed</b>, and this app is the proof. You need a backend when you need something Shopify does not store: your own database, a third-party system, a secret you cannot ship to a device, or work that must continue when the till is asleep.
+  </div>
+
+  <div class="trap">
+    <span class="label">The trade you are making</span>
+    Direct API Access means <b>the scopes are exercised from the shop floor</b>. This app holds <code>write_products</code> and <code>write_inventory_transfers</code>, and any code path in the extension can use them. There is no server in the middle to narrow what a device may do, to enforce a business rule, to rate-limit a stuck retry loop, or to keep an audit log. You trade a whole tier of control for the simplicity of deleting it.
+    <br><br>
+    That is a perfectly reasonable trade for an internal tool used by trained staff. Being able to <em>say it is a trade</em> is the part that reads as senior.
+  </div>
+
+  <h2>4. Two targets, and a router that is not a router</h2>
+
+  <p>The extension manifest declares exactly the two targets Lesson 5 described:</p>
+
+  <pre><code>[[extensions.targeting]]
+module = "./src/Tile.jsx"
+target = "pos.home.tile.render"
+
+[[extensions.targeting]]
+module = "./src/Modal.jsx"
+target = "pos.home.modal.render"</code></pre>
+
+  <p>The tile is 24 lines, and it is the entire entry point to the product:</p>
+
+  <pre><code>const TileComponent = () =&gt; {
+  const api = useApi();
+  return (
+    &lt;Tile
+      title="Inventory Transfers"
+      onPress={() =&gt; { api.action.presentModal(); }}
+      enabled
+    /&gt;
+  );
+};
+
+export default reactExtension("pos.home.tile.render", () =&gt; &lt;TileComponent /&gt;);</code></pre>
+
+  <p>Everything else hangs off the modal. Inside it, navigation works in a way that surprises web developers — there are no routes, no URLs and no path matching. You render every screen as a <b>sibling</b> inside a <code>&lt;Navigator&gt;</code>, each with a <code>name</code>, and you move between them by calling a function:</p>
+
+  <pre><code>&lt;Navigator&gt;
+  &lt;Screen name="Home" title="Transfers"&gt; … &lt;/Screen&gt;
+  &lt;NewTransferModal /&gt;        {/* renders &lt;Screen name="NewTransfer"&gt; */}
+  &lt;CameraScannerScreen /&gt;     {/* renders &lt;Screen name="CameraScanner"&gt; */}
+  &lt;EditDraftTransfer /&gt;
+  &lt;ReceiveTransfer /&gt;
+&lt;/Navigator&gt;
+
+// and to navigate:
+api.navigation.navigate("NewTransfer");</code></pre>
+
+  <div class="trap">
+    <span class="label">Every screen is mounted all the time</span>
+    Because the screens are siblings rather than route matches, <b>they all mount when the modal opens</b> — including their <code>useState</code>, their <code>useEffect</code> and any fetch those effects trigger. Screens in this app defend themselves by bailing out early, for example <code>if (!transfer) return null;</code> at the top of the receive screen.
+    <br><br>
+    This is the single biggest mental adjustment coming from React web work. "The component is not on screen" does <b>not</b> mean "the component is not running."
+  </div>
+
+  <h2>5. The domain: a transfer is a state machine</h2>
+
+  <p>Before the code makes sense, the Shopify object model has to. A transfer is not one record that changes a status field — it is <b>two related objects</b>, and knowing the split explains every mutation name in the app:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Object</th><th>What it represents</th></tr>
+    <tr><td><code>InventoryTransfer</code></td><td>The <b>intent</b>. Origin, destination, note, and the line items you plan to move.</td></tr>
+    <tr><td><code>InventoryShipment</code></td><td>The <b>physical event</b>. What actually left, in a box. A transfer can have several.</td></tr>
+  </table>
+  </div>
+
+  <p>That is why the receiving side accepts and rejects against a <em>shipment</em>, not against the transfer: you receive a box, and the box may not contain everything that was promised. The status flow the app drives looks like this:</p>
+
+  <div class="diagram">   DRAFT ──────────────► READY_TO_SHIP ──────────────► (in transit)
+     │  inventoryTransfer      │  inventoryShipment           │
+     │  MarkAsReadyToShip      │  CreateInTransit             │
+     │                                                         │
+     │ inventoryTransferDelete                                 ▼
+     ▼                                          inventoryShipmentReceive
+   (gone)                                                      │
+                                        ┌────────────────────┬─┴──────────────────┐
+                                        ▼                    ▼                    ▼
+                                    ACCEPTED             REJECTED         partial: per-line
+                                                                          ACCEPTED + REJECTED</div>
+
+  <p>Notice how this lands on <a href="0003-locations-and-multi-location-inventory.html">Lesson 3</a>. A transfer in flight is exactly why <code>incoming</code> exists as one of the eight inventory states — stock that has left one location and not yet arrived at another has to live <em>somewhere</em> in the model, and it lives there.</p>
+
+  <h2>6. The write path: six mutations, no transaction</h2>
+
+  <p>This is the most instructive function in the codebase. A staff member fills in a transfer and taps <b>Send</b>. Here is what one tap does, stripped to the calls:</p>
+
+  <pre><code>export async function updateDraftTransferToInProgress({ … }) {
+  // Step 1 — update destination, note and line items
+  const updateResult = await updateDraftTransfer({ … });   // ← itself 2–4 calls
+  if (!updateResult) return null;
+
+  // Step 2 — flip the status
+  await fetch(…)  // mutation inventoryTransferMarkAsReadyToShip
+
+  // Step 3 — create the physical shipment
+  await fetch(…)  // mutation inventoryShipmentCreateInTransit
+}</code></pre>
+
+  <p>And <code>updateDraftTransfer</code>, the innocuous-looking first line, is itself a sequence:</p>
+
+  <div class="diagram">   ONE TAP ON "SEND"
+
+   1. inventoryTransferEdit           set destination + note
+   2. fetchTransferDetails            read back, to find items to remove
+   3. inventoryTransferRemoveItems    remove the ones no longer wanted
+      ⏸  await sleep(300)
+   4. inventoryTransferSetItems       set the ones we keep
+      ⏸  await sleep(500)
+   5. fetchTransferDetails            read back again, to verify
+   6. inventoryTransferMarkAsReadyToShip
+   7. inventoryShipmentCreateInTransit
+
+   Any one of these can fail. There is no rollback.</div>
+
+  <div class="trap">
+    <span class="label">Partial failure is the real bug class here</span>
+    Suppose step 4 succeeds and step 7 fails — the wifi drops as the staff member taps, which is the ordinary case at the back of a shop. The function returns <code>null</code>, the UI reports a failure, and the staff member taps again. But the transfer <b>has already been edited and marked ready to ship</b>. The retry now runs against an object in a different state than the code assumed.
+    <br><br>
+    This is a distributed transaction wearing a plain <code>async function</code>. The fixes are known ones — make the sequence <b>idempotent</b> so replaying it is safe, drive it from a <b>single source of truth</b> you can re-read, or move the sequence <b>server-side</b> where you can retry it without a person standing there. This app does none of the three, which is a real risk and also an entirely normal state for a v1 internal tool.
+  </div>
+
+  <div class="note">
+    <span class="label">Those <code>sleep</code> calls deserve their own note</span>
+    <code>await new Promise(r =&gt; setTimeout(r, 300))</code> between two mutations is a <b>timing guess standing in for a consistency guarantee</b>. It is there because the developer saw a read return stale data after a write. 300ms usually wins the race on office wifi. It will lose it on a busy shop network, and when it loses, the failure is silent and the data is wrong.
+    <br><br>
+    The same instinct appears in the UI layer, where refreshing the list waits <code>2000</code>ms with the comment <em>"Delay to ensure server has processed the new transfer."</em> If you ever want a single line to explain read-after-write consistency in an interview, this is it.
+  </div>
+
+  <h2>7. The bug worth remembering</h2>
+
+  <p><a href="0005-pos-ui-extensions.html">Lesson 5</a> warned that on a till, <b>failure is public</b>. Here is that warning as a real defect, in the code that receives a shipment. First, the API helper:</p>
+
+  <pre><code>const json = await response.json();
+
+// the real path is json.data.inventoryShipmentReceive.userErrors
+if (json?.data?.userErrors &amp;&amp; json?.data?.userErrors?.length &gt; 0) {
+  console.error("errors", json.data.userErrors);
+  return null;
+}
+
+return null;   // ← and success returns null too</code></pre>
+
+  <p>Two faults stacked. The <code>userErrors</code> check reads the wrong path in the response, so it never fires. And <b>both branches return <code>null</code></b>, so the function's return value carries no information at all. Now the caller:</p>
+
+  <pre><code>const res = await mutateInventoryShipmentReceive(shipment.id, lineItems, type);
+
+if (res?.userErrors) {          // res is ALWAYS null — dead code
+  console.error(…);
+}</code></pre>
+
+  <p>And finally, how the staff member is told what happened:</p>
+
+  <pre><code>} catch (error) {
+  console.error("Error processing shipments:", error);
+} finally {
+  if (type === "ACCEPTED") {
+    setBanner({ message: ALL_RECEIVED_BANNER_MESSAGE, variant: "confirmation" });
+    onTransferReceived("ACCEPTED", transfer.name);
+  }
+  …
+}</code></pre>
+
+  <div class="trap">
+    <span class="label">The green banner is in a <code>finally</code> block</span>
+    <code>finally</code> runs whether the <code>try</code> succeeded or the <code>catch</code> caught. So if every mutation fails — network down, scope missing, invalid quantity — the staff member still sees a green <b>"Transfer received."</b> The stock is not received. The error exists only in a <code>console.error</code> nobody will ever read, on a device with no console.
+    <br><br>
+    This is precisely the failure mode Lesson 5 described in the abstract: a bug at the counter does not produce a stack trace on a dashboard, it produces <b>a confident wrong answer in front of a customer</b>. Someone will discover it during a stock count weeks later.
+  </div>
+
+  <p>The fix is not clever, and that is the point. Return the mutation result instead of <code>null</code>, read <code>userErrors</code> at the right path, and move the success banner out of <code>finally</code> into the success path.</p>
+
+  <div class="recall">
+    <span class="label">Cover the screen</span>
+    Why does the extension not need a backend? What does <code>finally</code> do that <code>try</code> does not? And why is a 300ms <code>sleep</code> between two mutations a bug rather than a fix?
+  </div>
+
+  <h2>8. The hardware loop</h2>
+
+  <p>The scanner is where this stops resembling web work. The API is a subscription — barcodes arrive as a stream of events, not as a function you call:</p>
+
+  <pre><code>const { data } = useScannerDataSubscription();
+const processedBarcodesRef = useRef(new Set());
+const isNavigatingRef = useRef(false);
+
+useEffect(() =&gt; {
+  if (data &amp;&amp; data.trim() !== ""
+      &amp;&amp; !processedBarcodesRef.current.has(data)   // not already handled
+      &amp;&amp; !isNavigatingRef.current) {               // not mid-navigation
+    processedBarcodesRef.current.add(data);
+    handleBarcodeScan(data);
+  }
+}, [data]);</code></pre>
+
+  <p>Both <code>useRef</code> guards exist because of physical reality. A hardware scanner fires repeatedly while the beam is on a barcode, so the same value arrives many times in a second — hence the <code>Set</code> of already-processed codes. And a scan triggers navigation, so a second scan landing mid-transition would navigate twice — hence the navigation flag.</p>
+
+  <div class="note">
+    <span class="label">Why <code>useRef</code> and not <code>useState</code></span>
+    A ref updates <b>synchronously</b>; state updates are batched and visible only on the next render. Two barcode events in the same tick would both see the old state and both pass the check. The ref is not a style preference here — it is the only one of the two that works.
+  </div>
+
+  <p>The scan handler then does something genuinely thoughtful. Before adding the item, it checks that the variant is stocked at <em>both</em> ends:</p>
+
+  <pre><code>const hasOriginLocation      = locationIds.includes(originLocationGid);
+const hasDestinationLocation = locationIds.includes(destinationLocationGid);
+
+if (!hasOriginLocation || !hasDestinationLocation) {
+  // three distinct messages, depending on which side is missing
+  setErrorMessage("Product variant is not tracked at destination location");
+  …
+}</code></pre>
+
+  <p>That is domain knowledge in the UI. You cannot transfer stock into a location that does not track the item, and catching it <b>at scan time</b> — rather than at submit time, after twenty items — is the difference between a tool staff trust and one they work around.</p>
+
+  <h2>9. Knowing what device you are on</h2>
+
+  <p>A phone and a tablet need different layouts, and the extension has no CSS media queries. Its answer:</p>
+
+  <pre><code>const deviceName = api?.device?.name || "";
+const isMobile = MOBILE_KEYWORDS.some(k =&gt; deviceName.toLowerCase().includes(k));
+
+// MOBILE_KEYWORDS = ["phone","android","ios","xiaomi","redmi","oppo","vivo",
+//                    "oneplus","samsung","google","htc","lg","motorola", …]</code></pre>
+
+  <p>The result picks between <code>&lt;PhoneTransferList&gt;</code> and <code>&lt;TabletTransferList&gt;</code>. It works, and it is fragile in an interesting way: <code>api.device.name</code> is the <b>user-assigned device name</b>, so an Android tablet named "Samsung Tab — Front Counter" matches <code>"samsung"</code> and renders the phone layout. A till named "Sony Store iPad" matches twice over. The honest description is <b>a heuristic over a display string</b>, and naming it as such is what a reviewer would want to hear.</p>
+
+  <h2>10. Two generations of state in one repo</h2>
+
+  <p>Read the folders in the order they were written and you can watch the team outgrow their first approach. <code>Modal.jsx</code>, the original, holds <b>18 separate <code>useState</code> calls</b> in one component:</p>
+
+  <pre><code>const [selected, setSelected]                 = useState("all");
+const [transfers, setTransfers]               = useState([]);
+const [cachedPages, setCachedPages]           = useState(new Set([0]));
+const [endCursor, setEndCursor]               = useState(null);
+const [hasNextPage, setHasNextPage]           = useState(false);
+const [currentPage, setCurrentPage]           = useState(1);
+const [isLoading, setIsLoading]               = useState(false);
+const [successTransferName, …]                = useState(null);
+const [successUpdateTransferName, …]          = useState(null);
+const [successDeleteTransferName, …]          = useState(null);
+// … eight more</code></pre>
+
+  <p>Three of those are near-identical success banners, and resetting the list means setting six of them by hand — a block that is duplicated in four places. The newer <code>screens/</code> folder replaces this with a small generic factory:</p>
+
+  <pre><code>const [Provider, useStateContext, useDispatch] = createReducerContext(
+  newTransferReducer, INITIAL_STATE, "NewTransferState",
+);</code></pre>
+
+  <p>What makes it good is what it exports. Not the raw state object, but <b>one narrow hook per concern</b>:</p>
+
+  <pre><code>export function useSelectedVariants()   { return useStateContext().selectedVariants; }
+export function useTransferQuantities() { return useStateContext().transferQuantities; }
+export function useAppendVariant() {
+  const dispatch = useDispatch();
+  return (variant) =&gt; dispatch({ type: "APPEND_VARIANT", payload: variant });
+}</code></pre>
+
+  <p>The payoff shows up in the scanner, which sits several screens away from the transfer form and needs to add an item to it. With the old pattern that meant threading a setter down through props. With this, it is one line — <code>const appendVariant = useAppendVariant();</code> — and the scanner needs to know nothing about how the list is stored.</p>
+
+  <div class="note">
+    <span class="label">The state/dispatch split, and why it matters more here</span>
+    <code>createReducerContext</code> creates <b>two</b> contexts, one for state and one for dispatch. A component that only dispatches subscribes to the dispatch context, which never changes, so it does not re-render when state changes. On a mid-range Android till rendering through <code>remote-dom</code>, avoided renders are worth more than they are in a browser.
+  </div>
+
+  <p>Both generations are live at once — <code>Modal.jsx</code> still owns the list, the newer screens own the create flow, and <code>EditTransfer.jsx</code> (1213 lines) sits beside <code>EditDraftTransfer.tsx</code> (1201 lines) as an unfinished fork of one screen into two. That is what a mid-refactor codebase looks like, and reading one is a more useful skill than reading a clean one.</p>
+
+  <h2>11. What you would raise in review</h2>
+
+  <p>Pulled together, ordered by what would actually hurt. This table is the most interview-useful thing on the page — it is a worked example of reading someone else's code and forming a judgement:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Finding</th><th>Why it matters</th><th>Severity</th></tr>
+    <tr>
+      <td>Success banner in a <code>finally</code> block; receive helper always returns <code>null</code></td>
+      <td>Staff are told stock arrived when it did not. Silent data divergence found weeks later at stock count.</td>
+      <td><b>Critical</b></td>
+    </tr>
+    <tr>
+      <td>Six-mutation send path with no rollback or idempotency</td>
+      <td>A drop mid-sequence leaves a transfer half-shipped, and the retry runs against unexpected state.</td>
+      <td><b>Critical</b></td>
+    </tr>
+    <tr>
+      <td><code>setTimeout</code> used as a consistency guarantee (300ms, 500ms, 2000ms)</td>
+      <td>Works on office wifi, fails on shop wifi, fails silently.</td>
+      <td><b>High</b></td>
+    </tr>
+    <tr>
+      <td>112 <code>console.log</code> calls shipping to production, several logging whole GraphQL responses</td>
+      <td>Noise, measurable cost on a low-power device, and product and location data written to device logs.</td>
+      <td><b>High</b></td>
+    </tr>
+    <tr>
+      <td>SQLite session store in a container on Cloud Run with <code>--max-instances 10</code></td>
+      <td>The database is inside the container filesystem. Each instance gets its own; instances are disposable. Sessions vanish or diverge. The template's own README warns SQLite only works "if your app runs as a single instance."</td>
+      <td><b>High</b></td>
+    </tr>
+    <tr>
+      <td><code>ENV SHOPIFY_API_SECRET=</code> declared in the <code>Dockerfile</code></td>
+      <td>Empty today, so not a live leak — but it invites the next person to paste a secret into a layer that ships with the image.</td>
+      <td><b>Medium</b></td>
+    </tr>
+    <tr>
+      <td><code>canEditDestination(status)</code> ignores its argument and returns <code>false</code></td>
+      <td>Reads as a rule with logic behind it; is actually a constant. Misleads the next reader.</td>
+      <td><b>Low</b></td>
+    </tr>
+    <tr>
+      <td>~1200-line edit screen forked into two ~1200-line near-copies</td>
+      <td>Every future fix has to be made twice, and one of them will be missed.</td>
+      <td><b>Medium</b></td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">How to deliver this without sounding like a hostile reviewer</span>
+    Lead with the constraint the team was under, then the finding. "This is a v1 internal tool for trained staff, shipped fast, and that is the right call — the thing I would fix first is the success banner in <code>finally</code>, because it is the one that can quietly corrupt stock counts." You have shown judgement about <em>severity</em>, not just an ability to spot defects. Anyone can list problems; ranking them is the senior skill.
+  </div>
+
+  <h2>12. Saying it in an interview</h2>
+
+  <div class="soundbite">
+    <span class="label">The updated honesty script</span>
+    <p>"I have not written a POS UI Extension myself. My agency has shipped one — an inventory-transfer app that lets shop staff move stock between locations from the till — and I have read that codebase closely. So I can talk about how it is actually built: two targets, a tile and a modal; screens as siblings inside a <code>Navigator</code> rather than routes; and Direct API Access, where the extension calls the Admin GraphQL API straight from the device and the app's own server exists only to carry OAuth. I would be learning the toolchain, not the concepts."</p>
+  </div>
+
+  <p>That answer is stronger than either alternative. It is more credible than "I know the docs," and unlike an overclaim it survives every follow-up, because all of it is true and you can go deeper on any sentence.</p>
+
+  <div class="soundbite">
+    <span class="label">If they ask what you would change</span>
+    <p>"Two things, in order. First, the receive flow reports success from a <code>finally</code> block, so a failed receive still shows a green banner — on a till, that is worse than an error, because the staff member walks away believing the stock arrived. Second, sending a transfer is six chained mutations with no rollback, so a dropped connection can leave it half-shipped. I would make that sequence idempotent, or move it server-side where it can be retried without someone standing at the counter waiting."</p>
+  </div>
+
+  <h2>13. Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>14. Say it like an interview</h2>
+  <div id="recall"></div>
+
+  <h2>Read this next</h2>
+  <div class="note">
+    <span class="label">Primary source — 20 minutes</span>
+    <a href="https://shopify.dev/docs/api/pos-ui-extensions/apis/direct-api"><b>shopify.dev · Direct API Access</b></a>, then the <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventoryTransferCreate">inventory transfer mutations</a> in the Admin API. Read them in that order. Direct API Access explains <em>how</em> this extension reaches Shopify with no backend; the mutation list explains <em>why</em> the send path needs six calls — there simply is no single mutation that does it.
+  </div>
+
+  <div class="recall" style="border-style:solid">
+    <span class="label">Remember this</span>
+    <ul style="margin:.3rem 0 .6rem; padding-left:1.2rem">
+      <li><b>Direct API Access</b> — <code>fetch("shopify:admin/api/graphql.json")</code> from the device. 33 calls in this app, <b>zero</b> to its own backend.</li>
+      <li><b>The app server exists for OAuth</b>, not for data. Its admin page is still the untouched starter template.</li>
+      <li><b>Screens are siblings inside <code>&lt;Navigator&gt;</code></b>, moved between by <code>api.navigation.navigate("Name")</code>. All of them mount at once.</li>
+      <li><b><code>InventoryTransfer</code> is the intent, <code>InventoryShipment</code> is the physical event.</b> You receive against a shipment.</li>
+      <li><b>Sending is six mutations with no transaction.</b> Partial failure is the real risk, not a failed call.</li>
+      <li><b>A success banner in a <code>finally</code> block lies to the staff member.</b> The clearest example of "failure is public" you will find.</li>
+      <li><b><code>useRef</code>, not <code>useState</code>, for scanner de-duplication</b> — refs update synchronously, and barcodes arrive in bursts.</li>
+      <li><b><code>sleep(300)</code> between mutations is a guess, not a guarantee.</b> It loses the race on a slow network, silently.</li>
+    </ul>
+    <b>If you remember one thing: this extension has no backend, and that is not a shortcut — Direct API Access means the till talks to Shopify itself. What it costs you is the tier where you would have put validation, rate limiting and an audit log.</b>
+  </div>
+
+  <div class="ask">
+    Want to go deeper on any of it — how you would make that six-mutation path idempotent, or how the offline story would change if the shop wifi dropped mid-send? <b>Ask me.</b>
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0005-pos-ui-extensions.html">← Lesson 5: POS UI Extensions</a></span>
+    <span><a href="0006-migrating-off-a-legacy-till.html">Lesson 6: Migrating off a legacy till →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'The extension calls the Admin API 33 times and its own Cloud Run backend zero times. Why is that possible?',
+    options: [
+      'Direct API Access — the runtime injects credentials into shopify:admin fetches',
+      'The Cloud Run service proxies requests transparently via a service worker',
+      'The extension bundles an offline copy of the Admin API session token',
+      'POS extensions are exempt from authentication when running on a till'
+    ],
+    answer: 0,
+    why: 'fetch("shopify:admin/api/graphql.json") is intercepted by the extension runtime, which attaches the merchant credentials granted at install and forwards it to the Admin GraphQL API. The Remix server still exists, but only to carry OAuth and session storage.'
+  },
+  {
+    q: 'What is the practical cost of having no backend between the till and the Admin API?',
+    options: [
+      'You lose the tier where validation, rate limiting and audit logging would live',
+      'You cannot use GraphQL mutations, only queries, from the device',
+      'The app must re-authenticate the staff member before each mutation',
+      'Access scopes have to be requested again every time the modal opens'
+    ],
+    answer: 0,
+    why: 'The scopes are exercised from the shop floor with nothing in the middle to narrow what a device may do. For a v1 internal tool used by trained staff that is a fair trade — but it is a trade, and saying so is the senior move.'
+  },
+  {
+    q: 'Sending a transfer runs six chained mutations. What is the real risk?',
+    options: [
+      'Partial failure — a drop mid-sequence leaves the transfer half-shipped with no rollback',
+      'Exceeding the Admin API rate limit and having the whole batch rejected',
+      'GraphQL rejecting the sequence because mutations must be sent in one document',
+      'The POS modal unmounting and cancelling the in-flight requests'
+    ],
+    answer: 0,
+    why: 'If step 4 lands and step 7 fails, the transfer has already been edited and marked ready to ship. The UI reports failure, the staff member retries, and the retry runs against a different state than the code assumed. The fixes are idempotency, a single re-readable source of truth, or moving the sequence server-side.'
+  },
+  {
+    q: 'Why does a failed receive still show a green "Transfer received" banner?',
+    options: [
+      'The banner is set in a finally block, which runs even after catch',
+      'The banner component ignores its variant prop and defaults to confirmation',
+      'The mutation returns HTTP 200 with userErrors, which counts as success',
+      'The catch block re-throws, so the error handler never runs'
+    ],
+    answer: 0,
+    why: 'finally runs whether the try succeeded or the catch caught. Compounding it, the API helper returns null on both paths and checks userErrors at the wrong response path, so the caller has no way to know anything failed.'
+  },
+  {
+    q: 'Why does the scanner de-duplicate barcodes with useRef rather than useState?',
+    options: [
+      'Refs update synchronously; batched state would let two events in one tick both pass',
+      'State cannot hold a Set because React requires serialisable state values',
+      'Refs persist across navigation while state is cleared when a screen unmounts',
+      'useState would trigger a re-render that cancels the scanner subscription'
+    ],
+    answer: 0,
+    why: 'A hardware scanner fires repeatedly while the beam is on a barcode. State updates are batched and visible only on the next render, so two events in the same tick would both read the stale value and both be processed. The ref is the only one of the two that actually works here.'
+  },
+  {
+    q: 'What is wrong with SQLite as the session store for this deployment?',
+    options: [
+      'It lives in the container filesystem, and Cloud Run runs up to 10 disposable instances',
+      'Prisma cannot generate a client for SQLite in a production Docker build',
+      'SQLite cannot store the BigInt userId field the Session model requires',
+      'Shopify requires session storage to be a managed database for embedded apps'
+    ],
+    answer: 0,
+    why: 'Each Cloud Run instance gets its own copy of the container filesystem and instances are replaced freely, so sessions vanish or diverge between them. The Shopify template README says plainly that SQLite works in production only if the app runs as a single instance.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Walk me through the architecture of a POS extension you have seen."',
+    answer: 'It is an inventory-transfer app that lets shop staff move stock between locations from the till instead of from the back office. Two targets: a <b>tile</b> on the smart grid, about twenty lines, whose only job is <code>api.action.presentModal()</code>, and a <b>modal</b> that holds the product.<br><br>Navigation is the first surprise coming from web work — there are no routes. Every screen renders as a <b>sibling inside a <code>&lt;Navigator&gt;</code></b> with a <code>name</code>, and you move by calling <code>api.navigation.navigate("NewTransfer")</code>. That means <b>every screen is mounted the whole time</b>, effects included, so screens guard themselves with early returns.<br><br>The part I found most interesting is that <b>it has no backend</b>. The extension calls <code>fetch("shopify:admin/api/graphql.json")</code> — that is <b>Direct API Access</b>, where the runtime attaches the merchant credentials and forwards to the Admin API. Thirty-three of those calls, and none to the app\'s own server. There <em>is</em> a Remix app on Cloud Run, but its only real job is OAuth and session storage; its admin page is still the unmodified starter template.'
+  },
+  {
+    prompt: '"When would a POS extension actually need a backend, then?"',
+    answer: 'When you need something the Admin API cannot give you. Four cases I would name: <b>your own data</b> that Shopify does not model — a loyalty ledger, a warranty register; <b>a third-party system</b>, like an ERP or a legacy till you have to reconcile against; <b>a secret you cannot ship to a device</b>, because anything in the extension bundle is effectively public; and <b>work that must continue when the till is asleep</b>, such as a scheduled sync or a webhook consumer.<br><br>There is a fifth, subtler one: <b>control</b>. Direct API Access exercises the app\'s scopes straight from the shop floor, so there is no tier in the middle to enforce a business rule, rate-limit a stuck retry, or keep an audit trail of who moved what. If the operation is risky or regulated, that missing tier is the reason to add a server even when the API alone would technically do the job.'
+  },
+  {
+    prompt: '"You have read this codebase. What would you change first?"',
+    answer: 'I would separate <em>this was shipped fast for trained internal staff</em> from <em>this is wrong</em>, because most of it is the former and correctly so.<br><br>Two things are the latter. First, the <b>receive flow reports success from a <code>finally</code> block</b>, so a completely failed receive still shows a green "Transfer received." The helper underneath returns <code>null</code> on both success and failure and checks <code>userErrors</code> at the wrong path, so the caller genuinely cannot tell. On a till that is worse than an error — staff walk away believing the stock arrived, and it surfaces at a stock count weeks later. That is a small fix: return the result, read the right path, move the banner into the success branch.<br><br>Second, <b>sending a transfer is six chained mutations with no rollback</b>, spaced with <code>setTimeout</code> delays that stand in for read-after-write consistency. A dropped connection mid-sequence leaves it half-shipped, and the retry runs against unexpected state. I would make the sequence idempotent, or move it server-side so it can be retried without a person standing at the counter waiting for it.<br><br>Everything else — the 112 <code>console.log</code> calls, the device-name heuristic for phone versus tablet, the 1200-line screen forked into two near-copies — is cleanup I would schedule, not block on.'
+  }
+]);
+</script>
