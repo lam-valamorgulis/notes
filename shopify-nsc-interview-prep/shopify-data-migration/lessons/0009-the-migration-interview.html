@@ -1,0 +1,613 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 9 — The Migration Interview</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 9 · Shopify Data Migration · Capstone</p>
+  <h1>The Migration Interview</h1>
+  <p class="subtitle">Eight lessons of knowledge, turned into a performance. Three question shapes, one honest opener, a five-stage script for the design question, the six answers that sink candidates, and a rapid-fire drill that mixes every lesson together on purpose.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> answer <em>"walk me through a data migration"</em> for four minutes without hedging — using a script you can run under pressure, and an opener that is <b>true</b>.
+  </div>
+
+  <p class="small">Ties to your <a href="../index.html">mission</a>: the mission ends at "answer for it in an interview." This is that page. Do it last, out loud, and preferably twice.</p>
+
+  <h2>1. Three shapes, and only three</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Shape</th><th>Sounds like</th><th>What they are testing</th><th>Your move</th></tr>
+    <tr>
+      <td><b>The design question</b></td>
+      <td>"They have 40,000 products and 4 years of orders on Magento. How would you move them?"</td>
+      <td>Whether you have a <em>shape</em> in your head or are improvising.</td>
+      <td>Run the five-stage script in section 3. Do not start with mutations.</td>
+    </tr>
+    <tr>
+      <td><b>The trap question</b></td>
+      <td>"What could go wrong?" / "What would you check first?"</td>
+      <td>Whether you have been burned, or only read.</td>
+      <td>Give a <em>silent</em> failure, not a loud one. Loud failures are easy; silent ones prove experience.</td>
+    </tr>
+    <tr>
+      <td><b>The experience question</b></td>
+      <td>"Tell me about a migration you have run."</td>
+      <td>Honesty, and whether your story survives follow-ups.</td>
+      <td>Section 2. Never inflate — the follow-up questions will find it.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The single best habit for all three</span>
+    <b>Name the silent failure.</b> Anyone can say "the import might fail". Only someone who has thought properly says "the import will <em>succeed</em> and be wrong — every 2019 order priced at 2026 prices, because omitting a line-item price makes the API use the current variant price." Silent failures are the currency of this subject.
+  </div>
+
+  <h2>2. The honest opener — 45 seconds</h2>
+
+  <p>The rest of this course is consistent about one thing: never claim work you have not done. Migration is the same. Fill this in with what is actually true for you, and say it once, early, without apology.</p>
+
+  <div class="soundbite">
+    <span class="label">The template</span>
+    <p>"To be straight with you about scope: I have ______________. What I have not done is ______________. But I know the shape of the job well, and I would rather show you that than overstate it — so let me walk you through how I would run one, including the parts I would expect to get wrong first."</p>
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>If your real experience is…</th><th>Fill the first blank with…</th></tr>
+    <tr><td>Theme and app integration work</td><td>"…moved catalogue and customer data at volume through the Admin API as part of integration work, and dealt with the reconciliation side when the numbers disagreed"</td></tr>
+    <tr><td>Bulk corrections and data fixes</td><td>"…run large bulk updates against live stores, which is the same idempotency problem with a smaller blast radius"</td></tr>
+    <tr><td>Only supporting a migration someone else led</td><td>"…worked on a migration led by someone else, where I owned <em>this</em> part"</td></tr>
+    <tr><td>Genuinely none</td><td>"…not run a full platform migration end to end"</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Why this works better than bluffing</span>
+    A migration interview is unusually easy to probe. Three follow-ups get to bedrock: <em>what was the matching key? how did you prove it worked? what was the rollback?</em> A borrowed story collapses on the second one. A true small story plus a strong design answer does not — and interviewers consistently rate honesty about scope as a senior signal, because it is what they need from you on a real project.
+  </div>
+
+  <h2>3. The five-stage script for the design question</h2>
+
+  <p>Say the stage names out loud as you go. It tells the interviewer you have a method and it stops you rambling.</p>
+
+  <div class="diagram">        THE SCRIPT — 4 MINUTES
+
+  ① SCOPE            "First I'd ask three things: is the old
+     30 s             system being switched off, how far back do
+                      orders go, and which Shopify plan are they on."
+
+  ② WHAT MOVES       "Then I'd sort every record into moves cleanly,
+     45 s             moves with loss, never moves — and send that
+                      list in writing before starting."
+
+  ③ IDENTITY         "The key technical decision is the matching key.
+     60 s             I'd put their primary key in an id-type metafield
+     ★ the core       and upsert with productSet identifier.customId,
+                      so the import is re-runnable by anyone."
+
+  ④ ROUTE + ORDER    "Products, then customers, then orders. One
+     45 s             mutation per record for accounting, bulk for
+                      volume. Inventory last, absolutely."
+
+  ⑤ PROOF + CUTOVER  "The deliverable is the reconciliation report —
+     60 s             counts AND money. Static data loads weeks
+                      early; the cutover moves only the delta,
+                      inventory, redirects and DNS. Rollback is DNS."
+
+  then STOP and ask: "which part would you like me to go
+  deeper on?" — that hands them the follow-up and shows
+  you know there IS more depth.</div>
+
+  <div class="trap">
+    <span class="label">The most common way strong candidates lose this question</span>
+    They start at stage ④. Mutations, rate limits, bulk operations — all correct, all the <em>easy third</em> of the job. Starting there tells the interviewer you have implemented a migration but never <em>owned</em> one. Stages ①–③ are what a lead does, and they cost you 2 minutes and 15 seconds.
+  </div>
+
+  <h2>4. Six answers that sink candidates</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>The red flag</th><th>Why it lands badly</th><th>Say this instead</th></tr>
+    <tr>
+      <td>"I'd export a CSV and import it."</td>
+      <td>Fine for a small shop; on a paid job it says you have not met a real dataset. And there is no order CSV import.</td>
+      <td>"CSV works for a small clean catalogue. On a paid migration I need a per-record result for every skipped record, so I'd go through the API."</td>
+    </tr>
+    <tr>
+      <td>"I'd use bulk operations because it's faster."</td>
+      <td>Optimises for the wrong thing. Speed is rarely the constraint; accounting is.</td>
+      <td>"Bulk for the volume-heavy passes. But the hardest requirement is accounting, not speed, so I want a per-record response where explanations matter."</td>
+    </tr>
+    <tr>
+      <td>"I'd make sure the import doesn't fail."</td>
+      <td>Names the loud failure. Migrations mostly fail by <em>succeeding wrongly</em>.</td>
+      <td>"Failure isn't my worry — silent success is. Wrong dates, today's prices on old orders, an unfulfilled backlog. All of those import cleanly."</td>
+    </tr>
+    <tr>
+      <td>"I'd roll back the import if there's a problem."</td>
+      <td>Not a real capability. Interviewers know it.</td>
+      <td>"The rollback is DNS, not data. I keep the old system alive and paid for an agreed window and point the domain back if needed."</td>
+    </tr>
+    <tr>
+      <td>"SKUs are the natural key."</td>
+      <td>Trusts the client's data. Every catalogue has blank and duplicated SKUs.</td>
+      <td>"I'd check for duplicate and blank SKUs first. I'd rather use their primary key in an id-type metafield, which Shopify makes unique automatically."</td>
+    </tr>
+    <tr>
+      <td>"I'd import everything they have."</td>
+      <td>Misses the biggest lever in the job, and can create an undeliverable timeline.</td>
+      <td>"I'd ask what they actually sell versus what's reference data, and how far back orders need to go. Both are scope levers worth real money."</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="recall">
+    <span class="label">Cover the screen</span>
+    Recite the five stage names in order. Then give one silent failure and one loud one, and say which is the better interview answer.
+  </div>
+
+  <h2>5. Rapid-fire — interleaved on purpose</h2>
+
+  <p>These jump between lessons deliberately. Mixing topics is harder than reviewing one at a time, and that difficulty is what builds durable memory rather than the feeling of knowing.</p>
+  <div id="quiz"></div>
+
+  <h2>6. The three set-pieces</h2>
+
+  <p>Say each one aloud, timed, before revealing the model answer. Four minutes for the first, two for the others.</p>
+  <div id="recall"></div>
+
+  <h2>7. Score yourself</h2>
+
+  <p>Run the design question aloud, record it, and mark it against this. Be strict — an interviewer will be.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Did you…</th><th>Weight</th><th>✓</th></tr>
+    <tr><td>Ask whether the old system is being switched off, before designing anything?</td><td>High</td><td></td></tr>
+    <tr><td>Name a <b>matching key</b> and say why it makes the job re-runnable?</td><td><b>Highest</b></td><td></td></tr>
+    <tr><td>Say the import order — products, customers, orders — <em>and</em> the reason?</td><td>High</td><td></td></tr>
+    <tr><td>Name at least two <b>silent</b> failures, not just loud ones?</td><td>High</td><td></td></tr>
+    <tr><td>Mention reconciling <b>money</b>, not only counts?</td><td>High</td><td></td></tr>
+    <tr><td>Put inventory last, and say why?</td><td>Medium</td><td></td></tr>
+    <tr><td>Say rollback is DNS rather than data?</td><td>Medium</td><td></td></tr>
+    <tr><td>Raise redirects and the client's search traffic unprompted?</td><td>Medium</td><td></td></tr>
+    <tr><td>Ask which plan the store is on before estimating a large load?</td><td>Medium</td><td></td></tr>
+    <tr><td>Stay honest about what you have and have not run?</td><td><b>Highest</b></td><td></td></tr>
+    <tr><td>Finish inside 4 minutes and hand back a follow-up question?</td><td>Medium</td><td></td></tr>
+  </table>
+  </div>
+
+  <p><b>Eight or more ticks, including both "Highest" rows, is a pass.</b> Missing a "Highest" row is a fail regardless of the rest — one is the technical core of the subject, the other is the thing that gets checked on every reference call.</p>
+
+  <h2>8. Read this next</h2>
+  <div class="note">
+    <span class="label">Then close the loop</span>
+    Re-read the <a href="../reference/runbook.html">runbook</a> and the <a href="../reference/what-moves-matrix.html">what-moves matrix</a> — those two pages are the whole sub-course compressed, and they are the right things to skim in the hour before an interview. The <a href="../reference/glossary.html">glossary</a> keeps your vocabulary exact under pressure.
+  </div>
+
+  <div class="recall" style="border-style:solid">
+    <span class="label">Remember this</span>
+    <ul style="margin:.3rem 0 .6rem; padding-left:1.2rem">
+      <li><b>Three question shapes:</b> design, trap, experience. Nothing else comes up.</li>
+      <li><b>Name silent failures, not loud ones.</b> "It imports cleanly and is wrong" beats "it might fail."</li>
+      <li><b>Open honestly about scope</b>, in one sentence, early. Three follow-ups always reach bedrock.</li>
+      <li><b>Five stages:</b> scope → what moves → identity → route and order → proof and cutover.</li>
+      <li><b>Do not start at stage 4.</b> Leading with mutations says you have implemented one, never owned one.</li>
+      <li><b>The matching key is the technical core.</b> If you say one thing well, say that.</li>
+      <li><b>Reconcile money, not just counts</b> — and say why counts alone would pass.</li>
+      <li><b>Rollback is DNS.</b> Keep the old platform paid for an agreed window.</li>
+      <li><b>Finish in four minutes and hand back a follow-up.</b></li>
+    </ul>
+    <b>If you remember one thing: the interviewer is not checking whether you can call the API — they are checking whether you can be trusted with something that is expensive to get wrong and easy to get wrong quietly.</b>
+  </div>
+
+  <div class="ask">
+    Ready? Say <b>"mock me on data migration"</b> and I will run it properly — all three question shapes, real follow-ups that push on the weak parts of your answer, and honest scoring against the section 7 rubric.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0008-the-cutover-and-the-proof.html">← Lesson 8</a></span>
+    <span><a href="../index.html">The Map →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Import order, and the reason for it?',
+    options: [
+      'Products, customers, orders — an order is mostly pointers to those',
+      'Orders, products, customers — orders define which products matter',
+      'Customers, orders, products — customers are the slowest to import',
+      'Any order works, provided every pass is idempotent and re-runnable'
+    ],
+    answer: 0,
+    why: 'Products, then customers, then orders, "so that products and customers can be properly connected to the orders". Get it wrong and orders import detached — a silent failure.'
+  },
+  {
+    q: 'Which metafield type does Shopify make unique automatically?',
+    options: ['id', 'json', 'single_line_text_field', 'number_integer'],
+    answer: 0,
+    why: 'Custom IDs use the id metafield type, and "ID metafield types are automatically configured to have unique values". That is what makes it the right home for a legacy primary key.'
+  },
+  {
+    q: 'A product CSV cannot exceed what size?',
+    options: ['15 MB', '100 MB', '20 MB', '1 GB'],
+    answer: 0,
+    why: '"Your product CSV can\'t exceed 15 MB." The 100 MB figure is the JSONL cap for a bulk operation — a different route.'
+  },
+  {
+    q: 'You omit processedAt on an imported order. What breaks?',
+    options: [
+      'The whole sales history is dated to the import day, ruining analytics',
+      'The order is rejected because a processed date is mandatory',
+      'The order imports as a draft until a date is supplied later',
+      'Nothing — Shopify derives the date from the transaction records'
+    ],
+    answer: 0,
+    why: 'processedAt "is the date that appears on your orders and that\'s used in the analytic reports". Omit it and four years of trading lands on one day, which is not fixable afterwards.'
+  },
+  {
+    q: 'productSet is given a partial variant list for a product. What happens?',
+    options: [
+      'Variants missing from the input are deleted',
+      'Variants missing from the input are left unchanged',
+      'The mutation errors because the list is incomplete',
+      'The missing variants are recreated with default values'
+    ],
+    answer: 0,
+    why: 'For list fields — variants, metafields, collections — productSet deletes entries not included in the input. Plain fields behave the opposite way: omitted means unchanged.'
+  },
+  {
+    q: 'Which plan is exempt from the daily limit on uploading new variants?',
+    options: ['Shopify Plus', 'Advanced Shopify', 'Any annual plan', 'No plan is exempt'],
+    answer: 0,
+    why: 'Both documentation pages state that the daily rate limit for uploading variants does not apply to Shopify Plus stores. On a large catalogue this can be the difference between 30 days and 300.'
+  },
+  {
+    q: 'Why reconcile total order value and not only order counts?',
+    options: [
+      'Omitted line prices default to today\'s price, which counts cannot detect',
+      'Shopify rounds order totals on import, so small drift is expected',
+      'Counts are unavailable until the store is published to a channel',
+      'Value is the only figure a client will actually read in the report'
+    ],
+    answer: 0,
+    why: 'The price default imports the right number of orders at the wrong prices. Counts reconcile perfectly; only the money row catches it.'
+  },
+  {
+    q: 'Which record type exports as a CSV but has no CSV import?',
+    options: ['Orders', 'Products', 'Customers', 'Pages'],
+    answer: 0,
+    why: 'Orders can be exported from the Orders page, but the documented import routes are migration apps, the Order API and the Transaction API. The export is an analysis format.'
+  },
+  {
+    q: 'A store-to-store Shopify migration breaks reference metafields. Why?',
+    options: [
+      'IDs are issued per store, so references point at the old store\'s records',
+      'Reference metafields cannot be written by the Admin API at all',
+      'Metafield definitions are locked to the store that created them',
+      'References are stored as CDN URLs, which expire after transfer'
+    ],
+    answer: 0,
+    why: 'Every product, variant, customer, order and metaobject gets a new ID on the destination store. That is why the job is two passes: create records, then re-link every reference using a mapping.'
+  },
+  {
+    q: 'What is the realistic rollback for a completed migration?',
+    options: [
+      'Revert DNS to the old system, kept alive for an agreed window',
+      'Delete the imported records and start the migration again',
+      'Restore the store from a Shopify-provided nightly snapshot',
+      'Cancel the running CSV import before it completes processing'
+    ],
+    answer: 0,
+    why: 'Un-importing tens of thousands of orders is not practical, sent emails cannot be recalled, and a CSV import cannot be cancelled once it begins. DNS, publishing, redirects and inventory are the reversible things.'
+  },
+  {
+    q: 'How many options can a Shopify product have, and what happens to extras on import?',
+    options: [
+      'Three, and additional options are dropped silently',
+      'Three, and the product import fails with a clear error',
+      'Five, and extras become metafields automatically',
+      'There is no limit, but only three are shown on the storefront'
+    ],
+    answer: 0,
+    why: 'Products support a maximum of three options, and "products with more than 3 options won\'t have their options imported". Nothing shouts, which is why you count option axes before estimating.'
+  },
+  {
+    q: 'What must happen before URL redirects are useful?',
+    options: [
+      'They must be live before the domain resolves to Shopify',
+      'The old platform must be fully cancelled and its DNS removed',
+      'Google Search Console must be verified on the new store first',
+      'The theme must be published, since redirects run in Liquid'
+    ],
+    answer: 0,
+    why: 'If the domain points at Shopify before the redirects exist, real visitors and crawlers hit 404s in that window — exactly when Google is looking. Redirects are just data, so submit them in advance.'
+  },
+  {
+    q: 'Which mutation should write inventory at cutover, and why?',
+    options: [
+      'inventorySetQuantities, because an absolute write is retry-safe',
+      'inventoryAdjustQuantities, because a delta is atomic and precise',
+      'productSet, because it can carry inventory alongside variants',
+      'inventoryMoveQuantities, because it preserves the on-hand total'
+    ],
+    answer: 0,
+    why: 'Absolute writes make a retry after a timeout harmless. A delta applied twice corrupts the count permanently and silently — the classic cause of long-term inventory drift.'
+  },
+  {
+    q: 'Importing 88,000 historical orders with default settings does what to staff?',
+    options: [
+      'Sends each notified staff member one email per imported order',
+      'Sends a single summary email when the import job completes',
+      'Sends nothing, because imported orders skip notifications',
+      'Locks staff notifications until the import queue has drained'
+    ],
+    answer: 0,
+    why: 'Any staff member set to receive new order notifications "will receive a new order email for each imported order". Switch notifications off first — and remember to switch them back on.'
+  },
+  {
+    q: 'Which is the stronger answer to "what could go wrong?"',
+    options: [
+      'The import succeeds and is wrong — old orders at today\'s prices',
+      'The import fails partway and leaves the store in a broken state',
+      'Rate limits slow the import so it misses the cutover window',
+      'The client changes their mind about the scope during the project'
+    ],
+    answer: 0,
+    why: 'Loud failures are easy to name and easy to detect. Silent ones — a successful import of wrong data — are what actually damage migrations, and naming one is the fastest way to show real experience.'
+  },
+  {
+    q: 'How far back does Shopify recommend importing orders?',
+    options: [
+      '2 to 5 years, with the return-policy window as the minimum',
+      'All available history, since order data cannot be added later',
+      '12 months, because older orders cannot be backdated correctly',
+      'Only open orders, since fulfilled ones are archived automatically'
+    ],
+    answer: 0,
+    why: 'The guidance is to cover at minimum the return-policy window so customers can see orders still open for return, with 2 to 5 years recommended. It is also one of the few honest scope levers in the job.'
+  },
+  {
+    q: 'The media limit per product is what, and does it change with 2,048 variants?',
+    options: [
+      '250 items, unchanged by the variant count',
+      '2,048 items, matching the variant limit',
+      '250 items, rising to 2,048 on Shopify Plus',
+      'There is no documented per-product media limit'
+    ],
+    answer: 0,
+    why: 'Up to 250 media items per product, and it holds even at 2,048 variants. So a distinct image per variant is impossible on a wide product — plan images per option value.'
+  },
+  {
+    q: 'Why prefer fileCreate by URL for migration images, and what does it cost you?',
+    options: [
+      'Shopify fetches the file, but the old site must stay online',
+      'Uploads are faster, but images are capped at 250 KB each',
+      'It skips processing, but images arrive without alt text',
+      'It works offline, but each file needs a signed URL per request'
+    ],
+    answer: 0,
+    why: '"Provide a URL and Shopify handles downloading, processing, and storing the file" — so you transfer no bytes. The dependency is that the source URLs stay reachable, which fails if the client cancels old hosting on cutover day.'
+  },
+  {
+    q: 'What proves an importer is idempotent before it touches a live store?',
+    options: [
+      'Running identical input twice on a dev store and seeing no change',
+      'Wrapping every mutation in a retry with exponential backoff',
+      'Confirming every mutation returns no userErrors on the first run',
+      'Checking the API version supports five concurrent bulk operations'
+    ],
+    answer: 0,
+    why: 'Run 2 with identical input must produce an identical count. If it doubles, identity is broken — and that is the one failure that cannot be repaired after go-live.'
+  },
+  {
+    q: 'Which step in a cutover is most often forgotten?',
+    options: [
+      'Turning new-order notifications back on afterwards',
+      'Writing inventory before the DNS switch is made',
+      'Freezing the source system before the delta pass',
+      'Running the reconciliation report during the cutover'
+    ],
+    answer: 0,
+    why: 'Notifications go off at the start and the project ends at the reconciliation report. Weeks later somebody asks why nobody heard about a large order. Put it in the runbook as a checkbox with a name against it.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: 'SET PIECE 1 — "They are moving from Magento: 40,000 products, 4 years of orders, 50,000 customers. Walk me through it." (4 minutes)',
+    answer: '<b>① Scope.</b> Three questions first. Is Magento being switched off — because if not this is a sync, not a migration. How far back do orders need to go: Shopify suggests the return-policy window as a minimum and two to five years as normal, and that is a real scope lever. And which Shopify plan, because non-Plus stores have a documented daily throttle on creating new variants and Plus is exempt.<br><br><b>② What moves.</b> I sort every record into three buckets and send the list in writing before starting. Products, collections, images, inventory, pages move cleanly. Customers move but <b>passwords do not</b>. Orders move but only through the API — there is no order CSV import. Gift cards move if I supply the original codes. Reviews and analytics history <b>never</b> move. Bucket three is a relationship risk, so it is a written note in week one, not a surprise at go-live.<br><br><b>③ Identity — the key decision.</b> I put Magento\'s primary key into an <code>id</code>-type metafield on each Shopify record, because that type is automatically unique, and then upsert with <code>productSet</code> and <code>identifier.customId</code>. That makes the whole import re-runnable: look up, update if found, create if not. The mapping lives in the platform rather than my database, so the next developer can use it too. I prove it by running identical input twice on a dev store — if the count doubles, I stop and fix the key.<br><br><b>④ Route and order.</b> Products, then customers, then orders, because an order is mostly pointers. One mutation per record by default, because the hardest requirement is accounting — I need a ledger row per source record, and that ledger is my resume mechanism, retry queue and reconciliation report at once. Bulk operations for the volume-heavy passes, with 100 MB JSONL files and up to five running at a time. Inventory last, absolute, with <code>compareQuantity</code>.<br><br>For orders specifically I set <code>processedAt</code> in the past, set line-item prices explicitly — omit them and the API uses today\'s variant price — set <code>fulfillmentStatus</code>, send real <code>transactions</code>, and switch off new-order notifications first.<br><br><b>⑤ Proof and cutover.</b> The deliverable is a reconciliation report: counts and total money on both sides, every difference explained. Static data loads weeks early; the cutover moves only the delta, inventory, redirects and DNS. Redirects come from Search Console ranked by traffic and go live before the domain moves. Rollback is DNS, with Magento kept alive and paid for an agreed window.<br><br>"Which part would you like me to go deeper on?"'
+  },
+  {
+    prompt: 'SET PIECE 2 — "What is the most common way a migration goes wrong?" (2 minutes)',
+    answer: 'It <b>succeeds</b> and is wrong. That is the answer, and it is why this work needs a particular kind of care.<br><br>Loud failures are easy. The API errors, you see it, you retry. What actually damages migrations is data that imports cleanly and is quietly incorrect, because there is no error to catch and nobody looks until months later.<br><br>My three favourite examples, all from Shopify\'s own documented defaults. <b>One:</b> omit <code>processedAt</code> and every historical order is dated to the import day — four years of trading on one date, and the analytics history is gone for good. <b>Two:</b> omit a line-item price and the API uses the variant\'s <em>current</em> price, so 2019 orders import at 2026 pricing. <b>Three:</b> <code>fulfillmentStatus</code> defaults to <code>unfulfilled</code>, so the client opens Shopify to what looks like a backlog of tens of thousands of unshipped orders.<br><br>All three import successfully. All three would pass a count-based reconciliation. Only a <b>money</b> reconciliation catches the second one, which is exactly why my report has a total-value row and not just counts.<br><br>There is a fourth that is not about data at all: importing orders emails every staff member on new-order notifications, once per order. That one is loud, immediate, and completely avoidable with one setting.'
+  },
+  {
+    prompt: 'SET PIECE 3 — "How would you handle a 300,000-variant catalogue?" (2 minutes)',
+    answer: 'I would push back on the premise first, then plan for the constraint.<br><br><b>The pushback:</b> a platform-scale catalogue is usually a <b>reference database</b> — every part or card that exists — while the store only needs what the merchant actually stocks. Those numbers often differ by a factor of a hundred. So I would import items with stock or sales history and create the rest on first stock movement. That is the biggest lever available, and it costs nothing to ask.<br><br><b>The constraint:</b> non-Plus stores have a <b>documented daily throttle on creating new variants</b>, and Plus is exempt. I would be careful about the exact number, because the two Shopify pages I have read disagree — one says the throttle starts at 50,000 variants and allows 1,000 a day, the other says 500,000 and 10,000 a day. At 10,000 a day, 300,000 variants is about a month. At 1,000 a day it is 300 days, which means the project as described is not deliverable. So before committing to a date I measure the real rate on the real store with a timed batch.<br><br><b>The shape:</b> three options maximum, so I choose the three a buyer must pick in order to buy and push everything else into metafields. Options multiply, so moving one axis out can cut the job by most of its size. Media caps at 250 items per product even at 2,048 variants, so images go per option value, not per variant.<br><br><b>The build:</b> a ledger row per record, so the loader is resumable — and because every write is an upsert keyed on a custom ID, a restarted loader can safely just try again.'
+  }
+]);
+</script>

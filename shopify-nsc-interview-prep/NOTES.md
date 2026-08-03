@@ -79,3 +79,46 @@
   Subtle real detail worth keeping: a **shipping** code can return `applicable: true` and still
   render nothing (no address until checkout); Horizon detects it by diffing the rendered pills
   against the cart payload. Root index counts bumped again: pages 126→127, lessons 74→75.
+- 2026-08-03: new **`shopify-data-migration/` sub-course** added — the fifth, and the largest
+  single-session build: 9 lessons + 3 reference cards + Map + MISSION + RESOURCES + 1 learning
+  record (13 HTML pages). Scope came from the learner directly: a *new sub-course* covering *all
+  three* migration scenarios (legacy platform → Shopify, huge catalogue load, Shopify → Shopify).
+  Built as a sub-course rather than lessons 0030+ because it is a distinct job with its own arc,
+  and because it must **route** to three existing pages instead of repeating them: `lessons/0018`
+  owns bulk-operation mechanics, `lessons/0011` owns the *ongoing* sync, and
+  `pos-in-store/0006` owns the *programme* shape of a cutover. Lesson 8 here covers only the
+  data-specific cutover steps. **Facts verified against shopify.dev / help.shopify.com on
+  2026-08-03**, all linked on-page: forced import order (products → customers → orders);
+  passwords never move + passwordless one-time-code sign-in; **no order CSV import** (Order API
+  + Transaction API only); `orderCreate` needs `write_orders` + an **offline token** and caps at
+  **5 orders/min on dev/trial stores**; `processedAt` explicitly documented for backdating
+  imports; **omitting a line price uses the variant's current price** ("can result in inaccurate
+  order data") — the money bug that count-only reconciliation misses; `fulfillmentStatus`
+  defaults to `unfulfilled`; **one notification email per imported order**; product CSV 15 MB,
+  Handle is the match key, blank columns overwrite but omitted ones do not, imports **cannot be
+  cancelled**, spreadsheet sorting loses image links, and **changing an Option value deletes and
+  recreates variant IDs**; bulk JSONL 100 MB / 24 h / **5 concurrent from 2026-01** / one
+  connection field, `file` parameter last; `productSet` **deletes list entries you omit**;
+  `metafieldsSet` 25 per call / 10 MB; 3 options, 2048 variants, **250 media** per product;
+  `fileCreate` fetches images by URL; `giftCardCreate` accepts your own code; saved cards move
+  only from **Stripe** (credit cards) and **Braintree** (credit cards + Apple Pay), PANs need
+  Plus/Enterprise + Professional Services; bulk redirects via `urlRedirectImportCreate` →
+  `urlRedirectImportSubmit`. **Two headline discoveries.** (1) **Custom IDs** — Shopify's own
+  documented answer to the matching-key problem (`id`-type metafield, "automatically configured
+  to have unique values", upsert via `productSet` `identifier.customId`); lookup covers products,
+  variants, collections, customers, orders, locations but **create-or-update covers products and
+  customers only**. This was absent from the entire course and is now the core lesson (L03).
+  (2) **Two Shopify pages disagree on the daily variant-creation throttle** — shopify.dev/api/usage/limits
+  says 50,000 variants → 1,000/day; help.shopify.com/add-variants says 500,000 → 10,000/day; both
+  agree Plus is exempt. At 1,000/day a 300,000-variant catalogue is **300 days**, so this decides
+  whether a project is deliverable. L05 teaches the disagreement itself and "measure on the real
+  store" rather than picking a number — and it corrects the Game Locker notes, which had only the
+  looser figure. Honesty rule held: L09's interview opener is a **fill-in-the-blank template**, so
+  no page claims migration experience on the learner's behalf. Root landing page counts **recounted from
+  disk** rather than incremented: sub-courses 4→**6**, pages 152→**180**, lessons 92→**109**,
+  references 37→**45**, katas 9 (already correct); Shopify sub-course total +49→**+62**.
+  The first attempt at that recount was **wrong** — it excluded `.site/` but not
+  `claude-architect-foundations/.vercel-site/`, inflating pages by 7, lessons by 6 and references
+  by 2. **Exclude both build directories**, exactly as the counting note says.
+  Verified after the build: 0 broken links repo-wide, all `<div>` tags balanced, every page has a
+  "← The Map" breadcrumb, no orphan files.

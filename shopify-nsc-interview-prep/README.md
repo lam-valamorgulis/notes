@@ -19,6 +19,7 @@ Days 4–6: **write real backend code live** and fix broken code. Day 7: **full 
 | `exercises/` | Live-coding katas — build-from-blank and debug-and-fix (built for Days 4–6). |
 | `learning-records/` | Progress notes, one per milestone. |
 | `assets/` | Shared styles + quiz engine (copied from round 1 so this folder is self-contained). |
+| Sub-course folders | Self-contained mini-courses, each with its own Map: `stockinstore-omnichannel/`, `theme-architecture/`, `pos-in-store/`, `shopify-data-migration/`, `game-locker/`. All five are linked from `index.html`. |
 
 The round-1 course is unchanged in `../shopify-erp-sync-1st-interview/`. Days 1–3 link back
 to those lessons for the depth pass.
