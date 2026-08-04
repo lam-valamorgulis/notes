@@ -1,0 +1,539 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 12 — The Vendor Stock-Feed Connector</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 12 · Track B · The thing you actually build</p>
+  <h1>The Vendor Stock-Feed Connector</h1>
+  <p class="subtitle">In Track B the vendor owns the availability engine. You own the pipe that feeds it. This lesson builds that pipe properly — as a relay with two failure surfaces, two rate limits, and one audit trail.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> design and code the <em>connector</em> — the small service that moves stock from the retailer's POS/ERP into the vendor's API. Name the one rule that makes a relay safe (<b>send absolute state, never deltas</b>), keep a <b>shadow table</b> so you can always answer "what did we send?", and size your batches against real Shopify and vendor rate limits.
+  </div>
+
+  <p class="small">Builds on <a href="0011-integrating-shopify-with-stockinstore-saas.html">Lesson 11</a> (the responsibility split) and on <a href="0002-inventory-ingestion-multi-source-sync.html">Lesson 2</a> (ingestion into your own database). The concerns rhyme, but a relay is <em>not</em> the same as an ingest — this lesson is about the difference.</p>
+
+  <h2>1. What a connector is, and why it exists</h2>
+  <p>The vendor says "we do the integration." They mean they integrate <em>their</em> logic. Nobody at the vendor has credentials to the retailer's till system in Ballarat. So somebody writes a small service that reads that till system and calls the vendor's API. That service is the <b>connector</b>, and it is yours.</p>
+  <div class="note">
+    <span class="label">The one-sentence definition</span>
+    A <b>connector</b> is a service you own that reads stock from a system you don't own, and writes it to an API you don't control. It owns no business logic. Its whole job is to be <em>correct, cheap, and observable</em> while sitting between two things that can both fail.
+  </div>
+  <p>That "between two things" is the whole lesson. In Lesson 2 you ingested into your own database, so you controlled the destination — you could pick the schema, add a column, run a repair query. Here the destination is a vendor's HTTP API with its own rules, its own rate limit, and its own opinion about what a stock update means. You cannot fix their side. So you design for it.</p>
+
+  <h2>2. An ingest has one failure surface. A relay has three.</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Lesson 2 (build it): ingest</th><th>Lesson 12 (integrate): relay</th></tr>
+    <tr><td>Source can fail</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>Your worker can fail</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>Destination can fail</td><td>Rarely — it's your DB, and a failed write rolls back</td><td><b>Often</b> — vendor 429, 500, timeout, schema change, maintenance window</td></tr>
+    <tr><td>Destination rate limit</td><td>None that matters</td><td><b>Hard cap you must respect</b></td></tr>
+    <tr><td>Can you inspect the stored state?</td><td>Yes — <code>SELECT</code> it</td><td>Only through their API, if they even expose a read</td></tr>
+    <tr><td>Can you repair it?</td><td>Yes — one <code>UPDATE</code></td><td>Only by re-sending</td></tr>
+  </table>
+  </div>
+  <p>Read the last two rows again. In a relay you can lose track of what the destination believes. That single fact drives two design decisions below: <b>absolute sends</b> (§4) and the <b>shadow table</b> (§5).</p>
+
+  <h2>3. The relay architecture</h2>
+  <div class="diagram">   SOURCES (not yours)          THE CONNECTOR (yours)              VENDOR (not yours)
+
+  ┌──────────────┐ push  ┌─────────────────────────────────────┐
+  │ Store A POS  │──────►│  1. RECEIVE / FETCH                 │
+  │  (webhook)   │       │     adapter per source type         │
+  └──────────────┘       │     verify HMAC · ack fast          │
+  ┌──────────────┐ pull  │            │                        │
+  │ Store B ERP  │◄─────►│            ▼                        │
+  │  (poll API)  │       │  2. NORMALISE                       │
+  └──────────────┘       │     source code → canonical sku     │
+  ┌──────────────┐ file  │     store code  → canonical loc     │──── HTTPS ───►┌─────────────┐
+  │ Store C      │──────►│     unit convert · reject stale     │  batched      │ stockinstore│
+  │  (SFTP CSV)  │       │            │                        │  absolute     │    API      │
+  └──────────────┘       │            ▼                        │  idempotent   │             │
+                         │  3. SHADOW TABLE  (what we sent)    │◄─── 200/429 ──│  availability
+                         │     last_sent_qty · hash · sent_at  │     /5xx      │  engine     │
+                         │            │                        │               └─────────────┘
+                         │            ▼  only if changed       │                      │
+                         │  4. SEND with token bucket + retry  │                      │ webhooks
+                         │     idempotency key · jitter · DLQ  │                      ▼  (L16)
+                         └─────────────────────────────────────┘               back to POS/ERP
+
+     Stage 3 is the stage juniors leave out. Without it you cannot answer
+     "does the vendor already know this?" — so you either spam them or drift.</div>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: the four connector stages, and why a relay has a failure surface an ingest does not.</div>
+
+  <h2>4. Absolute state, not deltas — the rule that saves you</h2>
+  <p>Two ways to tell a vendor that stock changed:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Delta ("adjust by −1")</th><th>Absolute ("set to 4")</th></tr>
+    <tr><td>A lost message means…</td><td><b>Permanent drift.</b> The count is wrong forever, silently.</td><td>Nothing. The next send repairs it.</td></tr>
+    <tr><td>A duplicated message means…</td><td><b>Double-applied.</b> Stock is now wrong by one.</td><td>Nothing. Setting 4 twice is still 4.</td></tr>
+    <tr><td>Out-of-order arrival means…</td><td>Wrong result — order matters.</td><td>Last write wins; guard with a timestamp.</td></tr>
+    <tr><td>Needs idempotency to be safe?</td><td><b>Yes, absolutely</b></td><td>It is naturally idempotent</td></tr>
+    <tr><td>Recovery after an outage</td><td>Replay every missed event in order</td><td>Send the current state once</td></tr>
+  </table>
+  </div>
+  <div class="tip">
+    <span class="label">The rule</span>
+    <b>When you relay across a boundary you don't control, send absolute state.</b> A delta is a differential equation that needs every step; an absolute value is self-healing. This is the same choice Shopify itself exposes — <code>inventorySetQuantities</code> (absolute) vs <code>inventoryAdjustQuantities</code> (delta) — and for a cross-system feed you want the absolute one.<sup><a href="#c1">1</a></sup>
+  </div>
+  <p>Deltas are not always wrong. A till that reports "sold 1" is <em>naturally</em> a delta, and asking a 15-year-old POS to compute a full count may not be possible. The fix is to convert as early as you can: apply the delta to your own shadow count, then send the resulting absolute number onward. The delta lives inside one system; the absolute crosses the boundary.</p>
+  <div class="trap">
+    <span class="label">The trap</span>
+    Relaying the POS's delta straight to the vendor because "it's less data." One dropped HTTP call, and that store's count for that SKU is wrong until a human notices. There is no error message. Availability quietly lies for weeks. This is the most expensive bug in this lesson.
+  </div>
+
+  <h2>5. The shadow table — your own memory of the vendor</h2>
+  <p>You do not own the vendor's database, so you keep a small local record of what you last told them. It is not a copy of their state; it is a log of your side of the conversation.</p>
+  <pre><code>-- one row per (location, sku): what we last successfully sent
+CREATE TABLE vendor_feed_state (
+  retailer_id   TEXT        NOT NULL,
+  location_id   TEXT        NOT NULL,   -- canonical, ours
+  sku           TEXT        NOT NULL,
+  sent_qty      INT         NOT NULL,   -- the absolute number we sent
+  sent_hash     TEXT        NOT NULL,   -- hash of the whole payload we sent
+  source_ts     TIMESTAMPTZ NOT NULL,   -- when the SOURCE measured it (UTC)
+  sent_at       TIMESTAMPTZ NOT NULL,   -- when we got a 2xx back
+  attempts      INT         NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  PRIMARY KEY (retailer_id, location_id, sku)
+);
+CREATE INDEX ON vendor_feed_state (retailer_id, sent_at);   -- for the staleness report</code></pre>
+  <p>Four things this one table buys you:</p>
+  <ol>
+    <li><b>Change suppression.</b> If the new payload hash equals <code>sent_hash</code>, skip the call. A nightly full file of 50,000 rows where 300 changed becomes 300 API calls, not 50,000. This is usually the difference between fitting inside the rate limit and not.</li>
+    <li><b>An answer to "what did we send?"</b> When the retailer says the widget is wrong, you can prove your side in one query instead of arguing with the vendor.</li>
+    <li><b>A staleness report.</b> <code>MAX(sent_at)</code> per location tells you a store went quiet, before a customer finds out.</li>
+    <li><b>A resend path.</b> After a vendor outage, select the rows whose <code>source_ts &gt; sent_at</code> and replay only those.</li>
+  </ol>
+  <div class="note">
+    <span class="label">Why a hash and not just the quantity</span>
+    Stock is not the only field you send. Price, active flag, and store trading hours may ride along. Comparing only <code>sent_qty</code> would skip a call when the quantity is unchanged but the price moved. Hash the full payload you actually send, and compare that.
+  </div>
+
+  <h2>6. The connector in code</h2>
+  <p>Node + TypeScript, framed the way a NestJS service would be. One adapter per source, one client for the vendor, one worker that joins them.</p>
+  <pre><code>// ---------- the only shape the rest of the connector knows about ----------
+type StockReading = {
+  retailerId: string;
+  locationId: string;      // canonical, already mapped (L13)
+  sku: string;             // canonical, already mapped (L13)
+  onHand: number;          // absolute, already unit-converted
+  sourceTs: Date;          // when the SOURCE measured it, UTC
+  source: string;          // 'retail-express' | 'store-c-sftp' | ...
+};
+
+// ---------- one adapter per POS/ERP: the only place quirks are allowed ----
+interface SourceAdapter {
+  readonly source: string;
+  /** Full snapshot of everything this source knows. Used for reconciliation. */
+  snapshot(retailerId: string): AsyncIterable&lt;StockReading&gt;;
+  /** Parse one inbound push into readings. Throws on a bad signature. */
+  parsePush(rawBody: Buffer, headers: Record&lt;string, string&gt;): StockReading[];
+}
+
+// ---------- the worker: normalise → suppress → send ----------
+async function relay(readings: StockReading[]) {
+  for (const batch of chunk(readings, VENDOR_BATCH_SIZE)) {
+    const toSend: StockReading[] = [];
+
+    for (const r of batch) {
+      const prev = await state.get(r.retailerId, r.locationId, r.sku);
+
+      // (a) staleness guard — never move stock backwards in time
+      if (prev &amp;&amp; r.sourceTs &lt; prev.source_ts) { metrics.stale++; continue; }
+
+      // (b) change suppression — the vendor already knows this
+      if (prev &amp;&amp; prev.sent_hash === hashPayload(r)) { metrics.unchanged++; continue; }
+
+      toSend.push(r);
+    }
+    if (toSend.length === 0) continue;
+
+    await bucket.take(costOf(toSend));              // §7 client-side rate limit
+    await sendWithRetry(toSend);                     // §8 retry + DLQ
+  }
+}
+
+async function sendWithRetry(readings: StockReading[], attempt = 0): Promise&lt;void&gt; {
+  // one stable key per batch: safe for the vendor to de-duplicate on
+  const idempotencyKey = sha256(readings.map(r =&gt;
+    `${r.locationId}|${r.sku}|${r.onHand}|${r.sourceTs.toISOString()}`).sort().join('\n'));
+
+  try {
+    await vendor.setInventory({ idempotencyKey, items: readings.map(toVendorShape) });
+    await state.markSent(readings);                  // shadow table, only on 2xx
+    metrics.sent += readings.length;
+  } catch (err) {
+    if (isRetryable(err) &amp;&amp; attempt &lt; MAX_ATTEMPTS) {
+      // full jitter: random between 0 and the capped exponential delay
+      const cap   = Math.min(30_000, 500 * 2 ** attempt);
+      const delay = Math.random() * cap;
+      if (err.status === 429 &amp;&amp; err.retryAfterMs) await sleep(err.retryAfterMs);
+      else await sleep(delay);
+      return sendWithRetry(readings, attempt + 1);
+    }
+    await deadLetter.put({ readings, err: String(err), attempt });   // never silently drop
+    metrics.dead += readings.length;
+  }
+}</code></pre>
+  <div class="tip">
+    <span class="label">Three details a reviewer looks for</span>
+    <b>(1)</b> <code>state.markSent</code> runs <em>only</em> after a 2xx — if you write the shadow row optimistically, a failed send makes you believe the vendor knows something it doesn't, and change suppression then hides the truth forever. <b>(2)</b> The idempotency key is derived from the <em>content</em>, sorted, so a retry of the same batch produces the same key. <b>(3)</b> <code>Retry-After</code> from a 429 beats your own backoff maths — the server knows better than you do.
+  </div>
+
+  <h2>7. Two rate limits, one budget</h2>
+  <p>A connector can be throttled at both ends. Size it against the real numbers.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Side</th><th>The real limit</th><th>What it means for the connector</th></tr>
+    <tr><td>Shopify GraphQL Admin API<sup><a href="#c1">1</a></sup></td><td>Cost-based leaky bucket: <b>100 points/second</b> (Standard), <b>200</b> (Advanced), <b>1000</b> (Plus), <b>2000</b> (Enterprise). A single query may not exceed <b>1,000 points</b> regardless of plan.</td><td>If you also read products/locations from Shopify, that read competes with every other app on the store. Cache the catalogue; don't re-read it per SKU.</td></tr>
+    <tr><td>Shopify bulk operations<sup><a href="#c1">1</a></sup></td><td>No max-cost or rate limit like single queries.</td><td>The right tool for the first full catalogue load, and for a monthly full reconciliation. Not for incremental updates.</td></tr>
+    <tr><td>The vendor's API</td><td>Whatever their contract says — often requests/minute plus a max batch size.</td><td><b>Get this in writing during discovery</b> (<a href="0018-the-integration-project.html">L18</a>). It sets your batch size and your worst-case catch-up time.</td></tr>
+    <tr><td>The POS/ERP</td><td>Often the weakest link: an on-premise box, sometimes single-threaded.</td><td>Poll gently, off-peak, staggered per store. A connector that DOSes the till system gets switched off by the retailer.</td></tr>
+  </table>
+  </div>
+  <div class="note">
+    <span class="label">The catch-up sum you should be able to do out loud</span>
+    50 stores × 20,000 SKUs = 1,000,000 rows. Vendor accepts 500 items per call at 60 calls/minute → 30,000 items/minute → <b>~33 minutes</b> for a full push. That is your disaster-recovery time, and it decides whether a full resend is a routine tool or a weekend. Ask for the numbers, then do this sum before you promise anything.
+  </div>
+
+  <h2>8. When to send: three triggers</h2>
+  <ul>
+    <li><b>Event-driven</b> — a push arrives, you relay within seconds. Best freshness, spiky load.</li>
+    <li><b>Micro-batch</b> — collect for 5–30 seconds, then send one call per location. Usually the right default: it collapses a burst of ten changes to one SKU into a single send, and it fits batch-oriented vendor APIs.</li>
+    <li><b>Scheduled reconciliation</b> — a full snapshot per source on a timer (nightly is typical). This is the only thing that repairs silent drift, and it is <b>not optional</b>. Compare the snapshot against the shadow table and send only the differences, so a nightly full run costs almost nothing when nothing changed.</li>
+  </ul>
+  <div class="trap">
+    <span class="label">The trap</span>
+    Shipping only the event path because it demos well. Feeds drop messages; a vendor has maintenance windows; an adapter gets deployed with a bug for six hours. Without scheduled reconciliation, every one of those leaves permanent wrong stock, and the first person to notice is a customer standing in a shop.
+  </div>
+
+  <h2>9. Observability: the five numbers on the wall</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Metric</th><th>Why it's the right one</th><th>Alert when</th></tr>
+    <tr><td><b>Feed age per location</b> (p95 and max of <code>now − source_ts</code>)</td><td>Catches a silent store. Averages hide one dead store in fifty — use max.</td><td>Max &gt; 2× that store's normal interval</td></tr>
+    <tr><td><b>Send success rate</b>, split 4xx vs 5xx</td><td>4xx is <em>your</em> bug (bad payload, bad mapping). 5xx is <em>theirs</em>. Different pager, different fix.</td><td>4xx &gt; 0.1%, or any sustained 5xx</td></tr>
+    <tr><td><b>Suppression ratio</b> (unchanged ÷ total)</td><td>A sudden drop means something is churning — a clock, a hash, a price feed. A jump to 100% means the source froze.</td><td>Changes by more than half, day over day</td></tr>
+    <tr><td><b>Dead-letter depth</b></td><td>Anything here is stock the vendor does not know about. Non-zero is an incident, not a metric.</td><td>&gt; 0 for more than one cycle</td></tr>
+    <tr><td><b>Reconciliation drift count</b></td><td>Rows the nightly snapshot had to correct. This is your honest measure of whether the event path works.</td><td>Trending up at all</td></tr>
+  </table>
+  </div>
+
+  <h2>10. Failure modes</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What breaks</th><th>How you handle it</th></tr>
+    <tr><td><b>Vendor returns 429</b></td><td>Honour <code>Retry-After</code>; back off with full jitter; the queue absorbs it. Never drop the reading — a throttle is a delay, not a failure.</td></tr>
+    <tr><td><b>Vendor is down for an hour</b></td><td>Retries fail, batches land in the DLQ. When it recovers, resend from the shadow table where <code>source_ts &gt; sent_at</code> — absolute sends mean you send <em>current state</em>, not a backlog of history.</td></tr>
+    <tr><td><b>Vendor changes a field name</b></td><td>4xx spike, isolated to one payload shape. Contract test against their sandbox in CI catches it before production. Pin the API version if they offer one.</td></tr>
+    <tr><td><b>POS clock is wrong</b></td><td>The staleness guard trusts <code>source_ts</code>, so a skewed clock can pin stock at an old value. Alert when a reading's <code>source_ts</code> is in the future or absurdly old; prefer a monotonic sequence number where the source offers one.</td></tr>
+    <tr><td><b>Shadow table and vendor disagree</b></td><td>Only reconciliation finds this. Re-send the location in full, then investigate. If the vendor exposes a read API, diff it weekly.</td></tr>
+    <tr><td><b>Connector deployed with a mapping bug</b></td><td>4xx or "unknown sku" from the vendor. Quarantine those rows, alert, keep the rest flowing. Never let one bad SKU stop a store's feed.</td></tr>
+    <tr><td><b>Someone reruns yesterday's file</b></td><td>The staleness guard rejects older <code>source_ts</code>; the hash suppresses unchanged rows; the idempotency key makes a true duplicate a no-op. Three layers, on purpose.</td></tr>
+    <tr><td><b>A store closes</b></td><td>Its feed stops, so feed age grows and looks like a fault. Deactivate the location in your registry (<a href="0013-identifier-mapping-registry.html">L13</a>) so it drops out of the alert and out of the vendor's store list.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (the connector in 6 sentences)</span>
+    <p>"The connector is the one service I really build in an integration: it reads stock from the retailer's POS or ERP and writes it into the vendor's API. I treat it as a relay, not an ingest, because the destination is a system I can't inspect or repair — so I always send <b>absolute state</b> rather than deltas, since a lost delta is permanent silent drift while a lost absolute heals on the next send. I keep a small <b>shadow table</b> of what I last sent per location and SKU, hashed, which gives me change suppression, a staleness report, proof of what I sent, and a clean resend path after an outage. I respect rate limits at both ends — Shopify's GraphQL Admin API is a cost-based bucket at 100 points a second on a standard plan, and the vendor has their own cap — so I micro-batch, back off with jitter, and honour <code>Retry-After</code>. I run three triggers: event-driven for freshness, micro-batch as the default, and a scheduled full reconciliation that repairs drift, because feeds always drop messages. And I watch five numbers — feed age per location, 4xx versus 5xx send rate, suppression ratio, dead-letter depth, and reconciliation drift — so a broken store surfaces to me before it surfaces to a customer."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://shopify.dev/docs/api/usage/limits">Shopify — API rate limits</a> — the cost-based GraphQL bucket per plan, the 1,000-point single-query cap, and why bulk operations are exempt.<br>
+  📖 <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventorySetQuantities">Shopify — <code>inventorySetQuantities</code></a> vs <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventoryAdjustQuantities"><code>inventoryAdjustQuantities</code></a> — absolute vs delta, in Shopify's own API.<br>
+  📖 <a href="https://www.stockinstore.com/integration/shopify/">stockinstore — Shopify integration</a> — "designed to work with every Point of Sale or ERP system", and the franchise case of several POS systems at once.</p>
+
+  <p class="small" id="c1">[1] Verified against shopify.dev (checked 2026-08-04): the GraphQL Admin API is limited by <b>calculated query cost</b> on a leaky bucket at <b>100 points/second</b> (Standard), <b>200</b> (Advanced Shopify), <b>1000</b> (Shopify Plus), <b>2000</b> (Enterprise / Commerce Components), and "a single query may not exceed a cost of 1,000 points, regardless of plan limits"; bulk operations "don't have the max cost limits or rate limits that single queries have." <code>inventorySetQuantities</code> sets absolute quantities and <code>inventoryAdjustQuantities</code> applies deltas. stockinstore's "we do the integration, not your developers" and "the stockinstore solutions were designed to work with every Point of Sale or ERP system" are quoted from stockinstore.com (checked 2026-08-04). The vendor's own request/minute cap and max batch size are contract-specific and deliberately not invented here — the lesson tells you to obtain them in discovery. The absolute-vs-delta argument, the shadow table, and the five metrics are standard integration engineering, not vendor documentation.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can explain why a relay is harder than an ingest without mentioning code, argue for absolute sends over deltas from the failure cases alone, draw the shadow table from memory and name its four uses, and do the catch-up sum in §7 out loud with made-up but sensible numbers.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the NestJS module wiring, the contract test against a vendor sandbox, or the SQL for the nightly drift report? Just ask. Next comes the thing that breaks more integrations than the connector does: <a href="0013-identifier-mapping-registry.html">identifier mapping</a>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0011-integrating-shopify-with-stockinstore-saas.html">← Prev: Track B Overview</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0013-identifier-mapping-registry.html">Next: Identifier Mapping →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "Why should a connector send absolute stock values instead of deltas to the vendor?",
+      options: [
+        "A lost or duplicated absolute send self-heals; a lost or duplicated delta causes permanent silent drift",
+        "Absolute values use less bandwidth",
+        "Vendors only accept absolute values",
+        "Deltas are not supported by HTTP"
+      ],
+      answer: 0,
+      why: "Setting a value to 4 twice is still 4, and the next send repairs any miss. A missed '−1' is wrong forever with no error message, and a duplicated '−1' is wrong by one. Since you cannot inspect or repair the vendor's state, you choose the message type that is naturally idempotent and self-healing."
+    },
+    {
+      q: "What is the shadow table for?",
+      options: [
+        "Recording what you last successfully sent, so you can suppress unchanged sends, report staleness, prove your side, and resend after an outage",
+        "Caching the vendor's availability answers for the widget",
+        "Storing customer PII for pickup",
+        "Replacing the vendor's database"
+      ],
+      answer: 0,
+      why: "It is a log of your side of the conversation, keyed on (retailer, location, sku), holding the sent quantity, a hash of the payload, the source timestamp and the send time. Four uses: change suppression, a staleness report, proof of what you sent, and a targeted resend path."
+    },
+    {
+      q: "When should the shadow row be written?",
+      options: [
+        "Only after the vendor returns 2xx",
+        "Before sending, so you don't send twice",
+        "Once a night, in a batch",
+        "Never — the vendor is the source of truth"
+      ],
+      answer: 0,
+      why: "If you write it optimistically and the send fails, change suppression will then skip that row forever — you believe the vendor knows something it never received. The shadow table must only ever record confirmed sends."
+    },
+    {
+      q: "What is the GraphQL Admin API rate limit on a standard Shopify plan?",
+      options: [
+        "A cost-based leaky bucket at 100 points per second, with no single query over 1,000 points",
+        "100 requests per second",
+        "2 requests per second",
+        "Unlimited for apps"
+      ],
+      answer: 0,
+      why: "The GraphQL Admin API is limited by calculated query cost, not request count: 100 points/second on Standard, 200 on Advanced, 1000 on Plus, 2000 on Enterprise, and a single query may never exceed 1,000 points. Bulk operations are exempt from those single-query limits, which is why they are the right tool for the first full load."
+    },
+    {
+      q: "Why is scheduled reconciliation not optional in a Track B connector?",
+      options: [
+        "Feeds drop messages and vendors have outages, so only a full snapshot comparison repairs silent drift",
+        "Because the vendor charges less for scheduled calls",
+        "To keep the queue warm",
+        "It replaces the event path entirely"
+      ],
+      answer: 0,
+      why: "The event path always loses some messages — a maintenance window, a bad deploy, a dropped webhook. None of those produce an error you will see later. Comparing a full source snapshot against the shadow table and sending only the differences is the only mechanism that finds and fixes that drift, and it is cheap because almost nothing changed."
+    },
+    {
+      q: "Send failures are 4xx. What does that tell you?",
+      options: [
+        "It is your bug — a bad payload or a bad mapping — not the vendor's outage",
+        "The vendor is down",
+        "You are rate limited",
+        "Nothing useful; treat all errors the same"
+      ],
+      answer: 0,
+      why: "Splitting 4xx from 5xx is why the metric is useful. 4xx means the vendor rejected what you sent: a malformed field, an unknown SKU, a bad location. That is your fix. Sustained 5xx means their side is unhealthy. Same alert for both, and you page the wrong person half the time."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: What is a connector, and why is building one harder than the ingestion pipeline in Lesson 2?",
+      answer: "A <b>connector</b> is a service you own that reads stock from a system you don't own (the POS/ERP) and writes it to an API you don't control (the vendor). Lesson 2 wrote into <em>your</em> database, so the destination was inspectable and repairable — one <code>SELECT</code>, one <code>UPDATE</code>. A relay's destination can fail often (429, 5xx, timeout, schema change), enforces a hard rate limit, and usually cannot be read back. So you design for a destination you cannot see: <b>absolute sends</b>, a <b>shadow table</b>, and <b>scheduled reconciliation</b>."
+    },
+    {
+      prompt: "Q: Walk me through the four stages of the connector.",
+      answer: "<b>(1) Receive / fetch</b> — one adapter per source type (push webhook, polled API, SFTP file); verify the HMAC signature, ack fast, enqueue. <b>(2) Normalise</b> — map the source's product code to a canonical SKU and its store code to a canonical location, convert units, and reject readings older than what you have. <b>(3) Shadow table</b> — compare the payload hash against what you last sent, and skip if unchanged. <b>(4) Send</b> — micro-batch, take from a client-side token bucket, POST with a content-derived idempotency key, retry with full jitter honouring <code>Retry-After</code>, dead-letter after N attempts, and write the shadow row only on 2xx."
+    },
+    {
+      prompt: "Q: The retailer says the widget shows the wrong stock for one store. What do you check, in order?",
+      answer: "<b>(1) Feed age</b> for that location — did the source stop? <b>(2) The shadow table</b> — what did we last send for that SKU, and when? That splits the problem cleanly into 'we never sent it' versus 'we sent it and the vendor shows something else'. <b>(3) Dead-letter queue</b> — is that row sitting in it? <b>(4) 4xx log</b> for that location — a mapping rejection. <b>(5) Mapping registry</b> — is the SKU or store code mapped at all (L13)? <b>(6) Reconciliation drift</b> — did the nightly run correct this row before? Only after all six do you open a vendor ticket, and then you can attach exactly what you sent and when."
+    }
+  ]);
+</script>

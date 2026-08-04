@@ -1,0 +1,534 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 13 — Identifier Mapping &amp; the Mapping Registry</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 13 · Track B · The bug that eats the project</p>
+  <h1>Identifier Mapping &amp; the Mapping Registry</h1>
+  <p class="subtitle">Three systems, three sets of names for the same shoe and the same shop. The mapping between them is the least glamorous part of the integration and the one that decides whether it works.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> build the <em>mapping registry</em> — a real, versioned, auditable table that joins Shopify ↔ POS/ERP ↔ vendor identifiers. Learn Shopify's own identifier traps (<b>SKU is not unique</b>, GID vs <code>legacyResourceId</code>, no store-code field on <code>Location</code>), the four-step match ladder, and why <b>97% mapping coverage is a failing grade</b>.
+  </div>
+
+  <p class="small">This is <a href="0002-inventory-ingestion-multi-source-sync.html">Lesson 2 §4</a> promoted to its own lesson, because in Track B it is a bigger share of the work. In the build-it track you own both ends of the join. Here you own neither, and there are three namespaces instead of two.</p>
+
+  <h2>1. Three namespaces, one shoe</h2>
+  <p>The same physical red shoe, size 42, sitting on a shelf in Geelong, has at least four names and the shop has three:</p>
+  <div class="diagram">                        THE SAME RED SHOE, SIZE 42
+
+  SHOPIFY                     POS / ERP                    VENDOR (stockinstore)
+  ───────────────────────     ───────────────────────      ───────────────────────
+  ProductVariant.id           ItemCode  "0042-RD"          product_ref  "SKU1001"
+    gid://shopify/…/44821     ProductID 88213              store_ref    "VIC-GEE"
+  ProductVariant.sku          Barcode   "0093672841003"
+    "SHOE-RED-42"             StoreCode "GEE"
+  ProductVariant.barcode      OutletID  17
+    "9336728410034"            (UoM: CASE of 6)
+  InventoryItem.id
+  Location.id
+    gid://shopify/Location/72
+  Location.legacyResourceId
+    72
+
+              ▲                        ▲                          ▲
+              └────────────┬───────────┴──────────────┬───────────┘
+                           │                          │
+                    ┌──────────────────────────────────────┐
+                    │        THE MAPPING REGISTRY          │  ← you own this
+                    │  canonical sku  ·  canonical location│
+                    │  + one row per (namespace, external) │
+                    └──────────────────────────────────────┘
+
+   Notice the barcode: Shopify has 9336728410034, the POS has 0093672841003.
+   Same barcode. Different length, leading zero, different check-digit handling.
+   That single row is a week of someone's life if you don't plan for it.</div>
+  <div class="note">
+    <span class="label">The rule that makes this tractable</span>
+    Never map namespace-to-namespace. Map <b>every namespace to one canonical identifier that you own</b>. Three systems mapped pairwise is 6 mappings; three mapped to a hub is 3. Add a fourth system (a second POS after an acquisition) and pairwise becomes 12 while the hub becomes 4.
+  </div>
+
+  <h2>2. Shopify's own identifier traps</h2>
+  <p>You will be asked to join "on the SKU." Here is why that sentence hides four problems.<sup><a href="#c1">1</a></sup></p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>What Shopify actually says</th><th>What it does to you</th></tr>
+    <tr><td><b>SKU is not unique</b></td><td><code>ProductVariant.sku</code> is "a case-sensitive identifier for the product variant in the shop" — the docs do <em>not</em> state a uniqueness requirement, and Shopify does not enforce one.</td><td>Your join on SKU can return two variants. A merchant with a duplicated or blank SKU silently breaks one product. <b>Check for duplicates before you trust the join</b>, and report them as data defects.</td></tr>
+    <tr><td><b>SKU is case-sensitive</b></td><td>Stated on the field itself.</td><td><code>shoe-red-42</code> and <code>SHOE-RED-42</code> are two different SKUs to Shopify but the same thing to a human and often to a POS. Normalise on the way in — and record that you normalised.</td></tr>
+    <tr><td><b>GID vs <code>legacyResourceId</code></b></td><td><code>id</code> is "a globally-unique ID"; <code>legacyResourceId</code> is "the ID of the corresponding resource in the REST Admin API", typed <code>UnsignedInt64</code>.</td><td>Two different values for the same object. Store the <b>GID</b> as the key and the numeric id only as a convenience — a vendor or a CSV that carries <code>72</code> instead of <code>gid://shopify/Location/72</code> will not join, and the failure looks like "no stock" rather than an error.</td></tr>
+    <tr><td><b><code>Location</code> has no store-code field</b></td><td>The object exposes <code>id</code>, <code>legacyResourceId</code>, <code>name</code>, <code>address</code>, <code>isActive</code>, <code>fulfillsOnlineOrders</code>, <code>localPickupSettingsV2</code> — and nothing for the retailer's own store code.</td><td>The retailer's <code>GEE</code> lives nowhere in Shopify by default. You either keep it in your registry or put it in a <b>metafield</b> on the location. Do not match on <code>name</code>; someone will rename "Geelong" to "Geelong (Westfield)" on a Friday.</td></tr>
+    <tr><td><b>SKU is required for fulfillment services</b></td><td>The <code>sku</code> docs note it is "required in order to connect to a fulfillment service."</td><td>If the vendor's app registers as a fulfillment service (<a href="0015-click-collect-at-checkout.html">L15</a>), blank SKUs are not a data-quality nag — they are a hard blocker. Find them in discovery.</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <span class="label">The trap juniors fall into</span>
+    Treating <code>sku</code> as a primary key because it looks like one. It is a free-text field a merchant types. It can be blank, duplicated, have trailing whitespace, differ in case, or be reused after a product is deleted. Your registry needs its own key, and SKU is just one of the columns you match on.
+  </div>
+
+  <h2>3. The registry, as a real schema</h2>
+  <p>One canonical table per entity, plus one alias table per entity. The alias table is where every external namespace lands.</p>
+  <pre><code>-- ---------- canonical: the hub. Yours. Never a vendor's id. ----------
+CREATE TABLE canon_product (
+  retailer_id  TEXT NOT NULL,
+  product_key  TEXT NOT NULL,          -- your own opaque key, e.g. 'p_01H8Z…'
+  title        TEXT,
+  uom          TEXT NOT NULL,          -- the unit YOU store in: 'EACH'
+  active       BOOLEAN NOT NULL DEFAULT TRUE,
+  PRIMARY KEY (retailer_id, product_key)
+);
+
+CREATE TABLE canon_location (
+  retailer_id  TEXT NOT NULL,
+  location_key TEXT NOT NULL,
+  name         TEXT,
+  lat          NUMERIC, lng NUMERIC,
+  timezone     TEXT NOT NULL,          -- stores span zones (L2 §1)
+  active       BOOLEAN NOT NULL DEFAULT TRUE,
+  PRIMARY KEY (retailer_id, location_key)
+);
+
+-- ---------- aliases: one row per (namespace, id type, external value) ----------
+CREATE TABLE product_alias (
+  retailer_id   TEXT NOT NULL,
+  namespace     TEXT NOT NULL,   -- 'shopify' | 'pos:retail-express' | 'vendor'
+  id_type       TEXT NOT NULL,   -- 'variant_gid' | 'sku' | 'barcode' | 'item_code'
+  external_id   TEXT NOT NULL,   -- stored EXACTLY as the source sends it
+  external_norm TEXT NOT NULL,   -- normalised form used for matching (§4)
+  product_key   TEXT NOT NULL,
+  uom_factor    NUMERIC NOT NULL DEFAULT 1,  -- source unit → canonical unit
+  confidence    TEXT NOT NULL,   -- 'exact' | 'barcode' | 'normalised' | 'manual'
+  approved_by   TEXT,            -- who accepted a non-exact match, and when
+  valid_from    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_to      TIMESTAMPTZ,     -- NULL = current. Never DELETE a mapping.
+  PRIMARY KEY (retailer_id, namespace, id_type, external_id, valid_from)
+);
+CREATE UNIQUE INDEX one_current_alias
+  ON product_alias (retailer_id, namespace, id_type, external_norm)
+  WHERE valid_to IS NULL;        -- at most one live mapping per external id</code></pre>
+  <p>Five design choices in there earn their keep:</p>
+  <ul>
+    <li><b>Both <code>external_id</code> and <code>external_norm</code>.</b> You match on the normalised value but you must be able to echo back the exact string the source sent, or you cannot debug anything or write back to the POS.</li>
+    <li><b><code>valid_from</code> / <code>valid_to</code> instead of <code>DELETE</code>.</b> Store codes get reused. A SKU gets retired and reissued. If you delete the old row you lose the ability to explain last month's orders. Close it, don't kill it.</li>
+    <li><b>The partial unique index.</b> It enforces "one live mapping per external id" while still allowing history. Without it, two overlapping mappings send the same shelf stock to two products.</li>
+    <li><b><code>confidence</code> + <code>approved_by</code>.</b> A machine-guessed match and a human-confirmed match are not the same fact, and you will be asked which is which.</li>
+    <li><b><code>uom_factor</code> on the alias, not the product.</b> The same shoe can arrive in eaches from one store and cases of 6 from another. The factor belongs to the <em>source</em>, so it lives on the alias row.</li>
+  </ul>
+
+  <div class="recall"><span class="label">Recall — cover the page</span>Say it out loud before you scroll: why map to a hub instead of pairwise, and three reasons a SKU is a bad primary key.</div>
+
+  <h2>4. The match ladder — four rungs, then a human</h2>
+  <p>Matching is a ladder, tried in order. Each rung is weaker than the one above, and the rung you used is recorded as <code>confidence</code>.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Rung</th><th>How</th><th>Trust</th></tr>
+    <tr><td>1</td><td><b>Explicit id</b></td><td>The source sends the Shopify variant GID or a previously-agreed key. Direct lookup.</td><td>Highest. Auto-accept.</td></tr>
+    <tr><td>2</td><td><b>Barcode / GTIN</b></td><td>Normalise (strip spaces, pad to 13 or 14 digits, decide once about the check digit) then match. Barcodes are assigned by the manufacturer, so they survive both systems.</td><td>High. Auto-accept if exactly one hit.</td></tr>
+    <tr><td>3</td><td><b>Exact SKU</b></td><td>Byte-for-byte match, case included.</td><td>High <em>only if</em> the SKU is unique in both systems. Auto-accept when the hit count is 1; quarantine when it is 2+.</td></tr>
+    <tr><td>4</td><td><b>Normalised SKU</b></td><td>Uppercase, trim, collapse inner whitespace, strip a documented separator set. Deterministic and written down.</td><td>Medium. <b>Queue for human approval</b>, don't auto-accept.</td></tr>
+    <tr><td>—</td><td><b>Fuzzy / title similarity</b></td><td>Levenshtein on titles, "looks like" matching.</td><td><b>Never automatic.</b> Use it only to <em>suggest</em> to a human, and store the result as <code>manual</code> with the approver's name.</td></tr>
+  </table>
+  </div>
+  <div class="trap">
+    <span class="label">Why fuzzy matching is a trap, not a shortcut</span>
+    A fuzzy match that is 99% accurate on 50,000 SKUs mislabels 500 products. Each one sends a customer to a shop for the wrong item, or shows a product out of stock that is on the shelf. Both are worse than an honest gap, because a gap is visible on a report and a wrong match is not. Suggest, never decide.
+  </div>
+
+  <h2>5. Normalisation, written down once</h2>
+  <p>Normalisation is only safe if it is deterministic and documented, because you will re-run it and it must give the same answer.</p>
+  <pre><code>// The normaliser is a pure function. Version it; log the version on the alias row.
+export const NORM_VERSION = 3;
+
+export function normSku(raw: string): string {
+  return raw
+    .normalize('NFKC')          // full-width characters from a Japanese POS export
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, ' ');      // collapse inner whitespace only — do NOT delete it
+}
+
+export function normBarcode(raw: string): string {
+  const digits = raw.replace(/\D/g, '');            // strip spaces, dashes
+  if (digits.length === 0) return '';
+  // UPC-A (12) → EAN-13 by left-padding. Decide ONE canonical width and stick to it.
+  if (digits.length === 12) return '0' + digits;
+  if (digits.length === 13) return digits;
+  if (digits.length === 14) return digits.replace(/^0+/, '').padStart(13, '0'); // GTIN-14
+  return digits;                                     // record, flag, let a human look
+}</code></pre>
+  <div class="trap">
+    <span class="label">The leading-zero disaster (this is not hypothetical)</span>
+    A retailer sends a nightly CSV. Someone opens it in Excel to check it. Excel reads the barcode column as a number and drops the leading zero: <code>0093672841003</code> becomes <code>93672841003</code>. Saved. Now that store's entire barcode column fails to match. The fix is threefold: <b>never match on raw barcodes</b>, always pad to a canonical width, and reject a file whose barcode column has changed length distribution since yesterday. Add the last check as a feed-level guard, not a per-row one.
+  </div>
+  <div class="note">
+    <span class="label">Why <code>replace(/\s+/g, ' ')</code> and not <code>replace(/\s/g, '')</code></span>
+    Deleting all whitespace merges genuinely different SKUs: <code>AB 12</code> and <code>A B12</code> both become <code>AB12</code>. Collapsing runs of whitespace fixes formatting noise without inventing collisions. Every normalisation step must be checked for "does this create a collision that didn't exist?" — and the answer belongs in a test.
+  </div>
+
+  <h2>6. Coverage is the project's real progress bar</h2>
+  <p>"We're integrated" is not a status. <b>Mapping coverage</b> is, and it is the number you report weekly.</p>
+  <pre><code>-- coverage, weighted by what actually matters: stock, not row count
+SELECT
+  l.location_key,
+  COUNT(*)                                             AS feed_rows,
+  COUNT(a.product_key)                                 AS mapped_rows,
+  ROUND(100.0 * COUNT(a.product_key) / COUNT(*), 2)    AS pct_rows_mapped,
+  -- the honest one: how much STOCK is invisible?
+  ROUND(100.0 * SUM(CASE WHEN a.product_key IS NULL THEN f.qty ELSE 0 END)
+              / NULLIF(SUM(f.qty), 0), 2)              AS pct_units_unmapped
+FROM feed_staging f
+JOIN canon_location l ON l.location_key = f.location_key
+LEFT JOIN product_alias a
+       ON a.retailer_id = f.retailer_id
+      AND a.namespace   = f.namespace
+      AND a.external_norm = f.external_norm
+      AND a.valid_to IS NULL
+GROUP BY l.location_key
+ORDER BY pct_units_unmapped DESC;      -- worst store first</code></pre>
+  <div class="tip">
+    <span class="label">97% is a failing grade — say the number out loud</span>
+    50,000 SKUs at 97% coverage means <b>1,500 products are invisible</b> in Find in Store. Nobody gets an error. The widget just says "not available nearby" and the customer leaves. Compare that to a broken deploy, which everyone notices in ten minutes. Set the acceptance bar as a number in the contract — <b>≥99.5% of units mapped, and a named owner for the remainder</b> — and put the unmapped list in front of the retailer's merchandising team every week, because only they can fix it.
+  </div>
+  <p>Weight by units, not rows. A thousand unmapped end-of-line SKUs with one unit each matter far less than fifty unmapped best-sellers with two hundred units each. The <code>pct_units_unmapped</code> column is the one that predicts complaints.</p>
+
+  <h2>7. Diagnosing "the widget says no stock"</h2>
+  <p>This is the single most common support ticket in Track B. It has six possible causes and they are cheap to separate in this order.</p>
+  <div class="diagram">  "Product X shows no stock at store Y, but it's on the shelf"
+                  │
+                  ▼
+  1. Is store Y in canon_location and active?  ──── no ──► location never mapped / deactivated
+                  │ yes
+                  ▼
+  2. Did a feed arrive for Y recently?         ──── no ──► connector / source problem (L12)
+     (MAX(source_ts) for that location)
+                  │ yes
+                  ▼
+  3. Was product X in that feed at all?        ──── no ──► POS didn't report it:
+                                                            wrong POS store, item not stocked
+                  │ yes
+                  ▼
+  4. Did that feed row map to a product_key?   ──── no ──► MAPPING GAP  ← most common
+                  │ yes
+                  ▼
+  5. Did we send it? (shadow table, L12 §5)    ──── no ──► suppressed / DLQ / 4xx
+                  │ yes
+                  ▼
+  6. We sent qty &gt; 0 and the vendor shows 0    ─────────► vendor-side: threshold, buffer,
+                                                            reservation, or their bug → ticket
+
+     Steps 1–5 are yours and take minutes. Only step 6 is a vendor conversation,
+     and by then you can attach exactly what you sent and when.</div>
+
+  <h2>8. Failure modes</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What breaks</th><th>How you handle it</th></tr>
+    <tr><td><b>Two Shopify variants share one SKU</b></td><td>The join returns 2 rows. Quarantine both, alert as a data defect, and ask the merchant to fix the catalogue. Never pick one arbitrarily — you will pick wrong for half the orders.</td></tr>
+    <tr><td><b>Blank SKU on a variant</b></td><td>Excluded from matching entirely (never match blank to blank). Report it; it is also a hard blocker if the vendor registers as a fulfillment service.</td></tr>
+    <tr><td><b>A store code is reused for a new shop</b></td><td>The old alias is closed with <code>valid_to</code>, a new row opens. History still explains old orders. This is exactly why you never <code>DELETE</code>.</td></tr>
+    <tr><td><b>Excel strips leading zeros from a barcode column</b></td><td>Canonical padding in <code>normBarcode</code>, plus a feed-level guard that rejects a file whose barcode length distribution shifted overnight.</td></tr>
+    <tr><td><b>New products arrive daily and are unmapped for a day</b></td><td>Auto-map rungs 1–3 on arrival, on a schedule, not only at onboarding. An integration that only maps once is out of date the week it launches.</td></tr>
+    <tr><td><b>A case-pack source is mapped without a UoM factor</b></td><td>You report 1 when 6 are on the shelf (undersell) or 6 when 1 is (oversell). <code>uom_factor</code> is mandatory on every alias row; default 1 must be a <em>decision</em>, not an omission.</td></tr>
+    <tr><td><b>Someone edits the registry by hand in production</b></td><td>Every change goes through the same code path with <code>approved_by</code> and a timestamp. An unaudited mapping change is indistinguishable from a bug three weeks later.</td></tr>
+    <tr><td><b>Vendor renames a store reference</b></td><td>Their side of the alias closes and reopens. Because the hub key never changed, nothing downstream moves — that is the payoff for not mapping pairwise.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say it like this (mapping in 6 sentences)</span>
+    <p>"Identifier mapping is where integrations actually fail, so I treat it as a real component with a schema, not a spreadsheet. I map every namespace — Shopify, each POS or ERP, and the vendor — to <b>one canonical key I own</b>, because a hub scales linearly while pairwise mappings explode as systems are added. I keep both the raw external id and a normalised form, with a versioned pure-function normaliser, and I never delete a mapping — I close it with a <code>valid_to</code> so history still explains last month's orders. Matching is a ladder: explicit id, then barcode, then exact SKU, then normalised SKU, and fuzzy matching only ever <em>suggests</em> to a human, because a 99%-accurate guess on fifty thousand SKUs is five hundred wrong products with no error message. I watch Shopify's own traps: SKU is case-sensitive and not enforced unique, the GID is not the <code>legacyResourceId</code>, and <code>Location</code> has no field for the retailer's store code, so that lives in my registry or a metafield — never in the location's name. And I report <b>coverage weighted by units, not rows</b>, because 97% of fifty thousand SKUs is fifteen hundred products that silently show 'not available nearby' and nobody ever gets an alert."</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p class="small">Answer from memory. Then say each answer out loud below.</p>
+  <div id="quiz"></div>
+
+  <h2>Now say it out loud</h2>
+  <div id="recall"></div>
+
+  <h2>Primary source (read these)</h2>
+  <p>📖 <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/ProductVariant">Shopify — <code>ProductVariant</code></a> — <code>sku</code> is "a case-sensitive identifier … required in order to connect to a fulfillment service"; note the absence of any uniqueness guarantee.<br>
+  📖 <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/Location">Shopify — <code>Location</code></a> — <code>id</code> vs <code>legacyResourceId</code>, <code>isActive</code>, <code>fulfillsOnlineOrders</code>, <code>localPickupSettingsV2</code>, and no store-code field.<br>
+  📖 <a href="https://shopify.dev/docs/apps/build/custom-data/metafields">Shopify — metafields</a> — where the retailer's own store code can live on a <code>Location</code> if you want it inside Shopify.</p>
+
+  <p class="small" id="c1">[1] Verified against shopify.dev (checked 2026-08-04): <code>ProductVariant.sku</code> is documented as "a case-sensitive identifier for the product variant in the shop" and "required in order to connect to a fulfillment service"; the reference states no uniqueness requirement for either <code>sku</code> or <code>barcode</code>. <code>ProductVariant.id</code> and <code>Location.id</code> are documented as "a globally-unique ID", with <code>legacyResourceId</code> as "the ID of the corresponding resource in the REST Admin API" typed <code>UnsignedInt64!</code> — two distinct values per object; the concrete <code>gid://shopify/&lt;Type&gt;/&lt;id&gt;</code> string shape shown in §1 is Shopify's standard global-ID format rather than a quote from that page. The <code>Location</code> reference exposes <code>id</code>, <code>legacyResourceId</code>, <code>name</code>, <code>address</code>, <code>isActive</code>, <code>fulfillsOnlineOrders</code> and <code>localPickupSettingsV2</code>, and no retailer store-code field. Barcode standards (UPC-A 12 digits, EAN-13, GTIN-14) are GS1 conventions, not Shopify documentation. The registry schema, the match ladder, the coverage query and the 99.5% acceptance bar are engineering recommendations, not vendor or platform requirements.</p>
+
+  <div class="tip">
+    <span class="label">You've got it when…</span>
+    you can argue for a hub over pairwise mapping with the 6-vs-3 count, name three reasons SKU is a bad key, explain why <code>valid_to</code> beats <code>DELETE</code>, refuse fuzzy auto-matching with the 500-wrong-products argument, and walk the six-step "no stock" diagnosis from memory.
+  </div>
+
+  <div class="ask">
+    <b>I'm your teacher — ask me anything.</b> Want the auto-mapper job, the approval-queue UI shape, or the migration that back-fills <code>external_norm</code> when <code>NORM_VERSION</code> changes? Just ask. Next: the surface the shopper actually sees — <a href="0014-storefront-surface-theme-app-extension.html">the storefront widget</a>.
+  </div>
+
+  <div class="footer-nav">
+    <a href="0012-vendor-stock-feed-connector.html">← Prev: The Connector</a>
+    <a href="../reference/glossary.html">Glossary</a>
+    <a href="0014-storefront-surface-theme-app-extension.html">Next: The Storefront Surface →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz', [
+    {
+      q: "Why map every system to a canonical key you own, instead of system-to-system?",
+      options: [
+        "Pairwise mappings grow quadratically; a hub grows linearly, so adding a fourth system costs one mapping instead of six",
+        "Because vendors require it",
+        "It uses less disk space",
+        "Canonical keys are faster to index"
+      ],
+      answer: 0,
+      why: "Three systems pairwise is 6 mappings; via a hub it is 3. Add a fourth and pairwise becomes 12 while the hub becomes 4. It also means a vendor renaming their store reference touches one alias row and nothing downstream."
+    },
+    {
+      q: "Shopify's ProductVariant.sku — what does the documentation guarantee?",
+      options: [
+        "Only that it is a case-sensitive identifier; uniqueness is not stated or enforced",
+        "That it is unique per shop",
+        "That it is unique globally across Shopify",
+        "That it is always present"
+      ],
+      answer: 0,
+      why: "The field is documented as 'a case-sensitive identifier for the product variant in the shop', with no uniqueness requirement. So a join on SKU can return two variants, and it can be blank. Your registry needs its own key, and SKU is just one column you match on."
+    },
+    {
+      q: "Why close a mapping with valid_to instead of deleting the row?",
+      options: [
+        "Store codes and SKUs get reused, and history must still explain past orders",
+        "Deletes are slow in PostgreSQL",
+        "So the vendor can read it",
+        "To save the primary key"
+      ],
+      answer: 0,
+      why: "A deleted mapping destroys your ability to explain what happened last month. Closing it with valid_to keeps history while a partial unique index on 'valid_to IS NULL' still enforces one live mapping per external id — so you get history and correctness at once."
+    },
+    {
+      q: "Should fuzzy title matching ever be applied automatically?",
+      options: [
+        "No — it may only suggest to a human, recorded as a manual match with an approver",
+        "Yes, if it scores above 90%",
+        "Yes, for new products only",
+        "Yes, because a gap is worse than a guess"
+      ],
+      answer: 0,
+      why: "99% accuracy on 50,000 SKUs is 500 wrong products, each one sending a customer to the wrong item or hiding stock — with no error anywhere. A gap appears on the unmapped report and gets fixed; a wrong match is invisible. Suggest, never decide."
+    },
+    {
+      q: "You report mapping coverage of 97%. Why is that a problem?",
+      options: [
+        "On 50,000 SKUs it means 1,500 products are silently invisible in Find in Store, with no error raised",
+        "It isn't — 97% is a pass",
+        "Because Shopify requires 100%",
+        "Because the vendor charges per unmapped SKU"
+      ],
+      answer: 0,
+      why: "Unmapped products don't error, they just show 'not available nearby' and the customer leaves. Set the bar as a contract number — 99.5% of units mapped with a named owner for the rest — and weight coverage by units rather than rows, because fifty unmapped best-sellers matter far more than a thousand unmapped end-of-line items."
+    },
+    {
+      q: "A stocked product shows 'no stock' at one store. What do you check before opening a vendor ticket?",
+      options: [
+        "Location active → feed arrived → product in the feed → row mapped → we sent it — five checks that are all yours",
+        "Nothing — it is always the vendor",
+        "Restart the connector",
+        "Re-install the app"
+      ],
+      answer: 0,
+      why: "Five of the six possible causes are on your side and take minutes to separate: the location isn't mapped or is inactive, no feed arrived, the product wasn't in the feed, the row didn't map (the most common), or the send was suppressed, dead-lettered or 4xx'd. Only after all five is it a vendor conversation — and then you can attach exactly what you sent and when."
+    }
+  ]);
+
+  renderRecall('#recall', [
+    {
+      prompt: "Q: Design the mapping registry on the whiteboard.",
+      answer: "Two canonical tables I own — <code>canon_product</code> and <code>canon_location</code>, each with my own opaque key, plus <code>uom</code> and <code>timezone</code>. Then one <b>alias table per entity</b> holding one row per <code>(namespace, id_type, external_id)</code> → <code>product_key</code>. Alias columns that matter: <code>external_id</code> exactly as sent <em>and</em> <code>external_norm</code> for matching; <code>uom_factor</code> (it belongs to the source, not the product); <code>confidence</code> plus <code>approved_by</code>; and <code>valid_from</code>/<code>valid_to</code> so mappings close instead of being deleted. A <b>partial unique index</b> on <code>WHERE valid_to IS NULL</code> enforces one live mapping per external id while keeping full history."
+    },
+    {
+      prompt: "Q: Give me Shopify's identifier traps in a Track B integration.",
+      answer: "<b>(1) SKU is not unique</b> and not guaranteed present — it is a free-text field a merchant types, so a join can return two variants or none. <b>(2) SKU is case-sensitive</b>, so <code>shoe-red-42</code> ≠ <code>SHOE-RED-42</code> to Shopify but the same to a human. <b>(3) GID ≠ <code>legacyResourceId</code></b> — <code>gid://shopify/Location/72</code> and <code>72</code> are both real ids for one object; store the GID as the key. <b>(4) <code>Location</code> has no store-code field</b>, so the retailer's <code>GEE</code> lives in my registry or a metafield — never matched on <code>name</code>, because someone will rename the shop. <b>(5)</b> SKU is <em>required</em> to connect to a fulfillment service, so blank SKUs become a hard blocker, not a nag."
+    },
+    {
+      prompt: "Q: How do you report progress on mapping to a client?",
+      answer: "As <b>coverage weighted by units, not rows</b>, per store, worst store first — because fifty unmapped best-sellers with two hundred units each matter far more than a thousand unmapped end-of-line SKUs with one unit each. I pair it with the raw unmapped list, sent weekly to the retailer's merchandising team, since only they can supply the missing codes. And I set the acceptance bar as a contract number — <b>≥99.5% of units mapped with a named owner for the remainder</b> — because 97% on fifty thousand SKUs is fifteen hundred silently invisible products and no alert will ever fire."
+    }
+  ]);
+</script>

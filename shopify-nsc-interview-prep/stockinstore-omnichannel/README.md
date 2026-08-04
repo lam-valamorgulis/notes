@@ -9,11 +9,20 @@ customer-facing products — **Find in Store**, **Store Locator**, **Click & Col
 and **Ship from Store** — but the real engineering is the back end that syncs stock from many
 store systems, computes trustworthy availability, and routes pickup and delivery orders.
 
-## The angle
+## The two angles
 
-Every page is framed as: **"You are the backend engineer designing and building a
-stockinstore-like system on Shopify + Node/NestJS."** This is not a guide to *using* the real
-stockinstore app — it is a guide to *building one*, because that is what the client hires for.
+"Like stockinstore" means one of two jobs, so the sub-course teaches both to the same depth.
+
+**Track A — build it** (Lessons 1–10). Framed as: **"You are the backend engineer designing and
+building a stockinstore-like system on Shopify + Node/NestJS."** Not a guide to *using* the real
+app — a guide to *building one*.
+
+**Track B — integrate it** (Lessons 11–20). The client bought the platform. Framed as: **"You are
+the engineer wiring a third-party omnichannel SaaS into their Shopify store and their tills."**
+The vendor owns availability, reservations and allocation; you own the stock feed, the identifier
+mapping, the storefront surfaces and the write-back — and that is where integrations actually fail.
+
+Ask the client which job it is on day one. Lesson 1 (the domain) serves both.
 
 ## Why this exists
 
@@ -26,7 +35,7 @@ reconciliation) — new domain shape.
 ## Start here
 
 1. **[index.html](index.html)** — the Map for this sub-course (single source of truth).
-2. **[reference/study-plan.html](reference/study-plan.html)** — the 3-day schedule through all 11 lessons, 4 katas, and 4 reference cards.
+2. **[reference/study-plan.html](reference/study-plan.html)** — the 5-day schedule through all 20 lessons, 5 katas, and 5 reference cards (Days 1–3 build it, Days 4–5 integrate it).
 3. **[lessons/0001-omnichannel-problem-and-domain.html](lessons/0001-omnichannel-problem-and-domain.html)** — read this first.
 
 ## Folder map
@@ -53,21 +62,43 @@ reconciliation) — new domain shape.
 8. Data model & consistency ✅
 9. Scale, multi-tenancy & failure modes ✅
 10. System-design interview: "Design stockinstore" ✅
-11. Integrating Shopify with the stockinstore SaaS (Track B — integrate, not build) ✅
+
+**Track B — integrate the SaaS instead of building it** (Chapter 7 on the Map)
+
+11. Integrating Shopify with the stockinstore SaaS — the overview and the responsibility split ✅
+12. The vendor stock-feed connector — a relay, not an ingest ✅
+13. Identifier mapping & the mapping registry ✅
+14. The storefront surface — theme app extensions in depth ✅
+15. Click & Collect at checkout (integration POV) ✅
+16. Webhooks, write-back & reconciliation ✅
+17. Vendor risk: scopes, protected customer data, SLA & fallback ✅
+18. The integration project: discovery to rollout ✅
+19. Build vs buy, lock-in & the exit ✅
+20. The Track B interview drill (capstone) ✅
 
 **Katas:** idempotent inventory upsert ✅ · find-in-store query API ✅ · Click & Collect reservation
-+ re-check ✅ · order-allocation fairness scorer ✅
++ re-check ✅ · order-allocation fairness scorer ✅ · the vendor feed connector (Track B) ✅
 
 **Reference:** domain glossary ✅ · "Design stockinstore" cheat sheet ✅ · data-model card ✅ ·
-rapid-fire Q&A ✅
+rapid-fire Q&A ✅ · "Integrate the SaaS" cheat sheet ✅ · study plan ✅
 
-**Status: the sub-course is complete** — 10 lessons, 4 katas, 4 reference cards. Each lesson was
-built and then reviewed against four goals (correct, enough, detailed, clear) and fixed.
+**Status: the sub-course is complete on both tracks** — 20 lessons, 5 katas, 5 reference cards.
+Lessons 1–10 teach how to **build** an omnichannel platform; Lessons 11–20 teach how to
+**integrate** one the client has already bought, to the same depth. Every Shopify and vendor fact
+in Lessons 12–20 was verified against shopify.dev and stockinstore.com on 2026-08-04, and each
+lesson carries a footnote saying exactly what was checked and what is engineering opinion.
+
+Two corrections landed in Lesson 11 during that pass, both recorded in its footnote [2]: the
+pickup-fulfilment scope is `write_merchant_managed_fulfillment_orders` (not the narrower-sounding
+assigned scope, because a retail store is a merchant-managed location), and stockinstore's own
+Click & Collect app targets **Shopify Plus** while their Find in Store app runs on Basic — a
+vendor plan gate that is separate from Shopify's.
 
 ## How we work
 
 Say **"next"** to build the next lesson, **"go deeper on X"** for more detail on any topic,
-or **"mock me on stockinstore"** for a domain-specific system-design drill. When you get the
+**"mock me on stockinstore"** for the build-it system-design drill, **"mock me on Track B"** for
+the integration drill, or **"mock me on build vs buy"** for just that decision. When you get the
 real job description, paste it and I re-target this sub-course to the client's actual stack.
 
 **Keeping the Map current:** whenever a page is added, `index.html` is updated in the same
