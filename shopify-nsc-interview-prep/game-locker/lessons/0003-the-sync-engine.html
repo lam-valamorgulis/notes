@@ -496,7 +496,106 @@
     <b>Auto-heal the explainable, alarm on the unexplainable.</b> A job that silently corrects everything it finds also hides the bug that is causing the drift — so the numbers look healthy forever while the real defect grows. A job that fixes what it understands and escalates what it does not is the difference between a sync you trust and a sync that lies to you.
   </div>
 
-  <h2>8. What you would actually build</h2>
+  <h2>8. Five sync cases, start to finish</h2>
+
+  <p>Everything above is a rule. Here are the rules doing their job, on one card — the Charizard from Lesson 1, in store 17 in Sydney. Walk these out loud and the whiteboard question stops being scary, because you are describing something you have already traced.</p>
+
+  <h3>Case 1 — a new card arrives at the shop</h3>
+
+  <div class="diagram">   A collector sells a Charizard to the shop over the counter.
+
+   1  GL creates a store_inventory row
+        store 17 · card 2 · NM · EN · holo · qty 1 · $480
+   2  GL asks: does store 17's Shopify already have a
+        product for this PRINTING?
+          no  → create the product and its variants
+          yes → reuse it
+   3  GL sets the inventory level on the NM/EN/holo variant</div>
+
+  <p><b>Owner:</b> Game Locker · <b>Direction:</b> GL → Shopify · <b>Runs:</b> on first acquisition.<br>
+  <b>Guard:</b> key the "does it exist?" check on the <b>printing</b>, never on the card name. A retry that creates a second product leaves two pages competing for the same search ranking, and merging them later is manual work.</p>
+
+  <h3>Case 2 — the nightly reprice</h3>
+
+  <div class="diagram">   Card prices move overnight.
+
+   1  the feed updates market_price on the SHARED card row
+   2  GL works out each store's new selling price
+   3  GL diffs against the price it last pushed
+        100,000 variants → maybe 5,000 actually moved
+   4  ONE bulkOperationRunMutation, a JSONL file, async</div>
+
+  <p><b>Owner:</b> Game Locker · <b>Direction:</b> GL → Shopify · <b>Runs:</b> nightly.<br>
+  <b>Guard:</b> push the <b>diff</b>, not all 100,000. A price write is not free — it burns your budget and invalidates caches. See <a href="0002-tcg-card-data-on-shopify.html">L02 §8</a>.</p>
+
+  <h3>Case 3 — the card sells online</h3>
+
+  <div class="diagram">   14:07  a collector pays for the Charizard on the website.
+
+   14:07:00  Shopify decrements ITSELF:  available 1 → 0
+   14:07:01  webhook orders/create fires
+   14:07:01  GL enqueues it and returns 200 straight away
+   14:07:03  the worker applies it: store_inventory 1 → 0
+               "order 1234 already applied" recorded FIRST</div>
+
+  <p><b>Owner:</b> whoever created it — here, Shopify · <b>Direction:</b> Shopify → GL.<br>
+  <b>Guard 1:</b> webhooks are at-least-once, so the order id is the idempotency key. You <em>will</em> get the same order twice.<br>
+  <b>Guard 2:</b> <b>GL must not push that 0 back to Shopify.</b> Shopify already did it. Stamp the origin on every write, or stock drops by 2 for one sale — the echo loop from §3.</p>
+
+  <h3>Case 4 — the card sells at the counter instead</h3>
+
+  <div class="diagram">   14:05  the same Charizard sells at the kiosk.
+
+   14:05:00  kiosk sells it. GL: store_inventory 1 → 0
+   14:05:00  the counter-sale EVENT fires a push at once
+   14:05:01  inventorySetQuantities
+               { available: 0, compareQuantity: 1 }
+   14:05:01  Shopify is correct again.
+
+   ⚠ Between 14:05:00 and 14:05:01, Shopify still said 1.
+     One second, not fifteen minutes — because the push is
+     event-driven and the batch job is only a safety net.</div>
+
+  <p><b>Owner:</b> Game Locker · <b>Direction:</b> GL → Shopify.<br>
+  <b>Guard:</b> push on the <b>event</b>, not the batch — defence #1, the biggest win for the least work. The write is absolute, so a retry is harmless.</p>
+
+  <h3>Case 5 — both doors sell the last copy</h3>
+
+  <p>The honest one. You cannot design this away, only shrink it and handle it.</p>
+
+  <div class="diagram">   14:05:00  the counter sells it.        GL: 1 → 0
+   14:05:01  a shopper online buys it too.  Shopify: 1 → 0
+   14:05:02  GL's push arrives:
+               { available: 0, compareQuantity: 1 }
+             → REJECTED. GL thought Shopify was 1. It is 0.
+
+   The rejection is the system WORKING. It has just told you
+   that something happened which GL did not know about.
+
+   GL re-reads, sees 0, agrees. The number is now right.
+   But one online order still exists for a card that is gone.
+     → it surfaces on the daily UNFULFILLABLE report
+     → the pre-agreed apology runs: refund, substitute, or hold</div>
+
+  <p><b>Owner:</b> contested for one second — and that single second is the whole reason this role exists.<br>
+  <b>Guard:</b> <code>compareQuantity</code> catches the stale write; the unfulfillable report is the <em>only</em> place the oversell is ever visible, because both systems end up agreeing on 0; the apology is a written procedure rather than an emergency.</p>
+
+  <p>Each case is a different part of this lesson doing its job:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Case</th><th>The part of the lesson it exercises</th></tr>
+    <tr><td><b>1</b> — new card</td><td>The ownership matrix. Products are one-way, GL → Shopify.</td></tr>
+    <tr><td><b>2</b> — reprice</td><td>Bulk operations, and the judgment to send a diff rather than everything.</td></tr>
+    <tr><td><b>3</b> — online sale</td><td>The echo loop, and idempotency keyed on the order id.</td></tr>
+    <tr><td><b>4</b> — counter sale</td><td>Absolute writes, <code>compareQuantity</code>, and pushing on an event.</td></tr>
+    <tr><td><b>5</b> — collision</td><td>The oversell minute, and why reconciliation cannot find it.</td></tr>
+  </table>
+  </div>
+
+  <p>Notice that <b>four of the five are calm</b> and only case 5 is a real problem. That proportion is worth saying out loud in an interview: most of the sync is boring one-way plumbing, and almost all of the difficulty sits in the one second where both systems are correct at the same time.</p>
+
+  <h2>9. What you would actually build</h2>
 
   <p>Pulling it together — the shape to draw when they say "design this".</p>
 
