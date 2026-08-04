@@ -1,0 +1,524 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — The Experience Gap</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 8 · Game Locker · Positioning</p>
+  <h1>The Experience Gap</h1>
+  <p class="subtitle">You have shipped themes and app integrations. You have never owned a service that keeps two systems agreeing. That is <b>one hole</b>, not a missing career. This lesson names the hole exactly, then turns it into four moves — one of which takes an afternoon and changes how you sound.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> two things. Say your gap in <b>one sentence</b>, with no apology and no overclaim. And decide — now, not later — whether you have the hours to build the <b>100-line proof</b> in section 4.
+  </div>
+
+  <p class="small">Read this <b>early</b>, not at the end. It is the one lesson that changes how you spend the other hours. If you feel underqualified for this job, read it in block 1 of the <a href="../reference/24-hour-plan.html">24-hour plan</a>.</p>
+
+  <h2>1. Name the hole exactly</h2>
+
+  <p>"I have never worked on a system like this" is too vague to act on. Vague gaps grow in your head. Split the job description into what you have <b>actually done</b> and see what is left.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>What the job needs</th><th>What you have actually done</th><th>Verdict</th></tr>
+    <tr>
+      <td>Liquid, Online Store 2.0, sections, blocks, JSON templates</td>
+      <td>Daily agency work, for years</td>
+      <td><b>No gap.</b> This is the JD's first bullet.</td>
+    </tr>
+    <tr>
+      <td>Fast, responsive front end</td>
+      <td>Theme work, plus the metrics and causes from <a href="0005-themes-for-game-stores.html">L05</a></td>
+      <td><b>No gap</b>, if you can name numbers instead of habits.</td>
+    </tr>
+    <tr>
+      <td>Admin API, webhooks, custom apps</td>
+      <td><b>Integrated</b> apps and consumed these APIs — did not author the app that writes</td>
+      <td><b>Partial.</b> Consumer, not author. Say it that way.</td>
+    </tr>
+    <tr>
+      <td>POS UI Extensions</td>
+      <td>Read one closely, found real defects in review; never authored one</td>
+      <td><b>Known and already scripted</b> — the honesty line in <a href="0004-pos-and-the-counter.html">L04</a>.</td>
+    </tr>
+    <tr>
+      <td>Node.js workers, queues, retries</td>
+      <td>Studied properly; not shipped as a production sync service</td>
+      <td><b>Partial.</b> Real knowledge, no production scar.</td>
+    </tr>
+    <tr>
+      <td><b>A two-way inventory sync service</b> that must survive drift</td>
+      <td>Nothing you owned</td>
+      <td><b>This is the hole.</b> One row.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The reframe that matters</span>
+    Your gap is not "systems". It is <b>owning the writer</b> — the service that decides what to push and what to do when the push is refused. One hole is preparable in a day. A missing career is not. Prepare like a person with one hole.
+  </div>
+
+  <h2>2. Why the hole is smaller than it feels</h2>
+
+  <p>Three reasons, and they compound.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Reason</th><th>Why it helps you specifically</th></tr>
+    <tr>
+      <td><b>They are the system of record.</b></td>
+      <td>Game Locker owns the data; Shopify is a channel hanging off it (<a href="0001-what-game-locker-actually-is.html">L01</a>). They need someone to own the <b>Shopify side</b> of that boundary. That side is themes, apps, and Admin API behaviour — your side.</td>
+    </tr>
+    <tr>
+      <td><b>The test is reasoning, not résumé.</b></td>
+      <td>What a design question actually checks is: <em>do you know how sync breaks, and would you notice?</em> That is preparable. "Have you run one for three years?" is not — and it is not the question they can ask, because almost nobody has.</td>
+    </tr>
+    <tr>
+      <td><b>The half you own is the half backend candidates fail.</b></td>
+      <td>A backend engineer can write a queue. Far fewer can say why <code>render</code> replaced <code>include</code>, why apps are the biggest performance cost, or how one theme serves many merchants. You can. That is not a consolation prize — it is the reason the role sits on the Shopify side.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Labelled as inference, not fact</span>
+    Nothing on their public site says who is on the engineering team. But a platform with 145 million cards and daily repricing already has people who write workers. What such a team is usually short of is someone fluent in the platform on the other end of the wire. Treat that as a reasonable guess, not a claim — and never say it to them as if you know it.
+  </div>
+
+  <h2>3. The four moves, ranked</h2>
+
+  <p>Ranked by how much each one changes the interview, not by effort.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Move</th><th>Cost</th><th>Why it ranks here</th></tr>
+    <tr><td><b>1</b></td><td>Build the 100-line proof</td><td>3–4 hours</td><td>Turns "I read about it" into "I built one and here is where it broke". Biggest single change to how you sound.</td></tr>
+    <tr><td><b>2</b></td><td>The honest bridge sentence</td><td>20 minutes</td><td>Named gap plus transferable mechanism beats confident vagueness. It also stops the interviewer probing for a lie.</td></tr>
+    <tr><td><b>3</b></td><td>Three pre-loaded stories</td><td>40 minutes</td><td>Your experience is the evidence. Evidence must be ready, not searched for while they wait.</td></tr>
+    <tr><td><b>4</b></td><td>Two sync questions for them</td><td>5 minutes</td><td>Only someone who thinks about drift asks these. It reframes you from candidate to colleague.</td></tr>
+  </table>
+  </div>
+
+  <h2>4. Move 1 — build the 100-line proof</h2>
+
+  <p>Not a product. A <b>proof</b>. On a Shopify development store, in an afternoon, thrown away afterwards.</p>
+
+  <div class="diagram">  webhook  inventory_levels/update
+     │
+     ├─ verify HMAC → enqueue → return 200        (never work inline)
+     │
+     ▼
+  handler
+     ├─ seen this X-Shopify-Webhook-Id before?  → drop
+     ├─ write with inventorySetQuantities + compareQuantity
+     └─ userErrors on compareQuantity?          → log "DRIFT"</div>
+
+  <p>Then deliberately break it, because the breakage is the point:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Make it fail</th><th>What you learn to say</th></tr>
+    <tr>
+      <td>Replay the same webhook twice</td>
+      <td>Webhooks are <b>at-least-once</b>, so every handler needs an idempotency key. You have now seen the double-apply, not just read about it.</td>
+    </tr>
+    <tr>
+      <td>Send a stale <code>compareQuantity</code></td>
+      <td>Shopify returns a <code>userErrors</code> entry <b>instead of overwriting</b>. This is compare-and-set, and it is the strongest single answer to "how do you stop two syncs fighting".</td>
+    </tr>
+    <tr>
+      <td>Push a delta while another write lands</td>
+      <td>Why absolute writes beat deltas: a lost delta is wrong forever, a lost absolute write is corrected by the next one.</td>
+    </tr>
+    <tr>
+      <td>Let your own write trigger your own webhook</td>
+      <td>The <b>echo loop</b>, seen live. You will remember the fix — tag or fingerprint your own writes — because you had to make it stop.</td>
+    </tr>
+  </table>
+  </div>
+
+  <p>The scaffold already exists: <a href="../../exercises/kata-03-idempotent-sync-worker.html">kata-03 — idempotent sync worker</a>. The mechanisms are in <a href="0003-the-sync-engine.html">L03</a>. Build it against a real dev store, keep the logs, and screenshot the drift line.</p>
+
+  <div class="trap">
+    <span class="label">Three ways this wastes your afternoon</span>
+    <b>Polishing it.</b> No tests, no Docker, no deploy. Ugly and working beats tidy and unfinished.<br>
+    <b>Making it real.</b> One product, one location, one card. Scale is a conversation, not a build.<br>
+    <b>Calling it production experience.</b> It is a toy and you say so — <em>"I built a small one to feel the failure modes"</em>. The honesty is what makes it land.
+  </div>
+
+  <div class="soundbite">
+    <span class="label">What the afternoon buys you</span>
+    <p>"I have not run a sync service in production. I did build a small one against a dev store so I would know the failure shapes first-hand — and the thing that surprised me was how fast my own writes came back at me as webhooks. I had to fingerprint my own writes before anything else worked. That is the bug I would look for first in an existing integration."</p>
+  </div>
+
+  <h2>5. Move 2 — the honest bridge</h2>
+
+  <p>Never claim you owned a platform. Say the true version, then bridge to the part that transfers. Three beats, in this order:</p>
+
+  <div class="diagram">  1. What I have NOT owned      ← said once, plainly, no apology
+  2. What I HAVE owned          ← the adjacent real thing
+  3. Where I met the failure    ← proof you have been near the pain</div>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Asked about</th><th>The bridge</th></tr>
+    <tr>
+      <td>Sync services</td>
+      <td>"I have not owned a two-way sync service. What I have owned is the Shopify surface an app writes into. That is where I met the failures — an app double-writing inventory, a handler with no idempotency key. So I have debugged it from the Shopify end, not the worker end."</td>
+    </tr>
+    <tr>
+      <td>POS UI Extensions</td>
+      <td>"I have not authored one. My agency shipped one and I read it closely enough to find real defects — a receive function that returned <code>null</code> on both paths, <code>userErrors</code> read at the wrong response path, and a success banner set inside a <code>finally</code>, so a failed receive told the user it worked."</td>
+    </tr>
+    <tr>
+      <td>Marketplaces</td>
+      <td>"I have not built a multi-vendor marketplace. I do know Shopify has no native path for one and that Marketplace Kit was deprecated, so it is an app or a custom build — and that paying sellers is the hard part, not listing them."</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The two ways this goes wrong</span>
+    <b>Overclaiming.</b> One probe deeper and it collapses — and then every other confident claim gets re-examined. This is the single most expensive mistake available to you.<br>
+    <b>Apologising twice.</b> Say the gap <b>once</b>, then move to what you do know. Repeating it turns one honest sentence into a theme, and the interviewer starts agreeing with you.
+  </div>
+
+  <h2>6. Move 3 — three stories, pre-loaded</h2>
+
+  <p>Your theme and integration work <em>is</em> the evidence. Write these out before the call. Not memorised word for word — but the numbers and the defect names must be ready.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Story</th><th>Shape</th><th>What it proves</th></tr>
+    <tr>
+      <td><b>A defect you found in someone else's integration</b></td>
+      <td>The POS extension review. Three named defects, each with the reason it was wrong.</td>
+      <td>Code review skill, and that you read other people's failure paths. Named defects cannot be faked.</td>
+    </tr>
+    <tr>
+      <td><b>A theme you made faster</b></td>
+      <td>What was slow, what caused it, what you removed, and the number if you have one.</td>
+      <td>Their JD asks for fast front ends. If you have no measurement, name the cause and the fix — "a third-party script blocking render" is still concrete.</td>
+    </tr>
+    <tr>
+      <td><b>Something that failed quietly, and how you noticed</b></td>
+      <td>An integration that stopped, a feed that went stale, a sold-out product still buyable.</td>
+      <td><b>The most valuable of the three.</b> Quiet failure is this entire job. If you noticed it before the client did, that is the ownership instinct they are hiring.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Why story three outranks the others</span>
+    Sync does not crash. It drifts. So the skill they need is not "can you build it" but "would you notice it was wrong". Any story where <b>you found the problem before the person paying you did</b> answers the real question, even if the system was only a theme.
+  </div>
+
+  <h2>7. Move 4 — the two questions that reframe you</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Ask</th><th>What it does</th></tr>
+    <tr>
+      <td>"When your platform and Shopify disagree on stock, who wins — and do you compare-and-set, or is it last-write-wins?"</td>
+      <td>Uses the exact vocabulary of the problem. Nobody asks this without having thought about conflicting writes.</td>
+    </tr>
+    <tr>
+      <td>"How do you find out about drift today — a nightly reconcile, or does a merchant tell you?"</td>
+      <td>The best question in the whole prep. Their answer tells you how mature the integration is, and if it is "the merchant tells us", you have just found your first month's work — and you can say so.</td>
+    </tr>
+  </table>
+  </div>
+
+  <p class="small">These are the same two ideas as questions 4 and 5 in <a href="0007-the-game-locker-interview.html">L07 §4</a> — kept here because for a candidate worried about experience, asking them is worth more than any answer given. A question proves how you think without requiring you to have done it.</p>
+
+  <h2>8. What loses it</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Do not</th><th>Cost</th></tr>
+    <tr><td>Claim backend ownership you do not have</td><td>They probe one level down and it collapses. Everything else you said gets re-checked.</td></tr>
+    <tr><td>Apologise for being "just a theme developer"</td><td>Theme depth is a hiring reason here, not a weakness. If you frame it as small, they will accept your framing.</td></tr>
+    <tr><td>Try to learn everything in the time left</td><td>Half-knowing six topics interviews worse than knowing sync cold. Depth in the centre beats breadth at the edge.</td></tr>
+    <tr><td>Lead with the gap</td><td>Answer the question first. The bridge comes when the gap is actually relevant — not as a pre-emptive disclaimer.</td></tr>
+  </table>
+  </div>
+
+  <h2>9. How much time do you have?</h2>
+
+  <p>This decides whether move 1 happens at all.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Time until the call</th><th>Do this</th></tr>
+    <tr>
+      <td><b>Tomorrow</b></td>
+      <td><b>Skip the build.</b> Blocks 3–8 of the plan (POS and inventory sync), then all of <a href="../reference/speaking-drills.html">the speaking drills</a>. Speech under pressure is the other declared weak spot, and it is worth more in one day than a rushed toy.</td>
+    </tr>
+    <tr>
+      <td><b>Three days or more</b></td>
+      <td><b>Build first</b>, on day one. It changes your voice for every answer afterwards, so the earlier it happens, the more of the prep it improves.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="ask">
+    <span class="label">Now do this</span>
+    <p>Say <b>"grade my honest bridge"</b> — you say the three beats out loud, I tell you where it overclaims or over-apologises.</p>
+    <p>Say <b>"walk me through kata-03"</b> — build the 100-line proof together against a dev store.</p>
+    <p>Say <b>"probe my experience"</b> — I play an interviewer who does not believe you have done this, and pushes until something breaks.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0007-the-game-locker-interview.html">← Lesson 7</a></span>
+    <span><a href="../reference/onepager.html">The one-pager →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Stated precisely, what is your actual experience gap for this role?',
+    options: [
+      'Owning the service that writes to Shopify and handles refused writes',
+      'Backend systems in general',
+      'Shopify platform knowledge',
+      'Trading card games and the collectibles domain'
+    ],
+    answer: 0,
+    why: 'Split the JD and only one row is empty: a two-way sync service you owned. Themes and performance are no gap at all, and the API and POS rows are "consumer, not author" — which is a sentence, not a hole. Calling it "backend systems in general" makes one preparable gap into an unpreparable one.'
+  },
+  {
+    q: 'You have four hours and a dev store. What is the highest-value use of them?',
+    options: [
+      'Build a small webhook → queue → compareQuantity worker and deliberately break it',
+      'Re-read the sync engine lesson twice more',
+      'Memorise the rate limit numbers for both APIs',
+      'Write a polished, tested, deployable sync service'
+    ],
+    answer: 0,
+    why: 'The breakage is the product. Replaying a webhook and getting a stale compareQuantity refused converts read knowledge into first-hand knowledge, and that difference is audible in an interview. Re-reading adds nothing new; polishing it burns the hours on work no interviewer will ever see.'
+  },
+  {
+    q: 'Which is the correct shape for the honest bridge?',
+    options: [
+      'What I have not owned → what I have owned → where I met the failure',
+      'What I have not owned → why that is not really important for this role',
+      'What I have studied → what I could build → how fast I learn',
+      'What I have owned → and I have basically done the rest too'
+    ],
+    answer: 0,
+    why: 'The gap is stated once, plainly, then immediately connected to real adjacent work and a real failure you were present for. Option 2 argues with their requirement. Option 3 offers potential instead of evidence. Option 4 is the overclaim that collapses on the first probe.'
+  },
+  {
+    q: 'Of the three stories to prepare, which answers the real question about sync?',
+    options: [
+      'Something that failed quietly, and how you noticed before the client did',
+      'A defect you found in someone else’s POS extension',
+      'A theme you made measurably faster',
+      'The largest project you have delivered'
+    ],
+    answer: 0,
+    why: 'Sync does not crash, it drifts. So the skill in demand is noticing, not building. A story where you caught a quiet failure before the person paying you did answers that directly — even when the system involved was only a theme. The other two are good stories that prove different things.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Your background looks like theme work. This role is deeper than that — talk me through the gap."',
+    answer: 'Straight at it, once.<br><br>"Fair. I have <b>not owned a two-way sync service</b> — that is the honest gap. What I have owned is the <b>Shopify surface an app writes into</b>: themes and integrations where a third-party system is the source of truth for stock. That is where I met the failures — an app double-writing inventory, a webhook handler with no idempotency key, a sold-out product still buyable because the feed went stale.<br><br>So I have debugged this from the Shopify end rather than the worker end. And I did build a small worker against a dev store so the failure shapes were first-hand, not read — webhook, queue, idempotency key, <code>inventorySetQuantities</code> with <code>compareQuantity</code>. What surprised me was how quickly my own writes came back at me as webhooks."<br><br>Then <b>stop</b>. Do not add a second apology. The gap was one sentence; the rest was evidence.'
+  },
+  {
+    prompt: 'Say the value of the 100-line proof in one breath — what you built, and the one thing it taught you.',
+    answer: '"A webhook handler that verifies, enqueues and returns 200 — then a worker that dedupes on the webhook id and writes with <code>inventorySetQuantities</code> and <code>compareQuantity</code>, logging every refused write as drift.<br><br>Two things it taught me that reading did not. One: <b>my own writes echoed back as webhooks</b>, so I had to fingerprint them or the loop never settles. Two: when <code>compareQuantity</code> does not match, Shopify <b>refuses and reports a <code>userErrors</code> entry</b> rather than overwriting — which means the safe write is also the drift detector. It is a toy, one card and one location, but the failure modes were real."'
+  },
+  {
+    prompt: 'Why is a theme and app background a strength for this specific job, not a weakness? Two reasons, out loud.',
+    answer: '<b>One — the role sits on the Shopify side of the boundary.</b> Game Locker is the system of record and Shopify is a channel hanging off it. Someone still has to own the Shopify end: the themes their game stores run, the app that writes, the API behaviour that decides what is even possible. That is exactly the side I have worked on.<br><br><b>Two — that is the half backend candidates get wrong.</b> Plenty of engineers can write a queue with retries. Far fewer can say why <code>render</code> replaced <code>include</code>, that apps and third-party scripts are usually the biggest performance cost, or how one theme serves many merchants through settings instead of branches. The rare combination is someone who can talk about drift <em>and</em> ship the storefront.<br><br>I do not say the gap does not exist. I say it is <b>one row</b>, and the rows next to it are mine.'
+  }
+]);
+</script>

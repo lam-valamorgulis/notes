@@ -55,6 +55,7 @@ Audited against the parent course before writing anything:
 | **Multi-vendor marketplace** | **No** | **L06** |
 | **The company itself** | **No** | **L01 + company brief** |
 | Speaking under pressure | Partly — `lessons/0015`, `0029` are behavioural, not language | **speaking-drills.html** |
+| **The candidate's own experience gap** | **No** — the course teaches the material, never how to position a theme-and-apps background against a platform role | **L08** (added 2026-08-04) |
 
 ## Hard constraints
 
@@ -119,6 +120,7 @@ game-locker/
              0005 themes for game stores     ← incl. performance
              0006 Storefront API & the marketplace
              0007 the Game Locker interview  ← capstone
+             0008 the experience gap         ← read early, not last
   reference/ 24-hour-plan.html   ← START HERE
              company-brief.html
              speaking-drills.html
@@ -127,8 +129,9 @@ game-locker/
   learning-records/
 ```
 
-Reading order is L01 → L02 → L03 → L04 → L05 → L06 → L07, but the **24-hour plan is the real
-entry point** — it interleaves these seven with about 15 pages from the parent course and puts
+Reading order is L01 → L02 → L03 → L04 → L05 → L06 → L07, with **L08 read first, out of order**
+(it decides whether an afternoon goes to building instead of reading). The **24-hour plan is the
+real entry point** — it interleaves these seven with about 15 pages from the parent course and puts
 the spoken drills at the end.
 
 ## Next, if there is time after the interview
