@@ -5,7 +5,7 @@ Status: **BUILT 2026-08-06**, published, then **corrected the same day** — see
 ## Why this sub-course exists
 
 Sync is the centre of the Game Locker job, and it is the one topic in this repo that is
-taught **everywhere and nowhere**. It appears as a section inside twelve different pages. It
+taught **everywhere and nowhere**. It appears as a section inside thirteen different pages. It
 has never been the subject of its own course.
 
 The migration sub-course says this out loud in its own index:
