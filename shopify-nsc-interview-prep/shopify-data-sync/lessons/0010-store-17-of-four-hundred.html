@@ -1,0 +1,491 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 — Store 17 of Four Hundred</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 10 · Shopify Data Sync · At size</p>
+  <h1>Store 17 of Four Hundred</h1>
+  <p class="subtitle">Everything so far has been one shop. Now widen the frame: Harbour City Cards is one tenant on a platform, and on Tuesday a new shop with 200,000 cards starts its first import. Mia's Charizard sells at the counter that afternoon, and her stock push is queued behind somebody else's backfill.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> say exactly what is <b>per store</b> and what is <b>shared</b>, explain why first-in-first-out is unfair by construction, and describe the two guards that stop one shop's bad day from becoming four hundred bad days.
+  </div>
+
+  <p class="small">This is a new lesson. <a href="../../stockinstore-omnichannel/lessons/0009-scale-multitenancy-failure-modes.html">stockinstore L09</a> covers multi-tenancy in general; nothing in the repo covers the <b>sync queue</b> across tenants.</p>
+
+  <h2>1. The good news, from the rate-limit docs</h2>
+
+  <p>Start with the fact that makes this manageable, because it removes a whole class of worry.</p>
+
+  <div class="soundbite">
+    <span class="label">shopify.dev, API rate limits — quoted</span>
+    <p>"GraphQL Admin API rate limits are based on the combination of the app and store. This means that calls from one app don't affect the rate limits of another app, even on the same store. Similarly, <b>calls to one store don't affect the rate limits of another store</b>, even from the same app."</p>
+  </div>
+
+  <div class="diagram">   SO, THROUGH SHOPIFY:
+
+     store 17  ──► its own ~100 points/sec ──► Shopify
+     store 218 ──► its own ~100 points/sec ──► Shopify
+     store 331 ──► its own ~100 points/sec ──► Shopify
+
+   Store 218 hammering its limit CANNOT slow store 17 down.
+   Shopify has already isolated the tenants for you.
+
+   ⚠ AND YET store 218 can still ruin store 17's afternoon.
+     Because the thing they share is not Shopify.
+     It is US.</div>
+
+  <h2>2. What is per store, and what is shared</h2>
+
+  <p>This table is the lesson. Everything else follows from it.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Per store — isolated for free</th><th>Shared — <b>your problem to isolate</b></th></tr>
+    <tr><td>Shopify rate limit (app + store)</td><td><b>The worker pool</b></td></tr>
+    <tr><td>The access token and scopes</td><td>The queue, unless you partition it</td></tr>
+    <tr><td>The store's own data and catalogue</td><td>The database and its connection pool</td></tr>
+    <tr><td>Its plan, and therefore its ceiling</td><td>The deploy — every store gets it at once</td></tr>
+    <tr><td>Its webhook subscriptions</td><td><b>Every bug you write</b></td></tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The sentence that reframes the whole lesson</span>
+    <b>Shopify isolated the tenants. You un-isolated them.</b> Every fairness problem below exists because we put four hundred shops through one pool of workers and one queue. That is a reasonable thing to do — running four hundred separate deployments would be worse — but it means <b>tenant fairness is entirely our responsibility</b>, and it will not appear until a big shop joins.
+  </div>
+
+  <h2>3. Tuesday: the noisy neighbour</h2>
+
+  <div class="diagram">   09:00  a new shop signs up. 200,000 cards.
+          Onboarding starts. It enqueues 200,000 messages.
+
+   09:05  the queue, oldest first:
+            msg 1 … msg 200,000   ← all store 331's backfill
+
+   14:05  Tom sells Mia's Charizard at the counter.
+          Store 17 enqueues ONE urgent message:
+            "set stock 0" on a $480 single.
+
+          It is message number 200,001.
+
+   14:05  FIFO says: after the other 200,000.
+   16:40  it finally runs.
+
+   For 2 hours 35 minutes Mia's website offered a card
+   that was already in somebody's pocket.
+
+   NOTHING FAILED. The queue worked perfectly.
+   The POLICY was wrong.</div>
+
+  <div class="trap">
+    <span class="label">Why FIFO is not neutral — it is actively unfair</span>
+    First-in-first-out feels like the fair default because it has no favourites. But it rewards <b>volume</b>: the more messages you produce, the more of the shared capacity you take. A shop with three messages waits behind a shop with two hundred thousand. <b>Treating every message equally is what makes it unfair to every small shop.</b> Fairness has to be per <em>tenant</em>, not per message.
+  </div>
+
+  <h2>4. Fair scheduling — one lane per store</h2>
+
+  <div class="diagram">   NOT ONE QUEUE. ONE LANE PER STORE, SERVED IN TURN.
+
+     store 17   │ msg │            ← 1 waiting
+     store 218  │ msg │ msg │      ← 2 waiting
+     store 331  │ msg │ msg │ … 200,000 waiting
+                  ▲
+                  └─ workers take ONE from each lane, in turn
+
+   RESULT
+     store 17's single urgent message waits for AT MOST
+     one message from each other active store — not for
+     200,000 messages from one of them.
+
+   Wait time now scales with the NUMBER OF ACTIVE STORES,
+   not with the LOUDEST store's volume.</div>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Policy</th><th>Store 17's wait for one urgent message</th></tr>
+    <tr><td>FIFO across all stores</td><td>Up to 200,000 messages. <b>Hours.</b></td></tr>
+    <tr><td>Round-robin per store</td><td>Up to one message per active store. <b>Seconds.</b></td></tr>
+    <tr><td>Round-robin <b>plus</b> the priority lanes from <a href="0008-the-backlog.html">L08</a></td><td>Its own urgent lane, first. <b>Immediate.</b></td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">The two policies compose, and that is the real answer</span>
+    <a href="0008-the-backlog.html">Lesson 8</a> prioritised <b>by message type</b> inside one shop. This lesson schedules <b>fairly across shops</b>. Put them together and the rule is: <em>round-robin between stores, and within a store, urgent stock decreases first.</em> Neither alone is enough — priority without fairness starves small shops, and fairness without priority puts a price update ahead of an oversell.
+  </div>
+
+  <h2>5. Backfill is not sync, and must not share a lane</h2>
+
+  <p>Store 331's 200,000 messages are a <b>backfill</b> — the one-time load of an existing catalogue. Mia's one message is <b>steady state</b>. They have opposite properties, and mixing them is what caused §3.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Backfill</th><th>Steady state</th></tr>
+    <tr><td>Size</td><td>200,000 messages</td><td>A handful per minute</td></tr>
+    <tr><td>Urgency</td><td><b>None.</b> Nobody is shopping there yet</td><td><b>Total.</b> A card is being sold right now</td></tr>
+    <tr><td>Acceptable duration</td><td>Days. Genuinely.</td><td>Seconds</td></tr>
+    <tr><td>If it pauses for an hour</td><td>Nobody notices</td><td>An oversell</td></tr>
+    <tr><td>So it should be</td><td><b>Slow, interruptible, background</b></td><td><b>Fast, protected, foreground</b></td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The rule</span>
+    <p>"Backfill runs in a separate, lower-priority lane with a cap on its share of the workers, and it can be paused at any moment without harm. A store that is not live yet has no urgent messages by definition — so it should never be able to delay a store that is trading."</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">This is the handover from the migration sub-course</span>
+    <a href="../../shopify-data-migration/index.html">Shopify Data Migration</a> ends at the cutover. This lesson is the hour after it: the backfill is still running while the sync has already started, so <b>both are writing to the same store at once</b>. Which means the backfill must use the same idempotent absolute writes as the sync (<a href="0004-absolute-writes-and-replay.html">L04</a>) and the same matching key (<a href="../../shopify-data-migration/lessons/0003-the-matching-key-and-idempotency.html">Migration L03</a>) — or the two of them fight over rows and the newer truth loses to the older import.
+  </div>
+
+  <h2>6. One broken store must not burn the pool</h2>
+
+  <p>The other multi-tenant failure runs the opposite way: not too much work from one store, but too much <em>waiting</em> on one store.</p>
+
+  <div class="diagram">   store 288's Shopify is having a bad day.
+   Every call takes 30 seconds, then times out.
+
+   WITHOUT A CIRCUIT BREAKER
+     workers pick up store 288's messages
+     each one occupies a worker for 30 seconds
+     retries put them straight back in the lane
+     → the pool fills with waiting, and the OTHER
+       399 stores slow down behind a shop that
+       cannot be helped anyway
+
+   WITH A PER-STORE CIRCUIT BREAKER
+     N consecutive failures for store 288
+       → OPEN the breaker for that store
+       → stop taking its messages; let them wait
+       → probe occasionally with a single call
+       → recovers on its own when the store does
+
+   ONE STORE'S OUTAGE STAYS ONE STORE'S OUTAGE.</div>
+
+  <div class="note">
+    <span class="label">Why the breaker must be per store, not global</span>
+    A global breaker would react to store 288's failures by pausing <b>everyone</b> — turning one shop's outage into a platform outage, which is the exact opposite of what it is for. The unit of isolation must match the unit of failure, and here the failure is one store's Shopify. Same principle as the per-store deletion budget in <a href="0005-deletes-archives-and-tombstones.html">L05</a>.
+  </div>
+
+  <h2>7. Blast radius</h2>
+
+  <p>The hardest change of mindset. In a single-shop integration, a bad deploy hurts one shop and one merchant phones you. Here it hurts four hundred at once, and you find out from a Discord thread.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Guard</th><th>What it does</th></tr>
+    <tr><td><b>Roll out per store</b></td><td>New sync logic to 1 store, then 10, then the rest. A destructive bug is caught at store one.</td></tr>
+    <tr><td><b>Per-store budgets</b></td><td>Deletion budget, heal budget, write budget — all scaled to the store. A shop with 300 cards must not share a threshold with one that has 200,000.</td></tr>
+    <tr><td><b>Per-store kill switch</b></td><td>Turn the sync off for one shop without a deploy. The first thing you want at 2am, and the thing nobody builds until they need it.</td></tr>
+    <tr><td><b>Per-store metrics</b></td><td>A platform average hides everything. "Lag is 4 seconds on average" can mean 399 stores at 1 second and one store at 30 minutes.</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The averages trap is worth stating carefully</span>
+    Aggregate dashboards are where multi-tenant problems go to hide. One badly broken store barely moves a mean across four hundred. Look at the <b>worst store</b>, not the average one — the highest lag, the highest mismatch rate, the most throttling. On a platform, the average tenant is not the tenant who churns.
+  </div>
+
+  <h2>8. What each shop is actually owed</h2>
+
+  <p>Which leads directly into the last lesson. All the machinery above exists to keep a promise, and the promise has to be sayable in a sentence a shopkeeper understands.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>The promise</th><th>What it costs us to keep</th></tr>
+    <tr><td>"A counter sale reaches your website in seconds"</td><td>Event-driven push, per-store fairness, an urgent lane</td></tr>
+    <tr><td>"Prices update overnight"</td><td>A nightly bulk diff, and permission to be slow</td></tr>
+    <tr><td>"If we ever sell something twice, you will hear it from us first"</td><td>The unfulfillable report, and someone who reads it</td></tr>
+    <tr><td>"Another shop's busy day is not your problem"</td><td>Everything in this lesson</td></tr>
+  </table>
+  </div>
+
+  <div class="recall">
+    <span class="label">Before you move on</span>
+    Cover the page. Say what Shopify isolates for you and what it does not. Say why FIFO is unfair. Then describe the noisy-neighbour Tuesday in four sentences.
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on multi-tenant sync"</b> — per-store versus shared, fair scheduling, circuit breakers, blast radius.</p>
+    <p><b>"design the queue with me for 400 stores"</b> — you talk, I interrupt with the follow-ups an interviewer would ask.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0009-reconciliation-and-the-numbers.html">← Lesson 9</a></span>
+    <span><a href="0011-the-sync-conversation-and-the-interview.html">Lesson 11: the sync conversation →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'A shop hammering its Shopify rate limit — can it slow down another shop on the same platform?',
+    options: [
+      'Not through Shopify — limits are per app-and-store pair — but yes through your shared worker pool',
+      'Yes, because the app has a single rate limit across all its stores',
+      'No, because each store runs in its own worker process',
+      'Only if both stores are on the same Shopify plan'
+    ],
+    answer: 0,
+    why: 'The docs state that "calls to one store don\'t affect the rate limits of another store, even from the same app". So Shopify already isolated the tenants. The interesting consequence is the second half: you un-isolated them by putting 400 shops through one pool and one queue, which makes tenant fairness entirely your responsibility.'
+  },
+  {
+    q: 'Why is first-in-first-out across all stores unfair?',
+    options: [
+      'It rewards volume — a shop with three messages waits behind a shop with 200,000',
+      'It processes messages in the wrong order within each store',
+      'It cannot guarantee per-card ordering',
+      'It always favours the store with the highest rate limit'
+    ],
+    answer: 0,
+    why: 'FIFO feels neutral because it has no favourites, but treating every <b>message</b> equally is exactly what makes it unfair to every small <b>tenant</b>. Round-robin per store means the wait scales with the number of active stores rather than with the loudest store\'s volume.'
+  },
+  {
+    q: 'A new shop\'s 200,000-message backfill is running. How should it relate to live stores\' sync traffic?',
+    options: [
+      'A separate lower-priority lane with a capped share of workers, pausable at any time',
+      'The same lane, since all messages are equally valid writes',
+      'A higher priority lane, so onboarding completes quickly',
+      'Blocked entirely until the shop goes live'
+    ],
+    answer: 0,
+    why: 'A store that is not trading yet has no urgent messages by definition — its backfill can take days and nobody notices. A live store\'s counter sale must land in seconds. Blocking it entirely is wrong too: onboarding has to make progress, just never at the expense of a shop that is selling.'
+  },
+  {
+    q: 'One store\'s Shopify is timing out on every call. What stops that harming the other 399?',
+    options: [
+      'A per-store circuit breaker — stop taking that store\'s messages, probe occasionally, recover automatically',
+      'A global circuit breaker that pauses all syncing until the errors stop',
+      'Increasing the worker count so there is spare capacity',
+      'Reducing the retry count to zero for all stores'
+    ],
+    answer: 0,
+    why: 'Without a breaker, each 30-second timeout occupies a worker and retries return it to the lane, so the pool fills with waiting and everyone slows behind a shop that cannot be helped anyway. A <b>global</b> breaker would be worse than none — it turns one store\'s outage into a platform outage. The unit of isolation must match the unit of failure.'
+  },
+  {
+    q: 'Why is "average lag across all stores is 4 seconds" a dangerous thing to report?',
+    options: [
+      'It can hide one store at 30 minutes among 399 at one second — look at the worst store, not the average',
+      'Averages cannot be computed correctly across tenants',
+      'Lag should be measured in messages, not seconds',
+      'It double-counts stores that share a worker'
+    ],
+    answer: 0,
+    why: 'Aggregate dashboards are where multi-tenant problems hide, because one badly broken store barely moves a mean across four hundred. On a platform the average tenant is not the tenant who churns, so the metrics that matter are the worst lag, the worst mismatch rate and the worst throttling.'
+  },
+  {
+    q: 'A backfill is still running while the live sync has started on the same store. What must be true?',
+    options: [
+      'Both use the same idempotent absolute writes and the same matching key, or the older import overwrites the newer truth',
+      'The backfill must finish before any sync message is processed',
+      'The backfill should use delta writes so it does not conflict',
+      'The sync should be paused until the backfill completes'
+    ],
+    answer: 0,
+    why: 'This is the hour after the cutover, and both processes are writing to the same store. If the backfill uses a different key or non-idempotent writes, the two fight over rows and a stale imported value can land on top of a fresh counter sale. Pausing the sync instead would mean every counter sale during the import is lost time.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"We have four hundred merchants. What changes about your sync design?"',
+    answer: 'The first thing I would check is what the platform already isolates for me, and the answer is more than people expect. Shopify\'s rate limits are per <b>app-and-store</b> pair — their docs say calls to one store do not affect the limits of another, even from the same app. So one shop hammering its limit cannot slow another shop down <em>through Shopify</em>.<br><br>Which leaves the honest version of the problem: <b>Shopify isolated the tenants and we un-isolated them.</b> What four hundred shops share is our worker pool, our queue, our database, our deploy and every bug we write. So tenant fairness is entirely ours to solve, and it will not show up in testing — it shows up the week a big shop joins.<br><br>Concretely, four things. <b>One lane per store, served round-robin</b>, so a shop with one urgent message waits at most one message per active store rather than behind somebody\'s 200,000-row backfill. <b>Backfill in a separate low-priority lane</b> with a capped share of workers, because a store that is not trading yet has no urgent messages by definition. <b>A per-store circuit breaker</b>, so one shop\'s bad Shopify day does not fill the pool with 30-second timeouts. And <b>per-store everything else</b> — budgets, kill switch, metrics — because a platform average hides exactly the tenant who is about to leave.'
+  },
+  {
+    prompt: '"Walk me through a concrete multi-tenant failure."',
+    answer: 'Tuesday morning a new shop signs up with two hundred thousand cards, and onboarding enqueues two hundred thousand messages. That afternoon a card sells at the counter of an existing shop, and that shop enqueues one urgent message — set stock to zero on a four-hundred-dollar single.<br><br>With one queue and first-in-first-out, that message is number two hundred thousand and one. It runs two and a half hours later. For two and a half hours the shop\'s website offered a card that was already in somebody\'s pocket, on its most expensive single.<br><br>And the thing I would emphasise is that <b>nothing failed</b>. No error, no timeout, no exception. The queue did precisely what it was told. <b>The policy was wrong, not the code.</b><br><br>FIFO feels like the fair default because it has no favourites, but it rewards volume — treating every message equally is what makes it unfair to every small shop. So the fix is fairness per <b>tenant</b> rather than per message: one lane per store, workers taking one from each in turn. Then the wait scales with the number of active stores instead of the loudest store\'s output. Combined with the urgent-stock lane from the backlog lesson, that message goes almost immediately.'
+  },
+  {
+    prompt: '"What worries you most about running this for four hundred shops rather than one?"',
+    answer: 'Blast radius. With one shop, a bad deploy hurts one merchant and she phones me. With four hundred, the same deploy hurts all of them in the same minute and I find out from a public Discord thread — and in this industry the merchants talk to each other, so a bad afternoon becomes a reputation problem quickly.<br><br>So I would want four things before I trusted myself with it. <b>Roll out per store</b> — new sync logic to one shop, then ten, then the rest, so a destructive bug is caught at store one instead of store four hundred. <b>Per-store budgets</b> for anything irreversible, especially the deletion budget, because a threshold that is safe for a two-hundred-thousand-card shop would let a three-hundred-card shop be wiped. <b>A per-store kill switch</b> that does not need a deploy, which is the first thing I would want at two in the morning and the thing nobody builds until the night they need it. And <b>per-store metrics</b> rather than averages.<br><br>That last one I feel strongly about. "Average lag is four seconds" can mean three hundred and ninety-nine stores at one second and one store at thirty minutes. On a platform, <b>the average tenant is not the tenant who churns</b> — so I want to look at the worst store, not the typical one.'
+  }
+]);
+</script>

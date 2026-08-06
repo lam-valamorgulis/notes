@@ -1,0 +1,515 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 6 — Clocks, Order and Staleness</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 6 · Shopify Data Sync · The write path out</p>
+  <h1>Clocks, Order and Staleness</h1>
+  <p class="subtitle">"Latest wins" sounds like a conflict rule. It is really an assumption — that you can tell which change was later. Two systems have two clocks, Shopify promises no ordering at all, and both of those facts break the rule before you have written a line of it.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> quote what Shopify actually promises about webhook ordering, name the header that lets you order events anyway, and state the rule that makes all of this manageable — <b>never compare one system's clock to another system's clock</b>.
+  </div>
+
+  <div class="note">
+    <span class="label">Sources</span>
+    Read from shopify.dev on <b>2026-08-06</b> and quoted below. Nothing in this repo covers clock disagreement, so this lesson is new rather than a retelling.
+  </div>
+
+  <h2>1. The assumption hiding inside "latest wins"</h2>
+
+  <p>Someone will propose this rule, and it sounds reasonable:</p>
+
+  <div class="diagram">   "If Game Locker and Shopify disagree, take whichever
+    one changed most recently."
+
+   To run that rule you need to answer:
+
+     which change was later?
+
+   Which needs:  a time for change A
+                 a time for change B
+                 and the two times to be COMPARABLE
+
+   The third one is where it falls over.</div>
+
+  <p>Game Locker's timestamp comes from Game Locker's servers. Shopify's comes from Shopify's. Nobody guarantees those agree. They will usually be close, and "usually close" is exactly the property that produces a bug you cannot reproduce.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Why two clocks disagree</th><th>Typical size</th></tr>
+    <tr><td>Ordinary clock drift between machines</td><td>Milliseconds to seconds</td></tr>
+    <tr><td>Time sync correcting a drifted clock — <b>time can move backwards</b></td><td>Whatever the drift was</td></tr>
+    <tr><td>Two servers in one cluster stamping the same event</td><td>Milliseconds — enough to reverse the order of two fast writes</td></tr>
+    <tr><td>A queue holding a message before it is stamped</td><td>Seconds to minutes</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The failure this creates is the nastiest kind</span>
+    It works in testing, because your test writes are seconds apart. It works in staging. It fails on release Saturday, on one card, when two changes land inside the same second — and by the time anyone looks, both systems agree on a value and there is nothing left to inspect. <b>A rule that is right 99.9% of the time is not a rule. It is a coin flip you have hidden from yourself.</b>
+  </div>
+
+  <h2>2. What Shopify actually promises about order</h2>
+
+  <p>Not "usually in order". Read it exactly:</p>
+
+  <div class="soundbite">
+    <span class="label">shopify.dev, About webhooks — quoted</span>
+    <p>"Shopify doesn't guarantee ordering within a topic, or across different topics for the same resource."</p>
+  </div>
+
+  <p>And the example the docs themselves give is the one that shows how strange it can get: a <code>products/update</code> can arrive <b>before</b> the <code>products/create</code> for the same product.</p>
+
+  <div class="diagram">   WHAT THIS MEANS FOR HANDLERS
+
+   NOT ordered within one topic:
+     inventory_levels/update  qty 3   ← sent first
+     inventory_levels/update  qty 1   ← sent second
+     … may arrive in either order.
+
+   NOT ordered across topics for the same resource:
+     products/create  ← may arrive AFTER
+     products/update
+
+   THEREFORE a handler that assumes "the newest message
+   I received is the newest thing that happened" is wrong.
+   Not occasionally. By design.</div>
+
+  <p>The same page also states delivery itself is not assured: "Webhook delivery isn't always guaranteed, and your app can miss or mishandle events for other reasons, such as handler failures or downtime." That is <a href="0007-webhooks-are-a-hint.html">Lesson 7</a>.</p>
+
+  <h2>3. The header that fixes ordering — within Shopify</h2>
+
+  <p>Shopify does not leave you stuck. Each delivery carries metadata headers, and one of them is the event time.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Header</th><th>What it is for</th></tr>
+    <tr><td><code>X-Shopify-Topic</code></td><td>Which topic this delivery is</td></tr>
+    <tr><td><code>X-Shopify-Hmac-Sha256</code></td><td>Verify it really came from Shopify</td></tr>
+    <tr><td><code>X-Shopify-Webhook-Id</code></td><td>Detect and skip a repeated delivery — see <a href="0004-absolute-writes-and-replay.html">L04 §5</a></td></tr>
+    <tr><td><code>X-Shopify-Event-Id</code></td><td>Correlate deliveries caused by the same merchant action</td></tr>
+    <tr><td><b><code>X-Shopify-Triggered-At</code></b></td><td><b>When the event happened.</b> Shopify recommends using this, or the payload's <code>updated_at</code>, to order events and to spot stale payloads</td></tr>
+  </table>
+  </div>
+
+  <p>It is an ISO 8601 timestamp with very fine precision — for example <code>2026-04-28T12:43:11.254245052Z</code>.</p>
+
+  <div class="tip">
+    <span class="label">Why this header is safe to trust and your own clock is not</span>
+    Every <code>X-Shopify-Triggered-At</code> comes from <b>Shopify's clock</b>. So comparing two of them is comparing one clock with itself, which is a valid comparison. Comparing one of them against a Game Locker timestamp is comparing two different clocks, which is not. <b>The header solves ordering inside Shopify. It does not solve conflict between the systems.</b>
+  </div>
+
+  <h2>4. The rule that makes all of this manageable</h2>
+
+  <div class="soundbite">
+    <span class="label">Memorise this one</span>
+    <p>"Never compare one system's clock to another system's clock. Compare Shopify's timestamps with Shopify's timestamps to order <em>its</em> events. Between the two systems, do not use time at all — use <b>ownership</b>."</p>
+  </div>
+
+  <p>This is why <a href="0003-ownership-per-field.html">Lesson 3</a> exists, and the connection is worth saying out loud in an interview because most people never make it:</p>
+
+  <div class="diagram">   "WHO WINS?" HAS TWO POSSIBLE ANSWERS
+
+   By TIME       "whoever changed it last"
+                 needs comparable clocks  →  you do not have them
+                 fails silently and rarely →  worst kind of bug
+
+   By OWNERSHIP  "the field's owner, always"
+                 needs no clock at all
+                 fails the same way every time  →  testable,
+                 explainable to a merchant, and boring
+
+   Ownership is not a stylistic preference.
+   It is what you use BECAUSE cross-system time is unusable.</div>
+
+  <h2>5. Per-card ordering is enough</h2>
+
+  <p>Once you accept messages can arrive out of order, the instinct is to force global order — one queue, one worker, strictly sequential. Resist it, and know why.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Global ordering</th><th>Ordering per card</th></tr>
+    <tr><td>Guarantee</td><td>Every message in the shop, in order</td><td>Messages about <b>one card</b>, in order</td></tr>
+    <tr><td>Parallelism</td><td><b>One at a time.</b> 12,000 cards behind one lane</td><td>As many lanes as you like</td></tr>
+    <tr><td>One slow message</td><td>Blocks <b>everything</b></td><td>Blocks that one card only</td></tr>
+    <tr><td>Correctness gained</td><td><b>None you needed.</b> Card A's order never mattered to card B</td><td>All of it</td></tr>
+  </table>
+  </div>
+
+  <p>The reason is simple once stated: <b>two different cards have no relationship</b>. There is no rule connecting the Charizard's stock to a Pikachu's. So the only ordering that ever mattered is within one card — and that is cheap.</p>
+
+  <div class="note">
+    <span class="label">How you get it</span>
+    Key the queue by the thing that must stay in order — the inventory item, or the variant. Everything with the same key goes to the same lane and is handled in sequence; different keys run in parallel. This is the standard partitioned-queue shape, and <a href="../../lessons/0012-event-driven-messaging.html">Main L12 §5</a> covers the messaging side of it.
+  </div>
+
+  <h2>6. The staleness guard</h2>
+
+  <p>Ordering per card handles messages that arrive out of sequence <em>inside your queue</em>. The staleness guard handles the ones that arrive late from outside.</p>
+
+  <div class="diagram">   STORE, PER CARD, THE TIME OF THE LAST EVENT YOU APPLIED.
+   (Shopify's clock, from X-Shopify-Triggered-At.)
+
+   a message arrives
+     │
+     ├─ triggered_at OLDER than what I already applied?
+     │     → DROP IT. It is news about a past I have moved on from.
+     │
+     └─ NEWER?
+           → apply it, and store its triggered_at
+
+   WHY THIS IS SAFE FOR ABSOLUTE WRITES:
+     the newest message contains the whole truth, so
+     discarding an older one loses nothing at all.
+
+   WHY IT WOULD BE FATAL FOR DELTA WRITES:
+     each delta carries a piece of the truth. Drop one
+     and it is gone forever — Lesson 4, the same reason.</div>
+
+  <div class="tip">
+    <span class="label">The link back to Lesson 4</span>
+    Notice that the staleness guard is only <em>allowed</em> to exist because the writes are absolute. Choosing <code>inventorySetQuantities</code> in Lesson 4 is what makes "just drop the old message" a safe sentence in Lesson 6. <b>One early decision keeps paying.</b> That kind of chain is worth pointing out in an interview — it shows you see the design as connected rather than as a list of tips.
+  </div>
+
+  <h2>7. What the staleness guard cannot catch</h2>
+
+  <p>Be honest about the limits, because an interviewer will look for them.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Case</th><th>Why the guard misses it</th><th>What actually covers it</th></tr>
+    <tr><td>Two events with the <b>same</b> timestamp</td><td>Neither is older. The guard has no opinion.</td><td>Ownership decides. Or, for quantity, <code>compareQuantity</code> — the loser is rejected and re-reads.</td></tr>
+    <tr><td>A counter sale versus an online sale</td><td>They come from <b>different clocks</b>, so the timestamps are not comparable at all.</td><td>Nothing time-based. Both are real; the collision is handled, not ordered. <a href="0009-reconciliation-and-the-numbers.html">L09</a>.</td></tr>
+    <tr><td>A message that never arrives</td><td>Nothing to compare. Silence has no timestamp.</td><td>The nightly read-back. <a href="0009-reconciliation-and-the-numbers.html">L09</a>.</td></tr>
+    <tr><td>A card whose <code>updated_at</code> moved but whose value did not</td><td>Looks newer, is not different.</td><td><code>last_pushed</code> from <a href="0003-ownership-per-field.html">L03</a> — compare values, not times.</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The trap in row four</span>
+    A common shortcut is "only sync cards whose <code>updated_at</code> changed". It is tempting and it leaks, because <code>updated_at</code> moves for reasons that are not real changes — a no-op save, a tag reorder, an app touching the record. You end up pushing thousands of rows that were already correct, burning API budget and invalidating caches for nothing. <b>Timestamps tell you something happened. Only values tell you what.</b>
+  </div>
+
+  <h2>8. Game Locker's own ordering, without clocks</h2>
+
+  <p>One more piece. Shopify's events can be ordered by its header, but what orders <em>Game Locker's</em> own pushes when two staff edit the same card in the same second?</p>
+
+  <div class="diagram">   NOT A TIMESTAMP. A VERSION NUMBER.
+
+     each card row carries  version: 41
+     any change increments it → 42, 43, 44 …
+
+   The push carries the version it was built from.
+   The change log is ordered by version, not by time.
+
+   WHY THIS IS BETTER THAN A CLOCK:
+     · it cannot go backwards
+     · it does not need two machines to agree
+     · "42 is after 41" is true with no assumptions
+     · a gap (41 → 43) is a VISIBLE missing event,
+       which a timestamp gap never is</div>
+
+  <p>The last line is the real prize. With timestamps, a lost event leaves no trace. With a version sequence, <b>a hole in the numbers is evidence</b> — and evidence is what makes a sync auditable rather than merely hopeful.</p>
+
+  <h2>9. The rules, collected</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>Rule</th></tr>
+    <tr><td>1</td><td>Never compare one system's clock to another's. Between systems, use <b>ownership</b>.</td></tr>
+    <tr><td>2</td><td>Order Shopify's events by <code>X-Shopify-Triggered-At</code> — its clock against itself.</td></tr>
+    <tr><td>3</td><td>Order your own events by a <b>version number</b>, not a timestamp.</td></tr>
+    <tr><td>4</td><td>Order <b>per card</b>, never globally. Two cards have no relationship.</td></tr>
+    <tr><td>5</td><td>Drop messages older than the last one applied for that card — safe only because writes are absolute.</td></tr>
+    <tr><td>6</td><td>Never decide "did this change?" from a timestamp. Compare values.</td></tr>
+  </table>
+  </div>
+
+  <div class="recall">
+    <span class="label">Before you move on</span>
+    Cover the page. Quote what Shopify promises about ordering. Name the header. Then say why ownership beats "latest wins" — in terms of clocks, not preference.
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on webhook ordering and staleness"</b> — including the four cases the staleness guard cannot catch.</p>
+    <p><b>"argue for latest-wins and make me refute it"</b> — I will play the engineer who wants timestamps, and you have to explain the clock problem clearly.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0005-deletes-archives-and-tombstones.html">← Lesson 5</a></span>
+    <span><a href="0007-webhooks-are-a-hint.html">Lesson 7: webhooks are a hint →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What does Shopify guarantee about webhook delivery order?',
+    options: [
+      'Nothing — "Shopify doesn\'t guarantee ordering within a topic, or across different topics for the same resource"',
+      'Order is guaranteed within a topic, but not across topics',
+      'Order is guaranteed for the same resource, but not across resources',
+      'Order is guaranteed unless a retry occurs'
+    ],
+    answer: 0,
+    why: 'Not even within one topic. The docs\' own example is that a <code>products/update</code> can arrive before the <code>products/create</code> for the same product. So a handler assuming "the newest message I received is the newest thing that happened" is wrong by design, not occasionally.'
+  },
+  {
+    q: 'Which header lets you order Shopify events correctly despite unordered delivery?',
+    options: [
+      'X-Shopify-Triggered-At — the time the event happened, on Shopify\'s clock',
+      'X-Shopify-Webhook-Id — deliveries are numbered in sequence',
+      'X-Shopify-Event-Id — events are ordered by id',
+      'There is no such header; you must use the payload id'
+    ],
+    answer: 0,
+    why: 'Shopify recommends using <code>X-Shopify-Triggered-At</code>, or a timestamp from the payload, to order events, spot stale payloads and detect delivery delays. The webhook id is for detecting repeat deliveries and the event id correlates deliveries caused by one merchant action — neither carries order.'
+  },
+  {
+    q: 'Why is "whoever changed it last wins" a poor conflict rule between two systems?',
+    options: [
+      'It needs timestamps from two different clocks to be comparable, and they are not',
+      'It requires storing full change history, which is expensive',
+      'Shopify does not expose an updated_at field on inventory',
+      'It always favours the faster system'
+    ],
+    answer: 0,
+    why: 'The rule silently assumes comparable clocks. Machines drift, time sync can move a clock backwards, and two servers in one cluster can stamp the same event milliseconds apart — enough to reverse two fast writes. It works in testing, where writes are seconds apart, and fails on the busy day inside one second. Ownership needs no clock and fails the same way every time, which makes it testable.'
+  },
+  {
+    q: 'Why order messages per card rather than globally?',
+    options: [
+      'Two different cards have no relationship, so global order buys correctness you never needed while blocking all parallelism',
+      'Global ordering is not supported by most queue systems',
+      'Per-card ordering is cheaper to store',
+      'Global ordering breaks the staleness guard'
+    ],
+    answer: 0,
+    why: 'No rule connects the Charizard\'s stock to a Pikachu\'s. Global ordering puts 12,000 cards behind one lane, so one slow message blocks everything, and it gains nothing — the only ordering that ever mattered was within a single card. Key the queue by the inventory item and different keys run in parallel.'
+  },
+  {
+    q: 'The staleness guard drops any message older than the last one applied for that card. Why is that safe?',
+    options: [
+      'Because the writes are absolute — the newest message contains the whole truth, so the older one holds nothing unique',
+      'Because Shopify re-sends dropped messages automatically',
+      'Because the nightly reconciler replays every dropped message',
+      'Because messages are never more than a few seconds apart'
+    ],
+    answer: 0,
+    why: 'This is the payoff from Lesson 4. An absolute write says "this is now 7", so an older message adds nothing. With delta writes the same guard would be fatal — each delta carries a piece of the truth, so discarding one loses it forever. The early choice of <code>inventorySetQuantities</code> is what makes "just drop the old message" a safe sentence here.'
+  },
+  {
+    q: 'Why order Game Locker\'s own pushes by a version number instead of a timestamp?',
+    options: [
+      'A version cannot go backwards, needs no agreement between machines, and a gap in the sequence is visible evidence of a lost event',
+      'Version numbers are smaller to store than timestamps',
+      'Shopify requires a version field on inventory writes',
+      'Timestamps cannot be compared within a single system'
+    ],
+    answer: 0,
+    why: 'The last point is the real prize: with timestamps a lost event leaves no trace, but a jump from 41 to 43 is proof that something is missing. That turns the sync from hopeful into auditable. Timestamps within one system <em>can</em> be compared — they are just weaker than a sequence.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Webhooks can arrive out of order. How do you handle that?"',
+    answer: 'I start from what Shopify actually promises, which is nothing: <b>"Shopify doesn\'t guarantee ordering within a topic, or across different topics for the same resource."</b> Their own example is that a <code>products/update</code> can arrive before the <code>products/create</code> for the same product. So I design for unordered arrival rather than treating it as an anomaly.<br><br>Three things handle it. First, each delivery carries <b><code>X-Shopify-Triggered-At</code></b>, the time the event happened on Shopify\'s clock — so I order events by that, not by the order they reached me. Second, I keep, per card, the triggered-at of the last event I applied, and <b>drop anything older</b>. Third, I order <b>per card</b> rather than globally: I key the queue by inventory item, so messages about one card are sequential while different cards run in parallel. Global ordering would put twelve thousand cards behind one lane and buy correctness I never needed, because two different cards have no relationship.<br><br>And the reason dropping an old message is safe is the decision I made earlier: the writes are <b>absolute</b>. The newest message contains the whole truth, so the older one holds nothing unique. With delta writes that same guard would lose data permanently.'
+  },
+  {
+    prompt: '"Someone proposes: if the two systems disagree, take whichever changed most recently. What do you say?"',
+    answer: 'I would say it sounds like a rule but it is really an assumption — that the two timestamps are comparable. They come from different machines, and nobody guarantees those clocks agree. Ordinary drift is milliseconds to seconds. Time sync correcting a drifted clock can move time <b>backwards</b>. Two servers inside one cluster can stamp the same event far enough apart to reverse the true order of two quick writes.<br><br>What worries me most is the shape of the failure. It works in testing, because test writes are seconds apart. It works in staging. It fails on the busiest Saturday, on one card, when two changes land in the same second — and by then both systems agree on a value, so there is nothing left to inspect. <b>A rule that is right 99.9% of the time is a coin flip you have hidden from yourself.</b><br><br>So my position is: use time <b>inside</b> a system and ownership <b>between</b> systems. Ordering Shopify\'s events by <code>X-Shopify-Triggered-At</code> is fine, because that is one clock compared with itself. Deciding whether Game Locker or Shopify is right is not a time question at all — it is the ownership matrix, which needs no clock and fails the same way every time. Predictable failure is testable and explainable to a merchant. Rare failure is neither.'
+  },
+  {
+    prompt: '"How do you know which of your own changes is newer, if you don\'t trust clocks?"',
+    answer: 'A <b>version number</b> on the card row. Any change increments it — 41 to 42 to 43 — and the change log is ordered by version rather than by time. The push carries the version it was built from.<br><br>Three reasons I prefer that to a timestamp, even within one system. It <b>cannot go backwards</b>, which a clock can. It needs no agreement between machines, so it is still correct if the work is spread across several. And "42 is after 41" is true with no assumptions behind it.<br><br>But the reason I actually reach for it is the fourth one: <b>a gap is evidence</b>. If I see 41 and then 43, I know an event is missing and I can go and find it. A gap between two timestamps looks exactly like a quiet afternoon. That difference is what makes the sync auditable instead of merely hopeful — and being able to prove what happened is most of what a merchant is really buying.'
+  }
+]);
+</script>

@@ -1,0 +1,519 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 — The Backlog</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 8 · Shopify Data Sync · When it is behind</p>
+  <h1>The Backlog</h1>
+  <p class="subtitle">Release Saturday, 17:00. Nothing has failed. No alarm is red. Every message will eventually be delivered. And the sync is forty minutes behind, which means every stock number on the website is forty minutes old — so the shop is quietly promising cards it does not have, at the busiest hour of its year.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> explain why <b>adding more workers does not fix this</b>, name what may be collapsed and what may never be, and give the order you would catch up in — with the reason it is that order.
+  </div>
+
+  <p class="small">This is a new lesson. The repo covers not asking Shopify too often (<a href="../../stockinstore-omnichannel/lessons/0002-inventory-ingestion-multi-source-sync.html">stockinstore L02 §6</a>), which is the opposite problem. Nothing covers being behind.</p>
+
+  <h2>1. The day</h2>
+
+  <div class="diagram">   SATURDAY — a new set releases
+
+   09:00  Mia lists 800 new cards. Each one is a product
+          and several variants. That is thousands of writes.
+   10:00  The shop fills up. Tom is selling constantly.
+          Every counter sale is a stock push.
+   11:00  The website is busy too. Orders coming back.
+   13:00  The nightly price job from last night is still
+          finishing its retries.
+
+   17:00  QUEUE DEPTH: 24,000 messages
+          OLDEST UNPROCESSED MESSAGE: 40 minutes old
+
+   ERRORS: zero.
+   FAILED JOBS: zero.
+   ALARMS: none.
+
+   Everything is working. That is the problem.</div>
+
+  <div class="trap">
+    <span class="label">Why no alarm fired</span>
+    Almost all monitoring watches for <b>failure</b>. Nothing here failed. Every message will be processed and every write will succeed. The system is <b>correct and useless at the same time</b> — because a stock number that is right about 16:20 is wrong about 17:00, and the collector is buying at 17:00. <b>Lag is a category of fault that error monitoring cannot see.</b>
+  </div>
+
+  <h2>2. Lag is the metric, not queue depth</h2>
+
+  <p>Two numbers look similar and only one tells you about risk.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Queue depth</th><th>Lag</th></tr>
+    <tr><td>Measures</td><td>How many messages are waiting</td><td><b>How old the oldest waiting message is</b></td></tr>
+    <tr><td>24,000 messages, drained in 30 seconds</td><td>Looks alarming</td><td>Fine. Lag is 30 seconds.</td></tr>
+    <tr><td>12 messages, stuck for an hour</td><td>Looks fine</td><td><b>Alarming.</b> Lag is 60 minutes.</td></tr>
+    <tr><td>Tells you</td><td>How much work there is</td><td><b>How wrong the website currently is</b></td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The sentence to bring to the monitoring conversation</span>
+    <p>"I would alarm on <b>lag</b>, not on queue depth. Depth tells me how busy we are. Lag tells me how stale the storefront is — which is the thing that actually costs the merchant money."</p>
+  </div>
+
+  <h2>3. Why adding workers does not save you</h2>
+
+  <p>This is the part that separates a real answer from a rehearsed one. The instinct is to scale out. Here is the ceiling that makes it pointless.</p>
+
+  <div class="diagram">   SHOPIFY'S GRAPHQL ADMIN API RATE LIMIT
+   (read from shopify.dev, 2026-08-06)
+
+     scope:  the combination of the APP and the STORE
+     Standard plan            100 points per second
+     Advanced Shopify         200 points per second
+     Shopify Plus            1000 points per second
+     enterprise              2000 points per second
+     single query max         1000 points, any plan
+
+   HARBOUR CITY CARDS IS ON A STANDARD PLAN.
+   So this store has ~100 points per second. TOTAL.
+
+   Run 4 workers  → still 100 points per second
+   Run 40 workers → still 100 points per second, plus
+                    thousands of throttled retries making
+                    everything SLOWER
+
+   The bottleneck is not our compute. It is the store's
+   share of the platform. You cannot buy your way past it
+   with concurrency.</div>
+
+  <div class="tip">
+    <span class="label">Read the scope line again, because it cuts both ways</span>
+    The limit is per <b>app-and-store</b> pair: "calls from one app don't affect the rate limits of another app, even on the same store. Similarly, calls to one store don't affect the rate limits of another store, even from the same app." That is good news for a platform — Harbour City Cards cannot slow down another shop through Shopify. But it also means <b>this store's ceiling is fixed and cannot be shared or borrowed</b>. It is the wall of this lesson, and it is the setup for <a href="0010-store-17-of-four-hundred.html">Lesson 10</a>, where the shared thing is our own worker pool rather than Shopify's limit.
+  </div>
+
+  <p>So the real levers are only three, and none of them is "more machines":</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Lever</th><th>What it does</th></tr>
+    <tr><td><b>Send fewer messages</b></td><td>Collapse redundant work. §4 — the biggest win by far.</td></tr>
+    <tr><td><b>Send more per call</b></td><td>Batch and use bulk operations. One call, many rows.</td></tr>
+    <tr><td><b>Choose what goes first</b></td><td>Prioritise. §6 — the difference between 40 minutes of risk and 40 minutes of delay.</td></tr>
+  </table>
+  </div>
+
+  <h2>4. Collapsing — the biggest win</h2>
+
+  <p>Look at what is actually in the queue for one card on a busy afternoon.</p>
+
+  <div class="diagram">   QUEUE, FOR THE SAME CARD, OLDEST FIRST
+
+     16:20  set stock = 4
+     16:31  set stock = 3
+     16:44  set stock = 2
+     16:52  set stock = 1
+     17:00  set stock = 0        ← the truth, right now
+
+   PROCESS ALL FIVE:
+     5 API calls. Four of them write a number that is
+     already wrong. The storefront shows 4, then 3, then
+     2… catching up to reality slowly and publicly.
+
+   COLLAPSE TO THE NEWEST PER CARD:
+     1 API call. set stock = 0.
+     Correct immediately. FIVE TIMES less budget spent.
+
+   Nothing was lost. Because the write is ABSOLUTE, the
+   newest message CONTAINS the whole truth — the earlier
+   four held no information the last one lacks.</div>
+
+  <div class="tip">
+    <span class="label">The third payoff from choosing absolute writes</span>
+    Lesson 4 chose absolute writes for replay safety. Lesson 6 used that to make dropping stale messages safe. Lesson 8 now uses it again to <b>collapse a backlog by 80%</b>. One decision in the first week, three separate rescues. If you can trace that chain out loud, you are describing a design rather than reciting tips.
+  </div>
+
+  <h2>5. What may never be collapsed</h2>
+
+  <p>Collapsing is not a general technique. It is safe for one specific kind of message, and dangerous for the rest.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Message</th><th>Collapse?</th><th>Why</th></tr>
+    <tr><td><b>Stock level for a card</b></td><td><b>Yes</b>, keep newest per card</td><td>It is a <b>state</b>. The newest value is the whole truth.</td></tr>
+    <tr><td><b>Price for a variant</b></td><td><b>Yes</b>, keep newest</td><td>Also a state. Nobody needs yesterday's price written first.</td></tr>
+    <tr><td><b>An order</b></td><td><b>NEVER</b></td><td>It is an <b>event</b>. It is money, a customer and a card that must leave the shop. Two orders are not a newer version of one order.</td></tr>
+    <tr><td><b>A refund or cancellation</b></td><td><b>NEVER</b></td><td>Also an event, and also money.</td></tr>
+    <tr><td><b>A tombstone</b> <span class="small">(L05)</span></td><td><b>No</b></td><td>Each removal has its own reason, and the reason decides the action.</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The test that decides it, every time</span>
+    <p>"Ask whether the message describes a <b>state</b> or an <b>event</b>. States collapse — the newest one replaces the rest and loses nothing. Events never collapse — each one happened separately and each one has a consequence. Stock is a state. An order is an event. Getting that backwards either wastes your entire API budget or loses somebody's money."</p>
+  </div>
+
+  <div class="trap">
+    <span class="label">The mistake this prevents</span>
+    A tempting shortcut on release Saturday is "the queue is huge, drop the old messages". Do it across the whole queue and you have just discarded orders — real cards that real people paid for, which the shop will now never pick and never post. <b>Collapsing must be done per key and per type, never as a blanket clear-out.</b>
+  </div>
+
+  <h2>6. Catch-up order</h2>
+
+  <p>Even after collapsing you may still be behind. So what goes first? Not first-in-first-out — that treats a $480 single like a 50-cent common.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Priority</th><th>What</th><th>Why it beats the row below it</th></tr>
+    <tr>
+      <td><b>1</b></td>
+      <td>Stock going <b>down to zero</b> on <b>quantity-1</b> cards</td>
+      <td>This is the <em>only</em> message that prevents an oversell. Everything else can be late without anybody being disappointed.</td>
+    </tr>
+    <tr>
+      <td><b>2</b></td>
+      <td>Any stock <b>decrease</b></td>
+      <td>A decrease that is late risks selling something. An increase that is late only risks not selling something.</td>
+    </tr>
+    <tr>
+      <td><b>3</b></td>
+      <td>Orders coming <b>back</b> from Shopify</td>
+      <td>The shop needs to pick and post them. Late is bad, not dangerous — the money is already taken.</td>
+    </tr>
+    <tr>
+      <td><b>4</b></td>
+      <td>Stock <b>increases</b></td>
+      <td>Costs a possible sale. Recoverable and invisible.</td>
+    </tr>
+    <tr>
+      <td><b>5</b></td>
+      <td><b>Prices</b>, and new listings</td>
+      <td>Nobody is harmed by yesterday's price for one more hour.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">The asymmetry that makes rows 2 and 4 different</span>
+    A late <b>decrease</b> means the website offers something the shop cannot supply — a taken payment, an apology, a refund, possibly a public complaint in a hobby community where people talk to each other. A late <b>increase</b> means the website says sold out when a card is available — a missed sale nobody ever knows about. Both are "stock is wrong". <b>One costs trust and one costs a maybe.</b> Priority follows the cost, not the symmetry of the data.
+  </div>
+
+  <div class="tip">
+    <span class="label">Why priority 1 is cheap to implement</span>
+    You already know which cards are quantity 1, and <a href="../reference/the-store.html">the store page</a> shows why it matters: singles are where the money and the anger live, and sealed product barely cares. So a two-lane queue — "single copies going to zero" and "everything else" — gets most of the benefit with very little machinery. It is a small change that buys the outcome that matters.
+  </div>
+
+  <h2>7. Shedding, and the honest limit</h2>
+
+  <p>If the backlog is growing faster than it drains, no ordering saves you. Then there are only two remaining moves, and both are decisions rather than code.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Move</th><th>What it means</th><th>Cost</th></tr>
+    <tr><td><b>Shed</b></td><td>Stop generating low-value messages. Pause the price job. Pause new listings. Keep only stock and orders moving.</td><td>Prices go stale for a day. Cheap, and reversible with a switch.</td></tr>
+    <tr><td><b>Reduce the promise</b></td><td>Ask Mia to move high-value singles to <code>safety_stock</code> for the afternoon, so the website stops offering the last copy at all.</td><td>Fewer sales today. Zero oversells today. <b>Her call, not yours.</b></td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The answer to "so what do you do when you cannot keep up?"</span>
+    <p>"I stop pretending the storefront is current, and I make it promise less until we are caught up. Pausing the price job and holding back the last copy of expensive singles for one afternoon costs the shop a few maybes. Selling forty cards we do not have costs the shop forty apologies and its reputation in a community where collectors talk to each other."</p>
+  </div>
+
+  <h2>8. What to put on the dashboard</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Metric</th><th>Alarm when</th><th>Because</th></tr>
+    <tr><td><b>Lag</b> — age of the oldest unprocessed message</td><td>Over a few minutes for stock</td><td>It is the direct measure of how wrong the storefront is</td></tr>
+    <tr><td><b>Lag on the priority-1 lane</b></td><td>Over ~30 seconds</td><td>This is the oversell window, measured</td></tr>
+    <tr><td>Queue depth <b>trend</b></td><td>Rising for 15 minutes</td><td>Growing means you will not recover on your own</td></tr>
+    <tr><td>Throttled-call rate</td><td>Above a low threshold</td><td>You are at the platform ceiling; adding workers will hurt</td></tr>
+    <tr><td>Collapse ratio <span class="small">(messages in ÷ calls out)</span></td><td>Falls near 1 on a busy day</td><td>Collapsing has stopped working, so budget is being wasted</td></tr>
+  </table>
+  </div>
+
+  <div class="recall">
+    <span class="label">Before you move on</span>
+    Cover the page. Say why more workers do not help. Say the state-versus-event test. Then give the top two catch-up priorities and the asymmetry behind them.
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on the backlog"</b> — collapsing rules, catch-up order, and the metrics.</p>
+    <p><b>"be my manager at 5pm on release Saturday"</b> — the queue is 40 minutes deep and I have to explain what I am doing and what I need from the merchant.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0007-webhooks-are-a-hint.html">← Lesson 7</a></span>
+    <span><a href="0009-reconciliation-and-the-numbers.html">Lesson 9: reconciliation →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'The sync is 40 minutes behind with zero errors. Why does running more workers not fix it?',
+    options: [
+      'Shopify\'s rate limit is per app-and-store pair, so the store\'s ceiling is fixed no matter how many workers you run',
+      'Workers cannot process the same queue in parallel',
+      'The queue system limits consumers to a fixed number',
+      'More workers would break per-card ordering'
+    ],
+    answer: 0,
+    why: 'A Standard-plan store gets about 100 points per second for your app, and that does not grow with your compute. Forty workers get the same 100 points plus thousands of throttled retries that make everything slower. The three real levers are sending fewer messages, sending more per call, and choosing what goes first.'
+  },
+  {
+    q: 'Which metric best tells you how wrong the storefront currently is?',
+    options: [
+      'Lag — the age of the oldest unprocessed message',
+      'Queue depth — the number of messages waiting',
+      'The error rate on API calls',
+      'Messages processed per second'
+    ],
+    answer: 0,
+    why: '24,000 messages that drain in 30 seconds are fine; 12 messages stuck for an hour are not. Depth tells you how much work there is. Lag tells you how stale the website is, which is what actually costs the merchant money.'
+  },
+  {
+    q: 'Five stock messages for the same card are queued, ending in "set stock = 0". What should you do?',
+    options: [
+      'Process only the newest — an absolute write contains the whole truth, so the earlier four hold no extra information',
+      'Process all five in order, so the audit trail is complete',
+      'Process the first and the last, skipping the middle three',
+      'Process them all but batch them into one API call'
+    ],
+    answer: 0,
+    why: 'Collapsing to the newest per card turns five calls into one and makes the storefront correct immediately instead of publicly counting down. Nothing is lost because the write is absolute — this is the third time that Lesson 4 decision pays off, after replay safety and the staleness guard.'
+  },
+  {
+    q: 'Which message type must NEVER be collapsed?',
+    options: [
+      'An order — it is an event, and two orders are not a newer version of one order',
+      'A stock level for a card',
+      'A price for a variant',
+      'A read-back result from the reconciler'
+    ],
+    answer: 0,
+    why: 'The test is state versus event. States collapse: the newest value replaces the rest and loses nothing. Events never collapse: each one happened separately, and an order is money, a customer, and a card that must leave the shop. Collapsing the queue as a blanket clear-out discards real orders.'
+  },
+  {
+    q: 'When catching up, what goes first?',
+    options: [
+      'Stock decreases to zero on quantity-1 cards — the only messages that prevent an oversell',
+      'Orders coming back, since the money is already taken',
+      'Oldest messages first, so nothing starves',
+      'Prices, because they affect every product page'
+    ],
+    answer: 0,
+    why: 'A late <b>decrease</b> means the website offers what the shop cannot supply — a taken payment and an apology. A late <b>increase</b> only means a missed sale nobody ever hears about. Both are "stock is wrong", but one costs trust and the other costs a maybe, so priority follows the cost rather than the arrival order.'
+  },
+  {
+    q: 'The backlog is growing faster than it drains. What are the two remaining moves?',
+    options: [
+      'Shed low-value work like the price job, and reduce what the storefront promises — for example holding the last copy of expensive singles back',
+      'Add workers and raise the request timeout',
+      'Switch to delta writes so payloads are smaller',
+      'Drop the oldest messages until the queue is short again'
+    ],
+    answer: 0,
+    why: 'Shedding is cheap and reversible: stale prices for a day harm nobody. Reducing the promise is the merchant\'s decision — fewer sales today, zero oversells today. Delta writes would break replay safety, collapsing and the staleness guard all at once, and dropping the oldest messages discards orders.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"It is 5pm on your busiest Saturday and the sync is 40 minutes behind with no errors. What do you do?"',
+    answer: 'First I say what is actually wrong, because nothing has failed. Every message will be processed and every write will succeed. The problem is that a stock number which was right at 16:20 is wrong at 17:00, and the collector is buying at 17:00. <b>Lag is a fault that error monitoring cannot see.</b><br><br>What I would <b>not</b> do is add workers. Shopify\'s rate limit is per app-and-store pair, and this shop is on a Standard plan — about a hundred points per second, no matter how much compute I bring. Forty workers get the same hundred points plus a pile of throttled retries that make it slower.<br><br>So, three moves. <b>Collapse</b>: for each card, keep only the newest stock message and discard the intermediate ones. On a busy afternoon that is typically a fivefold reduction, and it loses nothing because the writes are absolute. <b>Prioritise</b>: put stock decreases on quantity-1 cards in their own lane and drain it first, because that is the only message that prevents an oversell. <b>Shed</b>: pause the nightly price job and new listings for the afternoon — a stale price harms nobody today.<br><br>And I would go and talk to the merchant about the one thing that is her decision, not mine: moving high-value singles to <code>safety_stock</code> for the afternoon so the website stops offering the last copy at all. A few missed maybes against forty apologies is her trade to make, but she cannot make it if nobody tells her.'
+  },
+  {
+    prompt: '"You said you would collapse the queue. What could go wrong with that?"',
+    answer: 'Collapsing the wrong thing loses money, so I would be precise about when it is allowed. The test is whether the message describes a <b>state</b> or an <b>event</b>.<br><br>A <b>state</b> collapses safely. Stock and price are states: the newest value is the whole truth, so replacing five messages with the last one loses no information. That works only because the writes are absolute — with delta writes each message carries a piece of the truth and collapsing would destroy it.<br><br>An <b>event</b> never collapses. An order is money, a customer, and a card that has to physically leave the shop. Two orders are not a newer version of one order. Same for refunds and cancellations, and same for the deletion tombstones, because each one carries its own reason and the reason decides the action.<br><br>The specific mistake I am guarding against is the tempting shortcut at 5pm: "the queue is huge, drop the old messages". Done across the whole queue, that discards real orders — cards people paid for that the shop will now never pick or post. So collapsing is always <b>per key and per type</b>, never a blanket clear-out.'
+  },
+  {
+    prompt: '"Why would you prioritise a stock decrease over a stock increase? They are both wrong numbers."',
+    answer: 'Because the two mistakes cost completely different things, even though the data looks symmetrical.<br><br>A late <b>decrease</b> means the website is offering a card the shop cannot supply. Someone pays, and then there is an apology, a refund, and possibly a public complaint — and in a hobby community that matters more than usual, because collectors talk to each other in Discords and forums. A late <b>increase</b> means the website says sold out while the card is sitting in the box. That is a missed sale, and nobody ever finds out it happened.<br><br>So one costs <b>trust</b> and the other costs a <b>maybe</b>. When I cannot process everything, I would rather lose maybes.<br><br>The nice part is how cheap that is to build. I already know which cards are quantity one, and single-copy cards are where both the money and the anger live — sealed product with forty in stock barely cares about lag at all. So a two-lane queue, "single copies going to zero" and "everything else", gets nearly all the benefit with very little machinery.'
+  }
+]);
+</script>
