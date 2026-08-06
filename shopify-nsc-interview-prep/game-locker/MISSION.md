@@ -116,7 +116,7 @@ game-locker/
   lessons/   0001 what Game Locker actually is
              0002 TCG card data on Shopify
              0003 the sync engine            ← the core lesson
-             0004 POS and the counter
+             0004 the counter they do not own
              0005 themes for game stores     ← incl. performance
              0006 Storefront API & the marketplace
              0007 the Game Locker interview  ← capstone
