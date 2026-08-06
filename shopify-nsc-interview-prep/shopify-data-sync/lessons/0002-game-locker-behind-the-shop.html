@@ -1,0 +1,529 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 — Game Locker Behind the Shop</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Lesson 2 · Shopify Data Sync · The frame</p>
+  <h1>Game Locker Behind the Shop</h1>
+  <p class="subtitle">Now the second system goes in. Get its edges right, because the most useful thing to know about a platform is <b>what it is not</b> — and the two things Game Locker is not are exactly the two things most candidates would assume it is.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> draw the <b>three systems and two gaps</b> from memory, say the two things Game Locker <b>is not</b> and what each one costs the shop, and answer "keep them in sync" with the better question — <b>when they disagree, who is right?</b>
+  </div>
+
+  <p class="small">The shop is <a href="../reference/the-store.html">Harbour City Cards</a>. Everything factual about the Game Locker platform on this page was read from <b>gamelocker.co on 2026-08-06</b> and is quoted. See also <a href="../../game-locker/reference/company-brief.html">the company brief</a>. Inferences are labelled.</p>
+
+  <h2>1. What Mia actually bought</h2>
+
+  <p>Game Locker is not a shop. It is <b>software that card shops buy</b> — "built with game stores, for game stores". Mia's shop is one tenant on it, and in this sub-course it is <b>store 17</b>.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>What the platform gives Mia</th><th>Why she cannot get it from Shopify</th></tr>
+    <tr><td>A catalogue of <b>145,012,624 cards</b> across <b>18+ games</b></td><td>Shopify has no idea what a Base Set Charizard is. Somebody has to know.</td></tr>
+    <tr><td><b>Automated pricing</b>, with <b>daily syncs from global platforms</b></td><td>Card prices move daily on outside markets. Nobody types 12,000 prices.</td></tr>
+    <tr><td><b>Inventory management</b> — 20,000 items on Starter, unlimited on Advanced</td><td>One stock record per condition, language and finish, priced per card.</td></tr>
+    <tr><td>Order and customer management, team activity, custom roles, analytics</td><td>She wants one back office, not several.</td></tr>
+    <tr><td>A <b>customer-facing kiosk</b> — "let customers browse your inventory through an intuitive, self-service interface"</td><td>A screen in the shop where a collector searches stock and <b>submits an order or a buylist</b>. See §4.</td></tr>
+  </table>
+  </div>
+
+  <p>So the shape of the relationship is fixed, and it is the single most useful sentence to have ready:</p>
+
+  <div class="soundbite">
+    <span class="label">The sentence that frames the whole role</span>
+    <p>"Game Locker is the <b>system of record</b>, and Shopify is a <b>channel hanging off it</b>. So the hard part of this work is not the theme — it is keeping stock honest between a shop counter and a website."</p>
+  </div>
+
+  <h2>2. The two things Game Locker is not</h2>
+
+  <p>This section exists because getting these wrong makes every later design decision wrong, and because both are easy to assume. They were both assumed in an earlier draft of this sub-course, which is why they are stated so bluntly now.</p>
+
+  <h3>Not a point of sale</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>The assumption</th><th>What their site actually shows</th></tr>
+    <tr>
+      <td>"They sell a POS kiosk, so their kiosk owns the counter and takes the money."</td>
+      <td><b>No.</b> The kiosk is described as customer self-service: <em>"Let customers browse your inventory through an intuitive, self-service interface."</em> Customers <b>submit orders and buylists</b>. There is no till, no cash drawer, no payment taking.</td>
+    </tr>
+    <tr>
+      <td>"So what runs the counter?"</td>
+      <td>Something else. Game Locker offers <b>CSV imports</b> "compatible with major industry platforms (e.g. <b>Binder POS</b>, <b>Storepass</b>)" with ready-made templates — which tells you plainly that <b>the till is a separate product</b> and Game Locker sits behind one.</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Why this is the most expensive thing to get wrong</span>
+    If you believe their kiosk owns the counter, you design a <b>counter-sale event</b> that fires the instant a card is sold, and you promise the merchant a few seconds of lag. <b>Neither exists.</b> There is no event to hook, because you do not own the till — and the real path is a CSV that arrives hours later. A design built on the wrong assumption promises something it cannot deliver, and you find that out in front of the merchant.
+  </div>
+
+  <h3>Not an eBay integration</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>The assumption</th><th>What their site actually says</th></tr>
+    <tr><td>"They integrate with Shopify and eBay, so Shopify is one channel of several."</td><td><em>"Whilst we do not directly integrate with eBay, stores can install various eBay connector apps <b>through their Shopify</b>."</em></td></tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The corrected fact leads to a better conclusion than the wrong one did</span>
+    If eBay were a second direct channel, the lesson would be "do not build a Shopify-shaped sync". Because eBay is reached <b>through</b> Shopify, the lesson is the opposite and stronger: <b>Shopify is the hub every other channel hangs off.</b> So the quality of the data you push into Shopify is <b>load-bearing</b> — a wrong stock number there is a wrong number on eBay too, and on whatever channel the shop adds next. Your one integration is not one of several. It is the one they all depend on.
+  </div>
+
+  <h2>3. The catalogue is not the stock</h2>
+
+  <p>This confusion sinks candidates, and the numbers make it obvious once you see them side by side.</p>
+
+  <div class="diagram">   GAME LOCKER'S CATALOGUE        HARBOUR CITY'S STOCK
+   ───────────────────────        ────────────────────
+   145,012,624 cards              ~12,000 variants
+   every printing ever made       the cards in the box
+   shared by every store          store 17's own
+   reference data                 sellable, priced, counted
+
+   145 MILLION  vs  12 THOUSAND.   Ratio of about 12,000 : 1.
+
+   Mia's Starter tier is capped at 20,000 ITEMS.
+   The 145M catalogue is not her inventory — it is a dictionary.</div>
+
+  <div class="trap">
+    <span class="label">The mistake this prevents</span>
+    Never push the catalogue into Shopify. A store's Shopify holds <b>only what it physically has</b>. Sending 145 million reference rows to a shop that sells 12,000 of them would take months of API budget, wreck the store's search, and sell nothing. The catalogue answers "what is this card?" The stock answers "do we have one?" — and only the second belongs on the storefront.
+  </div>
+
+  <div class="note">
+    <span class="label">Where this is already taught in depth</span>
+    <a href="../../game-locker/lessons/0002-tcg-card-data-on-shopify.html">Game Locker L02 §7</a> works through what actually goes into Shopify and why. This lesson only needs the ratio.
+  </div>
+
+  <h2>4. The real map — three systems, two gaps</h2>
+
+  <p>Draw this on a whiteboard. Then notice which arrow is thin and which is thick, because that is the whole point.</p>
+
+  <div class="diagram">   BINDER POS                GAME LOCKER              SHOPIFY
+   the counter               the back office          the website
+   ──────────                ───────────────          ──────────
+   takes money               catalogue                online store
+   knows FIRST               stock records            takes money
+                             pricing                  ▲   │
+        │                    orders, customers        │   │
+        │                    the KIOSK                │   │
+        │                        │                    │   │
+        └──── CSV import ───────►│                    │   │
+              ⚠ GAP A            │                    │   │
+              hours. Manual.     │                    │   │
+              NOT OURS.          └── direct API ──────┘   │
+                                     GAP B                │
+                                     seconds. OURS.       │
+                                     ◄── webhooks ────────┤
+                                         orders back      │
+                                                          ▼
+                                                   eBay connector
+                                                   (a Shopify APP,
+                                                    not ours either)
+
+   THREE DOORS A CARD CAN LEAVE BY:
+     1. the counter   Binder POS takes the money
+     2. the website   Shopify takes the money
+     3. the kiosk     a customer SUBMITS an order — no money yet
+
+   Gap A is wider than Gap B and you own neither end of it.</div>
+
+  <div class="soundbite">
+    <span class="label">The observation that will separate you from other candidates</span>
+    <p>"Before I talk about how I would build the sync, I want to name where the biggest error actually is. The gap between the counter till and Game Locker is a CSV measured in hours. The gap I would be building is an API measured in seconds. <b>I can make my half a hundred times faster and the website will still be a day stale.</b> So I would want to fix my half properly <em>and</em> measure the other one, so the shop can see where its real exposure is."</p>
+  </div>
+
+  <h3>The kiosk is a third door, and a different shape</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Door</th><th>What happens</th><th>Money?</th><th>What Shopify should show</th></tr>
+    <tr><td><b>Counter</b></td><td>Binder POS sells it. The card leaves.</td><td>Taken</td><td>Nothing. Gone. <code>available</code> drops.</td></tr>
+    <tr><td><b>Website</b></td><td>Shopify sells it. The card is posted.</td><td>Taken</td><td>Shopify decrements itself.</td></tr>
+    <tr><td><b>Kiosk</b></td><td>A collector in the shop <b>submits an order</b>. Staff fulfil it at the counter later.</td><td><b>Not yet</b></td><td><b>Not available, but not sold either</b> — this is <code>committed</code>.</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Why the kiosk needs the eight inventory states, not just a number</span>
+    A kiosk order means a card is <b>spoken for without any money having moved and without leaving the shop</b>. If your design only tracks "how many are here?", the same card is offered to a kiosk customer and a website customer at the same time. Shopify already has the right concept — <code>committed</code>, one of the eight states in <a href="../../pos-in-store/lessons/0003-locations-and-multi-location-inventory.html">POS L03 §3</a>. Recognising that a held card is neither available nor sold is exactly the kind of detail that shows you have thought past the happy path.
+  </div>
+
+  <h2>5. Now there are several copies of every fact</h2>
+
+  <p>Here is the honest inventory of duplication. Every row is one fact stored more than once.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>The fact</th><th>Binder POS</th><th>Game Locker</th><th>Shopify</th><th>Can they differ?</th></tr>
+    <tr><td>Card name and image</td><td>Whatever was typed</td><td>From the catalogue</td><td>A copy, pushed in</td><td>Cosmetic.</td></tr>
+    <tr><td>Price</td><td>Its own</td><td>Nightly from the feed</td><td>Last push</td><td><b>Yes.</b> Costs margin or a sale.</td></tr>
+    <tr><td><b>Quantity</b></td><td><b>Freshest</b></td><td>Last import</td><td>Last told, minus its own sales</td><td><b>Yes — the expensive one.</b></td></tr>
+    <tr><td>An order</td><td>Counter sales</td><td>Kiosk orders, plus whatever it is told</td><td>Online orders</td><td><b>Yes.</b> Each holds a set the others lack.</td></tr>
+    <tr><td>A customer</td><td>Maybe a name</td><td>Walk-ins and kiosk users</td><td>Online buyers</td><td><b>Yes</b>, and they overlap messily.</td></tr>
+  </table>
+  </div>
+
+  <p>Five rows. Four can differ, and now <b>three</b> systems can disagree rather than two. This is the moment the job exists.</p>
+
+  <h2>6. Refuse the phrase "keep them in sync"</h2>
+
+  <p>Mia will say it. A project manager will say it. It sounds like a requirement. It is not one, because it does not tell you what to build.</p>
+
+  <div class="diagram">   "KEEP THEM IN SYNC"
+      hides the only question that matters
+             │
+             ▼
+   "WHEN THEY DISAGREE, WHICH ONE IS RIGHT?"
+
+   Until that is answered, per fact:
+     · every design meeting goes in a circle
+     · every bug is unfixable — because BOTH systems
+       are behaving correctly by their own rules
+     · every fix breaks something else, since there is
+       no rule to check the fix against</div>
+
+  <div class="soundbite">
+    <span class="label">Say this early in any sync conversation</span>
+    <p>"Before I design anything I want to name, for each piece of data, which system owns it. Sync is cheap when there is one owner and one direction. It is close to impossible when both sides can write the same field."</p>
+  </div>
+
+  <div class="trap">
+    <span class="label">Why "both systems are correct" is the worst kind of bug</span>
+    A normal bug has a component that is wrong, so there is something to fix. Here, Binder POS recorded a real counter sale and Shopify recorded a real online sale. <b>Neither write can be called the mistake.</b> There is nothing to fix inside either system — which is why the answer has to be a <em>rule</em> agreed in advance, not a patch found afterwards.
+  </div>
+
+  <h2>7. One owner, one direction — and the rows that break it</h2>
+
+  <p>Apply the rule to the five facts and something encouraging happens.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Fact</th><th>Owner</th><th>Direction</th><th>Hard?</th></tr>
+    <tr><td>Card name, image</td><td>Game Locker</td><td>GL → Shopify</td><td>No</td></tr>
+    <tr><td>Price</td><td>Game Locker</td><td>GL → Shopify</td><td>No</td></tr>
+    <tr><td>Orders</td><td>Whoever took the money</td><td>Shopify → GL for online<br>Binder POS → GL for counter, by import</td><td>A bit</td></tr>
+    <tr><td>Customers</td><td>Contested — <b>pick one, per side</b></td><td>Prefer Shopify → GL, matched on email</td><td>A bit</td></tr>
+    <tr><td><b>Quantity</b></td><td><b>Three systems decrement it, legitimately</b></td><td><b>Many-way</b> ⚠</td><td><b>Yes. All of it.</b></td></tr>
+  </table>
+  </div>
+
+  <p>Read the direction column. <b>Four of five are effectively one-way.</b> One-way sync is close to a solved problem: you push, you retry, you reconcile, and replaying it breaks nothing.</p>
+
+  <p>Quantity is different, and the reason is physical rather than technical. <b>Three doors sell out of one box.</b> The counter is right to decrement. The website is right to decrement. The kiosk is right to hold one back. You cannot fix it by choosing an owner, because choosing an owner is the tool that solves every other row.</p>
+
+  <div class="tip">
+    <span class="label">The judgement to state out loud</span>
+    Because many-way is where all the difficulty lives, the correct instinct is to <b>resist adding any more many-way fields</b>. Each new one multiplies the conflict cases you must reason about, and each one arrives disguised as a small convenience — "it would be handy if staff could also fix the title in Shopify". That specific request is <a href="0003-ownership-per-field.html">Lesson 3</a>, and it is harder than it sounds.
+  </div>
+
+  <h2>8. Customers deserve a real answer, not a shrug</h2>
+
+  <p>Several systems create customers. Shopify at checkout, Game Locker at the kiosk and the back office, and the till may hold a name. Most candidates say "match on email" and stop, which is only half an answer.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Why matching on email is imperfect</th><th>What it causes</th></tr>
+    <tr><td>Counter customers often give no email</td><td>Nothing to match on at all</td></tr>
+    <tr><td>A household shares one address</td><td>Two collectors merged into one person</td></tr>
+    <tr><td>People buy online <em>and</em> walk in</td><td>The same human as two records</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">The answer worth giving</span>
+    <b>Shopify owns the online customer record, Game Locker owns the in-store one, matched on email where it exists and deliberately left separate where it does not.</b> Forcing a merge on a fuzzy match produces wrong loyalty balances — and a wrong loyalty balance makes a customer angrier than a duplicate row ever does. Choosing the less tidy option because the tidy one fails louder is exactly the trade-off an interviewer is listening for.
+  </div>
+
+  <div class="recall">
+    <span class="label">Before you move on</span>
+    Cover the page. Draw the <b>three systems and two gaps</b>. Say the <b>two things Game Locker is not</b>. Then say what you would reply to "just keep them in sync".
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on the ownership matrix"</b> — until the five rows and their directions are automatic.</p>
+    <p><b>"play a PM who keeps saying just keep them in sync"</b> — you have to redirect the conversation to ownership without sounding difficult.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0001-the-store-on-shopify-alone.html">← Lesson 1</a></span>
+    <span><a href="0003-ownership-per-field.html">Lesson 3: ownership, per field →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Game Locker sells a "kiosk". What is it?',
+    options: [
+      'A customer-facing self-service screen — collectors browse stock and submit orders or buylists. It takes no payment',
+      'A point-of-sale till that staff use to sell cards and take money',
+      'A back-office dashboard for the shop owner',
+      'A hardware card scanner for intake'
+    ],
+    answer: 0,
+    why: 'Their site describes it as "let customers browse your inventory through an intuitive, self-service interface", and customers submit orders and buylists. Assuming it is a till is the most expensive mistake available here: you would design a counter-sale event that does not exist and promise the merchant seconds of lag you cannot deliver.'
+  },
+  {
+    q: 'So what runs Harbour City Cards\' counter, and how does that data reach Game Locker?',
+    options: [
+      'A separate till such as Binder POS, and the data arrives by CSV import — hours, not seconds',
+      'Game Locker\'s kiosk, in real time',
+      'Shopify POS, which decrements Shopify directly',
+      'Nothing — counter sales are entered into Game Locker by hand at the point of sale'
+    ],
+    answer: 0,
+    why: 'Game Locker advertises CSV imports "compatible with major industry platforms (e.g. Binder POS, Storepass)" with ready-made templates, which tells you the till is a separate product. That import is <b>gap A</b> — wider than the sync you would build, and you own neither end of it.'
+  },
+  {
+    q: 'Game Locker\'s catalogue holds about 145 million cards. How many belong in this shop\'s Shopify store?',
+    options: [
+      'Only the ~12,000 the shop physically has — the catalogue is reference data, not inventory',
+      'All of them, so collectors can search the full card database on the storefront',
+      'All of them, but as draft products so they are hidden until stocked',
+      'The subset for the games the shop sells, whether stocked or not'
+    ],
+    answer: 0,
+    why: 'The catalogue answers "what is this card?" The stock answers "do we have one?" Only the second belongs on a storefront. Pushing reference data in would burn months of API budget, wreck the store\'s search results, and sell nothing — and the Starter tier is capped at 20,000 items anyway, which tells you the platform itself treats these as different things.'
+  },
+  {
+    q: 'How does a Game Locker store reach eBay, and what follows from it?',
+    options: [
+      'Through a Shopify app — so Shopify is the hub every channel hangs off, which makes the data you push there load-bearing',
+      'Through Game Locker\'s own eBay connector, so Shopify is one channel of several',
+      'It cannot reach eBay at all',
+      'Through a CSV export uploaded to eBay directly'
+    ],
+    answer: 0,
+    why: 'Their site: "Whilst we do not directly integrate with eBay, stores can install various eBay connector apps through their Shopify." That reverses the obvious conclusion. Your one integration is not one of several — it is the one every other channel depends on, so a wrong stock number in Shopify becomes a wrong number on eBay too.'
+  },
+  {
+    q: 'A collector submits an order at the in-shop kiosk. What should Shopify show for that card?',
+    options: [
+      'Not available, but not sold either — this is what the committed state is for',
+      'Still available, since no money has changed hands',
+      'Sold out, the same as a counter sale',
+      'Nothing changes until staff fulfil it'
+    ],
+    answer: 0,
+    why: 'A kiosk order is a request, not a sale: the card is spoken for without money moving and without leaving the shop. A design that only tracks "how many are here?" will offer the same card to a kiosk customer and a website customer at once. <code>committed</code> is one of Shopify\'s eight inventory states and exists precisely for this.'
+  },
+  {
+    q: 'Of the five duplicated facts, why is quantity the only genuinely hard one?',
+    options: [
+      'Three systems legitimately reduce it, so you cannot solve it by choosing an owner',
+      'It changes more often than the other fields',
+      'Shopify does not expose an API for writing it reliably',
+      'It is the only field stored as a number rather than text'
+    ],
+    answer: 0,
+    why: 'Choosing an owner is the tool that solves every other row. It fails here for a physical reason: the counter, the website and the kiosk all draw on the same box, so every write is correct. That is why one-way sync is nearly a solved problem and this one row is the whole job.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Describe how our platform and a merchant\'s Shopify store relate to each other."',
+    answer: 'Game Locker is the <b>system of record</b> and Shopify is a <b>channel hanging off it</b>. The platform holds the card catalogue — about 145 million printings across 18-plus games — plus the shop\'s stock records, its automated pricing, its orders and customers, and the in-shop kiosk.<br><br>What I would want to be careful about is the two things the platform is <b>not</b>, because both are easy to assume and both change the design. First, <b>it is not a point of sale</b>. The kiosk is customer-facing self-service — collectors browse stock and submit orders or buylists — so it takes no money and it is not the till. The counter runs on something else; the CSV import templates for Binder POS and Storepass tell me that plainly. Second, <b>there is no direct eBay integration</b> — a store reaches eBay through a Shopify app.<br><br>That second fact leads somewhere useful. Because eBay hangs off Shopify rather than off you, <b>Shopify is the hub every channel depends on</b>. So the quality of what I push into Shopify is load-bearing: a wrong stock number there is a wrong number on eBay too, and on whatever channel the shop adds next.<br><br>And one boundary I would hold firmly: <b>the theme never calls Game Locker</b>. Liquid reads Shopify\'s own data. Putting an external platform in the path of every product page view means its slow afternoon becomes the store\'s slow afternoon, and it would not fix anything anyway, because the collector pays four minutes after the page renders.'
+  },
+  {
+    prompt: '"Where do you think the biggest source of error is in this setup?"',
+    answer: 'Not in the part I would be building, which is worth saying out loud.<br><br>There are <b>two gaps</b>. <b>Gap A</b> is the counter till reaching Game Locker. That is a CSV import, measured in hours, and often it is somebody exporting a file — and I own <em>neither end</em> of it. <b>Gap B</b> is Game Locker reaching Shopify. That is a direct API integration and I can get it down to seconds.<br><br>Which means I could make my half a hundred times faster and the website would still be a day out of date, because the freshest number in the building is sitting in the till. <b>The widest gap is the one I do not own.</b><br><br>So I would do two things rather than one. Build gap B properly — event-driven, idempotent, reconciled — and <b>measure gap A and report it</b>, so the shop can see where its real exposure is. The options there are not really code: a scheduled automatic import instead of a manual one, or a conversation about whether the till can be read more directly. Both are decisions for the shop and the till vendor.<br><br>I would rather say that early than have a merchant discover it after we promised "a few seconds".'
+  },
+  {
+    prompt: '"Walk me through your ownership matrix, and tell me which row you are worried about."',
+    answer: 'Five facts, stored more than once. <b>Card name and image</b> — Game Locker owns it, one way out; if it is wrong the damage is cosmetic. <b>Price</b> — Game Locker owns it, recalculated nightly from the feed, one way out; if it is wrong you sell too cheap or not at all. <b>Orders</b> — whoever took the money owns it, so online orders come back from Shopify by webhook and counter sales arrive from the till by import. <b>Customers</b> — contested, and I would deliberately keep separate records matched on email where it exists, because forcing a merge on a fuzzy match creates wrong loyalty balances and those anger people more than duplicates do.<br><br>Then <b>quantity</b>, which is the one I am worried about, and it is the reason the role exists. It is the only genuinely many-way field, and it is many-way for a physical reason rather than a technical one: <b>three doors draw on one box</b>. The counter sells, the website sells, and the kiosk holds one back for a customer who has not paid yet. Every one of those writes is correct, so I cannot fix it by choosing an owner — which is the tool that solves all four other rows.<br><br>The kiosk is the one people forget, and it is a different shape: a card spoken for with no money moved and nothing having left the shop. That is <code>committed</code> rather than sold, and a design that only tracks how many are on the shelf will promise the same card twice.'
+  }
+]);
+</script>

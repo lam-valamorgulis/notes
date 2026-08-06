@@ -23,14 +23,14 @@ written in the parent course); the gap is **retrieval and speech**, not reading.
 
 **Game Locker is not a Shopify store.** Their own site carries no Shopify signals. They are a
 SaaS platform that game stores buy — card catalogue (~145M cards, 18+ games), daily repricing
-from global price feeds, a **POS kiosk**, and **integrations with Shopify** plus an eBay
+from global price feeds, a **customer-facing self-service kiosk** (browse and submit orders — *not* a till), and a **direct Shopify integration** (eBay only via a Shopify app; corrected 2026-08-06). It also publishes CSV import templates for tills like Binder POS and Storepass, plus an older note about an eBay
 connector.
 
 So they are the **system of record** and Shopify is a **channel hanging off them**. The role is
 three arrows:
 
 1. **Sync** — products, stock, prices out; orders, customers back. Fails quietly (drift).
-2. **POS** — their kiosk owns the counter, so Shopify is downstream and briefly wrong after
+2. **POS** — **a third-party till owns the counter** (corrected 2026-08-06: Game Locker is *not* a POS), so Shopify sits **two hops** downstream and is wrong for longer after
    every counter sale. Fails loudly (oversell).
 3. **Storefront** — themes for *their customers* (many game stores, one theme) plus the new
    TCG marketplace. Fails visibly.

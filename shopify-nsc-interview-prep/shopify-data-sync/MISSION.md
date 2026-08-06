@@ -1,6 +1,6 @@
 # Mission — Shopify Data Sync (sub-course 6)
 
-Status: **PLAN, build started 2026-08-06.** Folders and assets exist. No pages written yet.
+Status: **BUILT 2026-08-06**, published, then **corrected the same day** — see the correction block below. 17 pages live.
 
 ## Why this sub-course exists
 
@@ -19,19 +19,44 @@ That lesson was never written. This is it.
 **One real-shaped store, built forward.** Not "here is an abstract integration". The course
 follows a single card shop from a plain Shopify storefront to a working integration:
 
-> **Harbour City Cards** — a Sydney trading-card shop. A physical counter with a Game Locker
-> POS kiosk, and a Shopify storefront selling singles online. It is **store 17** on the Game
-> Locker platform, and it sells the **$480 near-mint Charizard** used in
-> `game-locker/lessons/0003`. The store is a worked example, not a real business. Game Locker
-> itself is real and every claim about it comes from their public site or the job description.
+> **Harbour City Cards** — a Sydney trading-card shop with **three** systems: **Binder POS** at
+> the counter, **Game Locker** as the back office, and **Shopify** as the website. It is
+> **store 17** on the Game Locker platform, and it sells the **$480 near-mint Charizard** used
+> in `game-locker/lessons/0003`. The store is a worked example, not a real business. Game Locker
+> itself is real and every claim about it was read from gamelocker.co on 2026-08-06.
+
+### Correction applied 2026-08-06 — do not revert
+
+The first build of this sub-course said Game Locker's kiosk was a **POS at the counter**, and
+that Game Locker had its own **eBay connector**. **Both were wrong**, verified against
+gamelocker.co:
+
+- The kiosk is **customer-facing self-service** — *"Let customers browse your inventory through
+  an intuitive, self-service interface"*. Customers **submit orders and buylists**. No till, no
+  payment. Live at `kiosk.gamelocker.co`.
+- **Game Locker is not a point of sale.** It offers **CSV imports** "compatible with major
+  industry platforms (e.g. **Binder POS**, **Storepass**)" — so the till is a separate product.
+- **No direct eBay integration:** *"Whilst we do not directly integrate with eBay, stores can
+  install various eBay connector apps through their Shopify."*
+
+Two consequences reshaped the whole sub-course, and both made it better:
+
+1. **Two gaps, not one.** Gap A is the till reaching Game Locker (a CSV, hours wide, **you own
+   neither end**). Gap B is Game Locker reaching Shopify (an API, seconds, yours). The widest
+   gap is the one you do not own — so the honest senior move is to measure both and report both,
+   not just optimise your half. There is **no counter-sale event to hook**.
+2. **Shopify is the hub, not one channel of several.** Because eBay hangs off Shopify, the data
+   you push there is load-bearing for every channel the shop adds. This is the *opposite* of
+   what the first draft argued.
 
 The arc is deliberately in this order:
 
 1. **Build the storefront first.** What a card shop looks like as Shopify data only — product,
    variants, inventory, the theme reading stock. No external system at all.
-2. **Hit the wall.** The counter sells the same physical card, and Shopify has no idea.
-3. **Put Game Locker behind it.** Now two systems hold one card. Every remaining lesson is one
-   piece of making that safe.
+2. **Hit the wall.** The counter sells the same physical card, and neither Game Locker nor
+   Shopify hears about it for hours.
+3. **Put Game Locker behind it.** Now three systems hold one card — a third-party till, the
+   back office, and Shopify. Every remaining lesson is one piece of making that safe.
 
 The reader should be able to say: *"I have seen this exact store go from broken to trustworthy,
 step by step."* That is the whole design goal.
@@ -83,6 +108,7 @@ building rather than just a review page.
 | **The backlog.** The sync is 40 minutes behind. Replay every message, or keep only the newest per card? Why stock messages may collapse and order messages may not. | Nowhere. `stockinstore/0002 §6` is about not hammering, which is the opposite problem. |
 | **One store among many.** Harbour City Cards is store 17 of ~400. Rate limits are per shop; the worker pool is shared. Another store's backfill delays yours. | `stockinstore/0009` covers multi-tenancy in general, never the sync queue. |
 | **The lag conversation.** Naming the accepted delay to the shop owner, in writing, before it is a complaint. | One sentence in a `game-locker/0003` recall answer. |
+| **The gap you do not own.** The counter till is a third-party product and its data arrives by CSV, so the widest gap in the whole chain is one you cannot code your way out of. Measuring and reporting it beats optimising only your half. | Nowhere. Every page in the repo assumes you own both ends. Added 2026-08-06 with the correction. |
 
 ## The eleven lessons
 
@@ -93,7 +119,7 @@ Reading order is straight through, L01 → L11. Every lesson is Harbour City Car
 | # | Lesson | New or review | Content |
 |---|---|---|---|
 | L01 | The store on Shopify, and nothing else | **New frame** | Harbour City Cards as Shopify data only. Printing = product, condition × language × finish = the 3 options, one location, `InventoryLevel` = the number the theme reads. What the product page actually shows and where that number comes from. Then the wall: the counter sells the same card and Shopify never hears. Links to `game-locker/0002` for the data model and `theme-architecture/` for Liquid. |
-| L02 | Game Locker behind the counter | **Review**, retold | What the platform owns: the shared card catalogue, the daily reprice, the POS kiosk. Now two systems hold one card. The three arrows out of store 17. Refuse the phrase "keep them in sync" — the only question is *when they disagree, who is right?* |
+| L02 | Game Locker behind the shop | **Review + new** | What the platform owns, and — more usefully — **the two things it is not**: not a POS, no direct eBay. Three systems, two gaps, three doors (the kiosk holds a card without taking money, so `committed` not sold). Shopify as the hub. Refuse the phrase "keep them in sync" — the only question is *when they disagree, who is right?* |
 
 ### Chapter 2 — Decide before you build anything
 
@@ -134,7 +160,7 @@ Reading order is straight through, L01 → L11. Every lesson is Harbour City Car
 | Page | What it is |
 |---|---|
 | `reference/review-path.html` | The explicit **review route**, since re-learning is the stated goal. A numbered path through the sync sections that already exist across the repo, each with the one line it exists to teach, and a tick box. |
-| `reference/the-store.html` | Harbour City Cards on one page — its catalogue shape, its two doors, its numbers. The card to glance at while reading any lesson. |
+| `reference/the-store.html` | Harbour City Cards on one page — three systems, two gaps, the catalogue shape, its numbers. The card to glance at while reading any lesson. |
 | `reference/ownership-matrix.html` | A blank field-level matrix to fill in during a scoping call. Printable. |
 | `reference/conflict-cases.html` | The conflict taxonomy on one page: every conflict type, how you notice it, and the rule that resolves it. |
 | `reference/onepager.html` | The last-hour card. The four pieces, the four defences, the six lines to say. |
@@ -166,6 +192,9 @@ product and 3 options per product, and the custom-ID matching key.
 - **Design only.** No worker code, no queue code, no tests. Mutation names yes; bodies no.
 - **One store, all the way through.** If a lesson stops being about Harbour City Cards, it has
   drifted back into being an abstract integration page — which the repo already has.
+- **Never claim Game Locker is a POS, and never claim it integrates with eBay directly.** Both
+  were verified false on 2026-08-06. The kiosk is customer self-service; the till is a separate
+  product reached by CSV; eBay is a Shopify app.
 - **No fact stated that could not be verified.** Where two Shopify pages disagree, say so on
   the page instead of picking one.
 - **Do not repeat a page that already exists — link to it.** A review lesson retells the idea
@@ -181,7 +210,7 @@ shopify-data-sync/
   MISSION.md                 this file
   assets/                    base.css + quiz.js, copied from shopify-data-migration/
   lessons/  0001 the store on Shopify, and nothing else
-            0002 game locker behind the counter
+            0002 game locker behind the shop
             0003 ownership, per field not per record
             0004 absolute writes, and why replay must be safe
             0005 deletes, archives and tombstones        ← biggest new gap
