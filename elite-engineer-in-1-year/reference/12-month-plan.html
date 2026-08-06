@@ -1,0 +1,899 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>The 12-Month Plan — Elite Engineer in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+
+  <p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+  <p class="kicker">Reference · The contract</p>
+  <h1>The 12-month plan</h1>
+  <p class="subtitle">Front-end taken down to the metal, then AI. Twelve milestones, one month each.
+  Every month has a thing you build from a blank page, a thing you ship to real users, a gate you can
+  fail, and a post you publish.</p>
+
+  <div class="win">
+    <strong>How to read this page:</strong> each month has six lines. <b>Learn</b> is the knowledge.
+    <b>Build</b> is the thing you write from a blank page. <b>Ship</b> is software real people use.
+    <b>Prove</b> is the interview-grade performance. <b>Teach</b> is the public post.
+    <b>Gate</b> is pass or fail — and it names the way you fail, so you cannot lie to yourself.
+  </div>
+
+  <p><b>Start date: Monday 10 August 2026. Finish date: Friday 30 July 2027.</b>
+  8 hours a day, 6 days a week, about 2,300 hours. The dates are fixed. The scope inside a month
+  flexes. You never move a deadline; you cut scope and say what you cut.</p>
+
+  <div class="soundbite">
+    <span class="label">Why the plan is shaped like this</span>
+    <p>There are a hundred thousand engineers who can wire up a React component. There are very few
+    who have written a layout engine, a reconciler, a bundler, and an autograd engine. This plan moves
+    you from the first group into the second — because that is the only version of "front-end plus AI"
+    that is hard to replace.</p>
+  </div>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 720 306" role="img" aria-labelledby="year-shape-title">
+      <title id="year-shape-title">The year in four stages: the machine under the browser, the
+      framework layer, the product, then AI — with the same four proofs required every month.</title>
+
+      <!-- Stage 1 -->
+      <rect x="4"   y="6" width="168" height="26" rx="5" style="fill: var(--accent); opacity: 0.16;"></rect>
+      <text x="88"  y="24" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">1 · Under the browser</text>
+      <rect x="4"   y="40" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="16"  y="60" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M1 · Processes &amp; a tab</text>
+      <text x="16"  y="76" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">a shell, then a cost CLI</text>
+      <rect x="4"   y="90" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="16"  y="110" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M2 · The JS engine</text>
+      <text x="16"  y="126" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">an interpreter + the loop</text>
+      <rect x="4"   y="140" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="16"  y="160" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M3 · Rendering pipeline</text>
+      <text x="16"  y="176" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">a layout engine</text>
+
+      <!-- Stage 2 -->
+      <rect x="182" y="6" width="168" height="26" rx="5" style="fill: var(--accent); opacity: 0.16;"></rect>
+      <text x="266" y="24" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">2 · The framework layer</text>
+      <rect x="182" y="40" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="194" y="60" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M4 · Reconciliation</text>
+      <text x="194" y="76" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">a mini React with hooks</text>
+      <rect x="182" y="90" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="194" y="110" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M5 · The build layer</text>
+      <text x="194" y="126" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">a bundler with HMR</text>
+      <rect x="182" y="140" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="194" y="160" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M6 · Network for UI</text>
+      <text x="194" y="176" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">streaming on a socket</text>
+
+      <!-- Stage 3 -->
+      <rect x="360" y="6" width="168" height="26" rx="5" style="fill: var(--accent-2); opacity: 0.16;"></rect>
+      <text x="444" y="24" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-weight: 700;">3 · The product</text>
+      <rect x="360" y="40" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="372" y="60" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M7 · Performance</text>
+      <text x="372" y="76" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">five rounds, field numbers</text>
+      <rect x="360" y="90" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="372" y="110" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M8 · Taste &amp; access</text>
+      <text x="372" y="126" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">less code, better numbers</text>
+      <rect x="360" y="140" width="168" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="372" y="160" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M9 · Offline &amp; security</text>
+      <text x="372" y="176" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">attack your own app</text>
+
+      <!-- Stage 4 -->
+      <rect x="538" y="6" width="178" height="26" rx="5" style="fill: var(--accent-2); opacity: 0.16;"></rect>
+      <text x="627" y="24" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-weight: 700;">4 · AI</text>
+      <rect x="538" y="40" width="178" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="550" y="60" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M10 · Neural nets by hand</text>
+      <text x="550" y="76" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">autograd, then a small GPT</text>
+      <rect x="538" y="90" width="178" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="550" y="110" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M11 · LLM systems</text>
+      <text x="550" y="126" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">agent, evals, streaming UI</text>
+      <rect x="538" y="140" width="178" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="550" y="160" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px;">M12 · Zero to one</text>
+      <text x="550" y="176" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px;">an AI product, alone</text>
+
+      <!-- The constant band -->
+      <rect x="4" y="200" width="712" height="46" rx="6" style="fill: var(--accent); opacity: 0.10;"></rect>
+      <text x="360" y="220" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">Every single month, without exception:</text>
+      <text x="360" y="238" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">build it from a blank page  →  ship it to real users  →  pass the gate out loud  →  publish the write-up</text>
+
+      <!-- Quarter judges -->
+      <rect x="4" y="256" width="712" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--warn);"></rect>
+      <text x="360" y="276" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">Months 4, 6, 9, 12: an outside senior engineer judges you.</text>
+      <text x="360" y="292" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Not me. Not you. Someone with nothing to gain from being kind.</text>
+    </svg>
+    <figcaption>The shape of the year: go under the browser, rebuild the framework layer yourself,
+    turn that depth into product craft, then take the same standard into AI. The two bands at the
+    bottom never change.</figcaption>
+  </figure>
+
+  <h2>The eight rules</h2>
+
+  <ol class="rules">
+    <li><b>No tutorial without a build.</b> Watching is not learning. If you did not type it from a
+      blank page, with the tutorial closed, you do not know it.</li>
+    <li><b>Nothing counts until it is evidence.</b> A benchmark, a test, a trace, a public URL, a
+      recording. "I understood it" is not a unit of progress.</li>
+    <li><b>Delete before you add.</b> Every month you delete something: code, a dependency, a step in
+      a user flow, a feature nobody used. The best engineers subtract.</li>
+    <li><b>Three minutes, plain words, or you do not know it.</b> If you cannot explain it to a
+      non-engineer in three minutes, you learned the words and not the thing.</li>
+    <li><b>Go one level down.</b> For every claim, ask how you know it is true. Keep going down until
+      you reach something you measured yourself. That is first principles, and it is the whole job.</li>
+    <li><b>Field numbers beat lab numbers.</b> A Lighthouse score is a hint. Real users on real
+      phones are the truth. Every performance claim this year needs field data.</li>
+    <li><b>One rest day, every week.</b> Not a reward — a requirement. A tired engineer ships bugs and
+      calls it bad luck.</li>
+    <li><b>The gate is judged, not self-assessed.</b> In Months 4, 6, 9, and 12 an outside senior
+      engineer decides whether you passed. You do not grade your own exam.</li>
+  </ol>
+
+  <h2>The shape of every month</h2>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Week</th><th>What you do</th><th>What exists at the end of the week</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>Week 1</b><br>Acquire</td>
+          <td>Read the one primary source for the month. Notes in your own words only. Build the
+            smallest toy version to feel the shape of the thing.</td>
+          <td>Notes you wrote, a toy that runs, and a written list of the five things you still do not
+            understand.</td>
+        </tr>
+        <tr>
+          <td><b>Week 2</b><br>Build</td>
+          <td>Close every tab. Build the month's thing from a blank page. When stuck, write the
+            question down first, then look it up, then write the answer in your own words.</td>
+          <td>The build, with tests, a benchmark, and a README explaining how it works.</td>
+        </tr>
+        <tr>
+          <td><b>Week 3</b><br>Ship &amp; break</td>
+          <td>Put something in front of real users. Then attack it: throttle the CPU, kill the network,
+            use it with a keyboard only, use it on a cheap Android phone.</td>
+          <td>A public URL someone else uses, plus a list of the failures you caused and fixed.</td>
+        </tr>
+        <tr>
+          <td><b>Week 4</b><br>Prove &amp; teach</td>
+          <td>Timed drills, spoken explanations, the interview gate. Then the public post and the
+            learning record. Then the retro: what to keep, what to cut.</td>
+          <td>A passed (or failed) gate, a published post, and a learning record in
+            <code>learning-records/</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Where the daily 8 hours go</span>
+    The hour-by-hour shape of the day, the spacing schedule, and the evidence ledger are on their own
+    page: <a href="the-daily-8-hours.html">The daily 8 hours</a>. Read it before Day 1, not in Week 3.
+  </div>
+
+  <!-- ============================================================
+       STAGE 1
+       ============================================================ -->
+  <p class="stage">Stage 1 · Months 1–3 · The machine under the browser</p>
+  <p class="stage-sub">Goal: stop guessing about the platform. By November you can explain — and
+  partly rebuild — the machine your React code runs on.</p>
+
+  <div class="month" id="m1">
+    <p class="num">Month 1 · 10 Aug – 6 Sep 2026</p>
+    <h3>What a program is, and what a browser tab really is</h3>
+    <p class="spec"><span class="k">Learn</span> Process, thread, virtual memory, page fault, stack
+      versus heap, syscall, file descriptor, scheduler, cache lines. Then Chrome's real shape: the
+      browser process, one renderer process per site, the GPU process, site isolation — and inside a
+      renderer, the main thread, the compositor thread, and raster threads. What "the main thread is
+      blocked" physically means.</p>
+    <p class="spec"><span class="k">Build</span> (a) A small Unix shell in Python with
+      <code>fork</code>, <code>execvp</code> and <code>dup2</code> — real pipes and redirection, so
+      processes stop being an abstraction. (b) A page-cost CLI in TypeScript: drive Chrome over the
+      DevTools Protocol and report a page's real cost — process count, main-thread blocking time, long
+      tasks, JS heap size — as a table.</p>
+    <p class="spec"><span class="k">Ship</span> That CLI, published to npm with a README and a version
+      number, used by at least three people who are not you.</p>
+    <p class="spec"><span class="k">Prove</span> Whiteboard the path from pressing Enter on a URL to
+      pixels on screen, naming which process and which thread does each part. Explain a page fault, a
+      context switch, and why one long task destroys responsiveness.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "A browser tab is four processes and one very
+      busy thread".</p>
+    <p class="spec"><span class="k">Sources</span> <a href="https://cpu.land/">cpu.land</a> ·
+      <a href="https://www.chromium.org/developers/design-documents/multi-process-architecture/">Chromium multi-process architecture</a> ·
+      <a href="https://developer.chrome.com/blog/inside-browser-part1">Inside look at modern web browsers</a> ·
+      <a href="https://developer.chrome.com/docs/devtools/performance/">DevTools Performance docs</a> ·
+      <a href="https://man7.org/linux/man-pages/man2/fork.2.html"><code>man 2 fork</code></a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 1</span>
+      Your shell runs <code>cat file | grep x | wc -l</code> with real pipes and you explain every
+      <code>fork</code> and <code>dup2</code> from memory. Your CLI's main-thread blocking number lands
+      within 10% of the DevTools number on three real sites, and you can explain both numbers.<br>
+      <b>You fail if</b> you cannot say which process runs your JavaScript, or which thread scrolls the
+      page.
+    </div>
+  </div>
+
+  <div class="month" id="m2">
+    <p class="num">Month 2 · 7 Sep – 4 Oct 2026</p>
+    <h3>The JavaScript engine and the event loop</h3>
+    <p class="spec"><span class="k">Learn</span> How V8 runs your code: parse, bytecode, the optimising
+      compiler, hidden classes, inline caches, deoptimisation. Garbage collection: young and old
+      generation, minor and major collections, what keeps an object alive, what a leak looks like in a
+      heap snapshot. Then the loop: task queue versus microtask queue, <code>queueMicrotask</code>,
+      <code>requestAnimationFrame</code>, <code>requestIdleCallback</code>, rendering opportunities,
+      starvation.</p>
+    <p class="spec"><span class="k">Build</span> (a) A working programming language in TypeScript —
+      scanner, parser, resolver, and a tree-walking interpreter with closures and classes. This is what
+      makes closures stop being magic. (b) An event-loop simulator: your own task and microtask queues
+      plus a frame callback, which reproduces the classic ordering puzzles — and you check its output
+      against the real browser, case by case.</p>
+    <p class="spec"><span class="k">Ship</span> A small library on npm that real users run: a long-task
+      tracker, or a leak detector that samples the heap and reports growth.</p>
+    <p class="spec"><span class="k">Prove</span> Explain a stale closure bug at the level of
+      environments and heap references, and say what the garbage collector does with the captured
+      variable. Predict the output of six hard ordering puzzles cold. Read a heap snapshot and name the
+      leak. Explain one deoptimisation from a real trace.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "A closure is a pointer to an environment —
+      proved with my own interpreter".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://craftinginterpreters.com/">Crafting Interpreters</a> ·
+      <a href="https://v8.dev/blog">V8 blog</a> and <a href="https://v8.dev/docs">V8 docs</a> ·
+      <a href="https://tc39.es/ecma262/">ECMAScript spec</a> (lexical environments, jobs) ·
+      <a href="https://jakearchibald.com/2015/tasks-microtasks-queues-and-schedules/">Tasks, microtasks, queues and schedules</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model">MDN: JavaScript execution model</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 2</span>
+      Your interpreter runs recursive Fibonacci and a closure counter correctly, your simulator matches
+      the real browser on every puzzle, and you find a real leak in a real heap snapshot.<br>
+      <b>You fail if</b> you cannot say where a captured variable lives, or if you skipped the resolver
+      because "it worked without it".
+    </div>
+  </div>
+
+  <div class="month" id="m3">
+    <p class="num">Month 3 · 5 Oct – 1 Nov 2026</p>
+    <h3>The rendering pipeline — write a layout engine</h3>
+    <p class="spec"><span class="k">Learn</span> HTML parsing into a DOM, CSS parsing into rules, the
+      cascade and style resolution, layout (block, inline, text wrapping, flex), paint, raster,
+      composite. Which stages a given change re-runs. Why <code>transform</code> and
+      <code>opacity</code> can skip layout entirely. Layers, <code>will-change</code>,
+      <code>contain</code>, <code>content-visibility</code>, forced synchronous layout, and what the
+      compositor can animate without the main thread.</p>
+    <p class="spec"><span class="k">Build</span> A mini browser engine in TypeScript: HTML parser →
+      style tree with a real cascade → block layout with text wrapping → one flex row → paint to a
+      canvas. It must render a small target page correctly, compared against a screenshot.</p>
+    <p class="spec"><span class="k">Ship</span> A real page or component where you removed layout
+      thrashing or a forced reflow, with a measured before and after in the field.</p>
+    <p class="spec"><span class="k">Prove</span> Given any CSS change, say which pipeline stages re-run
+      and why. Explain why animating <code>top</code> is expensive and <code>transform</code> is not.
+      Read a performance trace and name the <em>cause</em> of the long task, not just its label.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "I wrote a layout engine and stopped guessing
+      about reflow".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://browser.engineering/">Web Browser Engineering</a> (the book to follow) ·
+      <a href="https://limpet.net/mbrubeck/2014/08/08/toy-layout-engine-1.html">Matt Brubeck's toy layout engine series</a>
+      and <a href="https://github.com/mbrubeck/robinson">robinson</a> ·
+      <a href="https://developer.chrome.com/docs/chromium/renderingng">RenderingNG</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/Performance/Guides/How_browsers_work">MDN: how browsers work</a> ·
+      <a href="https://html.spec.whatwg.org/multipage/parsing.html">HTML parsing spec</a> ·
+      <a href="https://drafts.csswg.org/css-flexbox-1/">CSS Flexbox spec</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 3</span>
+      Your engine renders the target page correctly, <em>including text that wraps</em>, and you trace
+      one style change through every pipeline stage by hand on paper.<br>
+      <b>You fail if</b> your layout only handles absolute positioning, or you skipped text wrapping
+      because it was hard. Text wrapping <em>is</em> the hard part.
+    </div>
+  </div>
+
+  <!-- ============================================================
+       STAGE 2
+       ============================================================ -->
+  <p class="stage">Stage 2 · Months 4–6 · The framework layer</p>
+  <p class="stage-sub">Goal: rebuild the tools you use every day. After this stage no framework is a
+  black box to you — and no framework question can corner you.</p>
+
+  <div class="month" id="m4">
+    <p class="num">Month 4 · 2 Nov – 29 Nov 2026</p>
+    <h3>Write a mini React: reconciler, hooks, scheduler</h3>
+    <p class="spec"><span class="k">Learn</span> <code>UI = f(state)</code>. The element tree, the fiber
+      tree, reconciliation, keys and why index keys lose state, the render phase versus the commit
+      phase, hooks as a linked list on the fiber, why hook order is a rule and not a style, batching,
+      effect timing, refs, context. Then concurrent rendering: time slicing, interruption, priorities,
+      and what it genuinely cannot fix.</p>
+    <p class="spec"><span class="k">Build</span> Your own React in TypeScript, from a blank page:
+      <code>createElement</code>, a fiber tree, reconciliation with keys, a commit phase, then
+      <code>useState</code>, <code>useEffect</code>, <code>useMemo</code>, <code>useRef</code> and
+      <code>useContext</code> — then a scheduler with time slicing and two priority levels. Test it by
+      rendering the same ten components as real React and comparing the result.</p>
+    <p class="spec"><span class="k">Ship</span> A real product's re-render problem fixed, measured with
+      the React Profiler: fewer renders, lower interaction latency, in the field.</p>
+    <p class="spec"><span class="k">Prove</span> Explain the hook order rule from the data structure,
+      not from the documentation. Explain a stale closure inside <code>useEffect</code> and three ways
+      to fix it, with the trade-off of each. Live-code <code>useState</code> in 45 minutes.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "Hooks are a linked list — here is my 300-line
+      React".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://github.com/acdlite/react-fiber-architecture">React fiber architecture</a> ·
+      <a href="https://pomb.us/build-your-own-react/">Build your own React</a> ·
+      <a href="https://react.dev/learn">react.dev</a> · the React source itself</p>
+    <div class="gate">
+      <span class="label">Gate — Month 4 · plus the first outside judge</span>
+      Your React updates a keyed list without losing component state, your hooks work in a real
+      component, and a long render can be interrupted. You can draw the fiber tree for a five-component
+      app from memory. Then: <b>your first mock interview with an outside senior engineer.</b><br>
+      <b>You fail if</b> you diff by index, or if state jumps to the wrong row when the list reorders.
+    </div>
+  </div>
+
+  <div class="month" id="m5">
+    <p class="num">Month 5 · 30 Nov – 27 Dec 2026</p>
+    <h3>The build layer: modules, bundling, transforms</h3>
+    <p class="spec"><span class="k">Learn</span> ES modules versus CommonJS, the module graph,
+      resolution rules, abstract syntax trees and transforms, tree shaking and why side effects defeat
+      it, code splitting, source maps, content hashing and long-term caching, a dev server and how hot
+      module replacement actually swaps a module, TypeScript compiling versus type checking, bundle
+      budgets.</p>
+    <p class="spec"><span class="k">Build</span> A mini bundler in TypeScript: entry file → parse →
+      module graph → resolve → transform → emit one file with a small runtime. Then add code splitting,
+      then a real source map, then a dev server with hot module replacement over a WebSocket.</p>
+    <p class="spec"><span class="k">Ship</span> A real repository's bundle reduced, with before and
+      after kilobytes and a field metric — plus the budget wired into CI so it cannot regress again.</p>
+    <p class="spec"><span class="k">Prove</span> Explain what tree shaking cannot remove, and why.
+      Explain a source map's <code>mappings</code> field well enough to decode one by hand. Diagnose a
+      duplicated dependency from a bundle report and say what to do about it.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "A bundler is a graph walk and a string join —
+      my 400-line version".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://github.com/ronami/minipack">minipack</a> (the smallest honest example) ·
+      <a href="https://rollupjs.org/introduction/">Rollup docs</a> (tree shaking, side effects) ·
+      <a href="https://esbuild.github.io/">esbuild docs</a> ·
+      <a href="https://vite.dev/guide/why.html">Vite: why</a> (dev server and HMR) ·
+      <a href="https://tc39.es/source-map/">Source map specification</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 5</span>
+      Your bundler builds a three-module app, its source map maps a real error back to the right line,
+      hot module replacement updates without a full reload, and the CI budget blocks a deliberate 50 kB
+      regression.<br>
+      <b>You fail if</b> an existing bundler appears anywhere in your pipeline.
+    </div>
+  </div>
+
+  <div class="month" id="m6">
+    <p class="num">Month 6 · 28 Dec 2026 – 24 Jan 2027</p>
+    <h3>The network, from the socket to first paint</h3>
+    <p class="spec"><span class="k">Learn</span> DNS, TCP, TLS, HTTP/1.1 framing, HTTP/2 multiplexing,
+      HTTP/3, head-of-line blocking, request priorities. Caching properly: <code>Cache-Control</code>,
+      <code>ETag</code>, stale-while-revalidate, CDN layers. <code>preload</code>,
+      <code>preconnect</code>, <code>prefetch</code>. Compression. Then rendering strategies: client
+      rendering, server rendering, streaming HTML, React Server Components, and the real cost of
+      hydration.</p>
+    <p class="spec"><span class="k">Build</span> An HTTP/1.1 server on a raw TCP socket with Node
+      <code>net</code>: request parsing, keep-alive, chunked responses, correct <code>400</code>s,
+      timeouts, graceful shutdown. Then stream HTML out of it progressively and measure first paint
+      against the buffered version. Then a WebSocket handshake and frame parser, by hand.</p>
+    <p class="spec"><span class="k">Ship</span> A real page moved to streaming or server rendering, or
+      its caching fixed, with field numbers for real users.</p>
+    <p class="spec"><span class="k">Prove</span> Draw the full path from URL to pixels with the timeout
+      and the failure mode at every hop. Explain why hydration is expensive and what reduces it.
+      Explain the three caches a response can come from, and which one lied to you.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "I streamed HTML from a raw socket and watched
+      first paint drop".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://hpbn.co/">High Performance Browser Networking</a> ·
+      <a href="https://www.rfc-editor.org/rfc/rfc9112.html">RFC 9112</a> and
+      <a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110</a> ·
+      <a href="https://beej.us/guide/bgnet/">Beej's Guide</a> ·
+      <a href="https://nodejs.org/api/net.html">Node <code>net</code> docs</a> ·
+      <a href="https://react.dev/reference/rsc/server-components">React Server Components</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 6 · plus the second outside judge</span>
+      One thousand concurrent keep-alive connections with no leaked file descriptors, and your streamed
+      page beats the buffered page on first paint by a measured margin you can explain. Then: <b>an
+      outside senior engineer runs a front-end system design interview on you.</b><br>
+      <b>You fail if</b> a framework appears in your request path, or if your streaming "improvement"
+      has no number attached.
+    </div>
+  </div>
+
+  <!-- ============================================================
+       STAGE 3
+       ============================================================ -->
+  <p class="stage">Stage 3 · Months 7–9 · The product</p>
+  <p class="stage-sub">Goal: turn that depth into things users feel. Depth with no taste produces
+  clever software nobody wants.</p>
+
+  <div class="month" id="m7">
+    <p class="num">Month 7 · 25 Jan – 21 Feb 2027</p>
+    <h3>Performance as an engineering discipline</h3>
+    <p class="spec"><span class="k">Learn</span> Lab versus field. LCP, INP and CLS, and what each one
+      actually measures. INP broken into input delay, processing, and presentation. The 16.7 millisecond
+      frame budget. Long tasks and yielding. Images and fonts. Virtualised lists.
+      <code>content-visibility</code>. Web workers. Real-user monitoring. Budgets in CI. And a
+      <em>method</em> for finding cost, instead of a list of tips.</p>
+    <p class="spec"><span class="k">Build</span> A real campaign on a real site: five rounds of measure
+      → predict → change → verify, each written down, including the rounds that made it worse. Plus a
+      virtualised list from scratch, and one heavy computation moved into a worker. Plus a CI gate that
+      fails a pull request on a budget breach.</p>
+    <p class="spec"><span class="k">Ship</span> A measurable field improvement on at least two vitals
+      for real users — not a lab score.</p>
+    <p class="spec"><span class="k">Prove</span> Given a trace you have never seen, find the top three
+      costs and rank the fixes by effort against impact. Defend the ranking when I push back.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "Five rounds of performance work with the numbers
+      — including the two that failed".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://web.dev/articles/vitals">Core Web Vitals</a> ·
+      <a href="https://web.dev/articles/inp">INP</a> and
+      <a href="https://web.dev/articles/optimize-inp">optimising INP</a> ·
+      <a href="https://developer.chrome.com/docs/devtools/performance/">DevTools Performance</a> ·
+      <a href="https://github.com/GoogleChrome/lighthouse-ci">Lighthouse CI</a> ·
+      <a href="https://www.brendangregg.com/sysperfbook.html">Systems Performance</a> (for the method)</p>
+    <div class="gate">
+      <span class="label">Gate — Month 7</span>
+      Two vitals improved in the field for real users, and a CI gate that blocks a deliberate regression
+      you introduce to test it.<br>
+      <b>You fail if</b> your evidence is a Lighthouse score, or the sentence "it feels faster".
+    </div>
+  </div>
+
+  <div class="month" id="m8">
+    <p class="num">Month 8 · 22 Feb – 21 Mar 2027</p>
+    <h3>Taste, accessibility, and deletion</h3>
+    <p class="spec"><span class="k">Learn</span> Perceived speed versus measured speed. Every state
+      designed: empty, loading, partial, error, offline. Motion with a purpose. One decision per
+      screen. Design tokens and a real design system. WCAG 2.2 and the ARIA authoring patterns.
+      Keyboard and screen-reader correctness as <em>correctness</em>, not kindness. Forms and error
+      messages. And Ousterhout's rules for the code behind it: deep modules, shallow interfaces.</p>
+    <p class="spec"><span class="k">Build</span> Rebuild one surface you own to a fanatical standard:
+      delete a third of the code and one step of the user's flow. Then build two accessible primitives
+      from scratch to the ARIA pattern — a combobox and a modal dialog — with keyboard tests and a real
+      screen-reader pass.</p>
+    <p class="spec"><span class="k">Ship</span> To real users, with task success measured before and
+      after.</p>
+    <p class="spec"><span class="k">Prove</span> A design defence: I attack every pixel and every
+      abstraction; you justify it or change it. Then a code review of someone else's pull request,
+      written to Google's standard, with severities.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "I deleted 40% of this feature and the numbers
+      went up".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://www.w3.org/WAI/ARIA/apg/">ARIA Authoring Practices</a> ·
+      <a href="https://www.w3.org/WAI/WCAG22/quickref/">WCAG 2.2 quick reference</a> ·
+      <a href="https://web.stanford.edu/~ouster/cgi-bin/book.php">A Philosophy of Software Design</a> ·
+      <a href="https://google.github.io/eng-practices/review/">Google code review standard</a> ·
+      <a href="https://martinfowler.com/architecture/">Fowler on architecture</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 8</span>
+      One user-facing metric measurably improved, zero accessibility failures on that flow (automated
+      check, keyboard-only pass, and a screen reader), and <b>fewer lines of code than you started
+      with</b>.<br>
+      <b>You fail if</b> it looks nicer and nothing was measured. Pretty with no number is decoration.
+    </div>
+  </div>
+
+  <div class="month" id="m9">
+    <p class="num">Month 9 · 22 Mar – 18 Apr 2027</p>
+    <h3>State, offline, real-time — and browser security</h3>
+    <p class="spec"><span class="k">Learn</span> Server state versus client state. Cache layers,
+      stale-while-revalidate, optimistic updates and rollback. IndexedDB, Service Worker strategies,
+      background sync, queued writes, conflict resolution and its failure cases. Real-time over
+      WebSocket or server-sent events, with reconnection and replay. Then security in the browser: XSS
+      and why escaping alone is not enough, Content Security Policy and Trusted Types, CSRF and
+      <code>SameSite</code> cookies, sessions versus tokens, OAuth in a browser, clickjacking, the npm
+      supply chain, and what must never reach the client.</p>
+    <p class="spec"><span class="k">Build</span> (a) An offline-first feature: local store, write queue,
+      sync, conflict handling — proved under a flaky-network simulator you wrote yourself. (b) Attack
+      your own application: write a working XSS, a CSRF, a token leak, and a replayed request. Fix each
+      one, add the regression test, and add a Content Security Policy that holds.</p>
+    <p class="spec"><span class="k">Ship</span> The offline feature to real users, plus the hardened
+      authentication or payment path.</p>
+    <p class="spec"><span class="k">Prove</span> A security review of a real codebase with CRITICAL /
+      HIGH / MEDIUM / LOW severities and evidence for each. Explain what a Content Security Policy
+      cannot stop. Explain your conflict rule and name the case where it loses data.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "I broke my own app four ways in one afternoon".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">OWASP XSS prevention</a> ·
+      <a href="https://owasp.org/www-project-top-ten/">OWASP Top 10</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP">MDN: CSP</a> ·
+      <a href="https://web.dev/articles/samesite-cookies-explained">SameSite cookies</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API">Service Worker API</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API">IndexedDB API</a> ·
+      <a href="https://tanstack.com/query/latest">TanStack Query</a> (cache semantics done well)</p>
+    <div class="gate">
+      <span class="label">Gate — Month 9 · plus the third outside judge</span>
+      Your offline feature loses no writes under the flaky-network simulator, and every exploit you
+      wrote has a test that failed before the fix and passes after. Then: <b>an outside senior engineer
+      runs a deep dive and a code review on you.</b><br>
+      <b>You fail if</b> you found no vulnerabilities. Finding nothing means you did not attack it.
+    </div>
+  </div>
+
+  <!-- ============================================================
+       STAGE 4
+       ============================================================ -->
+  <p class="stage">Stage 4 · Months 10–12 · AI</p>
+  <p class="stage-sub">Goal: be the engineer who builds AI products, not the person who writes
+  prompts. Same standard of proof as the browser months.</p>
+
+  <div class="month" id="m10">
+    <p class="num">Month 10 · 19 Apr – 16 May 2027</p>
+    <h3>Neural nets, built by hand</h3>
+    <p class="spec"><span class="k">Learn</span> The chain rule as code. Backpropagation. Tensors and
+      broadcasting. Loss functions and optimisers. Overfitting and underfitting. Tokenization,
+      embeddings, attention, the transformer block, the training loop, and how behaviour changes with
+      scale. Enough Python to be genuinely fluent, not merely able to read it.</p>
+    <p class="spec"><span class="k">Build</span> An autograd engine from scratch, yourself, about 150
+      lines. Then a character-level language model. Then a small GPT in PyTorch trained on text you
+      chose. Write it, break it, fix it — do not run someone's notebook.</p>
+    <p class="spec"><span class="k">Ship</span> Something real people use that a model powers, however
+      small: a classifier, a search reranker, a writing tool.</p>
+    <p class="spec"><span class="k">Prove</span> Derive backpropagation on paper for a two-layer
+      network. Explain attention in three minutes with a hand-drawn diagram. Explain why your loss
+      stopped improving, with evidence.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "Backpropagation is one rule applied twelve times
+      — here is my 150-line engine".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://github.com/karpathy/nn-zero-to-hero">Neural Networks: Zero to Hero</a> ·
+      <a href="https://github.com/karpathy/micrograd">micrograd</a> ·
+      <a href="https://github.com/karpathy/nanoGPT">nanoGPT</a> ·
+      <a href="https://nlp.seas.harvard.edu/annotated-transformer/">The Annotated Transformer</a> ·
+      <a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a> ·
+      <a href="https://pytorch.org/tutorials/">PyTorch tutorials</a> ·
+      <a href="https://fluentpython.com/">Fluent Python</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 10</span>
+      Your GPT trains from code you wrote and produces text clearly better than random, and you can name
+      every tensor shape in the forward pass from memory.<br>
+      <b>You fail if</b> you ran someone else's notebook and watched the loss go down.
+    </div>
+  </div>
+
+  <div class="month" id="m11">
+    <p class="num">Month 11 · 17 May – 13 Jun 2027</p>
+    <h3>LLM systems and the interfaces on top of them</h3>
+    <p class="spec"><span class="k">Learn</span> The raw API loop. Tool calling from first principles.
+      When a fixed workflow beats an agent. Context engineering. Retrieval done properly: chunking,
+      hybrid search, reranking. Evaluation: offline sets, model-as-judge and how it fools you,
+      regression gates in CI. Cost and latency budgets, caching, guardrails, partial failure. Then the
+      interface half, which is your edge: streaming over server-sent events, token-by-token rendering,
+      cancellation mid-stream, interruptible and optimistic UI, showing uncertainty honestly, and
+      on-device inference in the browser — including when it beats a server call.</p>
+    <p class="spec"><span class="k">Build</span> (a) An agent from raw HTTP calls, no framework: tools,
+      retries, cancellation, streaming, and a cost meter. (b) A streaming chat interface you wrote
+      yourself over server-sent events: token rendering, abort, resume, error recovery, and no layout
+      shift. (c) An evaluation suite that runs in CI and blocks a deploy on regression. (d) An MCP
+      server exposing your own tools.</p>
+    <p class="spec"><span class="k">Ship</span> An AI feature to real users, with evaluations gating
+      deploys, a cost dashboard, and a fallback for when the model is wrong or down.</p>
+    <p class="spec"><span class="k">Prove</span> Design an LLM system under time pressure with the cost
+      and latency arithmetic on the board. Defend why part of your design is deliberately <em>not</em>
+      an agent. Name your eval set's blind spots before I find them.</p>
+    <p class="spec"><span class="k">Teach</span> Post: "My agent worked in the demo and failed in
+      production — the eval suite that fixed it".</p>
+    <p class="spec"><span class="k">Sources</span>
+      <a href="https://www.anthropic.com/engineering/building-effective-agents">Building effective agents</a> ·
+      <a href="https://github.com/anthropics/anthropic-cookbook">Anthropic Cookbook</a> ·
+      <a href="https://modelcontextprotocol.io/">MCP docs</a> ·
+      <a href="https://github.com/openai/evals">OpenAI Evals</a> ·
+      <a href="https://dspy.ai/">DSPy</a> ·
+      <a href="https://huyenchip.com/books/">AI Engineering — Chip Huyen</a> ·
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events">MDN: server-sent events</a> ·
+      <a href="https://ai-sdk.dev/docs/introduction">AI SDK docs</a> (streaming UI patterns) ·
+      <a href="https://developer.chrome.com/docs/ai/built-in">Chrome built-in AI</a></p>
+    <div class="gate">
+      <span class="label">Gate — Month 11</span>
+      Your eval suite catches a regression you plant on purpose. Your streaming interface cancels
+      mid-stream cleanly, with no leaked request and no layout shift. You can state cost per request and
+      95th-percentile latency from memory.<br>
+      <b>You fail if</b> you shipped without evaluations. Vibes are not a test suite.
+    </div>
+  </div>
+
+  <div class="month" id="m12">
+    <p class="num">Month 12 · 14 Jun – 30 Jul 2027</p>
+    <h3>Zero to one: an AI product where the interface is the hard part</h3>
+    <p class="spec"><span class="k">Learn</span> Nothing new. This month you deliver.</p>
+    <p class="spec"><span class="k">Build</span> Find a real problem a real person has, where the
+      difficulty is the interface and not the model call. Four weeks. Design it, build it, ship it,
+      operate it, support it. Fixed date, flexible scope. Say no to everything that is not the core.
+      Every layer is yours now — the engine, the pipeline, the framework, the network, the model. Use
+      them.</p>
+    <p class="spec"><span class="k">Ship</span> Real users, a public URL, monitoring, evaluations in CI,
+      on-call (you), and a price if it deserves one.</p>
+    <p class="spec"><span class="k">Prove</span> Interview week: two system designs (one front-end
+      heavy, one AI heavy), two timed coding sessions, one deep dive on your own work, one code review,
+      and one "tell me about a failure you owned". Judged by an outside senior engineer.</p>
+    <p class="spec"><span class="k">Teach</span> Publish the year: twelve posts collected in one place,
+      with the numbers, including what failed.</p>
+    <p class="spec"><span class="k">Sources</span> Your own twelve months of notes. If you need a new
+      book in Month 12, the first eleven months did not work.</p>
+    <div class="gate">
+      <span class="label">Gate — Month 12 · the final judge</span>
+      It is live, someone who is not you uses it, and you can explain every layer of it — from the React
+      render down to the syscall — under questioning.<br>
+      <b>You fail if</b> it is a demo instead of a product, or if the only person who has ever used it is
+      you.
+    </div>
+  </div>
+
+  <!-- ============================================================
+       SUMMARY
+       ============================================================ -->
+  <h2>The year on one line each</h2>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Month</th><th>Built from a blank page</th><th>You pass when</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><b>1</b> Processes</td><td>A shell with real pipes; a page-cost CLI</td><td>Pipes work; your numbers match DevTools within 10%</td></tr>
+        <tr><td><b>2</b> JS engine</td><td>An interpreter; an event-loop simulator</td><td>Closures work; you find a real leak in a snapshot</td></tr>
+        <tr><td><b>3</b> Rendering</td><td>A layout engine that wraps text and paints</td><td>Your page renders correctly; you trace every stage</td></tr>
+        <tr><td><b>4</b> Framework</td><td>A mini React: fibers, hooks, scheduler</td><td>Keyed lists keep state; a render can be interrupted</td></tr>
+        <tr><td><b>5</b> Build tools</td><td>A bundler with source maps and HMR</td><td>HMR without reload; CI blocks a 50 kB regression</td></tr>
+        <tr><td><b>6</b> Network</td><td>An HTTP server on a socket; streamed HTML</td><td>1,000 keep-alive connections; streaming wins on first paint</td></tr>
+        <tr><td><b>7</b> Performance</td><td>Five measured rounds; a virtual list; a worker</td><td>Two vitals improved in the field, gated in CI</td></tr>
+        <tr><td><b>8</b> Taste</td><td>One surface rebuilt; combobox and dialog to spec</td><td>Metric up, zero a11y failures, less code than before</td></tr>
+        <tr><td><b>9</b> Offline &amp; security</td><td>Offline sync; working exploits on your own app</td><td>No lost writes; every exploit has a red-then-green test</td></tr>
+        <tr><td><b>10</b> Neural nets</td><td>An autograd engine, then a small GPT</td><td>It trains from your code; you know every shape</td></tr>
+        <tr><td><b>11</b> LLM systems</td><td>An agent from raw calls; a streaming UI; evals</td><td>Evals catch a planted regression; clean cancellation</td></tr>
+        <tr><td><b>12</b> Zero to one</td><td>A whole AI product, alone, in four weeks</td><td>Live, used by someone else, defended top to bottom</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>What this plan deliberately leaves out</h2>
+
+  <p>You cannot have everything in twelve months. These are cut on purpose. Each one is a
+  <em>read about it, do not build it</em> item:</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Cut</th><th>Why, and what you do instead</th></tr></thead>
+      <tbody>
+        <tr><td>A storage engine and a database-internals month</td>
+          <td>You still learn to read a query plan and choose an index when it comes up. You do not
+            write a write-ahead log this year. If you later go backend-heavy, this is the first thing
+            to add.</td></tr>
+        <tr><td>Distributed consensus (Raft, replication)</td>
+          <td>Replaced by the parts a front-end engineer actually meets: retries, idempotency, offline
+            sync, and conflict resolution in Month 9. Read the Raft paper; do not implement it.</td></tr>
+        <tr><td>Server operations and running a fleet</td>
+          <td>Replaced by real-user monitoring, CI budgets, and error tracking in Months 7 and 12. You
+            monitor what you ship; you do not run infrastructure.</td></tr>
+        <tr><td>Training or fine-tuning large models</td>
+          <td>You build a small one by hand in Month 10 to understand it. Production AI work here is
+            systems and interface work, not training runs.</td></tr>
+        <tr><td>A third language</td>
+          <td>TypeScript and Python only, all year. The C you read in Months 1 and 3 is for
+            understanding, not for writing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>When you fail a month</h2>
+
+  <p>You will fail one. Probably Month 3 or Month 5. The procedure is not negotiable:</p>
+
+  <ol class="rules">
+    <li><b>Say it out loud, in writing, the same day.</b> Which part of the gate failed, and what
+      evidence is missing. Hiding a failure is the only unrecoverable mistake here.</li>
+    <li><b>Re-run the gate in Week 1 of the next month.</b> Not the whole month — only the gate. You
+      keep moving, and the debt gets paid immediately.</li>
+    <li><b>Two failures in a row means the plan is wrong, not you.</b> Then we recut it: fewer hours,
+      longer months, or a different order. Effort is not the variable to increase.</li>
+    <li><b>A learning record for every failure.</b> What you believed, what was actually true, and what
+      it predicts you will get wrong next.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">The trap that ends most twelve-month plans</span>
+    Months 1 and 2 feel great, because reading feels like progress. <b>Month 3 is the wall</b>: text
+    wrapping in a layout engine is genuinely hard, nothing looks right for days, and no post gets
+    published. That is not a sign the plan is wrong. That is the first month the plan is working. Get
+    through Month 3 and Month 5 and the rest of the year is downhill.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this</span>
+    <ul>
+      <li><b>Four stages:</b> under the browser (1–3), the framework layer (4–6), the product (7–9),
+        AI (10–12).</li>
+      <li><b>You rebuild your own tools:</b> an interpreter, a layout engine, a React, a bundler, an
+        HTTP server, an autograd engine, an agent.</li>
+      <li><b>Every month has the same four proofs:</b> build from a blank page, ship to real users,
+        pass a spoken gate, publish a post.</li>
+      <li><b>Field numbers beat lab numbers.</b> A Lighthouse score is never the evidence.</li>
+      <li><b>Outside judges in Months 4, 6, 9 and 12.</b> You never grade your own exam.</li>
+      <li><b>Fixed dates, flexible scope.</b> Cut scope out loud; never move the date.</li>
+      <li><b>Failing a month is normal</b> — re-run only the gate, in Week 1 of the next month.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a month only counts when someone who is not you
+    can see the evidence.</b></p>
+  </div>
+
+  <div class="ask">
+    Stuck, disagreeing, or think a month is in the wrong order? <b>Say so.</b> I would rather argue with
+    you in Week 1 than watch you fail a gate in Week 4 politely.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="../index.html">&larr; The Map</a></span>
+    <span><a href="the-daily-8-hours.html">The daily 8 hours &rarr;</a></span>
+  </div>
+</div>
