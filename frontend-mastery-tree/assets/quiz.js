@@ -8,8 +8,10 @@
 
    2) renderRecall(selector, cards)
         cards: [{ prompt, answer }]
-        "Say it out loud, THEN flip." Free-recall for spoken
-        interview answers — the highest-value practice for this mission.
+        The lesson's "interview session": prompt is the interviewer's
+        question, answer's HTML ends with a "Likely follow-up: …" line.
+        Free-recall for spoken answers — the highest-value practice
+        for this mission.
    ============================================================ */
 (function () {
   var css = `
@@ -94,9 +96,9 @@
     var root = document.querySelector(selector);
     if (!root) return;
     root.classList.add('recall');
-    var head = document.createElement('div'); head.className = 'recall-head'; head.textContent = 'Say it out loud, then flip';
+    var head = document.createElement('div'); head.className = 'recall-head'; head.textContent = 'Interview session';
     var sub = document.createElement('div'); sub.className = 'quiz-sub';
-    sub.textContent = 'Answer each aloud as if the interviewer asked it. Tap to reveal a model answer, then compare.';
+    sub.textContent = 'Answer each aloud, as if an interviewer just asked it. Tap to reveal the model answer and the likely follow-up.';
     root.appendChild(head); root.appendChild(sub);
     cards.forEach(function (c) {
       var card = document.createElement('div'); card.className = 'card';

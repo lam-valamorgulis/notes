@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0002 · The scope chain &amp; lexical environment — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Execution model · Lesson 0002</p>
+<h1>The scope chain &amp; lexical environment</h1>
+<p class="subtitle">Lesson 0001 said an execution context holds "the call's own variables." This lesson opens that box: where variables actually live, and how the engine finds one when your code just writes its name.</p>
+
+<div class="win">
+  <strong>The win:</strong> after ~30 minutes you can predict, with no doubt, whether a name inside a nested function resolves to a local, an outer, or the global variable — and explain why a classic <code>var</code>-in-a-loop bug happens, before we even reach closures.
+</div>
+
+<h2>1. What a lexical environment actually is</h2>
+<p>
+  Every time a function runs, or a block (<code>{ }</code> after <code>if</code>, <code>for</code>, or on its own) executes, the engine creates a <strong>lexical environment</strong>. Plain words: <em>a small record of the names declared right here, plus one link back to the record it sits inside.</em> Per the
+  <a href="https://tc39.es/ecma262/#sec-lexical-environments">ECMA-262 spec on lexical environments</a>, that record has exactly two parts you should be able to name cold:
+</p>
+<ul>
+  <li><strong>An environment record</strong> — the bindings declared in this exact function or block: parameters, <code>let</code>/<code>const</code>/<code>function</code> declarations for a block, or the full set of locals for a function.</li>
+  <li><strong>A reference to the outer environment</strong> — the lexical environment of whatever code <em>textually contains</em> this one, fixed the moment this environment is created.</li>
+</ul>
+<p>
+  That word <strong>lexical</strong> is the whole lesson: the outer reference is decided by <em>where the code sits on the page</em>, not by who called it. This is different from <code>this</code> (lesson 0001's teaser, its own lesson later) — <code>this</code> is decided at the call site; the outer environment reference is decided at write time and never changes. A function called from ten different places still has exactly one, fixed outer environment.
+</p>
+<div class="note">
+  <span class="label">One thing to keep separate from execution contexts</span>
+  Lesson 0001's execution context and this lesson's lexical environment are not two competing ideas — every execution context <em>has</em> a lexical environment as one of its fields. The context is the whole running-call record; the lexical environment is specifically the part that answers "what variables can this code see, and in what order."
+</div>
+
+<h2>2. The scope chain: how the engine finds a name</h2>
+<p>
+  When your code reads an identifier, the engine does not know instantly where it lives. It <strong>searches</strong>:
+</p>
+<ol>
+  <li>Look in the current lexical environment's own record. Found it? Done.</li>
+  <li>Not found? Follow the outer reference to the next environment out, and look there.</li>
+  <li>Repeat until found, or until the global environment is reached and still nothing turns up — then, and only then, <code>ReferenceError: x is not defined</code>.</li>
+</ol>
+<p>
+  This walk — environment, outer, outer's outer, … up to global — is the <strong>scope chain</strong>. It is not a separate structure the engine builds specially; it is just the outer references, followed one at a time.
+</p>
+
+<pre><code>const storeName = "Anchor & Co";        <span class="cmt">// lives in the global environment</span>
+
+function makeGreeter(customerName) {
+  const greeting = "Welcome";            <span class="cmt">// lives in makeGreeter's environment</span>
+  function greet() {
+    console.log(`${greeting}, ${customerName}, to ${storeName}`);
+  }
+  return greet;
+}
+
+const greetLam = makeGreeter("Lam");
+greetLam();   <span class="cmt">// → </span><span class="out">"Welcome, Lam, to Anchor & Co"</span></code></pre>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 340" role="img" aria-label="Three nested lexical environments — greet, makeGreeter, and global — each with an outer reference to the next, and the scope-chain lookup for storeName walking outward from greet until it is found in global">
+  <style>
+    .frame { fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .frame.hot { stroke: var(--accent-2); stroke-width: 2.5; }
+    .flabel { font: 700 13px var(--font-mono); fill: var(--accent); }
+    .blabel { font: 12px var(--font-mono); fill: var(--ink); }
+    .arrow  { stroke: var(--ink-faint); stroke-width: 1.4; marker-end: url(#ah2); }
+    .lookup { stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 5 4; marker-end: url(#ah3); }
+    .num { font: 700 12px var(--font-sans); fill: #fff; }
+    .numbg { fill: var(--accent-2); }
+    .cap { font: italic 11px var(--font-sans); fill: var(--ink-faint); }
+  </style>
+  <defs>
+    <marker id="ah2" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="var(--ink-faint)"/>
+    </marker>
+    <marker id="ah3" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="var(--accent-2)"/>
+    </marker>
+  </defs>
+
+  <!-- greet's environment -->
+  <rect class="frame hot" x="40" y="20" width="230" height="70"/>
+  <text class="flabel" x="55" y="42">greet</text>
+  <text class="blabel" x="55" y="62">(no locals of its own)</text>
+  <circle class="numbg" cx="255" cy="35" r="10"/>
+  <text class="num" x="251" y="39">1</text>
+
+  <line class="arrow" x1="120" y1="90" x2="120" y2="130"/>
+  <text class="cap" x="130" y="112">outer</text>
+
+  <!-- makeGreeter's environment -->
+  <rect class="frame" x="40" y="140" width="280" height="80"/>
+  <text class="flabel" x="55" y="162">makeGreeter</text>
+  <text class="blabel" x="55" y="182">customerName = "Lam"</text>
+  <text class="blabel" x="55" y="200">greeting = "Welcome"</text>
+  <circle class="numbg" cx="305" cy="155" r="10"/>
+  <text class="num" x="301" y="159">2</text>
+
+  <line class="arrow" x1="120" y1="220" x2="120" y2="260"/>
+  <text class="cap" x="130" y="242">outer</text>
+
+  <!-- global environment -->
+  <rect class="frame hot" x="40" y="270" width="280" height="60"/>
+  <text class="flabel" x="55" y="292">global</text>
+  <text class="blabel" x="55" y="312">storeName = "Anchor & Co" · makeGreeter · greetLam</text>
+  <circle class="numbg" cx="305" cy="285" r="10"/>
+  <text class="num" x="301" y="289">3</text>
+
+  <!-- lookup path annotation, offset to the right -->
+  <text class="cap" x="400" y="45">Looking up <tspan font-family="var(--font-mono)" fill="var(--ink)">storeName</tspan> from inside greet:</text>
+  <text class="cap" x="400" y="65">① not in greet's own record</text>
+  <text class="cap" x="400" y="85">② not in makeGreeter's record</text>
+  <text class="cap" x="400" y="105">③ found in global — stop here</text>
+  <path class="lookup" d="M 400 130 C 450 130, 450 40, 275 35" fill="none"/>
+</svg>
+<figcaption>Three lexical environments, nested by where the code is <em>written</em> — greet inside makeGreeter inside global — each pointing outward via its fixed outer reference. Looking up a name walks that chain, checking one record at a time, until it is found.</figcaption>
+</figure>
+
+<h2>3. Shadowing: same name, chain stops at the first match</h2>
+<p>
+  If an inner environment declares a binding with the <em>same name</em> as one further out, the inner one wins for any code inside it — the chain lookup stops at the first match, it does not keep going to "check" the outer one. The outer binding still exists; it is simply <strong>shadowed</strong>, unreachable by that name from inside.
+</p>
+<div class="trap">
+  <span class="label">Trap</span>
+  Shadowing is not a bug by itself — reusing <code>item</code>, <code>i</code>, or <code>error</code> as a parameter name in a nested function is completely legal. The bug shows up when you <em>meant</em> to read the outer one and forgot the inner one shadows it. Interviewers ask this by nesting the same name three levels deep and asking which value logs — walk the chain from the innermost environment outward, stop at the first match, done.
+</div>
+
+<h2>4. Point at it: the Scope pane in DevTools <span class="pill soft">gate #3</span></h2>
+<p>The scope chain is not an abstraction you have to imagine — Chrome shows it to you, live, with the exact same layering as the diagram above:</p>
+<ol>
+  <li>Open the greeter example (or your own theme code) and set a breakpoint inside the innermost function.</li>
+  <li>DevTools → <b>Sources</b>, paused. The <b>Scope</b> pane on the right lists <b>Local</b> (the current environment's own bindings), then <b>Closure (functionName)</b> for each outer function environment, then <b>Script</b> and <b>Global</b> — read top to bottom, it <em>is</em> the scope chain.</li>
+  <li>Expand each level. A name you did not expect to see at the <em>Local</em> level, but do see under a <em>Closure</em> level further down, is shadowing or an outer reference doing its job — exactly what section 2 and 3 just described.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A Shopify theme's <code>product-card.js</code> has a module-level <code>let selectedVariant = null;</code> at the top, and further down a function <code>renderCard(selectedVariant)</code> that takes a parameter with the exact same name.</p>
+  Before flipping the last recall card below: inside <code>renderCard</code>, which <code>selectedVariant</code> does every line of that function see — the module-level one or the parameter? What does that tell you about the bug where changing the module-level variable elsewhere in the file seems to have "no effect" inside this function?
+</div>
+
+<h2>5. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type this without copying, using <code>var</code> for the loop counter:</p>
+  <pre><code>for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0);
+}</code></pre>
+  <p>Predict on paper, before running: what three numbers print, and in what order? Run it and check.</p>
+  <p>Now change only the keyword — <code>let</code> instead of <code>var</code> — and predict again before running:</p>
+  <pre><code>for (let i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i), 0);
+}</code></pre>
+  <p>Same loop, same callback, different output. Pause inside the arrow function with a breakpoint for both versions and compare the <b>Scope</b> pane: with <code>var</code> there is one shared environment holding one <code>i</code>, already <code>3</code> by the time any callback runs. With <code>let</code>, <code>for</code> creates a <em>new block environment per iteration</em>, so each callback's outer reference points at a different environment, each holding its own <code>i</code>.</p>
+</div>
+
+<h2>6. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Teach it to a junior — no jargon</span>
+  <p>Say or write this out loud: a junior on your team asks "why did my three <code>setTimeout</code> callbacks all log <code>3</code> instead of <code>0, 1, 2</code>, and why does changing <code>var</code> to <code>let</code> fix it?" You may not use the word "closure" — that word is next lesson's; explain it using only "environment," "binding," and "outer reference."</p>
+  <p>Cover, from first principles: what a lexical environment holds, why <code>var</code> puts its binding in one place shared by the whole loop while <code>let</code> makes a fresh block environment each turn, and why "fresh environment per turn" is exactly what makes the three callbacks see three different values.</p>
+  <p class="small">If your explanation needs the listener to already know what a closure is, you borrowed next lesson's answer instead of explaining this lesson's mechanism — the "different box per iteration" fact stands on its own, before you ever ask what a callback does with that box later.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>scope chain / lexical environment</b> done only if all three held, from memory: (1) you explained, in plain English with no jargon, what a lexical environment holds and how the scope chain walks outward (the explain-it-back exercise above); (2) you predicted both the <code>var</code> and <code>let</code> loop outputs before running them; (3) you compared the Scope pane between the two versions in DevTools. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Closures">MDN — Closures</a> (its first half covers lexical scoping directly; the closure-specific part is next lesson). Spec anchor if you want the ground truth: <a href="https://tc39.es/ecma262/#sec-lexical-environments">ECMA-262 § Lexical Environments</a>.
+</div>
+
+<p class="ask">Anything unclear — why the outer reference never changes, how block environments differ from function environments, how this shows up in your theme code? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>A <b>lexical environment</b> = an environment record (its own bindings) + a reference to the <b>outer</b> environment, fixed at creation time — by where the code is written, not who calls it.</li>
+    <li>The <b>scope chain</b> is just those outer references, followed one at a time: look here, then outer, then outer's outer, until found or until <code>ReferenceError</code>.</li>
+    <li><b>Shadowing</b>: an inner binding with the same name as an outer one wins for code inside it; the chain stops at the first match. The outer binding is not gone, just unreachable by that name from there.</li>
+    <li><code>var</code> binds to the nearest <b>function</b> (or global) environment; <code>let</code>/<code>const</code> bind to the nearest <b>block</b> environment — a <code>for (let …)</code> loop creates a fresh block environment every single iteration.</li>
+    <li>DevTools' <b>Scope</b> pane, paused on a breakpoint, is the scope chain rendered as UI: Local → Closure(fn) → … → Script → Global, top to bottom.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>every name lookup walks outward through fixed, write-time links until it finds a match — never inward, never sideways, never by who called you.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/execution-model.html">Cheat sheet: execution model</a>
+  <a href="../reference/frontend-mastery-tree.html">Tree tracker (2/175?)</a>
+  <span class="small">Next: 0003 — closures, captured environment not copied values (coming)</span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What two things does a lexical environment hold?',
+    options: [
+      'its own bindings, plus a reference to the outer environment',
+      'a copy of every outer variable, plus the call stack depth',
+      'the function\'s source code, plus its return value'
+    ],
+    answer: 0,
+    why: 'An environment record (the names declared right here) and a fixed outer reference. Nothing is copied from outer scopes — they are reached by following the reference when needed.'
+  },
+  {
+    q: 'A function is defined inside A, then passed around and finally called from deep inside unrelated function Z. Which environment is its outer environment?',
+    options: [
+      'A\'s environment — fixed by where it was written',
+      'Z\'s environment — fixed by where it was called',
+      'Whichever of A or Z declared more variables'
+    ],
+    answer: 0,
+    why: 'Lexical scoping: the outer reference is decided at creation time, by the surrounding code in the source, and never changes — regardless of where or how the function is later called. (Contrast with `this`, which the call site does decide.)'
+  },
+  {
+    q: 'Predict first: let x = "outer"; function f(){ let x = "inner"; console.log(x); } f(); — what logs?',
+    options: [
+      '"inner"',
+      '"outer"',
+      'ReferenceError'
+    ],
+    answer: 0,
+    why: 'f\'s own environment has its own x, so the lookup finds it on step 1 and stops there — shadowing. The outer x still exists, just unreachable by that name from inside f.'
+  },
+  {
+    q: 'for (var i = 0; i < 3; i++) { setTimeout(() => console.log(i), 0); } — what prints?',
+    options: [
+      '3, 3, 3',
+      '0, 1, 2',
+      '0, 0, 0'
+    ],
+    answer: 0,
+    why: 'var creates one binding in the function/global environment, shared by the whole loop. All three callbacks read the same i, which is already 3 by the time any of them runs.'
+  },
+  {
+    q: 'Where do you see the scope chain rendered directly in Chrome DevTools?',
+    options: [
+      'Sources panel, the Scope pane while paused on a breakpoint',
+      'Elements panel, the Computed styles tab',
+      'Network panel, the Timing tab of a request'
+    ],
+    answer: 0,
+    why: 'Pause execution and the Scope pane lists Local, then Closure(fn) for each outer function, then Script and Global — the scope chain, top to bottom, as UI.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What exactly does a lexical environment store, and how is the outer one chosen?"',
+    answer: 'It stores two things: <b>an environment record</b> — the bindings declared in this function or block — and <b>a reference to the outer environment</b>. That outer reference is fixed the moment this environment is created, based on <em>where the code is written</em> in the source, never on who calls it.<br><br><i>Likely follow-up:</i> "Is that the same as `this`?" No — `this` is set fresh at every call site; the outer reference is fixed once, at write time, and never changes across calls.'
+  },
+  {
+    prompt: '"Walk me through how the engine resolves a variable name."',
+    answer: 'It checks the current lexical environment\'s own record first. Not found — it follows the fixed outer reference to the next environment out and checks there. It repeats this until it finds a match, or until it has checked the global environment and still found nothing, at which point it throws <code>ReferenceError</code>.<br><br><i>Likely follow-up:</i> "What if two levels declare the same name?" The chain stops at the first match — the innermost — so that binding shadows the outer one for any code at that level or deeper.'
+  },
+  {
+    prompt: 'The product-card.js drill: a module-level `let selectedVariant` and a same-named function parameter. Which one does the function body see, and why does changing the module-level variable elsewhere look like it "does nothing" inside this function?',
+    answer: 'Inside <code>renderCard</code>, every reference to <code>selectedVariant</code> resolves to the <b>parameter</b> — it is declared in <code>renderCard</code>\'s own environment, so the lookup finds it on the very first step and never walks out to the module-level binding. The module-level variable is not broken; it is simply <b>shadowed</b> for the entire body of that function.<br><br><i>Likely follow-up:</i> "How would you fix it without renaming anything?" You cannot avoid renaming forever, but you can catch it fast: log <code>selectedVariant</code> at the top of the function during debugging — if it never reflects an outer change you just made, shadowing is the first suspect, before assuming the update logic itself is broken.'
+  }
+]);
+</script>
+</body>
+</html>

@@ -1,0 +1,765 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A07 — Rebuild Game Locker</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .pill.gap { background: var(--warn); }
+</style>
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Part A · Lesson A07 · The capstone</p>
+  <h1>Rebuild Game Locker</h1>
+  <p class="subtitle">Eight modules, in NestJS and Postgres. Not a tutorial — a specification, where every module's acceptance test is a behaviour someone observed in the real system. Ends with one thing you actually run.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> draw the eight modules and their dependency order from memory, name the <b>three hard problems</b> in the whole platform, and write the pricing evaluator with its rounding — then prove it against four real values, <b>including the one that does not reproduce</b>.
+  </div>
+
+  <p class="small">This lesson assumes <a href="0001-what-game-locker-actually-is.html">A01</a> through <a href="0010-the-buy-list-and-the-ledger.html">A06</a>. Every fact is a labelled row in <a href="../reference/verified-facts.html">verified-facts</a>, which doubles as the acceptance-test list.</p>
+
+  <h2>1. What you are building, in one paragraph</h2>
+
+  <p>A <b>multi-tenant SaaS</b> that game shops run their business on. It holds a catalogue of about <b>1.12 million</b> card items across <b>19 games</b>, growing by ~200 a day. It ingests a market price feed nightly and publishes derived prices at <b>06:00</b>. Each tenant configures <b>rules</b> that turn market prices into what they sell for and what they will pay. It tracks stock per <b>location</b>, orders in <b>both directions</b>, and a <b>credit ledger</b> of money owed to customers. It pushes the catalogue into each tenant's Shopify store and mirrors stock back. And it exposes one <b>tenant-scoped API</b> that its own front-ends consume.</p>
+
+  <div class="soundbite">
+    <span class="label">The sentence that shows you understand the shape</span>
+    <p>"It's a pricing engine with a catalogue attached, not a catalogue with prices attached. Everything hard about it comes from prices being derived rather than stored."</p>
+  </div>
+
+  <h2>2. The three genuinely hard problems</h2>
+
+  <p>Most of this system is ordinary CRUD. Say that out loud — it shows judgement. Then name the three parts that are not.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>The hard problem</th><th>Why it is hard</th></tr>
+    <tr>
+      <td>1</td>
+      <td><b>Derived prices at 1.12M scale</b></td>
+      <td>A price must reflect a rule the instant the rule changes, and also be materialised for a sync that cannot evaluate rules a million times. Two representations of the same truth, with a defined staleness</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td><b>Two systems writing one stock number</b></td>
+      <td>The counter sells a card and so does the website, out of one physical pile. Neither is wrong to write. Choosing an owner — the tool that solves every other field — does not work here</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td><b>One credit balance, two places to spend it</b></td>
+      <td>It is money you owe. In store and online both decrement it, and a lost decrement is not a bug report, it is a loss</td>
+    </tr>
+  </table>
+  </div>
+
+  <p>Everything else — cards, sets, users, tenants, search, reports — is a well-understood problem you can staff and schedule. These three are where an experienced engineer earns their salary, and where a rebuild goes wrong.</p>
+
+  <h2>3. The eight modules</h2>
+
+  <div class="diagram">   ingest                                  api
+   ──────                                  ───
+   market feed ──▶ catalogue ──┐            tenant-scoped JWT
+                               │            /inventory/search  ──▶ pricing (live)
+                               ▼
+                            pricing ◀──── rules authored by the tenant
+                               │
+                               ▼
+                            reprice  (nightly, publishes 06:00)
+                               │
+                     ┌─────────┴─────────┐
+                     ▼                   ▼
+                inventory           shopify-sync ──▶ each tenant's Shopify store
+                     ▲                   │
+                     │                   └── stock back ──┐
+                     │                                    │
+                     └────────────────────────────────────┘
+                     ▲
+                     │
+                  buylist ──▶ ledger        (credit owed to customers)</div>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Module</th><th>Owns</th><th>Acceptance test — an observed behaviour</th></tr>
+    <tr>
+      <td><code>catalogue</code></td>
+      <td>Cards, printings, sets, conditions. The reference data</td>
+      <td>Holds ~1.12M items over 19 games; absorbs ~201 new items and ~400 data corrections a day without downtime</td>
+    </tr>
+    <tr>
+      <td><code>pricing</code></td>
+      <td>Rules, and the evaluator. <b>Never stores a derived price</b></td>
+      <td>Three rule types including a <b>stop-buy veto</b>; a rule is a filter plus percentages; no rule means no offer</td>
+    </tr>
+    <tr>
+      <td><code>reprice</code></td>
+      <td>The nightly batch and the snapshot table</td>
+      <td>Publishes at <b>06:00</b>; touches only rows that moved or have stock — ~4% of the catalogue</td>
+    </tr>
+    <tr>
+      <td><code>inventory</code></td>
+      <td>Stock per sku per location</td>
+      <td>Identity is <code>{cardId}_{locationId}</code>; supports multiple stores per tenant</td>
+    </tr>
+    <tr>
+      <td><code>buylist</code></td>
+      <td>Orders with <code>type='buy'</code></td>
+      <td>Quoted → Reviewed → Completed; tracks payment status and <code>Profit %</code></td>
+    </tr>
+    <tr>
+      <td><code>ledger</code></td>
+      <td>Credit owed per customer</td>
+      <td>Balance, total spending, <b>total sold</b>; keyed to an external customer id</td>
+    </tr>
+    <tr>
+      <td><code>shopify-sync</code></td>
+      <td>Products and prices out; stock in</td>
+      <td>One product per printing, <b>foil separate</b>; 5 condition variants; attributes as <b>tags</b>; two undefined metafields</td>
+    </tr>
+    <tr>
+      <td><code>api</code></td>
+      <td>Auth, tenancy, the public surface</td>
+      <td>Tenant in a JWT claim; 24h tokens; <b>one search endpoint serving two very different screens</b></td>
+    </tr>
+  </table>
+  </div>
+
+  <h3>Build order</h3>
+
+  <p>Dependency order, not importance order. Each step is demonstrable before the next begins.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Step</th><th>Modules</th><th>Demo you can show</th></tr>
+    <tr><td>1</td><td><code>catalogue</code> + <code>api</code> skeleton</td><td>Search cards by name in one tenant, get nothing from another tenant's data</td></tr>
+    <tr><td>2</td><td><code>pricing</code></td><td>Author a rule, get a live buy quote. Change the rule, quote changes instantly</td></tr>
+    <tr><td>3</td><td><code>inventory</code></td><td>Stock per location, and the sku identity holds</td></tr>
+    <tr><td>4</td><td><code>reprice</code></td><td>A nightly run that writes snapshots and reports how many rows moved</td></tr>
+    <tr><td>5</td><td><code>buylist</code> + <code>ledger</code></td><td>Quote, review, complete, and a credit balance that reconciles</td></tr>
+    <tr><td>6</td><td><code>shopify-sync</code></td><td>A card appears in a real Shopify store with the right variants and tags</td></tr>
+  </table>
+  </div>
+
+  <p><b>Pricing at step 2, before inventory.</b> That is deliberate and worth defending: pricing is the hard part and the reason the product exists. Build the risky thing while there is still time to be wrong about it.</p>
+
+  <h2>4. The schema, whole</h2>
+
+  <p>Collected from A02, A03 and A06, plus what the last two modules need.</p>
+
+  <pre><code>-- ── tenancy ────────────────────────────────────────────────
+tenant            id, name, slug
+location          id, tenant_id, name, external_ref
+app_user          id, tenant_id, email, role
+
+-- ── catalogue (reference data, shared across tenants) ──────
+game              id, name                     -- 19 of these
+card_set          id, game_id, code, name, released_at
+card              id, game_id, name, oracle_text, rarity, extended jsonb
+printing          id, card_id, set_id, collector_no, finish, image_url
+                                               -- finish: normal | foil
+sku               id, printing_id, condition   -- NM|LP|MP|HP|DMG
+                                               -- THE priced atom
+
+-- ── prices ────────────────────────────────────────────────
+market_price      sku_id, source, amount, as_of        -- the ONLY stored price
+price_rule        id, tenant_id, type, priority, active,
+                  filter jsonb, sell_pct, cash_pct, credit_pct
+pricing_setting   tenant_id, rounding_mode, rounding_step
+price_snapshot    sku_id, tenant_id, sell, buy_cash, buy_credit,
+                  rule_id, computed_at, published_at   -- a CACHE
+
+-- ── stock ─────────────────────────────────────────────────
+stock             sku_id, location_id, qty
+stock_movement    id, sku_id, location_id, delta, reason,
+                  order_id, origin, created_at         -- append-only
+
+-- ── orders, both directions ───────────────────────────────
+customer          id, tenant_id, email, external_customer_id
+order             id, tenant_id, type, customer_id, channel, status,
+                  location_id, quoted_total, accepted_total,
+                  payout_method, payment_ref, payment_status,
+                  submitted_at, reviewed_at, completed_at
+order_line        id, order_id, sku_id, qty, quoted_unit, quoted_rule_id,
+                  accepted_unit, accepted_sku_id, reject_reason
+
+-- ── money owed ────────────────────────────────────────────
+credit_account    customer_id, tenant_id, balance, updated_at   -- a CACHE
+credit_entry      id, customer_id, amount, reason, order_id,
+                  actor, created_at                    -- append-only, THE TRUTH
+
+-- ── the sync ──────────────────────────────────────────────
+sync_link         sku_id, tenant_id, shopify_variant_gid,
+                  shopify_product_gid, last_pushed_at
+sync_outbox       id, tenant_id, entity, entity_id, op,
+                  payload jsonb, status, attempts, created_at
+</code></pre>
+
+  <div class="tip">
+    <span class="label">Three tables carry the whole design</span>
+    <b><code>market_price</code> is the only stored price.</b> If a second price column appears anywhere that is not <code>price_snapshot</code>, the derived model has leaked and you now have two truths.<br><br>
+    <b><code>credit_entry</code> is append-only and <code>credit_account.balance</code> is a cache.</b> The balance must be rebuildable by summing entries, because the question is always "how did it get there".<br><br>
+    <b><code>sync_outbox</code> exists so a push is replayable rather than fire-and-forget.</b> Without it, a failed sync is invisible and unrecoverable.
+  </div>
+
+  <h2>5. Multi-tenancy — decide it on day one</h2>
+
+  <p>Notice which tables carry <code>tenant_id</code> and which do not.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Shared across tenants</th><th>Per tenant</th></tr>
+    <tr><td>What</td><td><code>game</code>, <code>card_set</code>, <code>card</code>, <code>printing</code>, <code>sku</code>, <code>market_price</code></td><td>Rules, stock, orders, customers, credit, sync links</td></tr>
+    <tr><td>Why</td><td>A card is the same card in every shop. Storing it per tenant would multiply 1.12M rows by every customer you win</td><td>Prices, stock and money are opinions and possessions, never shared</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The one that bites</span>
+    Shared reference data plus per-tenant everything else means <b>every query that touches both must be filtered</b>, and the filter is easy to forget on a join. One missing <code>WHERE tenant_id = ?</code> shows a shop its competitor's stock or its competitor's margins. Enforce it below the query layer — Postgres <b>row-level security</b>, or a repository base class that refuses to build a statement without a tenant scope. <b>Do not rely on remembering.</b> The real system carries the tenant in a JWT claim (<code>custom:company</code>), which is the right instinct: the tenant should arrive with the request, not be passed around as an argument someone can drop.
+  </div>
+
+  <h2>6. Module notes worth writing down</h2>
+
+  <h3><code>pricing</code> — the evaluator is a pure function</h3>
+
+  <p>Everything in A03 §9, with one addition: keep the evaluator <b>pure</b>. Rules and market price in, prices out, no database access inside. That is what makes it testable against the real observed values in §8 below, and it is what lets the same code serve a live API call and a million-row batch.</p>
+
+  <pre><code>// pure. no I/O. this is the whole product, in one function.
+quote(input: {
+  market: Decimal,
+  sku: { condition: Condition, finish: Finish, rarity: string },
+  stockQty: number,
+  rules: PriceRule[],
+  setting: PricingSetting,
+}): { sell?: Money, cash?: Money, credit?: Money, ruleId?: string, reason?: NoOfferReason }
+</code></pre>
+
+  <p>Note <code>reason</code>. "No offer" has two causes — <b>the shop declined</b> and <b>we have no market price</b> — and they must be distinguishable even though the customer sees one message. Someone will ask how many cards fall in each bucket, and you want to answer without a migration.</p>
+
+  <h3><code>reprice</code> — the job that must finish</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Rule</th><th>Why</th></tr>
+    <tr><td>Only re-evaluate skus whose market price moved, or that have stock, or whose tenant edited a rule</td><td>~96% of the catalogue did not move. Evaluating it all is almost entirely wasted work</td></tr>
+    <tr><td>Write the whole run to <code>price_snapshot</code>, then hand the <b>changed set</b> to the sync</td><td>The sync should push differences, not everything</td></tr>
+    <tr><td>Record how many rows moved and by how much</td><td>That count is your best health signal. A sudden zero, or a sudden million, both mean the feed broke</td></tr>
+    <tr><td>A rule edit invalidates its matched set, not the whole catalogue</td><td>An owner changing one rule at 4pm should not trigger a full run</td></tr>
+  </table>
+  </div>
+
+  <h3><code>shopify-sync</code> — build it to match what they actually did</h3>
+
+  <p>This is where A02's observations become code. Reproduce their mapping exactly, because it is the acceptance test:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Your data</th><th>Shopify</th></tr>
+    <tr><td>One <code>printing</code></td><td>One <b>product</b>. A foil printing is <b>its own product</b>, title suffixed <code> - Foil</code></td></tr>
+    <tr><td>The 5 <code>sku</code> rows for that printing</td><td>5 <b>variants</b> on one option axis, <code>Condition</code></td></tr>
+    <tr><td><code>game.name</code></td><td><code>productType</code></td></tr>
+    <tr><td><code>location.name</code></td><td><code>vendor</code> — yes, really. And a <code>LocationId: …</code> tag</td></tr>
+    <tr><td>set, rarity, finish, location</td><td><b>Tags</b>, not metafields</td></tr>
+    <tr><td><code>card.oracle_text</code></td><td><code>descriptionHtml</code></td></tr>
+    <tr><td><code>sku.id</code> + <code>location.id</code></td><td>Variant <code>sku</code> as <code>{cardId}_{locationId}</code></td></tr>
+    <tr><td>Snapshot <code>sell</code></td><td>Variant <code>price</code></td></tr>
+    <tr><td>Snapshot <code>buy_cash</code>, <code>buy_credit</code></td><td><b>Variant</b> metafields — the slot the real system leaves empty</td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Two of those are worth arguing about</span>
+    <b><code>vendor</code> = location name</b> is a misuse of the field, and you should say so while also saying you would keep it. It is load-bearing for someone's saved filters by now. Add the proper <code>LocationId:</code> tag alongside and treat <code>vendor</code> as legacy.<br><br>
+    <b>Buy price must go on the <b>variant</b>, not the product.</b> Each condition is a separate variant with its own id, so a product-level field cannot express "NM cash price" and "DMG cash price" at once. This is not a preference — a product-level field makes per-condition quoting impossible.
+  </div>
+
+  <h3><code>api</code> — one endpoint, two screens</h3>
+
+  <p>The real system serves both the buy list and the full card page from a single <code>/inventory/search</code>. That is a good decision and worth copying, but it has a cost you should name: <b>the buy list needs ten prices per card and the card page needs one</b>. Serve both from one endpoint and either the card page over-fetches or the buy list under-fetches.</p>
+
+  <p>Solve it with a <b>field-selection parameter</b> rather than two endpoints. Two endpoints drift; a projection parameter cannot.</p>
+
+  <h2>7. What you would do differently — and say so</h2>
+
+  <p>An interviewer asking you to describe their system is also asking whether you can critique it without being rude. Four things, each with the reason it was probably done that way.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>They did</th><th>I would</th><th>But their choice makes sense because</th></tr>
+    <tr>
+      <td>Card attributes as <b>tags</b></td>
+      <td><b>Metafields</b> with definitions, so they are typed and filterable properly</td>
+      <td>Tags work on every Shopify plan, need no definition step, and every search app indexes them. Metafields need setup per store — across hundreds of tenants that is a support burden</td>
+    </tr>
+    <tr>
+      <td>Two metafields with <b>no definitions</b></td>
+      <td>Define them, so they are visible and typed</td>
+      <td>An app can write undefined metafields with no setup at all. It is invisible to a definitions query, which is a real trap — but it is also zero-friction</td>
+    </tr>
+    <tr>
+      <td><code>vendor</code> holding a location name</td>
+      <td>A tag, and leave <code>vendor</code> for a real vendor</td>
+      <td>It was probably the only free top-level field that shows up in Shopify's default filters</td>
+    </tr>
+    <tr>
+      <td>Only <b>one</b> of three option slots used</td>
+      <td>Nothing. This is correct</td>
+      <td>Foil is a physically different printing, not a state of the same card. Splitting it into products is more right than a variant axis, and it keeps two slots free</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The move that lands</span>
+    Give the reason <b>before</b> the criticism. "Tags work on every plan and need no per-store setup, which across hundreds of merchants is a real support saving — I'd still want definitions for the filterable ones, because rarity casing is already inconsistent and you can't safely branch on it." That is a colleague talking. "You should have used metafields" is a candidate talking.
+  </div>
+
+  <h2>8. The runnable proof</h2>
+
+  <p>Not the whole platform. One function, and the four real numbers it has to face. This is a ninety-minute exercise and it is the highest-value ninety minutes in Part A, because it ends with you having <b>tested a claim about their system</b>.</p>
+
+  <h3>The evaluator</h3>
+
+  <pre><code>type Condition = 'NM' | 'LP' | 'MP' | 'HP' | 'DMG';
+type RuleType  = 'sell' | 'buy' | 'stop_buy';
+
+interface PriceRule {
+  id: string;
+  type: RuleType;
+  priority: number;            // lower wins
+  active: boolean;
+  filter: {
+    marketMin?: number; marketMax?: number;
+    conditions?: Condition[];
+    finishes?: ('normal' | 'foil')[];
+    rarities?: string[];
+    stockMin?: number; stockMax?: number;
+  };
+  cashPct?: number;            // buy only
+  creditPct?: number;          // buy only
+}
+
+interface Setting { roundingMode: 'none' | 'nearest' | 'down' | 'up'; roundingStep: number; }
+
+type NoOffer = 'no_market_price' | 'stop_buy' | 'no_matching_rule';
+
+function matches(r: PriceRule, market: number, sku: Sku, stockQty: number): boolean {
+  const f = r.filter;
+  if (f.marketMin  !== undefined && market   <  f.marketMin) return false;
+  if (f.marketMax  !== undefined && market   >  f.marketMax) return false;
+  if (f.stockMin   !== undefined && stockQty <  f.stockMin)  return false;
+  if (f.stockMax   !== undefined && stockQty >  f.stockMax)  return false;
+  if (f.conditions && !f.conditions.includes(sku.condition)) return false;
+  if (f.finishes   && !f.finishes.includes(sku.finish))      return false;
+  if (f.rarities   && !f.rarities.includes(sku.rarity))      return false;
+  return true;
+}
+
+function round(v: number, s: Setting): number {
+  if (s.roundingMode === 'none' || !s.roundingStep) return r2(v);
+  const n = v / s.roundingStep;
+  const k = s.roundingMode === 'down' ? Math.floor(n)
+          : s.roundingMode === 'up'   ? Math.ceil(n)
+          :                             Math.round(n);
+  return r2(k * s.roundingStep);
+}
+const r2 = (v: number) => Math.round(v * 100) / 100;
+
+// The finding from A03 §7, encoded as a seam.
+// KNOWN WRONG by ~11% on the one card ever tested. When someone runs the
+// 200-row experiment, THIS is the only function that changes.
+function pricingBase(market: number): number {
+  return market;
+}
+
+function quoteBuy(
+  market: number | null, sku: Sku, stockQty: number,
+  rules: PriceRule[], setting: Setting,
+): { cash: number; credit: number; ruleId: string } | { noOffer: NoOffer } {
+  if (market === null) return { noOffer: 'no_market_price' };
+
+  const active = rules.filter(r => r.active);
+
+  // 1. the veto runs FIRST. it is not a competitor.
+  if (active.some(r => r.type === 'stop_buy' && matches(r, market, sku, stockQty)))
+    return { noOffer: 'stop_buy' };
+
+  // 2. then the buy rules
+  const buys = active
+    .filter(r => r.type === 'buy' && matches(r, market, sku, stockQty))
+    .sort((a, b) => a.priority - b.priority);
+
+  if (buys.length === 0) return { noOffer: 'no_matching_rule' };
+
+  const rule = buys[0];
+  const base = pricingBase(market);
+  return {
+    cash:   round(base * (rule.cashPct!   / 100), setting),
+    credit: round(base * (rule.creditPct! / 100), setting),
+    ruleId: rule.id,
+  };
+}
+</code></pre>
+
+  <h3>The tests that matter</h3>
+
+  <pre><code>const LP_FOIL_OVER_5: PriceRule = {
+  id: 'r1', type: 'buy', priority: 10, active: true,
+  filter: { marketMin: 5, conditions: ['LP'], finishes: ['foil'] },
+  cashPct: 10, creditPct: 15,
+};
+const NO_ROUNDING: Setting = { roundingMode: 'none', roundingStep: 0 };
+
+it('refuses a card with no matching rule', () => {
+  const nmFoil = { condition: 'NM', finish: 'foil', rarity: 'rare' };
+  expect(quoteBuy(34.02, nmFoil, 0, [LP_FOIL_OVER_5], NO_ROUNDING))
+    .toEqual({ noOffer: 'no_matching_rule' });
+});
+// ^ THE INVERSION. The Near Mint card — the BETTER card — gets nothing,
+//   because the rule is filtered to LP. Real observed behaviour.
+
+it('stop_buy beats a matching buy rule', () => {
+  const stop: PriceRule = { id: 'r0', type: 'stop_buy', priority: 999,
+                            active: true, filter: { finishes: ['foil'] } };
+  const lpFoil = { condition: 'LP', finish: 'foil', rarity: 'rare' };
+  expect(quoteBuy(34.02, lpFoil, 0, [LP_FOIL_OVER_5, stop], NO_ROUNDING))
+    .toEqual({ noOffer: 'stop_buy' });
+});
+// ^ note the priority: 999. The veto wins ANYWAY. That is the point.
+
+it('applies the rule at the documented ratio', () => {
+  const lpFoil = { condition: 'LP', finish: 'foil', rarity: 'rare' };
+  const q = quoteBuy(34.02, lpFoil, 0, [LP_FOIL_OVER_5], NO_ROUNDING) as any;
+  expect(q.credit / q.cash).toBeCloseTo(1.5, 5);   // 15/10 = 2:3. PASSES.
+});
+
+it('DOES NOT reproduce the real observed price — and that is the finding', () => {
+  const lpFoil = { condition: 'LP', finish: 'foil', rarity: 'rare' };
+  const q = quoteBuy(34.02, lpFoil, 0, [LP_FOIL_OVER_5], NO_ROUNDING) as any;
+
+  expect(q.cash).toBe(3.40);      // what OUR rule maths gives
+  expect(q.credit).toBe(5.10);
+
+  const REAL_CASH = 3.03;         // what the live API actually returned
+  const REAL_CREDIT = 4.54;
+
+  expect(q.cash).not.toBe(REAL_CASH);
+  expect(REAL_CREDIT / REAL_CASH).toBeCloseTo(1.5, 2);   // ratio still 2:3!
+  expect(REAL_CASH / 0.10).toBeCloseTo(30.28, 1);        // implied base != 34.02
+});
+</code></pre>
+
+  <div class="soundbite">
+    <span class="label">Why that last test is the point of the whole lesson</span>
+    <p>It is a test that <b>asserts your own model is wrong</b>, and pins down exactly how. The ratio passes, the absolute value fails, and the implied base is off by 11% — so the rule engine is right and the input is different. That is a finding, written as code, that will not rot.</p>
+  </div>
+
+  <h3>Then, if you have another hour</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Extension</th><th>What it teaches</th></tr>
+    <tr><td>Add <code>quoteSell</code> and assert the condition ladder 100/80/60/40/37% of NM</td><td>The ladder is verified for retail. Whether <b>buy</b> follows it is an <span class="pill alt">inference</span> at n=3 — write the test as <code>it.skip</code> with a comment saying why</td></tr>
+    <tr><td>Add rounding and re-run the failing test at <code>step: 0.05</code> and <code>0.25</code></td><td>Whether rounding could account for any of the 11% gap. It cannot account for all of it — prove that</td></tr>
+    <tr><td>A <code>reprice</code> job over 10,000 fake skus where only 4% have moved</td><td>The filtering that makes the batch finish, and the moved-row count as a health signal</td></tr>
+    <tr><td>The credit ledger with an idempotent <code>complete()</code></td><td>The most expensive bug in the system, and its test</td></tr>
+  </table>
+  </div>
+
+  <h2>9. What to say in two minutes</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Beat</th><th>Content</th></tr>
+    <tr><td><b>Frame</b></td><td>"It's a pricing engine with a catalogue attached, not the other way round"</td></tr>
+    <tr><td><b>Modules</b></td><td>Eight: catalogue, pricing, reprice, inventory, buylist, ledger, shopify-sync, api. Build pricing second, before inventory, because it is the risky part</td></tr>
+    <tr><td><b>Hard parts</b></td><td>Derived prices at a million rows · two systems writing one stock number · one credit balance spendable in two places</td></tr>
+    <tr><td><b>Tenancy</b></td><td>Catalogue shared, everything else per tenant, and the tenant arrives in the token rather than being passed around</td></tr>
+    <tr><td><b>Proof</b></td><td>"I wrote the evaluator and tested it against your real numbers. The ratio reproduces exactly. The absolute value doesn't — you're pricing off a base you don't expose"</td></tr>
+  </table>
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"whiteboard the rebuild with me"</b> — I talk, you interrupt with the follow-ups an interviewer would ask.</p>
+    <p><b>"review my evaluator"</b> — paste the function, get it picked apart.</p>
+    <p><b>"argue that tags were the wrong choice"</b> — and make me defend both sides.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0010-the-buy-list-and-the-ledger.html">← A06: buy list and ledger</a></span>
+    <span><a href="0008-the-experience-gap.html">Part B → B01: the experience gap</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Which tables should carry a tenant_id, and which should not?',
+    options: [
+      'Everything should carry it — it is safer',
+      'Catalogue reference data is shared; rules, stock, orders, customers and credit are per tenant',
+      'Only orders and credit, since those are the money tables',
+      'Nothing should — use a separate database per tenant'
+    ],
+    answer: 1,
+    why: 'A card is the same card in every shop, so duplicating 1.12M catalogue rows per customer is waste that grows with every sale you make. Prices, stock and money are opinions and possessions and must never be shared. Tenanting everything is not safer, it is expensive. A database per tenant is a legitimate architecture but it makes the shared 1.12M catalogue the problem instead.'
+  },
+  {
+    q: 'Why build the pricing module second, before inventory?',
+    options: [
+      'Because inventory depends on pricing',
+      'Because pricing is the hard, risky part and the reason the product exists — build the thing you might be wrong about while there is still time to be wrong',
+      'Because inventory is harder and needs more design',
+      'Because Shopify sync needs prices first'
+    ],
+    answer: 1,
+    why: 'Inventory does not depend on pricing, and inventory is well-understood work you can schedule. The derived-price model at a million rows is the part that could be wrong in a way that reshapes the schema, so it belongs early while changing your mind is still cheap. Sync needs prices eventually but it is step six.'
+  },
+  {
+    q: 'Why must the buy price land on a variant metafield rather than a product metafield?',
+    options: [
+      'Product metafields are not readable from the storefront',
+      'Because each condition is a separate variant with its own card id, so a product-level field cannot hold NM and DMG prices at the same time',
+      'Because variant metafields are cheaper to write',
+      'Because product metafields have a lower size limit'
+    ],
+    answer: 1,
+    why: 'This is a structural impossibility, not a preference. Five conditions are five variants, each with its own card id in the SKU, and each needs its own cash and credit price. One value on the product cannot express five. Product metafields are perfectly readable from the storefront, so the first option is false.'
+  },
+  {
+    q: 'In the evaluator, why does the stop_buy check run before buy rules are sorted by priority?',
+    options: [
+      'Because stop_buy rules are usually fewer, so it is faster',
+      'Because it is a veto — if it competed on priority, a buy rule with a lower number would silently defeat the shop’s explicit refusal to buy',
+      'Because stop_buy rules have no percentages',
+      'Because the rounding step must be applied afterwards'
+    ],
+    answer: 1,
+    why: 'The test in section 8 gives the stop rule priority 999 — the worst possible — and it still wins, which is the whole point. A refusal that can be outranked is not a refusal. Speed is irrelevant at this scale, and having no percentages is a consequence of being a veto rather than a reason for the ordering.'
+  },
+  {
+    q: 'What is the purpose of keeping pricingBase() as its own one-line function that just returns market?',
+    options: [
+      'It makes the code easier to read',
+      'It is the seam where a known-wrong assumption is isolated, so the 11% discrepancy can be fixed in exactly one place when someone measures it properly',
+      'It allows caching of the market price',
+      'It lets each tenant override the base'
+    ],
+    answer: 1,
+    why: 'The real buy price implies a base of about A$30.28 where the API exposes A$34.02, so returning market is known to be wrong by roughly 11% on the one card tested. Isolating that behind a named function turns an unknown into a single changeable line, and the comment records what is known. Per-tenant override may become true later but it is not why the seam exists today.'
+  },
+  {
+    q: 'Which criticism of their Shopify mapping should you NOT make?',
+    options: [
+      'That card attributes as tags lose type safety and have inconsistent casing',
+      'That the two metafields having no definitions makes them invisible to a definitions query',
+      'That vendor holding a location name misuses the field',
+      'That using only one of three option slots wastes the variant model'
+    ],
+    answer: 3,
+    why: 'Using one slot is correct, not wasteful. A foil is a physically different printing rather than a different state of the same card, so making it a separate product is more right than adding a variant axis — and it leaves two slots free. The other three are fair criticisms, and each should be delivered with the reason their choice made sense first.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"If you had to rebuild our platform, where would you start?" — the capstone question.',
+    answer: 'I would frame it first, because the framing decides the build order. <b>It is a pricing engine with a catalogue attached, not a catalogue with prices attached.</b> Almost everything hard about it comes from prices being <b>derived</b> rather than stored.<br><br>Eight modules: <b>catalogue, pricing, reprice, inventory, buylist, ledger, shopify-sync, api</b>. Most of that is ordinary work you can schedule. <b>Three</b> parts are genuinely hard — derived prices at a million rows, two systems writing one stock number, and one credit balance spendable in two places.<br><br>Build order: catalogue and an API skeleton, then <b>pricing second — before inventory</b>. That is deliberate. Pricing is the risky part and the reason the product exists, so I want to be wrong about it while being wrong is still cheap. Inventory is well-understood work.<br><br>On tenancy: the <b>catalogue is shared</b> across tenants, because a card is the same card in every shop and duplicating 1.12 million rows per customer gets worse every time you win one. Rules, stock, orders, customers and credit are <b>per tenant</b>. And I would have the tenant arrive <b>in the token</b> rather than being passed as an argument, with row-level security underneath — because one forgotten filter on a join shows a shop its competitor\'s margins.'
+  },
+  {
+    prompt: '"What would you have done differently?" — the trap where candidates get rude.',
+    answer: 'Three things, and one where I think you were right and I would have been wrong.<br><br>Card attributes arrive as <b>tags</b> rather than metafields, so they are untyped — and the rarity casing is already inconsistent, <code>mythic</code> in one place and <code>R</code> in another, which means you cannot safely branch on it. But tags work on every Shopify plan, need no definition step, and every search app indexes them. Across hundreds of merchants, metafield setup per store is a real support burden. So I would want definitions for the <b>filterable</b> ones and leave the rest as tags.<br><br>The two metafields have <b>no definitions</b>, which makes them invisible to a definitions query — a genuine trap that already caught someone. But undefined metafields need zero setup, which is presumably the point.<br><br><code>vendor</code> holds a location name, which is a misuse. I would still keep it, because it is load-bearing for someone\'s saved filters by now — add the proper tag alongside and treat <code>vendor</code> as legacy.<br><br>And the one I would have got wrong: using only <b>one</b> of the three option slots, with foil as a separate product. My instinct would have been condition × finish as two axes. Yours is better — a foil is a physically different printing, not a state of the same card — and it keeps two slots free.'
+  },
+  {
+    prompt: 'Draw the evaluator from memory, and name the seam.',
+    answer: 'Seven steps, and the order carries the design.<br><br><b>Market price</b> first — none means no offer. <b>Stop-buy veto</b> second, before anything is sorted, because a refusal that can be outranked is not a refusal. In my test I give the stop rule the worst possible priority and it still wins; that is the point. <b>Buy rules</b> third — none matching is also no offer, but a <b>different reason</b>, and I keep them distinct even though the customer sees one message, because someone will ask how many cards we refuse versus how many we lack prices for.<br><br>Fourth, <b>pick by explicit priority integer</b>. Most-specific-wins is prettier but "specific" is undefinable across six filter axes, and money-path code should be boring.<br><br>Fifth is the interesting one. Apply the percentages to <code>pricingBase(market)</code> — <b>a one-line function that just returns market, and is known to be wrong.</b> The real card implies a base of about A$30.28 where the API shows A$34.02, an 11% gap. That seam is the whole finding: when someone finally runs a two-hundred-row experiment, <b>exactly one function changes</b>.<br><br>Sixth, <b>round</b> per tenant setting. Seventh, return the numbers <b>with the rule id</b>, because the question is never "what is the price", it is "why is it that".<br><br>And the evaluator is <b>pure</b> — no database inside. That is what lets the same code serve one live API call and a million-row batch.'
+  },
+  {
+    prompt: 'Which single test would you show them, and why that one?',
+    answer: 'The one that <b>asserts my own model is wrong</b>.<br><br>I take the real rule — market ≥ $5, condition LP, foil, cash 10% and credit 15% — and the real card at a market price of A$34.02. My maths gives A$3.40 and A$5.10. The live API actually returned <b>A$3.03 and A$4.54</b>.<br><br>So the test asserts three things. That my numbers are 3.40 and 5.10. That they are <b>not</b> the real ones. And then the two facts that make it useful: the real ratio is <b>still exactly 2:3</b>, matching the rule to the cent, and the implied base is <b>A$30.28</b>, not the A$34.02 you expose.<br><br>I would show that one because of what it proves about the system rather than about me. The <b>rule engine is correct</b> — the percentages are applied precisely. What differs is the <b>input</b>: you price off a market figure you do not publish, probably something more conservative than the display price.<br><br>And it is one card. n equals one. So I would want about two hundred rows before I said it with any confidence — that is an afternoon, and I would happily do it. But a failing test that pins down <i>how</i> you are wrong is worth more than a passing one that only confirms what you already assumed.'
+  }
+]);
+</script>

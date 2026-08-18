@@ -1,0 +1,640 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Events &amp; controlled inputs — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 2 · Lesson 1 · State &amp; events</p>
+  <h1>Events &amp; controlled inputs</h1>
+  <p class="subtitle">How a keystroke becomes state — and why React wants to own the value of every input.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll be able to <b>(1)</b> wire up any event with a correctly typed handler, <b>(2)</b> explain <b>controlled vs uncontrolled</b> inputs and say which one you'd pick and why, and <b>(3)</b> drive a whole form from one piece of state. This is the month where React stops being read-only and starts taking input.
+  </div>
+
+  <p>Month 1 ended with a card you could click. That is one event and one number. A real app takes <em>typing</em>, and typing is where beginners lose the plot. The screen has its own idea of what is in the text box. React has its own idea. When those two disagree, you get the classic bug: <b>"I type and nothing appears."</b></p>
+  <p>This lesson fixes that for good, from first principles.</p>
+
+  <h2>First principle — an event is a message, state is the memory</h2>
+  <p>The browser tells you something happened. It tells you <b>once</b>. A click, a keypress, a change — each one is a message that arrives, gets handled, and is gone.</p>
+  <p>Now put that next to <code>UI = f(state)</code>. The screen shows <b>state</b>. So an event that does not end in a state update changes nothing that anyone can see.</p>
+
+  <div class="soundbite">
+    <span class="label">The job of every event handler</span>
+    <p>An event handler has one real job: <b>turn a moment into memory.</b> Read what the user did, then put it in state. The handler is the door; state is the room.</p>
+  </div>
+
+  <h2>Passing a handler — the shape that always works</h2>
+  <p>You pass the <b>function itself</b>. React calls it later, when the event happens.</p>
+
+  <pre><code>function DeleteButton() {
+  function handleClick() {
+    console.log('clicked');
+  }
+
+  return &lt;button onClick={handleClick}&gt;Delete&lt;/button&gt;;   <span class="cmt">// no parentheses</span>
+}</code></pre>
+
+  <p>When you need to pass an argument, wrap it in an inline arrow function. That arrow is the thing React calls; your real function runs inside it.</p>
+
+  <pre><code><span class="cmt">// WRONG — this calls handleDelete during render, on every render</span>
+&lt;button onClick={handleDelete(task.id)}&gt;✕&lt;/button&gt;
+
+<span class="cmt">// RIGHT — React calls the arrow on click, the arrow calls your function</span>
+&lt;button onClick={() =&gt; handleDelete(task.id)}&gt;✕&lt;/button&gt;</code></pre>
+
+  <div class="trap">
+    <span class="label">Why the wrong one is so bad</span>
+    <code>onClick={handleDelete(task.id)}</code> runs <em>during render</em> and passes the <b>return value</b> to <code>onClick</code>. If <code>handleDelete</code> sets state, that render sets state, which causes a render, which sets state again. You get an infinite loop, and the error message rarely points at this line.
+  </div>
+
+  <h2>Typing events — let TypeScript do it for you</h2>
+  <p>Every React handler receives one argument: the event object. It is a React <b>SyntheticEvent</b> — a thin wrapper over the native event, with the same API in every browser.</p>
+  <p>Here is the part people over-work. If you write the handler <b>inline in JSX</b>, TypeScript already knows the type. You annotate nothing.</p>
+
+  <pre><code><span class="cmt">// e is inferred as React.ChangeEvent&lt;HTMLInputElement&gt; — no annotation needed</span>
+&lt;input value={query} onChange={(e) =&gt; setQuery(e.target.value)} /&gt;</code></pre>
+
+  <p>You only write the type when you <b>pull the handler out</b> of the JSX, because then there is no context to infer from:</p>
+
+  <pre><code>function handleChange(e: React.ChangeEvent&lt;HTMLInputElement&gt;) {
+  setQuery(e.target.value);
+}
+
+function handleSubmit(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+  e.preventDefault();
+  <span class="cmt">// ...</span>
+}
+
+function handleClick(e: React.MouseEvent&lt;HTMLButtonElement&gt;) {
+  <span class="cmt">// ...</span>
+}</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>You are handling</th><th>Type</th><th>The value you want</th></tr></thead>
+    <tbody>
+      <tr><td>Text input, textarea, select</td><td><code>React.ChangeEvent&lt;HTMLInputElement&gt;</code></td><td><code>e.target.value</code> — always a <b>string</b></td></tr>
+      <tr><td>Checkbox</td><td><code>React.ChangeEvent&lt;HTMLInputElement&gt;</code></td><td><code>e.target.checked</code> — a boolean</td></tr>
+      <tr><td>Form submit</td><td><code>React.FormEvent&lt;HTMLFormElement&gt;</code></td><td>nothing — call <code>e.preventDefault()</code></td></tr>
+      <tr><td>Click</td><td><code>React.MouseEvent&lt;HTMLButtonElement&gt;</code></td><td><code>e.currentTarget</code>, or nothing at all</td></tr>
+      <tr><td>Keyboard</td><td><code>React.KeyboardEvent&lt;HTMLInputElement&gt;</code></td><td><code>e.key</code> — e.g. <code>'Enter'</code>, <code>'Escape'</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">One trap worth naming now</span>
+    A number input still gives you a <b>string</b>. <code>e.target.value</code> for <code>&lt;input type="number" /&gt;</code> is <code>"42"</code>, not <code>42</code>. Convert on the way into state: <code>setAge(Number(e.target.value))</code>. TypeScript will not catch this for you, because the string type is correct — it is your <em>meaning</em> that is wrong.
+  </div>
+
+  <h2>The form, and why <code>preventDefault</code> exists</h2>
+  <p>A submit button inside a <code>&lt;form&gt;</code> makes the browser reload the page and send the data itself. That is the default behaviour from before JavaScript existed. In a React app you want to keep the page and handle the data yourself.</p>
+
+  <pre><code>&lt;form onSubmit={handleSubmit}&gt;
+  &lt;input value={title} onChange={(e) =&gt; setTitle(e.target.value)} /&gt;
+  &lt;button type="submit"&gt;Add&lt;/button&gt;
+&lt;/form&gt;</code></pre>
+
+  <p>Use a real <code>&lt;form&gt;</code> with <code>onSubmit</code>, not a button with <code>onClick</code>. You get two things free: <b>Enter submits</b>, and screen readers announce it as a form. That is accessibility you did not have to write.</p>
+
+  <h2>Bubbling — the bug in every clickable row</h2>
+  <p>A React event travels <b>up</b> the tree. Click the ✕ inside a row, and the ✕'s handler runs, then the row's handler runs, then the row's parent's, and so on.</p>
+  <p>That is why this delete button also opens the task you just deleted:</p>
+
+  <pre><code>&lt;li onClick={() =&gt; openTask(task.id)}&gt;
+  {task.title}
+  &lt;button onClick={() =&gt; deleteTask(task.id)}&gt;✕&lt;/button&gt;   <span class="cmt">// deletes AND opens</span>
+&lt;/li&gt;</code></pre>
+
+  <p>The fix is to stop the message travelling further:</p>
+
+  <pre><code>&lt;button onClick={(e) =&gt; { e.stopPropagation(); deleteTask(task.id); }}&gt;✕&lt;/button&gt;</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Method</th><th>What it stops</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td><code>e.preventDefault()</code></td><td>The browser's built-in action (form reload, link navigation)</td><td>Form submit, custom link behaviour</td></tr>
+      <tr><td><code>e.stopPropagation()</code></td><td>The event reaching parent handlers</td><td>A button inside a clickable card or row</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>They are not the same thing, and interviewers like the difference. One stops the <b>browser</b>. The other stops the <b>tree</b>.</p>
+
+  <h2>Controlled inputs — the heart of this lesson</h2>
+  <p>Now the big idea. An <code>&lt;input&gt;</code> in the DOM has its own memory. You type, and the DOM element stores your text on its own, with no help from React. That is a <b>second source of truth</b>, sitting right next to your state.</p>
+  <p>React gives you two choices about that.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th></th><th>Uncontrolled</th><th>Controlled</th></tr></thead>
+    <tbody>
+      <tr><td>Who owns the value</td><td>The DOM element</td><td>Your React state</td></tr>
+      <tr><td>What you write</td><td><code>defaultValue="hi"</code></td><td><code>value={text} onChange={...}</code></td></tr>
+      <tr><td>To read it</td><td>Later, with a ref or the form data</td><td>It is already in state, right now</td></tr>
+      <tr><td>Re-renders while typing</td><td>No</td><td>Yes — one per keystroke</td></tr>
+      <tr><td>Can you react to each keystroke?</td><td>No</td><td>Yes — filter, validate, format, disable</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>A <b>controlled</b> input is one where the value you see is computed from state on every render:</p>
+
+  <pre><code>const [query, setQuery] = useState('');
+
+&lt;input
+  value={query}                                   <span class="cmt">// state decides what is shown</span>
+  onChange={(e) =&gt; setQuery(e.target.value)}      <span class="cmt">// typing updates state</span>
+/&gt;</code></pre>
+
+  <p>Follow one keystroke all the way around the loop. This is the whole mechanism:</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 330" role="img" aria-labelledby="fig7-title" width="640" height="330">
+      <title id="fig7-title">One keystroke in a controlled input: onChange reads the value, state updates, the re-render writes the value back into the input</title>
+
+      <rect x="70" y="20" width="330" height="48" rx="8" style="fill: var(--accent-2); stroke: none;"></rect>
+      <text x="235" y="40" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 12px; font-weight: 700;">1 · You press a key</text>
+      <text x="235" y="57" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px;">the DOM input briefly holds the new text</text>
+
+      <rect x="70" y="96" width="330" height="48" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="235" y="116" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">2 · onChange fires</text>
+      <text x="235" y="133" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">you read e.target.value</text>
+
+      <rect x="70" y="172" width="330" height="48" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="235" y="192" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">3 · setQuery(value)</text>
+      <text x="235" y="209" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">state changes → React re-renders</text>
+
+      <rect x="70" y="248" width="330" height="48" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="235" y="268" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">4 · value={query}</text>
+      <text x="235" y="285" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">React writes state back into the input</text>
+
+      <line x1="235" y1="68" x2="235" y2="94" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a7)"></line>
+      <line x1="235" y1="144" x2="235" y2="170" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a7)"></line>
+      <line x1="235" y1="220" x2="235" y2="246" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a7)"></line>
+
+      <path d="M400,272 L470,272 L470,44 L402,44" style="fill: none; stroke: var(--accent-2); stroke-width: 1.8; stroke-dasharray: 4 3;" marker-end="url(#a7o)"></path>
+      <text x="484" y="150" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">what you see on</text>
+      <text x="484" y="164" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">screen is always</text>
+      <text x="484" y="178" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">state — never the</text>
+      <text x="484" y="192" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">raw typing</text>
+
+      <text x="320" y="318" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-style: italic;">the loop runs once per keystroke — state is the only source of truth</text>
+
+      <defs>
+        <marker id="a7" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+        <marker id="a7o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>A controlled input never shows your typing directly. It shows state — which your typing happened to update a millisecond ago.</figcaption>
+  </div>
+
+  <p>Once you see step 4, the famous bug explains itself. Write <code>value={query}</code> and <b>forget <code>onChange</code></b>, and the input becomes read-only:</p>
+
+  <pre><code><span class="cmt">// BROKEN — you can type, but nothing appears</span>
+&lt;input value={query} /&gt;</code></pre>
+
+  <p>You press a key. Nothing updates state. React re-renders sooner or later and writes <code>query</code> — still <code>''</code> — back into the input. Your keystroke is erased by the very next render. React even warns you in the console about it.</p>
+
+  <div class="trap">
+    <span class="label">The other half of the same bug</span>
+    <code>value={undefined}</code> makes an input <b>uncontrolled</b>. So <code>value={user.name}</code> where <code>name</code> is missing gives you an input that works fine — until data arrives and React flips it to controlled, wiping what the user typed. Use <code>value={user.name ?? ''}</code>. An input's value should never be <code>null</code> or <code>undefined</code>.
+  </div>
+
+  <h2>When uncontrolled is the right answer</h2>
+  <p>Controlled is the default in this course, because it makes state the single source of truth. But uncontrolled is not a mistake — it is a trade.</p>
+  <ul>
+    <li><b>File inputs must be uncontrolled.</b> <code>&lt;input type="file" /&gt;</code> has a read-only value, for security. You cannot set it from state.</li>
+    <li><b>Big forms.</b> Controlled means one re-render per keystroke. On a 40-field form that starts to cost. Month 9 covers form libraries that keep values out of React state on purpose.</li>
+    <li><b>Fire-and-forget forms.</b> If you only need the values at submit time and nothing reacts to typing, uncontrolled is less code.</li>
+  </ul>
+  <p>The question to ask is simple: <b>does anything need to react to each keystroke?</b> Live filtering, character counters, "password too short", a disabled submit button — all yes. Then you need controlled.</p>
+
+  <h2>Many fields, one piece of state</h2>
+  <p>Five inputs do not need five <code>useState</code> calls. Group fields that travel together into one object, and use the input's <code>name</code> to decide which key to update.</p>
+
+  <pre><code>interface ProfileForm {
+  name: string;
+  email: string;
+  role: 'dev' | 'design' | 'pm';
+  available: boolean;
+}
+
+const [form, setForm] = useState&lt;ProfileForm&gt;({
+  name: '', email: '', role: 'dev', available: true,
+});
+
+function handleChange(e: React.ChangeEvent&lt;HTMLInputElement&gt;) {
+  const { name, value, type, checked } = e.target;
+  setForm(prev =&gt; ({
+    ...prev,                                    <span class="cmt">// keep every other field</span>
+    [name]: type === 'checkbox' ? checked : value,   <span class="cmt">// replace one field</span>
+  }));
+}</code></pre>
+
+  <p>Then every field shares one handler:</p>
+
+  <pre><code>&lt;input name="name"  value={form.name}  onChange={handleChange} /&gt;
+&lt;input name="email" value={form.email} onChange={handleChange} /&gt;
+&lt;input name="available" type="checkbox" checked={form.available} onChange={handleChange} /&gt;</code></pre>
+
+  <p>Two details in that <code>setForm</code> line matter, and both come from Month 1.</p>
+  <ol>
+    <li><b><code>prev =&gt;</code></b> — the new value is built from the old value, so use the updater form.</li>
+    <li><b><code>...prev</code></b> — you build a <b>new object</b> instead of editing the old one. React compares references to decide whether anything changed. Next lesson is entirely about this rule.</li>
+  </ol>
+
+  <div class="tip">
+    <span class="label">Note the extra parentheses</span>
+    <code>setForm(prev =&gt; ({ ...prev }))</code> wraps the object in <code>()</code>. Without them, JavaScript reads <code>{</code> as the start of a function body, not an object. It is a silent, confusing error — and now you know why the parentheses are there.
+  </div>
+
+  <h2>Build it for real — a team search bar</h2>
+  <p>Three controlled inputs of three different kinds, filtering one list. This is the smallest build that uses everything above. In your Vite project, replace <code>src/App.tsx</code>:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { useState } from 'react';
+
+type Role = 'all' | 'dev' | 'design' | 'pm';
+
+interface Member {
+  id: number;
+  name: string;
+  role: Exclude&lt;Role, 'all'&gt;;
+  available: boolean;
+}
+
+const TEAM: Member[] = [
+  { id: 1, name: 'Mai Nguyen',   role: 'dev',    available: true  },
+  { id: 2, name: 'Tomas Rehak',  role: 'design', available: false },
+  { id: 3, name: 'Aisha Bello',  role: 'dev',    available: false },
+  { id: 4, name: 'Jun Park',     role: 'pm',     available: true  },
+  { id: 5, name: 'Elena Rossi',  role: 'design', available: true  },
+];
+
+export default function TeamSearch() {
+  <span class="cmt">// three controlled inputs → three pieces of state</span>
+  const [query, setQuery] = useState('');
+  const [role, setRole] = useState&lt;Role&gt;('all');
+  const [onlyAvailable, setOnlyAvailable] = useState(false);
+
+  <span class="cmt">// DERIVED, not stored — recomputed on every render from the state above</span>
+  const visible = TEAM.filter(m =&gt; {
+    const matchesQuery = m.name.toLowerCase().includes(query.trim().toLowerCase());
+    const matchesRole = role === 'all' || m.role === role;
+    const matchesAvailability = !onlyAvailable || m.available;
+    return matchesQuery &amp;&amp; matchesRole &amp;&amp; matchesAvailability;
+  });
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Find a teammate&lt;/h1&gt;
+
+      &lt;input
+        type="search"
+        placeholder="Search by name…"
+        value={query}
+        onChange={(e) =&gt; setQuery(e.target.value)}
+      /&gt;
+
+      &lt;select value={role} onChange={(e) =&gt; setRole(e.target.value as Role)}&gt;
+        &lt;option value="all"&gt;All roles&lt;/option&gt;
+        &lt;option value="dev"&gt;Engineering&lt;/option&gt;
+        &lt;option value="design"&gt;Design&lt;/option&gt;
+        &lt;option value="pm"&gt;Product&lt;/option&gt;
+      &lt;/select&gt;
+
+      &lt;label&gt;
+        &lt;input
+          type="checkbox"
+          checked={onlyAvailable}
+          onChange={(e) =&gt; setOnlyAvailable(e.target.checked)}
+        /&gt;
+        Available only
+      &lt;/label&gt;
+
+      &lt;p&gt;{visible.length} of {TEAM.length} people&lt;/p&gt;
+
+      {visible.length === 0 ? (
+        &lt;p&gt;No one matches. Try clearing a filter.&lt;/p&gt;
+      ) : (
+        &lt;ul&gt;
+          {visible.map(m =&gt; (
+            &lt;li key={m.id}&gt;
+              &lt;b&gt;{m.name}&lt;/b&gt; — {m.role} {m.available ? '· free' : '· busy'}
+            &lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Run <code>npm run dev</code> and prove each idea to yourself:</p>
+  <ol>
+    <li><b>Type in the search box.</b> The list narrows on every keystroke. That is only possible because the input is controlled — the value reaches state immediately.</li>
+    <li><b>Delete the <code>onChange</code> on the search input.</b> Typing stops working, and the console warns you. Put it back. You have now caused and fixed the bug on purpose.</li>
+    <li><b>Look at what is <em>not</em> in state.</b> There is no <code>visibleMembers</code> state and no <code>count</code> state. Both are derived during render. Storing them would give you two truths to keep in sync.</li>
+    <li><b>Note the <code>as Role</code> cast on the select.</b> The DOM only knows strings, so <code>e.target.value</code> is <code>string</code>. You are telling TypeScript what you know and it cannot: those four option values are the only ones possible.</li>
+  </ol>
+
+  <div class="tip">
+    <span class="label">Try one more thing</span>
+    Change the checkbox to use <code>e.target.value</code> instead of <code>e.target.checked</code>. TypeScript stays quiet, and the filter breaks in a strange way — <code>value</code> for a checkbox is the literal string <code>"on"</code>. A truthy string is not a boolean answer to "is it ticked?".
+  </div>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate builds a task row. Clicking the row opens the task. Inside the row there is a ✕ button that deletes it. Both work — but clicking ✕ deletes the task <em>and</em> opens a detail panel for the task that no longer exists.</p>
+    What is happening, and what is the one-line fix?
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/responding-to-events">"Responding to Events"</a>, <a href="https://react.dev/learn/reacting-to-input-with-state">"Reacting to Input with State"</a>, and the <a href="https://react.dev/reference/react-dom/components/input">&lt;input&gt; reference</a> (read the "controlled" section twice).
+  </div>
+
+  <div class="ask">
+    Ask me to <b>drill you on event typing</b> without looking anything up, or to give you a broken form to debug. The fastest way to own controlled inputs is to break them three times.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>An event is a message; state is the memory.</b> A handler's job is to read what happened and put it in state. No state update means nothing visible changes.</li>
+      <li><b>Pass the function, don't call it:</b> <code>onClick={fn}</code>, and <code>onClick={() =&gt; fn(id)}</code> when you need an argument.</li>
+      <li><b>Inline handlers are typed for free.</b> Only annotate when you extract the handler — <code>React.ChangeEvent&lt;HTMLInputElement&gt;</code>, <code>React.FormEvent&lt;HTMLFormElement&gt;</code>, <code>React.MouseEvent&lt;HTMLButtonElement&gt;</code>.</li>
+      <li><b>preventDefault stops the browser</b> (form reload, link navigation). <b>stopPropagation stops the tree</b> (parent handlers). Different problems.</li>
+      <li><b>Controlled input = <code>value</code> + <code>onChange</code>.</b> The text on screen comes from state, not from your typing. Drop <code>onChange</code> and the input goes read-only, because the next render writes the old state back.</li>
+      <li><b>Never let an input's value be <code>undefined</code> or <code>null</code></b> — use <code>value={x ?? ''}</code>, or the input silently flips between controlled and uncontrolled.</li>
+      <li><b>Uncontrolled is a valid trade</b> for file inputs (required), very large forms, and forms where nothing reacts to typing.</li>
+      <li><b>Group related fields in one object</b> and update with <code>setForm(prev =&gt; ({ ...prev, [name]: value }))</code> — updater form plus a new object.</li>
+      <li><b>Real use case (built &amp; run):</b> a team search bar — text, select, and checkbox inputs, all controlled, with the filtered list and the count <em>derived</em> rather than stored.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>in a controlled input, the user does not change the text on screen — the user changes state, and state changes the text.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Responding to Events", "Reacting to Input with State", "&lt;input&gt;" component reference, "Choosing the State Structure".</p>
+
+  <div class="footer-nav">
+    <a href="./0004-build-an-interactive-dashboard-card.html">← Previous: Build an interactive dashboard card</a>
+    <a href="./0008-updating-objects-and-arrays-in-state.html">Next: Updating objects &amp; arrays in state →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A ✕ button inside a clickable row deletes the task AND triggers the row's click handler. The fix is:",
+      options: [
+        "Call e.stopPropagation() in the button's handler so the event doesn't reach the row",
+        "Call e.preventDefault() in the button's handler",
+        "Move the button outside the row",
+        "Give the button a higher z-index in CSS"
+      ],
+      answer: 0,
+      why: "React events bubble up the tree: the button's handler runs, then every ancestor's handler. stopPropagation() ends that upward travel, so the row's onClick never fires. preventDefault() is the wrong tool — it cancels the browser's own default action (submitting a form, following a link), not the journey up the tree."
+    },
+    {
+      q: "You write <input value={query} /> with no onChange. What happens when the user types?",
+      options: [
+        "Nothing appears — the next render writes the unchanged state back into the input, and React warns in the console",
+        "It works normally; onChange is optional",
+        "The component crashes on the first keystroke",
+        "The text appears but state stays empty, so the two drift apart"
+      ],
+      answer: 0,
+      why: "The value shown is computed from state on every render. With no onChange, the keystroke never reaches state, so React re-renders with the old value and overwrites what was typed. The input is effectively read-only. React logs a warning telling you to add onChange or use defaultValue (which would make it uncontrolled)."
+    },
+    {
+      q: "Which value should live in state for a search page listing 200 products?",
+      options: [
+        "The search text only — the filtered list is derived during render",
+        "The search text and the filtered list, so filtering runs less often",
+        "The filtered list only — the input can stay uncontrolled",
+        "The search text, the filtered list, and the result count"
+      ],
+      answer: 0,
+      why: "Anything you can compute from existing state should be computed, not stored. Storing the filtered list gives you two sources of truth that can disagree, plus extra code to keep them in sync. Filter during render instead. If profiling later shows the filtering itself is slow, useMemo (Month 6) caches the calculation — it does not make it state."
+    },
+    {
+      q: "You extract an input handler out of the JSX into a named function. What changes for TypeScript?",
+      options: [
+        "You must now annotate the event yourself, e.g. (e: React.ChangeEvent<HTMLInputElement>)",
+        "Nothing — TypeScript still infers the event type",
+        "You must annotate the return type as void",
+        "You have to cast the handler with `as EventHandler`"
+      ],
+      answer: 0,
+      why: "Inline handlers get their type from context: TypeScript knows the JSX attribute is onChange on an <input>, so it types the parameter for you. A standalone function has no such context, so the parameter would be an implicit `any` — annotate it. This is why inline handlers need less typing work, not more."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is a controlled component, and why would you use one?”",
+      answer: "A controlled input is one whose displayed value comes from React state: I pass <code>value={text}</code> and <code>onChange</code>, so every keystroke goes into state, and the state is written back to the input on the next render. That makes state the <b>single source of truth</b> — the DOM never holds a value React does not know about. I use it whenever something must react to each keystroke: live filtering, validation, a character counter, enabling or disabling the submit button. The cost is one re-render per keystroke. An <b>uncontrolled</b> input keeps its value in the DOM and I read it later; that is required for file inputs, and reasonable for very large forms or forms where nothing reacts to typing."
+    },
+    {
+      prompt: "Interviewer: “I type in my input and nothing appears. Walk me through the diagnosis.”",
+      answer: "Almost always <code>value</code> without <code>onChange</code>. The input's text is computed from state during render, so if the keystroke never reaches state, the next render writes the old value back and erases the typing. React warns about this in the console. The fix is to add <code>onChange={(e) =&gt; setText(e.target.value)}</code> — or, if I truly do not want React to own it, switch <code>value</code> to <code>defaultValue</code> and make it uncontrolled. The related version of this bug is <code>value={data?.name}</code>: while <code>name</code> is <code>undefined</code> the input is uncontrolled, then data arrives and React flips it to controlled and wipes the user's text. I guard that with <code>value={data?.name ?? ''}</code>."
+    },
+    {
+      prompt: "Interviewer: “What's the difference between preventDefault and stopPropagation?”",
+      answer: "They cancel two different things. <code>preventDefault()</code> cancels the <b>browser's built-in behaviour</b> for that event — a form submit reloading the page, a link navigating, a checkbox toggling. <code>stopPropagation()</code> stops the event <b>travelling further up the component tree</b>, so ancestor handlers never run. The classic case for the first is <code>onSubmit</code> on a form, where I want to handle the data in JavaScript and keep the page. The classic case for the second is a delete button inside a clickable row: without it, clicking delete also fires the row's onClick. They are independent, and sometimes I need both in one handler."
+    },
+    {
+      prompt: "Interviewer: “How do you handle a form with ten fields?”",
+      answer: "I group fields that belong together into one state object rather than writing ten <code>useState</code> calls: <code>useState&lt;ProfileForm&gt;({...})</code> with an interface describing the shape. Then one handler serves every field — I read <code>e.target.name</code> and update just that key with <code>setForm(prev =&gt; ({ ...prev, [name]: value }))</code>. That is the updater form because the new value depends on the old, and a fresh object because state must not be mutated. Checkboxes read <code>e.target.checked</code> instead of <code>value</code>, and number inputs need <code>Number(...)</code> because the DOM always gives strings. I wrap the fields in a real <code>&lt;form&gt;</code> with <code>onSubmit</code> and <code>e.preventDefault()</code>, so Enter submits and assistive technology sees a form. At the scale where one re-render per keystroke starts to hurt, I reach for a form library that keeps values out of React state."
+    }
+  ]);
+</script>

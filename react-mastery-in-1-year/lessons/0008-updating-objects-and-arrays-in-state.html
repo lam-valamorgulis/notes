@@ -1,0 +1,609 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Updating objects &amp; arrays in state — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 2 · Lesson 2 · State &amp; events</p>
+  <h1>Updating objects &amp; arrays in state</h1>
+  <p class="subtitle">Why React insists you make a new one — and the short list of recipes that covers every case.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll be able to <b>(1)</b> explain from first principles why editing state in place is invisible to React, <b>(2)</b> write every array and object update immutably without looking it up, and <b>(3)</b> recognise the "it works sometimes" bug that mutation causes — the most confusing bug in early React.
+  </div>
+
+  <p>Month 1 said "never mutate state" and promised a full explanation. This is it. This lesson is short on new API and long on one idea, because that one idea is behind a whole family of bugs.</p>
+
+  <h2>First principle — how React decides whether anything changed</h2>
+  <p>When you call a setter, React has to answer one question: <b>is this new value different from the one I already have?</b> If nothing changed, re-rendering would be wasted work.</p>
+  <p>For a number or a string, "different" is obvious. <code>0</code> is not <code>1</code>.</p>
+  <p>For an object or an array, JavaScript does not compare the contents. It compares <b>identity</b> — whether both names point at the same thing in memory. React uses <code>Object.is</code>, which behaves like <code>===</code> here.</p>
+
+  <pre><code>const a = [1, 2, 3];
+const b = [1, 2, 3];
+a === b;            <span class="cmt">// false — same contents, different objects</span>
+
+const c = a;
+c.push(4);
+c === a;            <span class="cmt">// true — one array with two names</span></code></pre>
+
+  <p>Now the consequence. This is the whole lesson in five lines:</p>
+
+  <pre><code>function addTask(title: string) {
+  tasks.push({ id: crypto.randomUUID(), title });   <span class="cmt">// edit the SAME array</span>
+  setTasks(tasks);                                   <span class="cmt">// hand React the same array back</span>
+}</code></pre>
+
+  <p>React compares the value you passed with the value it already holds. They are the <b>same array</b>. Nothing changed, as far as React can tell, so it does not re-render. Your data <em>did</em> change. The screen does not.</p>
+
+  <div class="soundbite">
+    <span class="label">The rule, in one line</span>
+    <p><b>React notices new objects, not new contents.</b> To tell React something changed, hand it a different object — not the same object with different insides.</p>
+  </div>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 350" role="img" aria-labelledby="fig8-title" width="640" height="350">
+      <title id="fig8-title">Mutating an array keeps the same memory address so React sees no change; copying creates a new address so React re-renders</title>
+
+      <rect x="215" y="14" width="210" height="46" rx="8" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="320" y="34" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 12px; font-weight: 700;">state: tasks</text>
+      <text x="320" y="50" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px;">an array living at address #1</text>
+
+      <line x1="270" y1="60" x2="165" y2="104" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a8)"></line>
+      <line x1="370" y1="60" x2="475" y2="104" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a8)"></line>
+
+      <!-- LEFT: mutation -->
+      <rect x="26" y="108" width="278" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 1.8;"></rect>
+      <text x="165" y="130" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">MUTATE — tasks.push(newTask)</text>
+      <text x="165" y="148" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">contents change, still address #1</text>
+      <text x="165" y="160" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">setTasks(tasks)</text>
+
+      <line x1="165" y1="166" x2="165" y2="212" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a8)"></line>
+
+      <rect x="26" y="216" width="278" height="74" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="165" y="238" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">React asks: Object.is(#1, #1)</text>
+      <text x="165" y="256" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 11px; font-weight: 700;">true → nothing changed</text>
+      <text x="165" y="276" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">✕ no re-render · stale screen</text>
+
+      <!-- RIGHT: copy -->
+      <rect x="336" y="108" width="278" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 1.8;"></rect>
+      <text x="475" y="130" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">COPY — [...tasks, newTask]</text>
+      <text x="475" y="148" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">a brand-new array at address #2</text>
+      <text x="475" y="160" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">setTasks(next)</text>
+
+      <line x1="475" y1="166" x2="475" y2="212" style="stroke: var(--ink-faint); stroke-width: 1.6;" marker-end="url(#a8)"></line>
+
+      <rect x="336" y="216" width="278" height="74" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="475" y="238" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">React asks: Object.is(#2, #1)</text>
+      <text x="475" y="256" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 11px; font-weight: 700;">false → something changed</text>
+      <text x="475" y="276" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">✓ re-render · screen updates</text>
+
+      <text x="320" y="322" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-style: italic;">React compares the address, not the contents</text>
+      <text x="320" y="340" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">same address = "no news" — even if every item inside is different</text>
+
+      <defs>
+        <marker id="a8" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Mutation edits the box React is already holding, so its check says "no news". A copy is a different box, so the check says "something changed".</figcaption>
+  </div>
+
+  <h2>Why this bug is so hard to find: it works <em>sometimes</em></h2>
+  <p>If mutation always did nothing, you would catch it in a minute. It does not always do nothing, and that is what wastes people's afternoons.</p>
+  <p>Renders are not private. When <b>any</b> state in that component changes, React calls your function again, and your function reads the mutated array — which now has the pushed item in it. So the item appears, late, when something unrelated happens.</p>
+
+  <pre><code><span class="cmt">// tasks was mutated earlier and never showed up.</span>
+<span class="cmt">// Then the user types one letter in an unrelated search box:</span>
+setQuery('a');   <span class="cmt">// → re-render → the map() now reads the mutated array</span>
+                 <span class="cmt">// → the missing task suddenly appears</span></code></pre>
+
+  <p>The symptoms people report are always the same, and now you can translate them:</p>
+  <ul>
+    <li>"It only updates when I click something else." → a mutated array, revealed by an unrelated render.</li>
+    <li>"It works in dev but the count is wrong." → mutation seen twice under StrictMode's double invoke.</li>
+    <li>"My memoised child does not update." → <code>React.memo</code> also compares by identity, so the child sees the same prop and skips the render (Month 6).</li>
+  </ul>
+
+  <div class="tip">
+    <span class="label">The other reasons, briefly</span>
+    Identity comparison is the reason you can <em>feel</em>. There are more: keeping past renders intact is what lets React compare snapshots, power DevTools time travel, make <code>useMemo</code> and <code>React.memo</code> trustworthy, and re-run rendering safely under concurrent features. All of them rest on the same promise — <b>a value you handed React is never edited afterwards</b>.
+  </div>
+
+  <h2>Treat state as read-only</h2>
+  <p>State is not technically frozen. JavaScript will happily let you push. The rule is a contract you keep, not a lock React puts on the object.</p>
+  <p>So the working sentence is: <b>once a value is in state, you never edit it — you replace it.</b> Copy what you need, change the copy, hand the copy to the setter.</p>
+
+  <h2>The array recipes — all of them</h2>
+  <p>There are only four things you do to a list. Learn one line for each and you are done.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>You want to</th><th>Do NOT use</th><th>Use this</th></tr></thead>
+    <tbody>
+      <tr><td><b>Add</b> to the end</td><td><code>push</code></td><td><code>setList([...list, item])</code></td></tr>
+      <tr><td><b>Add</b> to the start</td><td><code>unshift</code></td><td><code>setList([item, ...list])</code></td></tr>
+      <tr><td><b>Remove</b> one</td><td><code>splice</code>, <code>pop</code></td><td><code>setList(list.filter(x =&gt; x.id !== id))</code></td></tr>
+      <tr><td><b>Replace / update</b> one</td><td><code>list[i] = ...</code></td><td><code>setList(list.map(x =&gt; x.id === id ? { ...x, done: true } : x))</code></td></tr>
+      <tr><td><b>Insert</b> in the middle</td><td><code>splice</code></td><td><code>setList([...list.slice(0, i), item, ...list.slice(i)])</code></td></tr>
+      <tr><td><b>Sort / reverse</b></td><td><code>list.sort()</code></td><td><code>setList([...list].sort(fn))</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><code>filter</code> and <code>map</code> do the heavy lifting, and both already return a new array. That is why "remove" and "update" read so cleanly. Memorise the pair:</p>
+  <ul>
+    <li><b><code>filter</code> = remove</b> — keep the ones that are not it.</li>
+    <li><b><code>map</code> = update</b> — return a changed copy for the matching one, and the original for everyone else.</li>
+  </ul>
+
+  <div class="trap">
+    <span class="label">The two that catch everyone</span>
+    <code>sort()</code> and <code>reverse()</code> mutate <b>in place</b> and return the same array. <code>setList(list.sort(fn))</code> looks pure and is not — you just edited state and handed back the same identity, so you get a silent no-render. Always copy first: <code>[...list].sort(fn)</code>.
+    <br><br>Mnemonic: <b>sl</b>ice is <b>s</b>afe, <b>sp</b>lice <b>sp</b>oils.
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Mutating — avoid on state</th><th>Safe — returns a new array</th></tr></thead>
+    <tbody>
+      <tr><td><code>push</code>, <code>pop</code>, <code>shift</code>, <code>unshift</code></td><td><code>[...spread]</code>, <code>concat</code></td></tr>
+      <tr><td><code>splice</code>, <code>fill</code></td><td><code>slice</code>, <code>filter</code>, <code>map</code></td></tr>
+      <tr><td><code>sort</code>, <code>reverse</code></td><td><code>toSorted</code>, <code>toReversed</code> (newer runtimes)</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The object recipe — spread, then override</h2>
+  <p>One line covers the flat case. Later keys win, so put your change after the spread:</p>
+
+  <pre><code>setUser({ ...user, name: 'Mai' });               <span class="cmt">// copy everything, then replace name</span>
+setUser(prev =&gt; ({ ...prev, name: 'Mai' }));      <span class="cmt">// updater form — safer default</span></code></pre>
+
+  <p>Nested objects are where it gets ugly, and the ugliness is honest: a spread is <b>shallow</b>. It copies the top level only. Inner objects are still shared with the old state, so editing one of them is still mutation.</p>
+
+  <pre><code><span class="cmt">// state: { name: 'Mai', address: { city: 'Hanoi', zip: '100000' } }</span>
+
+<span class="cmt">// WRONG — the copy shares the same address object</span>
+const next = { ...user };
+next.address.city = 'Da Nang';    <span class="cmt">// mutates the old state too</span>
+
+<span class="cmt">// RIGHT — copy every level you touch, from the top down</span>
+setUser(prev =&gt; ({
+  ...prev,
+  address: { ...prev.address, city: 'Da Nang' },
+}));</code></pre>
+
+  <div class="tip">
+    <span class="label">The real lesson of nested spreads</span>
+    When the copying gets painful, that is a <b>signal about your state shape</b>, not a signal that you need a library. Deeply nested state is hard to update because it is hard to reason about. Flatten it, or split it into two pieces of state. Month 3 makes choosing the shape a skill of its own.
+  </div>
+
+  <h2>Arrays of objects — the shape you will use most</h2>
+  <p>Almost all real state is a list of records. Updating one field of one item combines both recipes: <code>map</code> for the list, spread for the item.</p>
+
+  <pre><code>interface Task { id: string; title: string; done: boolean; }
+const [tasks, setTasks] = useState&lt;Task[]&gt;([]);
+
+function toggle(id: string) {
+  setTasks(prev =&gt; prev.map(t =&gt;
+    t.id === id ? { ...t, done: !t.done } : t     <span class="cmt">// new item for the match, same item for the rest</span>
+  ));
+}</code></pre>
+
+  <p>Notice the <code>: t</code> at the end. Untouched items keep their <b>original identity</b>. That is not laziness — it is what lets React (and later <code>React.memo</code>) know those rows did not change.</p>
+
+  <div class="soundbite">
+    <span class="label">Local mutation is fine</span>
+    <p>The rule is about state, not about all objects. An object you <b>just created</b> inside your handler is yours to edit freely, because React has never seen it. Copy first, mutate the copy as much as you like, then set it.</p>
+  </div>
+
+  <pre><code>function addMany(titles: string[]) {
+  const next = [...tasks];                    <span class="cmt">// my own fresh array</span>
+  for (const title of titles) {
+    next.push({ id: crypto.randomUUID(), title, done: false });   <span class="cmt">// push is fine here</span>
+  }
+  setTasks(next);                             <span class="cmt">// a new identity → React re-renders</span>
+}</code></pre>
+
+  <h2>Build it for real — a task board with five immutable updates</h2>
+  <p>One list, one state variable, five operations. Every one of them makes a new array. Replace <code>src/App.tsx</code>:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { useState } from 'react';
+
+interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+const SEED: Task[] = [
+  { id: 'a', title: 'Write the spec',   done: true  },
+  { id: 'b', title: 'Review the Figma', done: false },
+  { id: 'c', title: 'Ship the banner',  done: false },
+];
+
+export default function TaskBoard() {
+  const [tasks, setTasks] = useState&lt;Task[]&gt;(SEED);
+  const [draft, setDraft] = useState('');
+
+  <span class="cmt">// 1 · ADD — spread the old list, append the new item</span>
+  function addTask(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+    e.preventDefault();
+    const title = draft.trim();
+    if (!title) return;
+    setTasks(prev =&gt; [...prev, { id: crypto.randomUUID(), title, done: false }]);
+    setDraft('');
+  }
+
+  <span class="cmt">// 2 · UPDATE one field of one item — map + spread</span>
+  function toggle(id: string) {
+    setTasks(prev =&gt; prev.map(t =&gt; (t.id === id ? { ...t, done: !t.done } : t)));
+  }
+
+  <span class="cmt">// 3 · RENAME — same recipe, different field</span>
+  function rename(id: string, title: string) {
+    setTasks(prev =&gt; prev.map(t =&gt; (t.id === id ? { ...t, title } : t)));
+  }
+
+  <span class="cmt">// 4 · REMOVE — filter keeps everything that is not it</span>
+  function remove(id: string) {
+    setTasks(prev =&gt; prev.filter(t =&gt; t.id !== id));
+  }
+
+  <span class="cmt">// 5 · REORDER — copy FIRST, then swap inside the copy</span>
+  function moveUp(index: number) {
+    if (index === 0) return;
+    setTasks(prev =&gt; {
+      const next = [...prev];                              <span class="cmt">// my own array now</span>
+      [next[index - 1], next[index]] = [next[index], next[index - 1]];
+      return next;
+    });
+  }
+
+  const doneCount = tasks.filter(t =&gt; t.done).length;      <span class="cmt">// derived, not stored</span>
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Task board&lt;/h1&gt;
+      &lt;p&gt;{doneCount} of {tasks.length} done&lt;/p&gt;
+
+      &lt;form onSubmit={addTask}&gt;
+        &lt;input
+          value={draft}
+          placeholder="New task…"
+          onChange={(e) =&gt; setDraft(e.target.value)}
+        /&gt;
+        &lt;button type="submit"&gt;Add&lt;/button&gt;
+      &lt;/form&gt;
+
+      &lt;ul&gt;
+        {tasks.map((t, i) =&gt; (
+          &lt;li key={t.id}&gt;
+            &lt;input
+              type="checkbox"
+              checked={t.done}
+              onChange={() =&gt; toggle(t.id)}
+            /&gt;
+            &lt;input
+              value={t.title}
+              onChange={(e) =&gt; rename(t.id, e.target.value)}
+            /&gt;
+            &lt;button onClick={() =&gt; moveUp(i)} disabled={i === 0}&gt;↑&lt;/button&gt;
+            &lt;button onClick={() =&gt; remove(t.id)}&gt;✕&lt;/button&gt;
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Now run it, and then break it on purpose. This is the important half of the exercise:</p>
+  <ol>
+    <li><b>Break "add".</b> Replace the body of <code>addTask</code>'s setter with <code>tasks.push({ id: crypto.randomUUID(), title, done: false }); setTasks(tasks);</code>. Add a task: nothing appears.</li>
+    <li><b>Now type one letter in the input.</b> The missing task appears — because that keystroke caused a re-render, and the render read the mutated array. This is the "it works sometimes" bug, on demand.</li>
+    <li><b>Break "reorder".</b> Change <code>moveUp</code> to sort or swap on <code>prev</code> directly. Nothing moves, for exactly the same reason.</li>
+    <li><b>Fix both</b> and note what changed: not the logic — only <em>who owns the array you edited</em>.</li>
+  </ol>
+
+  <div class="tip">
+    <span class="label">A word about Immer</span>
+    Libraries like Immer (<code>useImmer</code>) let you write <code>draft.tasks[3].done = true</code> and produce the immutable copy for you. They are legitimate, and React's own docs recommend them for deep state. Learn the plain spread first anyway — if you only know the shortcut, mutation bugs elsewhere in your app will stay invisible to you.
+  </div>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate's "add comment" button does nothing. Their handler is <code>comments.push(newComment); setComments(comments);</code>. They insist the code is right, and to prove it they show you that the comment <em>does</em> appear as soon as they type in the reply box below.</p>
+    Explain what is happening in one sentence, and give them the fixed line.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/updating-objects-in-state">"Updating Objects in State"</a>, <a href="https://react.dev/learn/updating-arrays-in-state">"Updating Arrays in State"</a>, and <a href="https://react.dev/learn/choosing-the-state-structure">"Choosing the State Structure"</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>quiz you cold</b> on the six array recipes, or to hand you a nested-state update to write from scratch. This is muscle memory work — worth ten minutes a day for a week.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>React compares identity, not contents</b> (<code>Object.is</code>). Editing state in place keeps the same identity, so React concludes nothing changed and skips the render.</li>
+      <li><b>Mutation causes the "works sometimes" bug.</b> Any later render reads the mutated data, so the change shows up late, triggered by something unrelated.</li>
+      <li><b>Treat state as read-only.</b> Copy what you touch, change the copy, hand the copy to the setter.</li>
+      <li><b>Array recipes:</b> add <code>[...list, x]</code> · remove <code>list.filter(...)</code> · update <code>list.map(...)</code> · insert <code>slice</code> + spread · sort <code>[...list].sort(fn)</code>.</li>
+      <li><b><code>filter</code> = remove, <code>map</code> = update.</b> Both already return new arrays.</li>
+      <li><b>Watch <code>sort</code> and <code>reverse</code></b> — they mutate in place and return the same array. Copy first. <em>slice is safe, splice spoils.</em></li>
+      <li><b>Objects:</b> <code>{ ...prev, key: value }</code>. Spread is <b>shallow</b>, so for nested state copy every level you change.</li>
+      <li><b>Arrays of objects</b> combine both: <code>map</code> the list, spread the one item, return the others untouched so their identity survives.</li>
+      <li><b>Local mutation is fine</b> on an object you just created. The contract only covers values React is already holding.</li>
+      <li><b>Painful nesting is a shape problem</b>, not a library problem — flatten the state (Month 3), or reach for Immer knowingly.</li>
+      <li><b>Real use case (built &amp; run):</b> a task board with add, toggle, rename, remove, and reorder — all immutable — then broken on purpose to watch the stale screen and the late update.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>React notices a new object, never new contents — so to change state, replace it, don't edit it.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Updating Objects in State", "Updating Arrays in State", "Choosing the State Structure", "State as a Snapshot".</p>
+
+  <div class="footer-nav">
+    <a href="./0007-events-and-controlled-inputs.html">← Previous: Events &amp; controlled inputs</a>
+    <a href="./0009-sharing-state-between-components.html">Next: Sharing state between components →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "comments.push(newComment) then setComments(comments) — the new comment only appears when the user types elsewhere. Why?",
+      options: [
+        "The array's identity never changed, so React skipped the render; an unrelated state change later re-rendered and read the mutated array",
+        "push is asynchronous, so the value arrives one tick late",
+        "setComments needs the updater form to work at all",
+        "React batches array updates and flushes them on the next user event"
+      ],
+      answer: 0,
+      why: "React compares the value you pass with the value it holds using Object.is. push edits the same array, so both are the same identity and React concludes nothing changed. Later, some other state change (a keystroke) triggers a render — and that render reads the array, which now really does contain the comment. That delay is what makes the bug so confusing. Fix: setComments(prev => [...prev, newComment])."
+    },
+    {
+      q: "Which line correctly sorts a list held in state?",
+      options: [
+        "setList([...list].sort(byName))",
+        "setList(list.sort(byName))",
+        "list.sort(byName); setList(list);",
+        "setList(list.slice().reverse().sort(byName))"
+      ],
+      answer: 0,
+      why: "sort() mutates the array in place and returns that same array, so options 2 and 3 both hand React the identity it already has — no re-render, and you have also edited state directly. Spreading into a new array first gives sort() a private copy to work on. (list.slice() would also work as the copy; the extra reverse() in option 4 just changes the result for no reason.)"
+    },
+    {
+      q: "State is { name, address: { city, zip } }. You need to change city. Which is correct?",
+      options: [
+        "setUser(prev => ({ ...prev, address: { ...prev.address, city: 'Da Nang' } }))",
+        "setUser(prev => ({ ...prev, city: 'Da Nang' }))",
+        "const next = { ...user }; next.address.city = 'Da Nang'; setUser(next);",
+        "setUser({ ...user, address: { city: 'Da Nang' } })"
+      ],
+      answer: 0,
+      why: "Spread is shallow — it copies the top level only, so a shallow copy still shares the inner address object. Option 3 therefore mutates the old state through the copy. Option 2 adds a stray top-level city key and leaves the real one untouched. Option 4 replaces the whole address object and silently loses zip. You must copy every level you change, from the top down."
+    },
+    {
+      q: "You need to mark one task done in a Task[] state. Which is right?",
+      options: [
+        "setTasks(prev => prev.map(t => t.id === id ? { ...t, done: true } : t))",
+        "setTasks(prev => { const t = prev.find(x => x.id === id); t.done = true; return prev; })",
+        "setTasks(prev => prev.filter(t => t.id === id).map(t => ({ ...t, done: true })))",
+        "setTasks(prev => [...prev, { ...prev.find(t => t.id === id), done: true }])"
+      ],
+      answer: 0,
+      why: "map replaces the one matching item with a changed copy and returns every other item unchanged — which keeps their identity, so React knows those rows did not change. Option 2 mutates both the item and returns the same array. Option 3 throws away every other task. Option 4 appends a duplicate instead of updating."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why must state updates be immutable in React?”",
+      answer: "Because React decides whether to re-render by comparing <b>identity</b>, not contents — it runs <code>Object.is</code> on the new state value against the old one. If I mutate an array or object in place and pass it back, both are the same object, so React concludes nothing changed and skips the render: my data moved and the screen did not. Handing React a <b>new object</b> is how I say 'this changed'. The same identity check is what makes <code>React.memo</code> and <code>useMemo</code> work, so mutation quietly breaks those too. And keeping past values untouched is what lets React treat each render as a stable snapshot — which matters for StrictMode, DevTools, and concurrent rendering. The practical rule I follow: once a value is in state, I never edit it, I replace it."
+    },
+    {
+      prompt: "Interviewer: “Someone says their list updates only when they click something else. What's wrong?”",
+      answer: "That symptom is almost always mutation. They pushed into the state array and set it back, so React saw the same identity and did not re-render. The data really did change, though — so the next time <em>anything</em> re-renders that component, the render reads the mutated array and the missing item appears. That is why it looks intermittent rather than broken. I would look for <code>push</code>, <code>splice</code>, <code>sort</code>, <code>reverse</code>, or a direct <code>obj.field = x</code> on something that came from <code>useState</code>, and replace it with the copy-first version: <code>setList(prev =&gt; [...prev, item])</code>."
+    },
+    {
+      prompt: "Interviewer: “Give me the immutable version of add, remove, update, and sort on a list in state.”",
+      answer: "<b>Add:</b> <code>setList(prev =&gt; [...prev, item])</code> — or <code>[item, ...prev]</code> for the front. <b>Remove:</b> <code>setList(prev =&gt; prev.filter(x =&gt; x.id !== id))</code>. <b>Update one item:</b> <code>setList(prev =&gt; prev.map(x =&gt; x.id === id ? { ...x, done: true } : x))</code> — the matching item becomes a changed copy, everyone else is returned as-is so their identity survives. <b>Sort:</b> <code>setList(prev =&gt; [...prev].sort(fn))</code>, because <code>sort</code> mutates in place and returns the same array. The way I remember the safe methods: <code>map</code>, <code>filter</code>, <code>slice</code>, <code>concat</code>, and spread all return something new; <code>push</code>, <code>pop</code>, <code>splice</code>, <code>sort</code>, <code>reverse</code> all edit in place."
+    },
+    {
+      prompt: "Interviewer: “Is it ever OK to mutate an object in a React component?”",
+      answer: "Yes — as long as React has never seen it. The contract is about values that are already in state or already passed as props. An object or array I create inside my own handler is private, so I can build it however I like: <code>const next = [...tasks]</code>, then push and splice that copy freely, then <code>setTasks(next)</code>. Because <code>next</code> is a new identity, React re-renders. The same goes for a fresh object I am assembling before setting it. What I must never do is edit the array or object that came out of <code>useState</code>, or edit a prop."
+    }
+  ]);
+</script>

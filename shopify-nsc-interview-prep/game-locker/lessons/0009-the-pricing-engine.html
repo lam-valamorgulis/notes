@@ -1,0 +1,626 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A03 — The Pricing Engine</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .pill.gap { background: var(--warn); }
+</style>
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Part A · Lesson A03 · Build it</p>
+  <h1>The Pricing Engine</h1>
+  <p class="subtitle">A card shop does not have a price. It has three, and only one of them is stored. Understand how the other two are produced and you understand the most interesting subsystem Game Locker has.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> explain why <b>buy price is derived rather than stored</b>, draw the rule model from memory — <b>filter plus two percentages</b>, three rule types, global rounding — and narrate the one real test where the price <b>did not reproduce</b>, and what that failure tells you about their architecture.
+  </div>
+
+  <p class="small">Every fact here is a labelled row in <a href="../reference/verified-facts.html">verified-facts</a> §6. Labels: <span class="pill">verified</span> read from a live tenant · <span class="pill alt">inference</span> reasoned, sample size given · <span class="pill gap">gap</span> never state as fact.</p>
+
+  <h2>1. Three prices, and only one is a number</h2>
+
+  <p>Start by refusing the word "price". On a trading-card platform it means at least three different things, and mixing them up is the fastest way to build the wrong system.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Name</th><th>What it is</th><th>Who sets it</th><th>Stored?</th></tr>
+    <tr>
+      <td><b>Market price</b></td>
+      <td>What this card is worth in the world right now, from a global price feed</td>
+      <td>Nobody. It is observed, not decided</td>
+      <td><b>Yes.</b> It is data that arrives</td>
+    </tr>
+    <tr>
+      <td><b>Sell price</b></td>
+      <td>What the shop charges you for it</td>
+      <td>The shop, as a <b>rule</b> over market price</td>
+      <td>No — computed, then published</td>
+    </tr>
+    <tr>
+      <td><b>Buy price</b></td>
+      <td>What the shop pays you for it. Two of them: <b>cash</b> and <b>store credit</b></td>
+      <td>The shop, as a <b>rule</b> over market price</td>
+      <td><b>No.</b> Computed on demand</td>
+    </tr>
+  </table>
+  </div>
+
+  <p>Only market price is a stored fact. The other two are <b>opinions the shop holds</b>, expressed as rules, evaluated when someone asks.</p>
+
+  <div class="soundbite">
+    <span class="label">Say it like this</span>
+    <p>"Their buy price isn't a column. It's the output of a rule engine over a market feed. That's why a card can have no buy price at all — it isn't missing data, it's the shop saying it doesn't want that card."</p>
+  </div>
+
+  <h2>2. Why derived beats stored, and where it stops being true</h2>
+
+  <p>Imagine the alternative. You store <code>buy_cash</code> and <code>buy_credit</code> on every priced row. There are around <b>1.12 million</b> catalogue items, five conditions each, so several million rows. Now the shop owner decides to pay 12% instead of 10% for foils over five dollars.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Stored</th><th>Derived</th></tr>
+    <tr><td>Change one rule</td><td>Rewrite millions of rows. Minutes to hours, and it can half-fail</td><td>Update one row. Instant</td></tr>
+    <tr><td>Market price moves</td><td>Rewrite every affected row again</td><td>Nothing to do</td></tr>
+    <tr><td>"Why is this card $3.03?"</td><td>You cannot tell. The number lost its reason</td><td>Name the rule that produced it</td></tr>
+    <tr><td>Reading one card</td><td>One index lookup</td><td>Evaluate rules per read</td></tr>
+    <tr><td>Reading sixty cards for a search page</td><td>One query</td><td>Sixty evaluations, unless you are careful</td></tr>
+  </table>
+  </div>
+
+  <p>Derived wins on every row except the last two, and the last two are exactly where a naive implementation dies. So the real design is not "derived <i>or</i> stored". It is:</p>
+
+  <div class="tip">
+    <span class="label">The shape that actually works</span>
+    <b>Derived is the source of truth. Materialised is a cache with a publish time.</b> The API evaluates rules live, so a rule change is visible immediately. A nightly job materialises the same numbers into a snapshot table and publishes them outward to Shopify, because a sync cannot re-evaluate a rule engine a million times. When they disagree, the live evaluation is right and the snapshot is stale — <b>and you can say by exactly how long</b>, because the snapshot carries its publish time.
+  </div>
+
+  <p>You can see both halves in the real system. The API returns a live buy price on <code>/inventory/search</code>. The catalogue change log says <i>"Changes will be reflected on Inventory tomorrow at 6.00 am"</i> — that is the materialised half, on a daily cadence.</p>
+
+  <h2>3. The rule model — a filter plus two percentages</h2>
+
+  <p>This is the whole model, and it is smaller than you would guess.</p>
+
+  <div class="diagram">   A RULE
+     ┌─────────────────────────────────────────────┐
+     │ type      sell │ buy │ stop-buy             │
+     │                                             │
+     │ FILTER — which cards does this rule touch?  │
+     │   game            Magic: The Gathering      │
+     │   market price    >= $5.00                  │
+     │   condition       LP                        │
+     │   rarity          All                       │
+     │   print variant   Foil                      │
+     │   stock           Any                       │
+     │                                             │
+     │ OUTPUT — what does it pay?                  │
+     │   cash            10 %                      │
+     │   credit          15 %                      │
+     └─────────────────────────────────────────────┘
+                  matched 746,555 items</div>
+
+  <p class="small"><span class="pill">verified</span> Those are the real filter axes and the real numbers from one active rule on a live tenant. A second active rule matched 2,830 items. Five automations existed in total.</p>
+
+  <p>Two things are worth noticing immediately.</p>
+
+  <p><b>Credit pays more than cash.</b> 15% versus 10%. That is not generosity — store credit costs the shop less, because it comes back as a sale at retail margin. The ratio is a lever the owner tunes, and on the observed tenant it was exactly <b>2:3</b>.</p>
+
+  <p><b>The percentages are of market price, not of sell price.</b> That sounds obvious and it is the thing everyone gets backwards. A card that sells for $34 might be bought for $3. The shop's margin on a trade-in is enormous compared with its margin on a wholesale purchase, and that is the entire economics of a card shop.</p>
+
+  <h2>4. Three rule types, not one</h2>
+
+  <p>The most commonly missed fact about this engine.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Type</th><th>What it does</th><th>Why it exists</th></tr>
+    <tr>
+      <td><b>Sell</b></td>
+      <td>Sets the retail price: market price × a percentage</td>
+      <td>Ordinary repricing. Keeps the shelf in line with the market without anyone typing</td>
+    </tr>
+    <tr>
+      <td><b>Buy</b></td>
+      <td>Sets what the shop pays, in cash and in credit</td>
+      <td>The trade-in offer</td>
+    </tr>
+    <tr>
+      <td><b>Stop buy</b></td>
+      <td><b>Refuses</b> to buy the matched cards, whatever any Buy rule says</td>
+      <td>"We already have eleven of these." A shop's shelf space and cash are finite</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Stop-buy is the one that proves it is a real product</span>
+    A pricing engine written by someone who has not run a shop has two rule types. A third type that exists purely to say <b>no</b> — and which must therefore <b>override</b> a rule that says yes — only gets built after a shop owner has been stuck with sixty copies of a card nobody wants. When you see a negative rule type in a pricing system, someone with a warehouse asked for it.
+  </div>
+
+  <p>Above all three sits a global <b>Price rounding</b> control. It applies last, to whatever the rules produced. That matters more than it sounds — see §7.</p>
+
+  <h2>5. No rule means no offer, and that is a feature</h2>
+
+  <p>On a live tenant, a card with no matching rule returned <code>activeBuyRule: __UNSET__</code> and a blank buy price — rendered as <code>—/—</code>.</p>
+
+  <p>The instinct is to call that a data-coverage bug. It is not. <b>A card with no buy rule is the shop saying it does not want that card.</b> Blank is the answer, and the correct front-end behaviour is to say <i>"we're not currently buying this card"</i> rather than to show an empty field or fall back to a guess.</p>
+
+  <div class="trap">
+    <span class="label">The number you must not quote</span>
+    An early version of this discovery measured buy-rule coverage at <b>10.8%</b> — 18,077 of 167,311 rows — and concluded the feature would launch mostly blank. <b>The author retracted it three weeks later:</b> it was a dev-tenant figure produced by a single test rule, and never a production measurement. It is a perfect example of a number that is precise, memorable, quotable, and wrong. If you repeat it in a room with someone who works there, you are telling them something false about their own product.
+  </div>
+
+  <h2>6. The inversion — why mint cards get refused</h2>
+
+  <p>Here is a consequence of the model that nobody designed and everybody has to live with.</p>
+
+  <p>The observed active rule filtered on <b>Condition = LP</b> — Lightly Played. Only LP. So:</p>
+
+  <div class="diagram">   A customer brings in two copies of the same card
+
+     Near Mint copy   ── no rule matches ──▶  no offer   "we're not buying this"
+     Lightly Played   ── rule matches    ──▶  $3.03 cash / $4.54 credit
+
+     The BETTER card is the one the shop refuses.</div>
+
+  <p>Nothing is broken. The rule engine did exactly what it was told. But the customer experience is incoherent, and the person who wrote the rule almost certainly did not picture this moment — they were thinking "let me test a rule on LP foils" and it became the live configuration.</p>
+
+  <div class="tip">
+    <span class="label">This is a great thing to notice out loud</span>
+    It is a <b>design consequence, not a bug</b>, and saying so is the difference between a bug report and an engineering opinion. The fix is not code. It is either a rule-authoring UI that warns when a rule covers a worse condition but not a better one, or a validation that a Buy rule set must be monotonic across the condition ladder. Both are product decisions. Naming which one you would argue for is the answer they are listening for.
+  </div>
+
+  <h2>7. The test that failed — and why it is the best fact in the course</h2>
+
+  <p>Someone had a clean theory: buy price is a percentage of market price, both of which the API returns, so we can compute it ourselves and stop depending on the vendor.</p>
+
+  <p>They tested it against one real card.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Cash</th><th>Credit</th></tr>
+    <tr><td>Rule says 10% / 15% of <code>marketPrice</code> A$34.02</td><td>A$3.40</td><td>A$5.10</td></tr>
+    <tr><td><b>Actual, from the API</b></td><td><b>A$3.03</b></td><td><b>A$4.54</b></td></tr>
+    <tr><td>Ratio between the two outputs</td><td colspan="2"><b>2 : 3 — exact, in both the prediction and the actual</b></td></tr>
+    <tr><td>Base price implied by the actual</td><td colspan="2"><b>~A$30.28</b>, not the A$34.02 the API exposes</td></tr>
+  </table>
+  </div>
+
+  <p><span class="pill">verified</span>, n=1. Now read what that pattern actually says.</p>
+
+  <p>The <b>ratio is exact</b>. 3.03 : 4.54 is 2:3, and 10% : 15% is 2:3. So the rule engine is applying the rule precisely as documented. Nothing is fuzzy or rounded away at the percentage step.</p>
+
+  <p>The <b>base is wrong</b>. It is off by about 11%. That is far too large to be rounding and far too consistent to be noise.</p>
+
+  <div class="soundbite">
+    <span class="label">The conclusion</span>
+    <p>"They price off a market figure they don't expose. The <code>marketPrice</code> in the API is a display number — probably a trend or a high — while the engine uses something more conservative underneath. So the fallback of computing it yourself is dead, not because the rule is secret, but because the input is."</p>
+  </div>
+
+  <div class="note">
+    <span class="label">Why this matters more than a correct guess would have</span>
+    A failed prediction, reported honestly, with the failure analysed, is a stronger signal than any right answer. It shows someone formed a hypothesis, tested it against reality, and let reality win. In an interview, <b>"we tested our own assumption and it failed, and here is what the failure told us"</b> is worth three confident claims. Most candidates never test their assumptions at all.
+  </div>
+
+  <h3>What you still do not know</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Unknown</th><th>Label</th></tr>
+    <tr><td>Which market figure the engine really uses — low, median, trend, seven-day average, or something bespoke</td><td><span class="pill gap">gap</span></td></tr>
+    <tr><td>Whether the global rounding control was contributing to the gap</td><td><span class="pill gap">gap</span></td></tr>
+    <tr><td>Whether the pattern holds across many cards. <b>One</b> card was tested</td><td><span class="pill gap">gap</span></td></tr>
+    <tr><td>Whether the <b>buy</b> ladder across conditions matches the <b>retail</b> ladder (100/80/60/40/37% of NM)</td><td><span class="pill alt">inference</span> — n=3, and measured on retail prices</td></tr>
+  </table>
+  </div>
+
+  <p>Closing the first one takes about two hundred rows and an afternoon. That is a good thing to offer to do.</p>
+
+  <h2>8. The nightly run</h2>
+
+  <p>The catalogue change log on a live tenant, verbatim:</p>
+
+  <div class="diagram">   Last updated today 9.22 pm
+   Changes will be reflected on Inventory tomorrow at 6.00 am
+
+   Magic: The Gathering
+     38,715 updates          3 new sets added
+     403 items corrected     389 out of 38,309 prices moved >= 30%</div>
+
+  <p>Four things fall out of that box, and together they kill a very expensive assumption.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Reading</th><th>Number</th><th>So</th></tr>
+    <tr><td>Cadence</td><td>Daily, published at <b>06:00</b></td><td>Not hourly, not streaming. A batch with a known publish time</td></tr>
+    <tr><td>Share of the catalogue that moves</td><td>38,309 of ~869,531 MTG cards = <b>~4.4%</b></td><td>A given card is <b>usually unchanged</b> day to day</td></tr>
+    <tr><td>Share that moves hard</td><td>389 = <b>~0.04%</b></td><td>Big swings are rare enough to alert on individually</td></tr>
+    <tr><td>Non-price changes</td><td>403 corrections, 3 new sets, plus image and duplicate work</td><td>The feed carries <b>data quality</b>, not only prices</td></tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The assumption this destroys</span>
+    A project plan for integrating with this platform was written around <b>"hourly price updates for 100,000+ SKUs"</b> and treated it as the primary performance risk. The real cadence is a daily batch in which <b>96% of rows do not change</b>. An entire performance workstream was scoped against a number nobody had checked. <b>Measure the feed before you architect for it.</b>
+  </div>
+
+  <p>It also softens a design worry. If only one card in twenty-three moves on a given day, a quote you gave a customer yesterday is very likely still right. A 24 to 48 hour quote validity is a reasonable business choice rather than a dangerous one — and note that this is a <b>catalogue</b> movement figure. Buy price moves when the market moves <i>or</i> when staff edit a rule, and the rule-edit rate was never measured. <span class="pill gap">gap</span></p>
+
+  <h2>9. Build it — schema and evaluation order</h2>
+
+  <p>NestJS and Postgres, as decided in the mission. Start with the tables, because the tables are where the "derived" decision either holds or leaks.</p>
+
+  <h3>The atom</h3>
+
+  <p>The priced thing is not a card. It is a <b>printing in a condition</b> — that is what the real system gives its own id to, which you can see in the SKU: each of the five conditions carries a <b>different</b> card id.</p>
+
+  <pre><code>card          id, game, name, oracle_text, rarity, image_url
+printing      id, card_id, set_code, collector_no, finish        -- finish: normal | foil
+sku           id, printing_id, condition                          -- NM|LP|MP|HP|DMG
+                                                                  -- THIS is the priced atom
+market_price  sku_id, source, amount, as_of                       -- the only stored price
+inventory     sku_id, location_id, qty
+</code></pre>
+
+  <p class="small">Model <code>finish</code> on <code>printing</code>, not on <code>sku</code>. That mirrors what they did — a foil card is a separate product in Shopify, not a variant — and it is correct, because a foil is a physically different printing, not a different state of the same object.</p>
+
+  <h3>The rules</h3>
+
+  <pre><code>price_rule
+  id            uuid
+  tenant_id     uuid
+  type          'sell' | 'buy' | 'stop_buy'
+  priority      int          -- lower wins. See the gap below
+  active        bool
+  filter        jsonb        -- game, market_min, market_max, conditions[],
+                             -- rarities[], finishes[], stock_min, stock_max
+  cash_pct      numeric      -- buy only
+  credit_pct    numeric      -- buy only
+  sell_pct      numeric      -- sell only
+
+tenant_pricing_setting
+  tenant_id     uuid
+  rounding_mode 'none' | 'nearest' | 'up' | 'down' | 'charm'
+  rounding_step numeric      -- e.g. 0.05, 0.25, 0.50
+</code></pre>
+
+  <div class="note">
+    <span class="label">A real gap you have to decide yourself</span>
+    <b>What happens when two Buy rules match the same card?</b> The live tenant had five automations and two active Buy rules, but their precedence was never observed. <span class="pill gap">gap</span> So this is a design decision you own, and it is worth stating which you would pick: <b>most specific filter wins</b> (elegant, but "specific" is hard to define across six axes), or <b>an explicit priority integer</b> (ugly, obvious, debuggable, and what a shop owner can actually reason about). Take the integer. Pricing bugs cost money, and money-path code should be boring.
+  </div>
+
+  <h3>The evaluation, in order</h3>
+
+  <div class="diagram">   quoteBuy(sku, location) ->  { cash, credit } | null
+
+   1  market = marketPriceOf(sku)
+      if market is null            -> return null      (no feed, no offer)
+
+   2  stop = matchRules('stop_buy', sku, market, location)
+      if stop is not empty         -> return null      (refused on purpose)
+
+   3  buy = matchRules('buy', sku, market, location)
+      if buy is empty              -> return null      ("not buying this card")
+
+   4  rule = lowestPriority(buy)
+
+   5  base = pricingBaseFor(sku)                       <-- NOT market
+      cash   = base * rule.cash_pct
+      credit = base * rule.credit_pct
+
+   6  cash   = round(cash,   setting)
+      credit = round(credit, setting)
+
+   7  return { cash, credit, ruleId: rule.id }</div>
+
+  <p>Three things about that pipeline are worth defending out loud.</p>
+
+  <p><b>Step 2 comes before step 3.</b> Stop-buy is a veto, not a competitor. If you evaluate it alongside Buy rules and pick by priority, a badly-priced rule can outrank the shop's own refusal to buy. Veto first, always.</p>
+
+  <p><b>Steps 3 and 5 return the same thing for different reasons.</b> Both produce "no offer", but one means <i>the shop declines</i> and the other means <i>we have no data</i>. Return them as distinct reasons even though the customer sees the same message, because in six weeks someone will ask "how many cards are we refusing versus how many are we missing prices for" and you will want to answer without a migration.</p>
+
+  <p><b>Step 5 is deliberately not <code>market</code>.</b> That is the finding from §7 encoded as a function boundary. <code>pricingBaseFor()</code> starts as <code>return market</code> and carries a comment saying it is known to be wrong by about 11% on the one card tested. When someone finally runs the two-hundred-row experiment, exactly one function changes.</p>
+
+  <h3>The two jobs</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Job</th><th>When</th><th>What it does</th></tr>
+    <tr><td><code>ingest-market-feed</code></td><td>Nightly, before the publish window</td><td>Upsert <code>market_price</code>. Record how many rows changed and by how much — that count is the number in §8, and it is your best health signal</td></tr>
+    <tr><td><code>publish-prices</code></td><td><b>06:00</b></td><td>Re-evaluate sell and buy for every sku with stock or a recent market move, write <code>price_snapshot</code>, then hand the changed set to the sync</td></tr>
+  </table>
+  </div>
+
+  <p>Note the filter on the second job: <b>with stock or a recent market move</b>. Re-evaluating 1.12 million items nightly when 96% of them did not move is the difference between a job that finishes and a job that does not.</p>
+
+  <div class="tip">
+    <span class="label">The invariant worth a test</span>
+    <b>A snapshot row must always name the rule that produced it.</b> <code>price_snapshot.rule_id</code> is not optional. Six weeks from now the question is never "what is the price" — it is <b>"why is it that"</b>, asked by an angry shop owner. A price with no traceable reason is an unanswerable support ticket, and you will get one per week forever.
+  </div>
+
+  <h2>10. What to say in ninety seconds</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Beat</th><th>Content</th></tr>
+    <tr><td><b>Point</b></td><td>Buy price is derived from rules over a market feed, never stored</td></tr>
+    <tr><td><b>Because</b></td><td>A shop tunes its rules constantly, and a stored price would mean rewriting millions of rows per edit — and would lose the reason behind the number</td></tr>
+    <tr><td><b>Example</b></td><td>Three rule types, including a <b>stop-buy</b> veto. A rule is a filter plus a cash and a credit percentage. No matching rule means no offer, which is the shop declining rather than data missing</td></tr>
+    <tr><td><b>So</b></td><td>The build is a live evaluator for the API plus a nightly materialiser for the sync, and every snapshot row carries the rule id that produced it</td></tr>
+  </table>
+  </div>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on the pricing engine"</b> — the three rule types, the inversion, and the failed prediction, until they are automatic.</p>
+    <p><b>"design the rule precedence with me"</b> — you argue for the priority integer, Claude argues for most-specific-wins.</p>
+    <p><b>"quiz me but try to make me quote the 10.8% figure"</b></p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0002-tcg-card-data-on-shopify.html">← A02: the card data model</a></span>
+    <span><a href="0003-the-sync-engine.html">A04: the sync engine →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'A card returns a blank buy price. What has most likely happened?',
+    options: [
+      'The market feed failed for that card',
+      'No buy rule matches it — the shop is declining to buy it',
+      'The card is out of stock',
+      'The nightly publish job has not run yet'
+    ],
+    answer: 1,
+    why: 'Buy price is derived from the active buy rule. No matching rule returns blank, and that is the shop saying it does not want the card. Treating it as missing data and falling back to a guess would have you quote a price the owner never authorised. Note the first option is also a real cause — which is exactly why the evaluator should return distinct reasons even though the customer sees one message.'
+  },
+  {
+    q: 'Why does stop-buy have to be evaluated before buy rules rather than alongside them?',
+    options: [
+      'It is faster, because stop-buy rules are usually fewer',
+      'Because it is a veto — evaluating it by priority would let a buy rule outrank the shop’s own refusal',
+      'Because stop-buy rules have no percentages to apply',
+      'Because Shopify requires refusals to resolve first'
+    ],
+    answer: 1,
+    why: 'Stop-buy exists to say no, whatever else says yes. If it competes on priority, a badly-ordered buy rule silently defeats it and the shop buys stock it explicitly refused. Veto rules are always a separate, earlier pass. The third option is true but irrelevant, and the fourth is invented — Shopify is nowhere near this decision.'
+  },
+  {
+    q: 'A real card with marketPrice A$34.02 under a 10%/15% rule returned A$3.03 cash and A$4.54 credit instead of the predicted A$3.40 / A$5.10. What is the strongest conclusion?',
+    options: [
+      'The rule engine applies percentages imprecisely',
+      'The API response was stale',
+      'The rule is applied exactly, but the base is a market figure the API does not expose',
+      'Global rounding reduced both values'
+    ],
+    answer: 2,
+    why: 'The cash:credit ratio is exactly 2:3 in both the prediction and the actual, so the percentages are being applied precisely. What differs is the base — the actual implies about A$30.28 rather than the exposed A$34.02, an 11% gap that is far too large for rounding. Rounding is worth ruling out with a second test, but it cannot explain 11% at this price.'
+  },
+  {
+    q: 'Why does the nightly publish job filter to skus with stock or a recent market move?',
+    options: [
+      'Because Shopify rate limits would reject the full set',
+      'Because only about 4% of the catalogue moves on a given day, so re-evaluating all 1.12M items is almost entirely wasted work',
+      'Because cards with no stock have no price',
+      'Because the market feed only covers cards in stock'
+    ],
+    answer: 1,
+    why: 'The change log shows roughly 38,000 of about 869,000 MTG cards moving on a sampled day — about 4.4%. Re-evaluating everything means doing 96% of the work for nothing, and it is the difference between a job that finishes inside the publish window and one that does not. Shopify limits are a real downstream concern but they are not why you filter at the evaluation step.'
+  },
+  {
+    q: 'A rule is filtered to Condition = LP. A customer brings a Near Mint copy of a matching card. What happens, and how should you describe it?',
+    options: [
+      'They get a higher offer, because NM is worth more — working as intended',
+      'They get no offer, and it is a bug in the rule engine',
+      'They get no offer — the engine is correct, and this is a design consequence worth raising as a product issue',
+      'The engine falls back to the nearest matching condition'
+    ],
+    answer: 2,
+    why: 'The rule matched LP only, so NM matches nothing and returns no offer — the better card is refused. The engine did exactly what it was told, so calling it a bug is wrong and will be corrected by anyone who works there. Calling it a design consequence, and proposing either a rule-authoring warning or a monotonicity check across the condition ladder, is an engineering opinion rather than a complaint. There is no fallback behaviour.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How does our pricing work?" — answer as if they are testing whether you actually looked.',
+    answer: 'You have three prices and only one is stored. <b>Market price</b> arrives from a feed and is the only stored number. <b>Sell price</b> and <b>buy price</b> are both <b>derived</b> — outputs of a rule engine over that market price, evaluated when someone asks.<br><br>A rule is <b>a filter plus percentages</b>. The filter is game, market price range, condition, rarity, print variant and stock level. The output for a buy rule is two percentages, <b>cash and credit</b>, and credit pays more because it comes back as a sale.<br><br>There are <b>three</b> rule types, not two — sell, buy, and <b>stop buy</b>, which refuses cards whatever the buy rules say. A global rounding control sits above all of them. And a card with no matching rule returns <b>blank</b>, which is the shop declining rather than data missing.<br><br>The reason I would keep it derived is that a shop owner retunes rules constantly. Stored prices would mean rewriting millions of rows per edit, and worse, the number would lose its reason — you could never answer "why is this card $3.03".'
+  },
+  {
+    prompt: '"Could you just compute our buy prices yourself from the market price?" — the trap question.',
+    answer: 'I would have said yes, and I would have been wrong. That got tested on a real card and it did not reproduce.<br><br>The card had a market price of A$34.02 under a 10% cash / 15% credit rule, so the prediction was A$3.40 and A$5.10. The actual was <b>A$3.03 and A$4.54</b>. The interesting part is the shape of the miss — the <b>ratio is exactly 2:3</b>, matching the rule to the cent, but the implied base is about <b>A$30.28</b>, not the A$34.02 the API returns.<br><br>So the rule is being applied precisely, and what differs is the <b>input</b>. You price off a market figure you do not expose — probably something more conservative than the display price, maybe with rounding on top. Which means computing it externally is not viable, and not because the rule is secret.<br><br>That is one card though, so I would want about two hundred rows before I said it with confidence. It is an afternoon of work and I would happily do it.'
+  },
+  {
+    prompt: '"How often do our prices change?" — and why the honest answer is the useful one.',
+    answer: 'Daily, but far less than people assume. The change log says updates land on inventory at <b>6am</b> the following morning, so it is a batch with a known publish time rather than a stream.<br><br>The volume is the surprising part. On a sampled day about <b>38,000</b> Magic prices moved out of roughly <b>869,000</b> cards — around <b>4.4%</b>. And only <b>389</b> of those moved by 30% or more, which is about <b>0.04%</b>. So a given card is usually unchanged from one day to the next.<br><br>That changes a design decision. If one card in twenty-three moves on a given day, a quote you gave a customer yesterday is very likely still good, so a 24 to 48 hour quote validity is a business choice rather than a risk. I have seen a plan built around "hourly updates for 100,000 SKUs" and it scoped a whole performance workstream against a number nobody had measured.<br><br>One caveat I would state: those are <b>catalogue</b> movements. Buy price moves when the market moves <b>or</b> when someone edits a rule, and I have no measurement of how often rules get edited.'
+  },
+  {
+    prompt: 'Whiteboard the evaluation order for a buy quote.',
+    answer: 'Seven steps, and the order carries the design.<br><br>First, <b>get the market price</b>. No feed, no offer — return null.<br><br>Second, <b>evaluate stop-buy rules</b>. If any match, return null. This has to come first because stop-buy is a <b>veto</b>, not a competitor. If you rank it against buy rules by priority, a badly ordered rule silently defeats the shop\'s own refusal and you buy stock they told you not to.<br><br>Third, <b>evaluate buy rules</b>. None matching means no offer — but I would return that as a <b>distinct reason</b> from "no market price", even though the customer sees the same message, because someone will eventually ask how many cards we are refusing versus how many we are missing data for.<br><br>Fourth, <b>pick the winner</b> by an explicit priority integer. Most-specific-wins is more elegant but "specific" is undefinable across six filter axes, and money-path code should be boring and debuggable.<br><br>Fifth, apply the percentages to a <b>pricing base</b> — and I would put that behind its own function rather than using the market price directly, because we know the base differs and one day someone will find out how.<br><br>Sixth, <b>round</b> using the tenant setting. Seventh, return the numbers <b>with the rule id</b>. That last part is not optional — a price with no traceable reason is a support ticket you cannot answer.'
+  }
+]);
+</script>

@@ -1,0 +1,749 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build it — a filterable task list — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 2 · Lesson 4 · The real build</p>
+  <h1>Build it — a filterable task list</h1>
+  <p class="subtitle">Everything from Month 2 in one small app: controlled inputs, immutable updates, lifted state, typed callbacks, and keys.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a working app you can rebuild from memory in about twenty minutes — add, edit, complete, delete, search, and filter. It is the most-asked live-coding exercise in front-end interviews, and every line of it is one of Month 2's ideas doing its job.
+  </div>
+
+  <p>Three lessons gave you three habits: <b>state owns every input's value</b>, <b>never edit state in place</b>, and <b>state lives above everyone who reads it</b>. This lesson puts them together, and it starts where every real build should start — on paper, before any code.</p>
+
+  <h2>The plan — decide the state before you type</h2>
+  <p>The feature list: add a task, tick it off, rename it, delete it, search by text, and filter by All / Active / Done, with a live count.</p>
+  <p>Now the only question that matters. Every value on that screen is one of three things:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Value</th><th>State, derived, or constant?</th><th>Lives where — and why</th></tr></thead>
+    <tbody>
+      <tr><td>The list of tasks</td><td><b>State</b> — the source of everything</td><td><code>App</code>. The list, the counts, and the filters all read it.</td></tr>
+      <tr><td>Search text</td><td><b>State</b> — the user types it</td><td><code>App</code>. The filter bar shows it; the list is filtered by it.</td></tr>
+      <tr><td>Status filter (all / active / done)</td><td><b>State</b> — the user picks it</td><td><code>App</code>, same reason.</td></tr>
+      <tr><td>The new-task text box</td><td><b>State</b> — but private</td><td><code>TaskForm</code>. Nobody else reads a half-typed title, so it stays local.</td></tr>
+      <tr><td>"Am I editing this row?" + the edit draft</td><td><b>State</b> — but private</td><td><code>TaskRow</code>. One row's edit mode is nobody else's business.</td></tr>
+      <tr><td>The visible tasks</td><td><b>Derived</b></td><td>Computed in <code>App</code> during render from tasks + query + filter.</td></tr>
+      <tr><td>Active count, done count</td><td><b>Derived</b></td><td>Computed from tasks. Storing them would be a second truth to keep in sync.</td></tr>
+      <tr><td>The three filter labels</td><td><b>Constant</b></td><td>A plain array outside the component.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>That table <em>is</em> the architecture. Two things fall out of it before you write a line:</p>
+  <ul>
+    <li><b>Three pieces of state in <code>App</code></b>, because more than one component reads each of them.</li>
+    <li><b>Two pieces of state kept local</b>, because nobody else reads them. Local state is a deliberate choice here, not laziness.</li>
+  </ul>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 320" role="img" aria-labelledby="fig10-title" width="640" height="320">
+      <title id="fig10-title">Component tree: App owns tasks, query and status; TaskForm and TaskRow keep private local state; props flow down and callbacks flow up</title>
+
+      <rect x="170" y="14" width="300" height="70" rx="8" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="320" y="36" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 12.5px; font-weight: 700;">App — the owner</text>
+      <text x="320" y="53" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px;">state: tasks · query · status</text>
+      <text x="320" y="70" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9.5px; opacity: .85;">derived here: visible, activeCount, doneCount</text>
+
+      <line x1="230" y1="84" x2="120" y2="134" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a10)"></line>
+      <line x1="320" y1="84" x2="320" y2="134" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a10)"></line>
+      <line x1="410" y1="84" x2="520" y2="134" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a10)"></line>
+
+      <rect x="16" y="138" width="192" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="112" y="159" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">TaskForm</text>
+      <text x="112" y="175" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px;">local state: draft</text>
+      <text x="112" y="188" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">calls onAdd(title)</text>
+
+      <rect x="224" y="138" width="192" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="320" y="159" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">FilterBar</text>
+      <text x="320" y="175" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">no state at all</text>
+      <text x="320" y="188" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">fully controlled</text>
+
+      <rect x="432" y="138" width="192" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="528" y="159" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">TaskList</text>
+      <text x="528" y="175" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">no state — maps visible</text>
+      <text x="528" y="188" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">key={task.id}</text>
+
+      <line x1="528" y1="196" x2="528" y2="228" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a10)"></line>
+
+      <rect x="432" y="232" width="192" height="58" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="528" y="253" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">TaskRow</text>
+      <text x="528" y="269" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px;">local state: isEditing, draft</text>
+      <text x="528" y="282" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">calls onToggle / onRename / onDelete</text>
+
+      <path d="M120,232 L120,110 L206,90" style="fill: none; stroke: var(--accent-2); stroke-width: 1.7; stroke-dasharray: 4 3;" marker-end="url(#a10o)"></path>
+      <text x="126" y="252" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">every change goes back up</text>
+      <text x="126" y="266" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">children never edit the list —</text>
+      <text x="126" y="279" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">they call a function and App decides</text>
+
+      <text x="320" y="312" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-style: italic;">shared state at the top · private state where it is private · everything else derived</text>
+
+      <defs>
+        <marker id="a10" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a10o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Five components. Three pieces of shared state at the top, two private pieces at the bottom, and not one stored copy of anything that can be computed.</figcaption>
+  </div>
+
+  <h2>Build it for real — five small files</h2>
+  <p>Real projects split components into files. Create these inside <code>src/</code>, in this order.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/types.ts</b> — the shape of the data, in one place</p>
+  <pre><code>export interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+export type Status = 'all' | 'active' | 'done';</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/TaskForm.tsx</b> — a controlled input with private state</p>
+  <pre><code>import { useState } from 'react';
+
+interface TaskFormProps {
+  onAdd: (title: string) =&gt; void;      <span class="cmt">// the only thing the parent gives it</span>
+}
+
+export function TaskForm({ onAdd }: TaskFormProps) {
+  <span class="cmt">// Local on purpose: nobody else needs a half-typed title.</span>
+  const [draft, setDraft] = useState('');
+
+  function handleSubmit(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+    e.preventDefault();                <span class="cmt">// keep the page — don't let the browser submit</span>
+    const title = draft.trim();
+    if (!title) return;                <span class="cmt">// guard: no empty tasks</span>
+    onAdd(title);                       <span class="cmt">// report up; App owns the list</span>
+    setDraft('');                       <span class="cmt">// clear the box for the next one</span>
+  }
+
+  return (
+    &lt;form onSubmit={handleSubmit}&gt;
+      &lt;input
+        value={draft}
+        placeholder="What needs doing?"
+        onChange={(e) =&gt; setDraft(e.target.value)}
+        aria-label="New task title"
+      /&gt;
+      &lt;button type="submit" disabled={draft.trim() === ''}&gt;Add&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/FilterBar.tsx</b> — fully controlled, owns nothing</p>
+  <pre><code>import type { Status } from './types';
+
+const FILTERS: { value: Status; label: string }[] = [
+  { value: 'all',    label: 'All'    },
+  { value: 'active', label: 'Active' },
+  { value: 'done',   label: 'Done'   },
+];
+
+interface FilterBarProps {
+  query: string;
+  status: Status;
+  onQueryChange: (next: string) =&gt; void;
+  onStatusChange: (next: Status) =&gt; void;
+}
+
+export function FilterBar({ query, status, onQueryChange, onStatusChange }: FilterBarProps) {
+  return (
+    &lt;div&gt;
+      &lt;input
+        type="search"
+        value={query}
+        placeholder="Search tasks…"
+        onChange={(e) =&gt; onQueryChange(e.target.value)}
+        aria-label="Search tasks"
+      /&gt;
+
+      {FILTERS.map(f =&gt; (
+        &lt;button
+          key={f.value}
+          onClick={() =&gt; onStatusChange(f.value)}
+          aria-pressed={status === f.value}
+        &gt;
+          {f.label}
+        &lt;/button&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/TaskRow.tsx</b> — the busiest component: two local states, three callbacks</p>
+  <pre><code>import { useState } from 'react';
+import type { Task } from './types';
+
+interface TaskRowProps {
+  task: Task;
+  onToggle: (id: string) =&gt; void;
+  onRename: (id: string, title: string) =&gt; void;
+  onDelete: (id: string) =&gt; void;
+}
+
+export function TaskRow({ task, onToggle, onRename, onDelete }: TaskRowProps) {
+  <span class="cmt">// Both local: one row's edit mode is nobody else's business.</span>
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState(task.title);
+
+  function startEditing() {
+    setDraft(task.title);      <span class="cmt">// seed the draft AT THE MOMENT editing starts</span>
+    setIsEditing(true);
+  }
+
+  function handleSave(e: React.FormEvent&lt;HTMLFormElement&gt;) {
+    e.preventDefault();
+    const title = draft.trim();
+    if (title) onRename(task.id, title);   <span class="cmt">// App owns the list, so App renames</span>
+    setIsEditing(false);
+  }
+
+  if (isEditing) {
+    return (
+      &lt;li&gt;
+        &lt;form onSubmit={handleSave}&gt;
+          &lt;input
+            value={draft}
+            onChange={(e) =&gt; setDraft(e.target.value)}
+            onKeyDown={(e) =&gt; { if (e.key === 'Escape') setIsEditing(false); }}
+            autoFocus
+            aria-label="Edit task title"
+          /&gt;
+          &lt;button type="submit"&gt;Save&lt;/button&gt;
+          &lt;button type="button" onClick={() =&gt; setIsEditing(false)}&gt;Cancel&lt;/button&gt;
+        &lt;/form&gt;
+      &lt;/li&gt;
+    );
+  }
+
+  return (
+    <span class="cmt">/* clicking the row toggles it — so inner buttons must stop the event */</span>
+    &lt;li onClick={() =&gt; onToggle(task.id)}&gt;
+      &lt;input
+        type="checkbox"
+        checked={task.done}
+        onChange={() =&gt; onToggle(task.id)}
+        onClick={(e) =&gt; e.stopPropagation()}   <span class="cmt">// else the row toggles it back</span>
+        aria-label={`Mark "${task.title}" as done`}
+      /&gt;
+      &lt;span style={{ textDecoration: task.done ? 'line-through' : 'none' }}&gt;
+        {task.title}
+      &lt;/span&gt;
+      &lt;button onClick={(e) =&gt; { e.stopPropagation(); startEditing(); }}&gt;Edit&lt;/button&gt;
+      &lt;button onClick={(e) =&gt; { e.stopPropagation(); onDelete(task.id); }}&gt;✕&lt;/button&gt;
+    &lt;/li&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/TaskList.tsx</b> — a list, a key, and an empty state</p>
+  <pre><code>import type { Task } from './types';
+import { TaskRow } from './TaskRow';
+
+interface TaskListProps {
+  tasks: Task[];
+  onToggle: (id: string) =&gt; void;
+  onRename: (id: string, title: string) =&gt; void;
+  onDelete: (id: string) =&gt; void;
+}
+
+export function TaskList({ tasks, onToggle, onRename, onDelete }: TaskListProps) {
+  if (tasks.length === 0) {
+    return &lt;p&gt;Nothing here. Change the filter, or add a task.&lt;/p&gt;;
+  }
+
+  return (
+    &lt;ul&gt;
+      {tasks.map(task =&gt; (
+        &lt;TaskRow
+          key={task.id}            <span class="cmt">// identity — never the array index</span>
+          task={task}
+          onToggle={onToggle}
+          onRename={onRename}
+          onDelete={onDelete}
+        /&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b> — the owner: all shared state, all immutable updates</p>
+  <pre><code>import { useState } from 'react';
+import type { Status, Task } from './types';
+import { TaskForm } from './TaskForm';
+import { FilterBar } from './FilterBar';
+import { TaskList } from './TaskList';
+
+const SEED: Task[] = [
+  { id: 't1', title: 'Read "Updating Arrays in State"', done: true  },
+  { id: 't2', title: 'Rebuild this app from memory',    done: false },
+  { id: 't3', title: 'Say the immutability answer out loud', done: false },
+];
+
+export default function App() {
+  <span class="cmt">// three pieces of shared state — everything else is derived</span>
+  const [tasks, setTasks] = useState&lt;Task[]&gt;(SEED);
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState&lt;Status&gt;('all');
+
+  <span class="cmt">// ---- the four updates. every one makes a NEW array. ----</span>
+
+  function handleAdd(title: string) {
+    setTasks(prev =&gt; [
+      ...prev,
+      { id: crypto.randomUUID(), title, done: false },
+    ]);
+  }
+
+  function handleToggle(id: string) {
+    setTasks(prev =&gt; prev.map(t =&gt;
+      t.id === id ? { ...t, done: !t.done } : t
+    ));
+  }
+
+  function handleRename(id: string, title: string) {
+    setTasks(prev =&gt; prev.map(t =&gt;
+      t.id === id ? { ...t, title } : t
+    ));
+  }
+
+  function handleDelete(id: string) {
+    setTasks(prev =&gt; prev.filter(t =&gt; t.id !== id));
+  }
+
+  <span class="cmt">// ---- derived values: recomputed every render, never stored ----</span>
+
+  const needle = query.trim().toLowerCase();
+
+  const visible = tasks.filter(t =&gt; {
+    const matchesText = t.title.toLowerCase().includes(needle);
+    const matchesStatus =
+      status === 'all' ? true :
+      status === 'done' ? t.done :
+      !t.done;
+    return matchesText &amp;&amp; matchesStatus;
+  });
+
+  const doneCount = tasks.filter(t =&gt; t.done).length;
+  const activeCount = tasks.length - doneCount;
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Tasks&lt;/h1&gt;
+      &lt;p&gt;{activeCount} active · {doneCount} done · showing {visible.length}&lt;/p&gt;
+
+      &lt;TaskForm onAdd={handleAdd} /&gt;
+
+      &lt;FilterBar
+        query={query}
+        status={status}
+        onQueryChange={setQuery}
+        onStatusChange={setStatus}
+      /&gt;
+
+      &lt;TaskList
+        tasks={visible}
+        onToggle={handleToggle}
+        onRename={handleRename}
+        onDelete={handleDelete}
+      /&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+
+  <p>Run <code>npm run dev</code>. It works, and it is about 200 lines with no library beyond React.</p>
+
+  <h2>The walkthrough — every Month-2 idea, mapped</h2>
+  <p>Read down this table with the code open. This is the part that turns a working app into knowledge you can say out loud.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where it is</th><th>Why it had to be that way</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Controlled input</b></td>
+        <td><code>value={draft}</code> + <code>onChange</code> in <code>TaskForm</code>; <code>value={query}</code> in <code>FilterBar</code></td>
+        <td>The Add button must disable itself while the box is empty, and the list must filter on every keystroke. Both need the value in state <em>now</em>.</td>
+      </tr>
+      <tr>
+        <td><b>Form, not a click handler</b></td>
+        <td><code>&lt;form onSubmit={handleSubmit}&gt;</code> + <code>e.preventDefault()</code></td>
+        <td>Enter submits, and screen readers announce a form. <code>preventDefault</code> stops the browser reloading the page.</td>
+      </tr>
+      <tr>
+        <td><b>stopPropagation</b></td>
+        <td>The checkbox, Edit, and ✕ buttons inside <code>TaskRow</code></td>
+        <td>The row itself is clickable. Without it, deleting also toggles, and the checkbox toggles twice — once for itself, once for the row.</td>
+      </tr>
+      <tr>
+        <td><b>Immutable add</b></td>
+        <td><code>[...prev, newTask]</code></td>
+        <td><code>push</code> would keep the same array identity, so React would see no change and skip the render.</td>
+      </tr>
+      <tr>
+        <td><b>Immutable update</b></td>
+        <td><code>prev.map(t =&gt; t.id === id ? { ...t, done: !t.done } : t)</code></td>
+        <td><code>map</code> replaces one item and returns the rest untouched — so unchanged rows keep their identity.</td>
+      </tr>
+      <tr>
+        <td><b>Immutable delete</b></td>
+        <td><code>prev.filter(t =&gt; t.id !== id)</code></td>
+        <td><code>filter</code> already returns a new array. <code>splice</code> would mutate.</td>
+      </tr>
+      <tr>
+        <td><b>Updater form</b></td>
+        <td>Every setter uses <code>prev =&gt;</code></td>
+        <td>Each new list is built from the previous one. The updater form is immune to stale snapshots and to batching.</td>
+      </tr>
+      <tr>
+        <td><b>Lifted state</b></td>
+        <td><code>tasks</code>, <code>query</code>, <code>status</code> in <code>App</code></td>
+        <td><code>FilterBar</code> shows the query, <code>TaskList</code> is filtered by it, and the header counts read the tasks. More than one reader means it goes to the common parent.</td>
+      </tr>
+      <tr>
+        <td><b>Local state kept local</b></td>
+        <td><code>draft</code> in <code>TaskForm</code>; <code>isEditing</code> and <code>draft</code> in <code>TaskRow</code></td>
+        <td>Nobody else reads them. Lifting them would re-render the whole page on every keystroke and buy nothing.</td>
+      </tr>
+      <tr>
+        <td><b>Typed callback props</b></td>
+        <td><code>onAdd: (title: string) =&gt; void</code>, <code>onRename: (id: string, title: string) =&gt; void</code></td>
+        <td>The type <em>is</em> the contract between parent and child, enforced by the compiler.</td>
+      </tr>
+      <tr>
+        <td><b>Derived, not stored</b></td>
+        <td><code>visible</code>, <code>doneCount</code>, <code>activeCount</code></td>
+        <td>Anything computable from state must be computed. A stored copy is a second truth that goes stale.</td>
+      </tr>
+      <tr>
+        <td><b>Keys by id</b></td>
+        <td><code>key={task.id}</code> in <code>TaskList</code></td>
+        <td>Rows carry their own local state (edit mode). With an index key, deleting row 1 would hand row 1's state to the old row 2.</td>
+      </tr>
+      <tr>
+        <td><b>A deliberate draft copy</b></td>
+        <td><code>setDraft(task.title)</code> inside <code>startEditing</code></td>
+        <td>This is <em>not</em> the <code>useState(props.x)</code> bug: the draft is re-seeded by an <b>event</b>, so it is never stale when editing begins.</td>
+      </tr>
+      <tr>
+        <td><b>Type-only import</b></td>
+        <td><code>import type { Task } from './types'</code></td>
+        <td>Types vanish at build time. <code>import type</code> says "this is erased", so no runtime import is generated.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Look at what is not here</span>
+    No <code>useEffect</code>. No state library. No <code>useMemo</code>. A filterable list with live search needs none of those, and reaching for them early is the most common way people make React harder than it is. Effects arrive in Month 4 — for talking to the <em>outside world</em>, which this app never does.
+  </div>
+
+  <h2>Extend it — three reps to make it yours</h2>
+  <p>Do these without looking at the code above. Each one is a small trap.</p>
+  <ol>
+    <li><b>"Clear completed" button.</b> One line in the parent: <code>setTasks(prev =&gt; prev.filter(t =&gt; !t.done))</code>. Then make the button disappear when <code>doneCount === 0</code> — derived, not a new piece of state.</li>
+    <li><b>"Toggle all" checkbox.</b> Flip every task to match. <code>setTasks(prev =&gt; prev.map(t =&gt; ({ ...t, done: nextValue })))</code>. Watch the parentheses around the object — without them the arrow body is read as a block.</li>
+    <li><b>Sort A→Z.</b> The trap you were warned about: <code>setTasks(prev =&gt; [...prev].sort((a, b) =&gt; a.title.localeCompare(b.title)))</code>. Write it without the spread first, watch nothing happen, then fix it. Feeling that bug once is worth more than reading it three times.</li>
+  </ol>
+  <p>One more, harder: give each task a <code>priority: 'low' | 'high'</code> and a <code>&lt;select&gt;</code> per row. You will need the <code>as</code> cast on <code>e.target.value</code>, an <code>onClick</code> with <code>stopPropagation</code>, and the map-plus-spread update. If you can do that one unaided, Month 2 is finished.</p>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate refactors this app "for performance". They add <code>const [visible, setVisible] = useState(tasks)</code> and update it inside every filter handler, so the filtering runs once per change instead of once per render. Search and the filter buttons work. But now renaming a task shows the old title until you touch a filter, and deleting one leaves a ghost row.</p>
+    Explain what they created, why the symptoms look random, and what you would do instead.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/adding-interactivity">"Adding Interactivity"</a> (the whole chapter), <a href="https://react.dev/learn/choosing-the-state-structure">"Choosing the State Structure"</a>, and <a href="https://react.dev/learn/sharing-state-between-components">"Sharing State Between Components"</a>. Next month you learn React's own method for doing the planning step you did by hand here.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>time you rebuilding this from a blank file</b>, or to mock-interview you on it: "walk me through your state choices" is the real question behind this exercise. Twenty minutes, no notes, is the target.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Plan the state before the components.</b> Sort every value on screen into state, derived, or constant — that table is the architecture.</li>
+      <li><b>Shared state goes up, private state stays down.</b> <code>tasks</code>, <code>query</code>, and <code>status</code> have several readers; a half-typed title and one row's edit mode have none.</li>
+      <li><b>Children report, parents decide.</b> Rows call <code>onToggle</code> / <code>onRename</code> / <code>onDelete</code>; only <code>App</code> ever changes the list.</li>
+      <li><b>Four immutable recipes cover a whole CRUD app:</b> add <code>[...prev, x]</code> · update <code>map</code> + spread · delete <code>filter</code> · reorder or sort on a copy.</li>
+      <li><b>Every setter used the updater form</b> <code>prev =&gt;</code>, because each new list is built from the last one.</li>
+      <li><b>Derived beats stored.</b> <code>visible</code>, <code>activeCount</code>, and <code>doneCount</code> are recomputed each render — storing them creates a second truth that goes stale.</li>
+      <li><b>Keys are identity.</b> Rows hold their own state, so an index key would hand a deleted row's edit mode to its neighbour.</li>
+      <li><b>Seed a draft from an event, never from <code>useState(props.x)</code></b> — <code>startEditing</code> re-seeds the draft at the moment editing begins.</li>
+      <li><b>Use a real form</b> with <code>onSubmit</code> and <code>preventDefault</code>, and <code>stopPropagation</code> on buttons inside a clickable row.</li>
+      <li><b>No effects, no memo, no state library</b> — a filterable searchable list needs none of them.</li>
+      <li><b>Real use case (built &amp; run):</b> a five-component task app — add, toggle, inline rename, delete, live text search, and a status filter with live counts.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>decide what is state, what is derived, and who owns it — then the code almost writes itself.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Adding Interactivity", "Updating Arrays in State", "Sharing State Between Components", "Choosing the State Structure", "Preserving and Resetting State", "Rendering Lists".</p>
+
+  <div class="footer-nav">
+    <a href="./0009-sharing-state-between-components.html">← Previous: Sharing state between components</a>
+    <a href="../reference/12-month-plan.html">Month 3 · Thinking in React →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A teammate stores the filtered list in state (setVisible) instead of deriving it. Renaming a task shows the old title until you touch a filter. Why?",
+      options: [
+        "There are now two sources of truth — `visible` only refreshes in the filter handlers, so any other change leaves it stale",
+        "map() returns a shallow copy, so the rename never reached the array",
+        "React batched the rename with the filter update and dropped one",
+        "The list needs a key change to pick up the new title"
+      ],
+      answer: 0,
+      why: "The filtered list is a function of tasks + query + status. Once you store it, it stops being a function of anything — it is a snapshot that only the handlers you remembered to update will refresh. Rename and delete change `tasks` but not `visible`, so the screen shows old data until a filter handler happens to rebuild it. Derive it during render instead; if profiling later shows the filtering itself is expensive, useMemo caches the computation without making it state."
+    },
+    {
+      q: "In TaskRow, why does the ✕ button call e.stopPropagation() before onDelete?",
+      options: [
+        "The row element itself has an onClick that toggles the task, and the click would bubble up to it",
+        "To stop React re-rendering the whole list",
+        "Because onDelete is asynchronous and needs the event to be held open",
+        "To prevent the browser's default action for buttons"
+      ],
+      answer: 0,
+      why: "React events travel up the tree. The button's handler runs first, then every ancestor's — including the row's onClick, which toggles done. So deleting would also toggle the task on its way out, and clicking the checkbox would toggle twice. stopPropagation ends the upward journey. preventDefault would be the wrong tool: it cancels the browser's own default behaviour, not the bubbling."
+    },
+    {
+      q: "Why is the new-task draft kept inside TaskForm instead of lifted to App?",
+      options: [
+        "No other component reads it, so lifting adds wiring and re-renders the whole page on every keystroke",
+        "App is not allowed to hold more than three pieces of state",
+        "Lifting it would break the controlled input",
+        "Because forms must always own their own values"
+      ],
+      answer: 0,
+      why: "Lift only what more than one component reads. A half-typed title is read by nobody else — App only needs the finished title, which arrives through onAdd(title). Keeping it local means each keystroke re-renders one small component instead of the whole page, and TaskForm stays reusable. The same reasoning keeps isEditing and the edit draft inside TaskRow."
+    },
+    {
+      q: "TaskRow does `const [draft, setDraft] = useState(task.title)`. Why is that not the classic copy-props-into-state bug?",
+      options: [
+        "Because startEditing re-seeds the draft from the prop each time editing begins, so it is never a stale copy",
+        "Because task.title is a string, and only objects have that problem",
+        "Because the row has a key, which refreshes all its state on every render",
+        "It is the same bug — the code is wrong"
+      ],
+      answer: 0,
+      why: "The bug is rendering a stale copy of a prop. Here the draft is only shown while editing, and startEditing sets it from task.title at that moment, so the editor always opens on current data. That is the legitimate pattern: a deliberate local draft, re-seeded by an event. The wrong version would render `draft` instead of `task.title` in read mode, where it would silently ignore later renames. (The key on the row also helps: a different task is a different component with fresh state.)"
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Build a filterable to-do list. Before you type — talk me through your state.”",
+      answer: "I start by sorting every value on the screen into three buckets. <b>State:</b> the task list, the search text, and the status filter — those are the things a user changes and nothing else can produce them. <b>Derived:</b> the visible tasks, the active count, the done count — all computed from the state during render, never stored, because a stored copy is a second truth that goes stale. <b>Constant:</b> the filter labels, which live outside the component. Then ownership: the three pieces of state have more than one reader — the filter bar shows the query, the list is filtered by it, the header counts the tasks — so they go in the closest common parent, <code>App</code>. Two things stay local: the half-typed new-task title, and one row's edit mode and draft, because nobody else reads either. Children get the values as props plus typed callbacks — <code>onAdd</code>, <code>onToggle</code>, <code>onRename</code>, <code>onDelete</code> — so only <code>App</code> ever changes the list."
+    },
+    {
+      prompt: "Interviewer: “Show me the four update functions for that list.”",
+      answer: "All four take the updater form, because each new list is built from the previous one, and all four produce a <b>new array</b> so React sees a new identity. <b>Add:</b> <code>setTasks(prev =&gt; [...prev, { id: crypto.randomUUID(), title, done: false }])</code>. <b>Toggle:</b> <code>setTasks(prev =&gt; prev.map(t =&gt; t.id === id ? { ...t, done: !t.done } : t))</code> — the matching task becomes a changed copy, every other task is returned as-is so its identity survives. <b>Rename</b> is the same shape with <code>{ ...t, title }</code>. <b>Delete:</b> <code>setTasks(prev =&gt; prev.filter(t =&gt; t.id !== id))</code>. If I add sorting, I copy first — <code>[...prev].sort(fn)</code> — because <code>sort</code> mutates in place and would hand React the identity it already has."
+    },
+    {
+      prompt: "Interviewer: “Why does each row need key={task.id} rather than the index?”",
+      answer: "Because the key is the row's <b>identity</b>, and React uses it to decide which existing component matches which item. My rows hold their own local state — edit mode and the edit draft. With an index key, deleting the first row shifts everything up: the component that was showing task 2 is now at index 1, so React reuses the state that belonged to the deleted row's neighbour. You see it as edit mode jumping to the wrong task, or typed text appearing in a different row. With a stable id, React knows the row moved rather than changed, keeps its state with it, and simply removes the one that is gone. The same rule applies to uncontrolled inputs inside a list."
+    },
+    {
+      prompt: "Interviewer: “This app has no useEffect. Should it?”",
+      answer: "No. An effect is for stepping outside React — a network request, a subscription, a timer, a browser API. Everything in this app is a pure function of state: the filtered list, the counts, and the rendered rows are all computed during render from tasks, query, and status. Using an effect to 'keep the filtered list in sync' would mean rendering with stale data, then re-rendering to fix it, and adding a dependency array I can get wrong. The rule I use: if I can compute it during render, I compute it during render. The moment this app loads tasks from an API or saves them to localStorage, that <em>is</em> outside work and an effect — or a data library — becomes the right tool."
+    }
+  ]);
+</script>

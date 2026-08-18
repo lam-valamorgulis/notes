@@ -1,0 +1,645 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sharing state between components — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 2 · Lesson 3 · State &amp; events</p>
+  <h1>Sharing state between components</h1>
+  <p class="subtitle">Lifting state up, events flowing back, and how to find the one component that should own each piece of data.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you'll be able to <b>(1)</b> decide which component should own any piece of state, <b>(2)</b> lift state up with correctly typed callback props, and <b>(3)</b> spot the two classic mistakes — copying props into state, and lifting things that should have stayed local.
+  </div>
+
+  <p>You can now hold state and take input. The last piece of Month 2 is the one that makes an <em>app</em> instead of a pile of widgets: <b>two components that need the same data</b>.</p>
+
+  <h2>First principle — siblings cannot see each other</h2>
+  <p>Props flow one way: down. A component can read what its parent passed and nothing else. It cannot reach sideways into a sibling, and it cannot reach up.</p>
+  <p>So if two components need the same value, there is exactly one place that value can live: <b>a component above both of them</b>. That is not a workaround. It is the direct consequence of one-way data flow, and it is why you can always answer "who changed this?" in a React app.</p>
+
+  <div class="soundbite">
+    <span class="label">The rule</span>
+    <p><b>State belongs to the closest component that is above everyone who needs it.</b> Data flows down as props. Events flow back up as function calls.</p>
+  </div>
+
+  <h2>The problem, concretely</h2>
+  <p>Two panels. Each owns whether it is open:</p>
+
+  <pre><code>function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+  const [isOpen, setIsOpen] = useState(false);       <span class="cmt">// local state</span>
+  return (
+    &lt;section&gt;
+      &lt;h3&gt;{title}&lt;/h3&gt;
+      {isOpen
+        ? &lt;p&gt;{children}&lt;/p&gt;
+        : &lt;button onClick={() =&gt; setIsOpen(true)}&gt;Show&lt;/button&gt;}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>This works fine — until the requirement arrives: <b>only one panel open at a time.</b> Now Panel A must know about Panel B. It can't. Each panel has its own private <code>isOpen</code>, and neither can see the other's.</p>
+  <p>No amount of cleverness inside <code>Panel</code> fixes this. The state is in the wrong place.</p>
+
+  <h2>Lifting state up — three mechanical steps</h2>
+  <p>The fix has a name and a recipe. You do the same three steps every time.</p>
+
+  <ol>
+    <li><b>Remove the state from the child.</b> Delete the <code>useState</code>.</li>
+    <li><b>Pass the value down</b> from the common parent as a prop.</li>
+    <li><b>Pass a function down</b> so the child can ask the parent to change it.</li>
+  </ol>
+
+  <pre><code>function Panel({ title, isOpen, onShow, children }: {
+  title: string;
+  isOpen: boolean;                 <span class="cmt">// 2 · value comes in</span>
+  onShow: () =&gt; void;              <span class="cmt">// 3 · a way to ask for a change</span>
+  children: React.ReactNode;
+}) {
+  return (
+    &lt;section&gt;
+      &lt;h3&gt;{title}&lt;/h3&gt;
+      {isOpen ? &lt;p&gt;{children}&lt;/p&gt; : &lt;button onClick={onShow}&gt;Show&lt;/button&gt;}
+    &lt;/section&gt;
+  );
+}
+
+function Accordion() {
+  <span class="cmt">// one value describes the whole group — which index is open</span>
+  const [openIndex, setOpenIndex] = useState(0);
+
+  return (
+    &lt;&gt;
+      &lt;Panel title="About"   isOpen={openIndex === 0} onShow={() =&gt; setOpenIndex(0)}&gt;
+        Etc.
+      &lt;/Panel&gt;
+      &lt;Panel title="Billing" isOpen={openIndex === 1} onShow={() =&gt; setOpenIndex(1)}&gt;
+        Etc.
+      &lt;/Panel&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p>Read what happened to the requirement. "Only one open at a time" is no longer a rule you enforce with code — it is a <b>fact about the state shape</b>. One number cannot describe two open panels. The bug became impossible instead of being fixed.</p>
+
+  <div class="tip">
+    <span class="label">This is the real prize</span>
+    Choosing the right owner and the right shape removes whole categories of bug. Two booleans need syncing and can disagree; one index cannot. Month 3 is built on this idea.
+  </div>
+
+  <h2>Data down, events up</h2>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig9-title" width="640" height="300">
+      <title id="fig9-title">The parent owns the state; props flow down to both children and callbacks flow back up, while siblings cannot talk to each other directly</title>
+
+      <rect x="196" y="16" width="248" height="66" rx="8" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="320" y="40" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 12.5px; font-weight: 700;">TeamPage — the owner</text>
+      <text x="320" y="58" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px;">state: query, selectedId</text>
+      <text x="320" y="73" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9.5px; opacity: .85;">the single source of truth</text>
+
+      <!-- left child -->
+      <rect x="26" y="176" width="232" height="62" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="142" y="199" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">SearchBar</text>
+      <text x="142" y="216" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">props: query, onQueryChange</text>
+      <text x="142" y="230" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">owns nothing</text>
+
+      <!-- right child -->
+      <rect x="382" y="176" width="232" height="62" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="498" y="199" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">MemberList</text>
+      <text x="498" y="216" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">props: visible, selectedId, onSelect</text>
+      <text x="498" y="230" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">owns nothing</text>
+
+      <!-- down arrows (props) -->
+      <line x1="248" y1="84" x2="160" y2="172" style="stroke: var(--accent); stroke-width: 1.8;" marker-end="url(#a9)"></line>
+      <line x1="392" y1="84" x2="480" y2="172" style="stroke: var(--accent); stroke-width: 1.8;" marker-end="url(#a9)"></line>
+
+      <!-- up arrows (callbacks) -->
+      <line x1="120" y1="174" x2="212" y2="86" style="stroke: var(--accent-2); stroke-width: 1.8; stroke-dasharray: 4 3;" marker-end="url(#a9o)"></line>
+      <line x1="520" y1="174" x2="428" y2="86" style="stroke: var(--accent-2); stroke-width: 1.8; stroke-dasharray: 4 3;" marker-end="url(#a9o)"></line>
+
+      <!-- legend in the middle -->
+      <text x="320" y="122" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">data goes DOWN as props ↓</text>
+      <text x="320" y="140" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">events come UP as callbacks ↑</text>
+
+      <!-- sibling line -->
+      <line x1="262" y1="207" x2="378" y2="207" style="stroke: var(--ink-faint); stroke-width: 1.4; stroke-dasharray: 2 4;"></line>
+      <text x="320" y="201" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">✕</text>
+      <text x="320" y="224" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">no sideways path</text>
+
+      <text x="320" y="272" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-style: italic;">one owner, many readers — so there is always exactly one answer to "what is the current query?"</text>
+      <text x="320" y="290" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">a child never changes the value itself; it calls a function and the owner decides</text>
+
+      <defs>
+        <marker id="a9" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a9o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>The lifted pattern: the parent holds the value, hands it down, and hands down a function. Children report; they do not decide.</figcaption>
+  </div>
+
+  <p>The function you pass down is called a <b>callback prop</b>. Two conventions make code readable, and every React codebase uses them:</p>
+  <ul>
+    <li>The <b>prop</b> is named <code>onSomething</code> — <code>onSelect</code>, <code>onQueryChange</code>, <code>onDelete</code>.</li>
+    <li>The <b>function</b> in the parent is named <code>handleSomething</code> — <code>handleSelect</code>, <code>handleQueryChange</code>.</li>
+  </ul>
+
+  <pre><code><span class="cmt">// parent</span>
+function handleSelect(id: string) { setSelectedId(id); }
+&lt;MemberList onSelect={handleSelect} /&gt;
+
+<span class="cmt">// child — the prop type says exactly what the parent will receive</span>
+interface MemberListProps {
+  members: Member[];
+  selectedId: string | null;
+  onSelect: (id: string) =&gt; void;      <span class="cmt">// takes an id, returns nothing</span>
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">TypeScript makes the contract explicit</span>
+    <code>onSelect: (id: string) =&gt; void</code> is a small piece of documentation the compiler enforces. The child cannot call it wrongly, and the parent cannot accept the wrong shape. Prop types are where TypeScript pays for itself in React.
+  </div>
+
+  <h2>Controlled and uncontrolled — one level up</h2>
+  <p>You met these words for inputs. They mean the same thing for your own components, and using them out loud marks you as someone who has done this before.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th></th><th>Uncontrolled child</th><th>Controlled child</th></tr></thead>
+    <tbody>
+      <tr><td>Who owns the value</td><td>The child, in its own <code>useState</code></td><td>The parent, passed in as a prop</td></tr>
+      <tr><td>Parent needs</td><td>Nothing</td><td>State + a handler</td></tr>
+      <tr><td>Good for</td><td>Self-contained widgets — a tooltip, a local "show more"</td><td>Anything that must coordinate with something else</td></tr>
+      <tr><td>Cost</td><td>The parent cannot influence it</td><td>More wiring in the parent</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Real component libraries often support both, by making the prop optional and falling back to internal state. You do not need that yet — but that is the pattern you are looking at when a library says a component is "controlled or uncontrolled".</p>
+
+  <h2>Finding the owner — the procedure</h2>
+  <ol>
+    <li><b>List every component that reads the value.</b> Reads, not writes — writing goes through the callback anyway.</li>
+    <li><b>Find their closest common parent.</b> Walk up until one component contains all of them.</li>
+    <li><b>Put the state there.</b> Pass the value down, pass a setter or handler down.</li>
+    <li><b>If that feels wrong</b> — for instance the common parent is a layout component with no business meaning — put it one level higher, where it makes sense to a human.</li>
+  </ol>
+  <p>Then check the invariant: <b>one piece of information, one owner.</b> If the same fact is stored in two places, they will drift apart, and the bug report will say "sometimes it shows the wrong name".</p>
+
+  <h2>The classic mistake — copying props into state</h2>
+  <p>This is the highest-value bug in the lesson, because it looks so reasonable:</p>
+
+  <pre><code>function PriceTag({ price }: { price: number }) {
+  const [value, setValue] = useState(price);   <span class="cmt">// ✕ a copy of the prop</span>
+  return &lt;span&gt;{value}&lt;/span&gt;;
+}</code></pre>
+
+  <p>The parent changes <code>price</code> to 99. The component re-renders. The screen still shows the old number.</p>
+  <p>Why? Because the argument to <code>useState</code> is the <b>initial</b> value — used once, on the first render of that component, and ignored on every render after. You created a second source of truth, and it froze at birth.</p>
+
+  <div class="trap">
+    <span class="label">What to do instead</span>
+    <b>Just use the prop.</b> If the value comes from above, read it from above: <code>&lt;span&gt;{price}&lt;/span&gt;</code>. If the child genuinely needs to edit it, the state belongs in the <em>parent</em> and the child gets <code>value</code> + <code>onChange</code>. The only case for copying is a deliberately independent draft — for example an edit form pre-filled from the server value — and then you must decide how it resets. Which brings us to <code>key</code>.
+  </div>
+
+  <h2>Resetting state with <code>key</code></h2>
+  <p>State does not belong to your function. It belongs to a <b>position in the tree</b>. React keeps state for "the third child of this list" as long as something of the same type stays in that position.</p>
+  <p>That explains a bug that feels supernatural. You have an edit form with a draft in local state. The user selects a different member — and the form still shows the previous member's text, because from React's view it is the same component in the same position, just with new props.</p>
+  <p>The fix is one attribute:</p>
+
+  <pre><code><span class="cmt">// changing the key tells React: this is a DIFFERENT component now</span>
+&lt;MemberNote key={selectedId} memberId={selectedId} /&gt;</code></pre>
+
+  <p>When the key changes, React throws the old component away — state and all — and mounts a fresh one. Same idea as list keys in Month 1: the key is the identity.</p>
+
+  <div class="soundbite">
+    <span class="label">Two ways to reset a child's state</span>
+    <p><b>Give it a <code>key</code> that changes</b> when the identity changes — clean, declarative, no extra code. Or <b>lift the value up</b> so the parent controls it and can set it back. Reaching for an effect to "sync" props into state is almost always the wrong third option (Month 4 explains why).</p>
+  </div>
+
+  <h2>When <em>not</em> to lift</h2>
+  <ul>
+    <li><b>Only one component reads it?</b> Keep it local. Local state is not a lesser thing — it keeps re-renders small and the component readable and reusable.</li>
+    <li><b>Passing a prop through four components that do not use it?</b> That is <em>prop drilling</em>. It is a real smell, but the first answer is usually better composition — pass the JSX down instead of the data. If it is genuinely app-wide (theme, current user), that is what Context is for in Month 6.</li>
+    <li><b>Lifting everything to the top</b> makes one giant component that re-renders on every keystroke. Put state as high as it must go, and no higher.</li>
+  </ul>
+
+  <h2>Build it for real — a filter bar, a list, and a detail panel</h2>
+  <p>Three sibling components, no state of their own, all coordinated by one parent. Replace <code>src/App.tsx</code>:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { useState } from 'react';
+
+interface Member {
+  id: string;
+  name: string;
+  role: string;
+}
+
+const TEAM: Member[] = [
+  { id: 'm1', name: 'Mai Nguyen',  role: 'Engineering' },
+  { id: 'm2', name: 'Tomas Rehak', role: 'Design' },
+  { id: 'm3', name: 'Aisha Bello', role: 'Engineering' },
+  { id: 'm4', name: 'Jun Park',    role: 'Product' },
+];
+
+<span class="cmt">// ---------- child 1: fully controlled, owns nothing ----------</span>
+interface SearchBarProps {
+  query: string;
+  onQueryChange: (next: string) =&gt; void;
+}
+
+function SearchBar({ query, onQueryChange }: SearchBarProps) {
+  return (
+    &lt;input
+      type="search"
+      placeholder="Filter by name…"
+      value={query}
+      onChange={(e) =&gt; onQueryChange(e.target.value)}
+    /&gt;
+  );
+}
+
+<span class="cmt">// ---------- child 2: reports clicks, decides nothing ----------</span>
+interface MemberListProps {
+  members: Member[];
+  selectedId: string | null;
+  onSelect: (id: string) =&gt; void;
+}
+
+function MemberList({ members, selectedId, onSelect }: MemberListProps) {
+  if (members.length === 0) return &lt;p&gt;No one matches that filter.&lt;/p&gt;;
+
+  return (
+    &lt;ul&gt;
+      {members.map(m =&gt; (
+        &lt;li key={m.id}&gt;
+          &lt;button
+            onClick={() =&gt; onSelect(m.id)}
+            aria-current={m.id === selectedId}
+          &gt;
+            {m.name} — {m.role}
+          &lt;/button&gt;
+        &lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}
+
+<span class="cmt">// ---------- child 3: has its OWN state on purpose ----------</span>
+function MemberNote({ member }: { member: Member }) {
+  <span class="cmt">// A private draft. Nobody else needs it, so it stays local.</span>
+  const [note, setNote] = useState('');
+
+  return (
+    &lt;div&gt;
+      &lt;h2&gt;{member.name}&lt;/h2&gt;
+      &lt;p&gt;{member.role}&lt;/p&gt;
+      &lt;textarea
+        value={note}
+        placeholder={`Private note about ${member.name}…`}
+        onChange={(e) =&gt; setNote(e.target.value)}
+      /&gt;
+    &lt;/div&gt;
+  );
+}
+
+<span class="cmt">// ---------- the owner ----------</span>
+export default function TeamPage() {
+  const [query, setQuery] = useState('');
+  const [selectedId, setSelectedId] = useState&lt;string | null&gt;(null);
+
+  <span class="cmt">// both derived — never stored</span>
+  const visible = TEAM.filter(m =&gt;
+    m.name.toLowerCase().includes(query.trim().toLowerCase())
+  );
+  const selected = TEAM.find(m =&gt; m.id === selectedId) ?? null;
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Team&lt;/h1&gt;
+
+      &lt;SearchBar query={query} onQueryChange={setQuery} /&gt;
+
+      &lt;MemberList
+        members={visible}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+      /&gt;
+
+      {selected &amp;&amp; (
+        <span class="cmt">/* key = identity. New member → brand-new component → empty note. */</span>
+        &lt;MemberNote key={selected.id} member={selected} /&gt;
+      )}
+    &lt;/main&gt;
+  );
+}</code></pre>
+
+  <p>Run it, then do these four experiments. Each one proves a claim from this lesson:</p>
+  <ol>
+    <li><b>Type in the search box.</b> The input, the list, and the empty-state message all move together — because there is only one <code>query</code>, in one place.</li>
+    <li><b>Pick a member, type a note, then pick a different member.</b> The note clears. Now <b>delete <code>key={selected.id}</code></b> and repeat: the old note stays behind. You have just seen that state belongs to a position, not to a component.</li>
+    <li><b>Try to make <code>MemberList</code> clear the search box.</b> You cannot — it has no access. That is one-way data flow doing its job. It would have to call a callback the parent gave it.</li>
+    <li><b>Ask yourself why <code>note</code> was not lifted.</b> Nothing else reads it. Lifting it would add wiring, add re-renders to the whole page on every keystroke, and buy nothing.</li>
+  </ol>
+
+  <div class="tip">
+    <span class="label">Notice what you passed as a callback</span>
+    <code>onQueryChange={setQuery}</code> passes the state setter straight down. That is fine and common when the child's value <em>is</em> the state. Write a named <code>handleQueryChange</code> when the parent needs to do more than store it — validate, trim, also clear the selection, log it.
+  </div>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate's <code>&lt;CartTotal total={total} /&gt;</code> shows a stale number. Inside, they wrote <code>const [displayTotal, setDisplayTotal] = useState(total);</code> and render <code>displayTotal</code>. Adding an item updates <code>total</code> in the parent, the child re-renders — and the old number stays on screen.</p>
+    Name the mistake, say why the re-render does not help, and give the fix.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/sharing-state-between-components">"Sharing State Between Components"</a>, <a href="https://react.dev/learn/preserving-and-resetting-state">"Preserving and Resetting State"</a>, and <a href="https://react.dev/learn/choosing-the-state-structure">"Choosing the State Structure"</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>give you a mockup</b> and grill you on where each piece of state should live. That decision is most of what "thinking in React" means — and it is next month's whole subject.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Siblings cannot see each other.</b> Props flow one way, so shared data must live in a component above everyone who reads it.</li>
+      <li><b>Lifting state up, three steps:</b> remove the <code>useState</code> from the child · pass the value down as a prop · pass a function down so the child can request a change.</li>
+      <li><b>Data down, events up.</b> Prop named <code>onSomething</code>, parent function named <code>handleSomething</code>, typed as <code>(arg: T) =&gt; void</code>.</li>
+      <li><b>Controlled child</b> = the parent owns its value. <b>Uncontrolled child</b> = it owns its own. Same words as inputs, one level up.</li>
+      <li><b>Find the owner</b> by listing every component that reads the value and taking their closest common parent — then move it higher only if that place makes human sense.</li>
+      <li><b>One fact, one owner.</b> Two copies of the same information will drift apart.</li>
+      <li><b>Never copy a prop into state</b> — <code>useState(props.x)</code> only uses <code>x</code> on the first render, so later prop changes are ignored. Read the prop, or lift the state.</li>
+      <li><b>State lives at a position in the tree.</b> Change a component's <code>key</code> to throw its state away and start fresh — the clean way to reset an edit form.</li>
+      <li><b>Don't lift what only one component reads.</b> Local state keeps re-renders small; prop drilling is answered by composition first, Context (Month 6) second.</li>
+      <li><b>Real use case (built &amp; run):</b> a search bar, a list, and a detail panel — two children with no state at all, one parent owning <code>query</code> and <code>selectedId</code>, a private local note in the third child, and <code>key</code> resetting it per member.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>put each piece of state in the closest component above everyone who reads it — then send data down and events up.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Sharing State Between Components", "Preserving and Resetting State", "Choosing the State Structure", "Passing Props to a Component".</p>
+
+  <div class="footer-nav">
+    <a href="./0008-updating-objects-and-arrays-in-state.html">← Previous: Updating objects &amp; arrays in state</a>
+    <a href="./0010-build-a-filterable-task-list.html">Next: Build it — a filterable task list →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A child renders useState(props.total) and shows a stale number after the parent updates total. Why?",
+      options: [
+        "The argument to useState is only the INITIAL value — it is ignored on every render after the first",
+        "The parent forgot to pass the updated prop",
+        "useState needs a dependency array to track the prop",
+        "The child must call the setter inside its render to stay in sync"
+      ],
+      answer: 0,
+      why: "useState(x) reads x once, when that component first mounts, to seed its state. After that the state is independent, so later prop changes are invisible to it. You now have two sources of truth and one of them is frozen. Fix: render the prop directly. If the child must edit the value, lift the state to the parent and pass value + onChange down."
+    },
+    {
+      q: "Two sibling components need the same 'selectedId'. Where should it live?",
+      options: [
+        "In their closest common parent, passed down as a prop with a callback to change it",
+        "In each sibling, kept in sync by calling the other's setter",
+        "In a module-level variable outside both components",
+        "In the topmost App component, always"
+      ],
+      answer: 0,
+      why: "Props flow one way, so the only place both siblings can read the same value is above them both. The closest common parent keeps the state as local as possible while still reaching everyone. A module variable is invisible to React, so changing it triggers no re-render. Hoisting everything to App works but makes one huge component that re-renders on every small change."
+    },
+    {
+      q: "An edit form keeps showing the previous item's draft text when the user selects a different item. The cleanest fix is:",
+      options: [
+        "Give the form a key that changes with the item id, so React mounts a fresh component",
+        "Add an effect that resets the draft whenever the id prop changes",
+        "Move every draft field up into the parent",
+        "Call the setter during render when the id looks different"
+      ],
+      answer: 0,
+      why: "React keeps state for a position in the tree, so the same component in the same slot keeps its state even when props change. Changing the key changes the identity: React unmounts the old one and mounts a new one with fresh state. That is one attribute and no extra logic. The effect version works but adds a render-then-fix cycle and is the pattern React's docs steer you away from."
+    },
+    {
+      q: "Which of these should stay as local state in a child, not be lifted?",
+      options: [
+        "Whether a self-contained tooltip inside that child is currently visible",
+        "The search query that also filters a sibling list",
+        "The id of the row selected, which a detail panel also reads",
+        "The current filter, which the parent shows a count for"
+      ],
+      answer: 0,
+      why: "Lift only what more than one component reads. A tooltip's open flag is read by nobody else, so lifting it adds wiring and makes the parent re-render for a purely local detail. The other three are all read by at least two components, so they belong in the closest common parent."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What does 'lifting state up' mean, and how do you do it?”",
+      answer: "It means moving a piece of state out of a child and into the closest component above everyone who needs it, because props only flow one way and siblings cannot see each other's state. Three steps: <b>remove the <code>useState</code> from the child</b>; <b>pass the value down</b> as a prop; and <b>pass a function down</b> — a callback prop like <code>onSelect</code> — so the child can ask the parent to change it. The child becomes <b>controlled</b>: it renders what it is given and reports events, but it does not decide. The payoff is a single source of truth, so two parts of the UI can never disagree. The related discipline is not lifting more than I need — state that only one component reads stays local, so re-renders stay small."
+    },
+    {
+      prompt: "Interviewer: “How do you decide which component owns a piece of state?”",
+      answer: "I list every component that <b>reads</b> the value, then find their closest common parent, and put the state there. Writers do not matter for the decision, because writing happens through a callback anyway. If that common parent is a meaningless wrapper — a layout div component — I move it one level up to somewhere a human would expect it. Then I check the invariant: one fact, one owner. If the same information is stored twice, the copies drift and I get 'sometimes it shows the wrong value'. And I keep asking whether the value is really state at all — if it can be computed from other state, like a filtered list or a count, it should be derived during render instead."
+    },
+    {
+      prompt: "Interviewer: “Why is useState(props.value) usually a bug?”",
+      answer: "Because the argument to <code>useState</code> is only the <b>initial</b> value. React reads it once, when that component first mounts, and ignores it on every later render. So the child now holds an independent copy that froze at birth: the parent updates the prop, the child re-renders, and the screen still shows the old value. It is a second source of truth. The fix is normally to just render the prop. If the child needs to edit the value, the state belongs in the parent and the child takes <code>value</code> plus <code>onChange</code>. The one legitimate use is a deliberate local draft — an edit form pre-filled from server data — and then I reset it by changing the component's <code>key</code> when the identity changes, not by syncing with an effect."
+    },
+    {
+      prompt: "Interviewer: “What does the key prop do outside of lists?”",
+      answer: "It sets a component's identity. React keeps state for a <b>position in the tree</b>, so a component that stays in the same slot keeps its state even when its props change completely. Giving it <code>key={selectedId}</code> means that when the id changes, React sees a different component: it unmounts the old one, throws its state away, and mounts a fresh one. That is the cleanest way to reset a form or a draft when the thing being edited changes. It is exactly the same mechanism as keys in a list — there the identity tells React which row is which, so it can move a row instead of rebuilding it."
+    }
+  ]);
+</script>

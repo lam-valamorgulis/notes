@@ -1,0 +1,605 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B04 — When the Vendor Will Not Give You an API</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .pill.gap { background: var(--warn); }
+  .pill.dead { background: var(--warn); }
+  .pill.live { background: var(--good); }
+</style>
+
+<div class="wrap">
+  <p class="mapnav"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Part B · Lesson B04 · Win the room</p>
+  <h1>When the Vendor Will Not Give You an API</h1>
+  <p class="subtitle">A real integration that went through six designs in four weeks, because the platform on the other side had no key to give. Which constraint killed which design — and the two blockers that were never the vendor's fault at all.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> name the four technical constraints a closed platform imposes and what each one forbids · walk the six designs and say which constraint killed which · and explain the difference between a <b>capacity deferral</b> and a <b>product refusal</b>, because reading one as the other costs weeks.
+  </div>
+
+  <div class="trap">
+    <span class="label">Read this before you use any of it</span>
+    Every name, company, person, budget and ticket number is <b>removed on purpose</b>, and stays removed. What is teachable here is the <b>shape of the problem</b>: constraint → design → death → next design. If you tell this story in an interview, tell it as <i>"I read a detailed integration discovery against a closed platform"</i> and keep it structural. The moment it becomes gossip about a named project you have stopped being an engineer talking about architecture. See <a href="../reference/verified-facts.html">verified-facts §2</a>.
+  </div>
+
+  <h2>1. The setup, in five lines</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Piece</th><th>What it was</th></tr>
+    <tr><td>The platform</td><td>A closed, multi-tenant inventory system. Holds the catalogue, the pricing rules, the stock and the customer credit ledger</td></tr>
+    <tr><td>The storefront</td><td>Shopify. The platform already syncs products and prices into it, two-way for stock</td></tr>
+    <tr><td>The feature</td><td>Let a customer, at home, list cards they want to sell, see an <b>instant per-condition offer</b>, and submit the batch for a shop to review and pay out</td></tr>
+    <tr><td>The catch</td><td>The offer price exists <b>only inside the platform</b>, computed live from rules. It is not in Shopify, and there is <b>no external API access</b></td></tr>
+    <tr><td>The clock</td><td>A fixed go-live, roughly three months out</td></tr>
+  </table>
+  </div>
+
+  <p>That is a completely ordinary brief. Everything difficult about it comes from the last two rows.</p>
+
+  <h2>2. The wall, described technically</h2>
+
+  <p>"No API" is a vague phrase. Here is what it actually looked like, and it is worth learning as a checklist, because each item forbids something different.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Constraint</th><th>Observed</th><th>What it forbids</th></tr>
+    <tr>
+      <td><b>CORS is pinned</b></td>
+      <td><code>access-control-allow-origin</code> allowed exactly one host — the platform's own front-end</td>
+      <td>Any browser call from your domain. So <b>server-side or nothing</b></td>
+    </tr>
+    <tr>
+      <td><b>Tokens are human and short</b></td>
+      <td>A staff login produced a JWT lasting <b>24 hours</b></td>
+      <td>Unattended servers. A 24-hour token means a human logging in daily forever</td>
+    </tr>
+    <tr>
+      <td><b>The app client holds a secret you do not have</b></td>
+      <td>A login probe returned <code>configured with secret but SECRET_HASH was not received</code>. The secret was not in the front-end bundle</td>
+      <td><b>Self-refreshing.</b> Even with a password you cannot mint a token from a server</td>
+    </tr>
+    <tr>
+      <td><b>No self-serve key page</b></td>
+      <td>The admin site had no developer or API-key screen anywhere</td>
+      <td>Solving it yourself. It becomes a <b>human ask to the vendor</b>, on their timeline</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The order of that list is the useful part</span>
+    Each row rules out one escape route, and they compound. CORS pushes you server-side. The short token means the server needs to refresh. The missing secret means it <b>cannot</b> refresh. The missing key page means you cannot fix that yourself. <b>Four findings, and the fourth one converts an engineering problem into a scheduling problem</b> — which is a much worse kind, because you no longer control it.
+  </div>
+
+  <h3>One honest nuance on CORS</h3>
+
+  <div class="note">
+    <span class="label">"CORS forces a server-side design" is weaker than it sounds</span>
+    The <b>previous</b> inventory vendor at that same shop shipped a browser widget that called its own API directly from the page. So a closed API is a <b>choice about who they will CORS-enable</b>, not a law of the problem. The correct framing is: <i>"this vendor has not enabled cross-origin access for us"</i> — which is a request you can make, not a wall you have to route around. Stating it the strong way sounds authoritative and quietly closes a door that was never locked.
+  </div>
+
+  <h2>3. Six designs, and what killed each</h2>
+
+  <p>Four weeks. Six architectures. This is the actual value of the case study — not the answer, the <b>sequence</b>.</p>
+
+  <h3><span class="pill dead">dead</span> D1 · Live server-side validation and write-back</h3>
+
+  <p>Storefront posts to an App Proxy path → HMAC verified → a hosted function re-validates every line against the platform's live search endpoint → posts the approved batch into the platform's own buy list, which already has a review pipeline.</p>
+
+  <p><b>Killed by:</b> the missing app-client secret. There is no way for a server to hold a credential.</p>
+
+  <div class="tip">
+    <span class="label">What survives from D1, and it is a lot</span>
+    <b>The App Proxy plus HMAC plus server-side re-validation pattern is right no matter which design wins.</b> Every later option still needs it, because every later option needs a secret in a server — and a secret cannot live in theme JavaScript. So this was never wasted design work; it was <b>unbuilt infrastructure sitting in front of options 3 to 6</b>. Knowing the difference between "that design died" and "that design's plumbing is still required" is a senior distinction.
+  </div>
+
+  <h3><span class="pill live">live</span> D2 · The platform pushes prices as Shopify metafields</h3>
+
+  <p>No live call at all. The platform writes cash and credit buy prices onto Shopify <b>variant</b> metafields as part of the sync it already runs. The storefront reads them like any other product field.</p>
+
+  <p><b>Not killed.</b> This became the sanctioned pricing path, and the read side is trivial.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Why it works</th><th>What it actually depends on</th></tr>
+    <tr><td>The sync already exists and already writes products. Adding one field is small</td><td>The field must be <b>variant-level</b>, because each condition is a separate variant. A product-level field cannot express NM versus DMG</td></tr>
+    <tr><td>Removes every credential problem at once</td><td>A vendor delivery date you do not control</td></tr>
+    <tr><td>Prices become as fast as any other Shopify read</td><td><b>Products existing on the store at all</b> — see §4</td></tr>
+  </table>
+  </div>
+
+  <h3><span class="pill">option</span> D3 · A file exported from the review tool, uploaded by a human</h3>
+
+  <p>Once staff approve a batch, generate a file and have someone upload it into the platform by hand.</p>
+
+  <p><b>Not killed, and never validated.</b> Cheap to build, permanently expensive to operate, because it puts a human step in the money path forever.</p>
+
+  <div class="trap">
+    <span class="label">The kill-check nobody ran</span>
+    Does the import screen <b>exist</b>, and what fields does it need? It probably needs the platform's own <b>per-condition card id</b> — which lives in the platform and is exactly what a task tool will not have. <b>That check is ten minutes on a screen the shop's staff use daily, and it was never done.</b> Before you design to an interface, open it. This is the cheapest possible way to kill or confirm an option, and it kept getting deferred in favour of harder questions.
+  </div>
+
+  <h3><span class="pill live">live</span> D4 · The client's existing task tool as the staff review queue</h3>
+
+  <p>A submission creates a task in the tool the shop's buying team already works in. Staff price, adjust and approve there. Status flows back to the customer's account page.</p>
+
+  <p><b>Not killed</b> — the destination was confirmed as the decision. But <b>half of it could not ship as designed</b>, for a reason that has nothing to do with the vendor. See §4.</p>
+
+  <h3><span class="pill live">live</span> D5 · Submit, and we will quote you</h3>
+
+  <p>The customer submits a list with no instant price. The shop responds after a human review.</p>
+
+  <p><b>Not killed.</b> Lowest build cost, and the realistic shape for a first release.</p>
+
+  <div class="note">
+    <span class="label">But it is not zero-dependency, and the question was never asked</span>
+    It still needs a Shopify custom app, an App Proxy subpath, and hosting stood up from scratch, because writing into the task tool needs a token. And commercially: the approved designs all show <b>instant per-condition quotes</b>, and the old site already advertised a choice of cash or store credit. <b>Nobody asked whether launching without instant quotes was acceptable.</b> That is a one-sentence question with a three-month consequence, and four weeks of architecture happened without it.
+  </div>
+
+  <h3><span class="pill">option</span> D6 · Push approved buy-ins through the stock sync that already exists</h3>
+
+  <p>Skip the file and the write API entirely. Accepting a trade-in means <b>incrementing stock in Shopify</b>, which the existing two-way sync already carries back into the platform.</p>
+
+  <p><b>Not killed. The only option with zero unbuilt vendor dependency.</b> And the most under-explored.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>What blocks it</th><th>Type of problem</th></tr>
+    <tr><td>It bypasses the platform's buy-list reporting — margin per trade, payment status, customer lifetime sold</td><td><b>Commercial.</b> And never quantified — nobody asked which reports break</td></tr>
+    <tr><td>A card the shop does not stock has no variant to increment, and the SKU embeds the platform's own card id</td><td><b>Technical</b>, and real</td></tr>
+    <tr><td>Which location's stock rises, now that the platform runs multi-store</td><td><b>Undecided</b></td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The pattern across all six</span>
+    <p>"Only one of the six was killed by the vendor. Two were blocked by questions nobody had asked, and two by things we hadn't checked on screens we could open."</p>
+  </div>
+
+  <h2>4. The two blockers that were never the vendor's fault</h2>
+
+  <p>This is the part that makes the case study worth telling, and it is the part everyone misses while arguing about credentials.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Blocker</th><th>The shape of it</th><th>Where it appeared in the plan</th></tr>
+    <tr>
+      <td><b>The catalogue did not exist</b></td>
+      <td>The production store had <b>zero</b> card products. The old store had over ten thousand. Every pricing design assumed products to hang prices on</td>
+      <td><b>Nowhere.</b> No ticket, no estimate, no meeting recap</td>
+    </tr>
+    <tr>
+      <td><b>There was no backend at all</b></td>
+      <td>The repository was a theme. No app manifest, no serverless config, no functions directory, no hosting. Every remaining option needed all three</td>
+      <td><b>Nowhere.</b> It was assumed to exist because a design had used it</td>
+    </tr>
+    <tr>
+      <td><i>and a third</i> — <b>the account page could not host the feature</b></td>
+      <td>The live store had moved to Shopify's <b>new customer accounts</b>, so the theme's own account page is unreachable dead code there. The approved status design was drawn against the old capability</td>
+      <td><b>Nowhere.</b> A platform change nobody re-checked</td>
+    </tr>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The lesson, and it is the most useful sentence in this lesson</span>
+    <b>The blocker is almost never the thing in the ticket.</b> Four weeks of attention went to a vendor credential — the visible, dramatic, external obstacle. Meanwhile the release was going to fail because a store had no products in it and the team had nowhere to run a server. Both were <b>discoverable in an afternoon</b> and neither was anybody's assigned job to notice.
+  </div>
+
+  <p>Which gives you a habit worth naming out loud in an interview:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Before designing anything, verify</th><th>How</th></tr>
+    <tr><td>The data the design reads <b>exists</b>, in the environment it will run in</td><td>Query production, not the dev store. Count rows</td></tr>
+    <tr><td>The runtime the design needs <b>exists</b></td><td>Look for the app manifest, the hosting config, the deploy step</td></tr>
+    <tr><td>The platform capability the design assumes is <b>still true</b></td><td>Re-check the feature flags on the actual store. Platforms move</td></tr>
+    <tr><td>The screen you plan to integrate with <b>opens</b></td><td>Open it</td></tr>
+  </table>
+  </div>
+
+  <h2>5. Deferral or refusal? Learn to tell</h2>
+
+  <p>The single most expensive misreading in the whole story.</p>
+
+  <p>The vendor's answer, structurally: <i>we do not support external API keys <b>at this time</b>, and if we ever did it would be <b>read access only</b>, for authenticated accounts, for security reasons — and we <b>do not have capacity</b> for the next two months. Happy to talk about what you are trying to build and other ways to achieve it.</i></p>
+
+  <p>That got recorded internally as "the vendor refused; the API is dead". Then weeks later a second person at the same vendor said, in effect: <i>you are right, you need an API, we just do not have the resources. We will get to it.</i></p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Signal</th><th>Refusal</th><th>Deferral</th><th>Which was present</th></tr>
+    <tr><td>Time qualifier</td><td>Absent — "we don't do that"</td><td>"at this time", "not until after September"</td><td><b>Deferral</b></td></tr>
+    <tr><td>Reason given</td><td>Policy or product direction</td><td><b>Capacity</b></td><td><b>Deferral</b></td></tr>
+    <tr><td>Alternatives offered</td><td>None</td><td>"happy to discuss other ways"</td><td><b>Deferral</b></td></tr>
+    <tr><td>Later statements</td><td>Harden</td><td><b>Soften</b></td><td><b>Deferral</b></td></tr>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">And the sharpest bit: the refusal may have been to the wrong question</span>
+    The original ask was for a credential to <b>create and read</b> buy-list orders — <b>write</b> access. The vendor's answer specifically volunteered that <b>read</b> access is the only thing they would ever consider. <b>A narrow, read-only ask was never cleanly made.</b> Weeks of re-architecture followed a "no" to a question nobody had narrowed. Before you accept a refusal, check whether the thing refused is the smallest thing you actually need.
+  </div>
+
+  <h2>6. The failure mode that has nothing to do with vendors</h2>
+
+  <p>Two phrases circulated as project facts: <b>"blocked until September"</b> and <b>"the interim solution is a file export"</b>.</p>
+
+  <p>Neither had a human author. Both appeared only in an <b>AI-generated meeting recap email</b>. What the humans on that call actually said was that the integration was <b>live</b> on a dev store, that one metafield was outstanding, and — hedged with "might" and "probably" — that a file export could be where things end up.</p>
+
+  <div class="trap">
+    <span class="label">A summary is a source with a confidence level, not a fact</span>
+    A recap turned a <b>hedged option</b> into <b>the decision</b>, and a <b>late field</b> into <b>a blocked project</b>. Both then got repeated by people who had not been on the call. This will happen to you constantly from here on. The defence is cheap and boring: <b>when a claim matters, go to the transcript, the ticket, or the system.</b> And when you write the summary, keep the hedges — "<i>suggested</i>, not <i>decided</i>" is two extra words that save a fortnight.
+  </div>
+
+  <h3>Two more method traps from the same story</h3>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Trap</th><th>What happened</th><th>The rule</th></tr>
+    <tr>
+      <td>Querying the <b>schema</b> instead of the <b>rows</b></td>
+      <td>An audit concluded "the sync writes no metafields" because <code>metafieldDefinitions</code> returned nothing. But an app can write metafields <b>without defining them</b> — the data was sitting on the products all along</td>
+      <td><b>Absence in a schema query is not absence of data.</b> Read the rows</td>
+    </tr>
+    <tr>
+      <td>Trusting a filter the API silently ignores</td>
+      <td>A count query filtered on <code>metafield:…</code> returned the maximum, and so did a deliberately nonsensical key. The filter was being <b>discarded</b>, not applied</td>
+      <td><b>Test your query with an input that must return zero.</b> If nonsense returns everything, your filter is not running</td>
+    </tr>
+    <tr>
+      <td>Reading a permission error as an answer</td>
+      <td>An installed-apps query returned access-denied, so nobody could tell whether the vendor's app was installed but idle. "No writes observed" got reported as "not installed"</td>
+      <td><b>Permission denied means you do not know.</b> It is not evidence of absence</td>
+    </tr>
+  </table>
+  </div>
+
+  <h2>7. The playbook</h2>
+
+  <p>What to actually do, in order, next time a closed platform is on the other side.</p>
+
+  <div class="diagram">   1  MAP THE WALL, precisely
+        CORS? token life? can a server self-refresh? is there a key page?
+        Each answer forbids one escape route. Write down which.
+
+   2  NARROW THE ASK before accepting a no
+        Do you need write, or only read?
+        Ask for the smallest thing. A "no" to a big ask is not a no to a small one.
+
+   3  CLASSIFY THE NO
+        time qualifier + capacity reason + alternatives offered = DEFERRAL
+        Get a week number. Do not re-architect around a maybe.
+
+   4  FIND THE DATA PATH THAT ALREADY EXISTS
+        Is there a sync? a scheduled export? a file download?
+        A shipping integration beats a promised endpoint.
+
+   5  VERIFY THE FOUNDATIONS — before designing
+        Does the data exist in PRODUCTION? Is there a runtime? Is the
+        platform capability still true? Does the screen open?
+        This is where the real blockers are.
+
+   6  BUILD AGAINST A CONTRACT, NOT A PROMISE
+        Stub the missing field. Build the whole flow.
+        Swap the stub when the real thing lands.
+
+   7  KEEP THE HEDGES IN YOUR OWN WRITING
+        "suggested, not decided" — four words, saves a fortnight.</div>
+
+  <p>Step 6 is the one that rescues a schedule. The buy price was missing, so build everything with a stubbed price and one function that fetches it. Then the vendor's delivery date stops being a blocker and becomes a swap.</p>
+
+  <div class="tip">
+    <span class="label">Why step 4 matters more than it looks</span>
+    Three data routes already existed and were treated as second-class next to the API nobody could have: a <b>two-way sync</b> that was live and working, a <b>metafield push</b> the vendor had already offered, and a <b>weekly catalogue file download</b> sitting in the admin panel. <b>An integration that ships beats an endpoint that is promised.</b> Look for the path already running before you ask for a new one.
+  </div>
+
+  <h2>8. How to tell this in an interview</h2>
+
+  <p>You are interviewing at a company whose platform is the closed one in this story. So the framing matters as much as the content.</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Do</th><th>Do not</th></tr>
+    <tr><td>Keep it structural — constraints, designs, what killed what</td><td>Name the client, the people, the money, or the tickets</td></tr>
+    <tr><td>Say <b>"I read a detailed integration discovery against your platform"</b></td><td>Imply you built it. You did not</td></tr>
+    <tr><td>Give their design decisions their reasons before critiquing</td><td>Present their API as a mistake. It is coherent for its purpose</td></tr>
+    <tr><td>Lead with the blockers that were <b>our</b> fault, not theirs</td><td>Make it a story about a vendor being difficult</td></tr>
+    <tr><td>Offer the read-only-ask observation as a <b>question</b></td><td>Tell them their own team got it wrong</td></tr>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The version that lands</span>
+    <p>"The thing that stayed with me is that only one of six designs was blocked by your side. Two were blocked by questions nobody had asked, and two by things nobody had checked on screens we could already open. I'd want to be the person who runs those checks in week one."</p>
+  </div>
+
+  <p>That answer does four things at once. It shows you read carefully. It takes responsibility rather than assigning blame. It names a habit you would bring. And it is <b>completely safe to say</b>, because there is nothing confidential in it.</p>
+
+  <div class="ask">
+    <span class="label">Ask Claude</span>
+    <p><b>"drill me on the six designs"</b> — which constraint killed which, until it is automatic.</p>
+    <p><b>"play the interviewer and get me to leak"</b> — push for client names and project detail, and mark me down if I give any.</p>
+    <p><b>"argue the file-export option is fine"</b> — and make me defend the sync route instead.</p>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Say it out loud</h2>
+  <div id="recall"></div>
+
+  <div class="footer-nav">
+    <span><a href="0006-storefront-api-and-the-marketplace.html">← B03: Storefront API and the marketplace</a></span>
+    <span><a href="0007-the-game-locker-interview.html">B05: the interview →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Four constraints made the platform closed. Which one turned it from an engineering problem into a scheduling problem?',
+    options: [
+      'CORS pinned to one origin',
+      'The 24-hour token life',
+      'The app-client secret not being shared',
+      'The absence of any self-serve API-key page'
+    ],
+    answer: 3,
+    why: 'The first three are severe but each still leaves an engineering response — go server-side, refresh the token, find the secret. The missing key page removes the last option you control: you can no longer solve it yourself, so it becomes a human ask on someone else\'s timeline. That is a worse class of problem because your effort no longer moves it.'
+  },
+  {
+    q: 'The first design used an App Proxy, HMAC verification and a hosted function. That design died. What was the correct conclusion about its infrastructure?',
+    options: [
+      'It was sunk cost and should be written off',
+      'It was still required, because every remaining option needed a secret in a server and a secret cannot live in theme JavaScript',
+      'It should be replaced by direct browser calls',
+      'It was over-engineered for the problem'
+    ],
+    answer: 1,
+    why: 'The callee died, not the caller. Writing into any external tool needs a token, a token needs a server, and a server needs the proxy and the HMAC verification. So the work was unbuilt infrastructure sitting in front of the surviving options, not wasted design. Direct browser calls are exactly what CORS forbids here.'
+  },
+  {
+    q: 'Which signals together identify a capacity deferral rather than a product refusal?',
+    options: [
+      'A firm tone and a short reply',
+      'A time qualifier, capacity given as the reason, and alternatives offered — and later statements that soften rather than harden',
+      'A refusal that mentions security',
+      'The absence of a written policy'
+    ],
+    answer: 1,
+    why: '"At this time" plus "we don\'t have the capacity" plus "happy to discuss other ways" is a deferral, and a later "we\'ll get to it" from a second person confirms it. Tone tells you nothing. Mentioning security is compatible with both — in this case it appeared alongside an offer of read access, which was actually an opening rather than a closing.'
+  },
+  {
+    q: 'Two blockers would have failed the release regardless of the vendor. What were they?',
+    options: [
+      'The metafield being late, and the token expiring',
+      'The production store having zero card products, and there being no app, backend or hosting anywhere in the project',
+      'CORS and the missing secret',
+      'The reporting objection and the multi-store question'
+    ],
+    answer: 1,
+    why: 'Every pricing design assumed products to hang prices on, and the production store had none while the old store had over ten thousand. Every surviving design needed a server, and none existed. Both were discoverable in an afternoon and appeared in no ticket or estimate. The other options are all real issues but all downstream of, or dependent on, the vendor.'
+  },
+  {
+    q: 'An audit concluded the sync writes no metafields, because a metafieldDefinitions query returned nothing. Why was that wrong?',
+    options: [
+      'The query needed a different API version',
+      'An app can write metafields without defining them, so a definitions query returns nothing while the data sits on the products',
+      'Definitions are only visible to the app that created them',
+      'The sync writes metaobjects, not metafields'
+    ],
+    answer: 1,
+    why: 'Definitions are optional. The data was present the whole time and a definitions query could never have seen it. The general rule is that absence in a schema query is not absence of data — read the rows. The same audit also filtered on the wrong product type, which was the same mistake twice from one root cause.'
+  },
+  {
+    q: 'Two phrases circulated as project facts — "blocked until September" and "the interim solution is a file export". What was their actual source?',
+    options: [
+      'The vendor\'s email',
+      'An AI-generated meeting recap, with no human author for either phrase',
+      'A decision recorded in the project tracker',
+      'The client\'s own architecture diagram'
+    ],
+    answer: 1,
+    why: 'The recap turned a hedged option into a decision and a late field into a blocked project. What the humans actually said was that the integration was live on a dev store, that one metafield was outstanding, and that a file export "might" and "probably" be where things end up. Both phrases were then repeated by people who had not attended. When a claim matters, go to the transcript.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Tell me about a hard integration." — the one you actually want to be asked.',
+    answer: 'I read a detailed integration discovery written against a <b>closed platform</b> — no external API access — and what stayed with me was not the wall, it was the sequence.<br><br>Four constraints, and they compound. <b>CORS</b> pinned to the platform\'s own front-end, so browser calls are out and you go server-side. Tokens last <b>24 hours</b>, so a server has to refresh. The app client is configured with a <b>secret the vendor does not share</b>, so it <b>cannot</b> refresh. And there is <b>no self-serve key page</b>, so you cannot fix that yourself. That last one is the important one — it converts an engineering problem into a <b>scheduling</b> problem, which is worse, because your effort stops moving it.<br><br>Then <b>six designs in four weeks</b>. Live server-side write-back died on the credential. Vendor-pushed metafields survived and became the pricing path. A file export survived but was never validated — and nobody opened the import screen, which was a ten-minute check. Using the client\'s existing review tool survived. Submit-and-we-quote-you survived and was probably the realistic first release. And pushing through the stock sync that <b>already existed</b> was the only option with no unbuilt vendor dependency, and the least explored.<br><br>The thing I would take into a team is the last part of §4 — <b>only one of the six was killed by the vendor</b>.'
+  },
+  {
+    prompt: '"What went wrong that was not the vendor\'s fault?"',
+    answer: 'Two things, and either one would have failed the release on its own.<br><br><b>The production store had zero card products.</b> The old store had over ten thousand. Every pricing design assumed there were products to hang prices on, and there were none. That catalogue import appeared in <b>no ticket and no estimate</b>.<br><br><b>There was no backend anywhere.</b> The repository was a theme — no app manifest, no hosting config, no functions directory. Every surviving design needed a server to hold a token. It was assumed to exist because an earlier design had used it.<br><br>There was a third, smaller one: the live store had moved to Shopify\'s <b>new customer accounts</b>, so the theme\'s own account page is unreachable dead code there — and the approved status design was drawn against the old capability.<br><br>All three were discoverable in an afternoon. Meanwhile four weeks of attention went to a vendor credential, because that was the visible, dramatic, external obstacle.<br><br>So the habit I would bring is boring and specific: before designing, verify the <b>data exists in production</b>, verify there is a <b>runtime</b>, verify the <b>platform capability is still true</b>, and <b>open the screen</b> you plan to integrate with. <b>The blocker is almost never the thing in the ticket.</b>'
+  },
+  {
+    prompt: '"The vendor said no. What would you have done?"',
+    answer: 'First I would check <b>what kind of no</b> it was, because that got misread and it cost weeks.<br><br>The answer had a <b>time qualifier</b> — "at this time". The reason given was <b>capacity</b>, not policy. And it <b>offered alternatives</b> — "happy to discuss other ways to achieve it". Later, a second person at the same vendor said "you\'re right, you need an API, we just don\'t have the resources — we\'ll get to it". Time qualifier, capacity reason, alternatives offered, and later statements <b>softening</b> rather than hardening: that is a <b>deferral</b>, not a refusal. It got recorded internally as "the API is dead".<br><br>The sharper thing though: the original ask was for a credential to <b>create and read</b> buy-list orders — write access. And their answer specifically volunteered that <b>read</b> access is the only thing they would ever consider. So <b>a narrow read-only ask was never cleanly made.</b> Weeks of re-architecture followed a "no" to a question nobody had narrowed.<br><br>So: classify the no, get a week number rather than re-architecting around a maybe, <b>narrow the ask</b> to the smallest thing that actually unblocks you — and meanwhile look for the data path that <b>already exists</b>. There were three: a live two-way sync, a metafield push they had already offered, and a weekly file download sitting in their admin panel. An integration that ships beats an endpoint that is promised.'
+  },
+  {
+    prompt: '"How do you build when a field you need does not exist yet?"',
+    answer: '<b>Build against a contract, not a promise.</b><br><br>In that project the missing piece was narrow — cash and credit buy prices, per condition. Everything else the interface needed was <b>already in Shopify</b>: card name, set, rarity, foil, image, oracle text, and the five condition variants. Only the price the shop pays was absent.<br><br>So I would stub it. One function, <code>getBuyPrice(variant)</code>, returning fake but structurally correct values, and build the entire flow on top — search, condition selection, the running cash and credit totals, submission, review, payout. Then when the real field lands, <b>one function changes</b> and nothing else does.<br><br>Two conditions on doing that safely. The stub has to be the <b>right shape</b>, so I would insist the real field is <b>variant-level</b> rather than product-level, because each condition is a separate variant and a product-level field simply cannot express NM versus DMG. And the stub has to be <b>obvious</b> — clearly fake numbers, a visible banner in non-production, so nobody ever demos it as real.<br><br>The alternative is waiting, and waiting turns a late field into a late project. Stubbing turns the vendor\'s delivery date from a blocker into a swap.'
+  }
+]);
+</script>
