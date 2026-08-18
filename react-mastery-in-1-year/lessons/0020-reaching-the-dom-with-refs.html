@@ -1,0 +1,783 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reaching the DOM with refs — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 5 · Lesson 2</p>
+  <h1>Reaching the DOM with refs</h1>
+  <p class="subtitle">React writes the DOM. A ref is a borrow permit, not a transfer of ownership — and the difference between focusing a node and rewriting one is the difference between a normal feature and a crash.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> focus, scroll, and measure real DOM nodes on purpose — including a whole list of them — plus the three ways to attach a ref, the React 19 <code>ref</code>-as-a-prop change, and the one-line fix for "my scroll always lags one item behind".
+  </div>
+
+  <p>Everything so far has been one-directional: you describe the screen, React writes it. That covers almost everything, and then you hit a wall. There is no prop for <em>focus this input</em>. There is no prop for <em>scroll this row into view</em>, <em>how tall is this element</em>, <em>play this video</em>, or <em>select the text in this field</em>.</p>
+
+  <p>Those are not descriptions of a screen. They are <b>commands to a node that already exists</b>. To send one, you need the node itself — and a ref is how React hands it to you.</p>
+
+  <h2>First principle — you are borrowing, not taking over</h2>
+
+  <p>React keeps its own picture of what the DOM should be and updates the real DOM to match. When you hold a node in your hand, you are holding something React still believes it owns. So there are two categories of thing you can do with it, and only one of them is safe.</p>
+
+  <div class="note">
+    <span class="label">React docs · Best practices for DOM manipulation with refs</span>
+    "Refs are an escape hatch. You should only use them when you have to 'step outside React'. Common examples of this include managing focus, scroll position, or calling browser APIs that React does not expose." … "<b>If you stick to non-destructive actions like focusing and scrolling, you shouldn't encounter any problems.</b> However, if you try to <b>modify</b> the DOM manually, you can risk conflicting with the changes React is making."
+  </div>
+
+  <div class="note">
+    <span class="label">React docs · Avoid changing DOM nodes managed by React</span>
+    "<b>Avoid changing DOM nodes managed by React.</b> Modifying, adding children to, or removing children from elements that are managed by React can lead to inconsistent visual results or crashes like above." … "However, this doesn't mean that you can't do it at all. It requires caution. <b>You can safely modify parts of the DOM that React has <em>no reason</em> to update.</b> For example, if some <code>&lt;div&gt;</code> is always empty in the JSX, React won't have a reason to touch its children list. Therefore, it is safe to manually add or remove elements there."
+  </div>
+
+  <p>That gives you a clean two-column test you can apply in one second:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Safe — React has no opinion about it</th><th>Dangerous — React owns this</th></tr></thead>
+    <tbody>
+      <tr><td><code>node.focus()</code>, <code>node.blur()</code></td><td><code>node.innerHTML = …</code></td></tr>
+      <tr><td><code>node.scrollIntoView()</code>, reading <code>scrollTop</code></td><td><code>node.appendChild(…)</code> / <code>removeChild(…)</code> on a node whose children come from JSX</td></tr>
+      <tr><td><code>node.getBoundingClientRect()</code> (measuring)</td><td><code>node.textContent = …</code> where JSX renders the text</td></tr>
+      <tr><td><code>node.select()</code>, <code>setSelectionRange()</code></td><td><code>node.setAttribute('class', …)</code> where JSX sets <code>className</code></td></tr>
+      <tr><td><code>video.play()</code>, <code>audio.pause()</code>, <code>dialog.showModal()</code></td><td><code>node.remove()</code> — the classic crash: React later tries to remove it again</td></tr>
+      <tr><td>Attaching a listener React has no prop for (<code>animationend</code> on a third-party node)</td><td>Setting <code>value</code> directly on a controlled input</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The right-hand column is not a style objection. React holds a reference to the node it created; if you delete or refill it, React's next update writes into something that no longer matches, and you get either a wrong screen or an exception from the browser.</p>
+
+  <h2>When is the ref actually filled in?</h2>
+
+  <p>A ref starts as <code>null</code> and gets its node during the commit phase — after React has rendered and written to the DOM, before any effect runs. That order is the whole reason "read the DOM in an effect, never during render" works.</p>
+
+  <div class="note">
+    <span class="label">React docs · Manipulating the DOM with Refs</span>
+    "The <code>useRef</code> Hook returns an object with a single property called <code>current</code>. Initially, <code>myRef.current</code> will be <code>null</code>. <b>When React creates a DOM node for this <code>&lt;div&gt;</code>, React will put a reference to this node into <code>myRef.current</code>.</b> You can then access this DOM node from your event handlers and use the built-in browser APIs defined on it."
+  </div>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig20-title" width="640" height="250">
+      <title id="fig20-title">The life of a DOM ref across one render: during render the ref is null, React attaches the node during commit, so layout effects, effects and event handlers all see the node, and on removal React detaches it or calls the ref callback's cleanup</title>
+      <defs>
+        <marker id="a20" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+      </defs>
+
+      <line x1="20" y1="60" x2="622" y2="60" style="stroke: var(--rule); stroke-width: 1;"></line>
+
+      <rect x="20" y="40" width="104" height="40" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="72" y="58" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">render</text>
+      <text x="72" y="72" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">returns JSX</text>
+
+      <line x1="124" y1="60" x2="152" y2="60" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a20)"></line>
+
+      <rect x="154" y="40" width="116" height="40" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="212" y="58" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">commit</text>
+      <text x="212" y="72" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">DOM written · refs attached</text>
+
+      <line x1="270" y1="60" x2="298" y2="60" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a20)"></line>
+
+      <rect x="300" y="40" width="108" height="40" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="354" y="58" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">layout effect</text>
+      <text x="354" y="72" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">measure here</text>
+
+      <line x1="408" y1="60" x2="436" y2="60" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a20)"></line>
+
+      <rect x="438" y="40" width="70" height="40" rx="4" style="fill: var(--paper); stroke: var(--rule);"></rect>
+      <text x="473" y="64" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">paint</text>
+
+      <line x1="508" y1="60" x2="536" y2="60" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a20)"></line>
+
+      <rect x="538" y="40" width="84" height="40" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="580" y="58" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">effect</text>
+      <text x="580" y="72" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">+ handlers</text>
+
+      <text x="20" y="106" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">ref.current at each step</text>
+      <text x="72" y="124" text-anchor="middle" style="fill: var(--accent-2); font-family: monospace; font-size: 10px;">null</text>
+      <text x="212" y="124" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">&lt;node&gt;</text>
+      <text x="354" y="124" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">&lt;node&gt;</text>
+      <text x="473" y="124" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">&lt;node&gt;</text>
+      <text x="580" y="124" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">&lt;node&gt;</text>
+
+      <line x1="20" y1="142" x2="622" y2="142" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="20" y="164" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">✕ during render the node does not exist yet</text>
+      <text x="20" y="180" style="fill: var(--ink-soft); font-family: monospace; font-size: 9.5px;">const h = ref.current.offsetHeight;   // TypeError: null</text>
+
+      <text x="20" y="204" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">✓ when the element is removed</text>
+      <text x="20" y="220" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">object ref → React sets .current back to null</text>
+      <text x="20" y="236" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">callback ref → React calls the cleanup function you returned (React 19+)</text>
+    </svg>
+  </div>
+
+  <h2>The shape you will type a thousand times</h2>
+
+  <pre><code>import { useRef } from 'react';
+
+export function SearchBox() {
+  const inputRef = useRef&lt;HTMLInputElement&gt;(null);
+
+  function handleClear() {
+    setQuery('');
+    inputRef.current?.focus();      <span class="cmt">// ✓ optional chaining: .current is typed as possibly null</span>
+  }
+
+  return (
+    &lt;&gt;
+      &lt;input ref={inputRef} value={query} onChange={…} /&gt;
+      &lt;button onClick={handleClear}&gt;Clear&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p>Two TypeScript notes that save real time:</p>
+
+  <ul>
+    <li><b>Give the element type, pass <code>null</code>.</b> <code>useRef&lt;HTMLInputElement&gt;(null)</code>. The type comes from the tag you are attaching to: <code>HTMLInputElement</code>, <code>HTMLDivElement</code>, <code>HTMLVideoElement</code>, <code>HTMLDialogElement</code>. Hover the JSX tag in your editor if you are unsure — it is not guesswork.</li>
+    <li><b><code>.current</code> is nullable and should stay that way.</b> Use <code>?.</code> or an <code>if</code> guard. Do not write <code>useRef&lt;HTMLInputElement&gt;(null!)</code> to silence it — that is a promise to TypeScript that you cannot keep, and it turns a clear <code>undefined</code> into a crash the first time the element is conditionally rendered.</li>
+  </ul>
+
+  <h2>Three ways to attach a ref</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Way</th><th>Use it when</th><th>Shape</th></tr></thead>
+    <tbody>
+      <tr><td><b>Object ref</b></td><td>One known element.</td><td><code>const r = useRef&lt;HTMLDivElement&gt;(null)</code> → <code>&lt;div ref={r}&gt;</code></td></tr>
+      <tr><td><b>Callback ref</b></td><td>Many elements, or you need to run code the moment a node appears or disappears.</td><td><code>&lt;li ref={node =&gt; { … ; return () =&gt; { … } }}&gt;</code></td></tr>
+      <tr><td><b>A ref on your own component</b></td><td>The node you want is inside a child component you wrote.</td><td>React 19: <code>ref</code> is just a prop. React 18: <code>forwardRef</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Callback refs — and the React 19 cleanup</h3>
+
+  <p>Instead of a ref object, you can pass a function. React calls it with the node when the element is mounted. Since React 19, whatever you return from it is treated as a cleanup function:</p>
+
+  <div class="note">
+    <span class="label">React 19 release notes · Cleanup functions for refs</span>
+    "We now support returning a cleanup function from <code>ref</code> callbacks" … "<b>When the component unmounts, React will call the cleanup function returned from the <code>ref</code> callback.</b> This works for DOM refs, refs to class components, and <code>useImperativeHandle</code>." … "Previously, React would call <code>ref</code> functions with <code>null</code> when unmounting the component. If your <code>ref</code> returns a cleanup function, React will now skip this step."
+  </div>
+
+  <p>There is a TypeScript trap hidden in that change, and it is worth knowing before it bites you:</p>
+
+  <div class="note">
+    <span class="label">React 19 release notes · the implicit-return trap</span>
+    "Due to the introduction of ref cleanup functions, <b>returning anything else from a <code>ref</code> callback will now be rejected by TypeScript.</b> The fix is usually to stop using implicit returns, for example:"
+    <pre><code>- &lt;div ref={current =&gt; (instance = current)} /&gt;
++ &lt;div ref={current =&gt; {instance = current}} /&gt;</code></pre>
+    "The original code returned the instance of the <code>HTMLDivElement</code> and TypeScript wouldn't know if this was <em>supposed</em> to be a cleanup function or if you didn't want to return a cleanup function."
+  </div>
+
+  <p>So: <b>braces, not parentheses</b>, in a callback ref. One character of arrow-function shorthand is now a type error, and the error message is confusing until you have read the paragraph above.</p>
+
+  <h3>A list of refs — the Map pattern</h3>
+
+  <p>You cannot call <code>useRef</code> in a loop; hooks run in a fixed order (that is the rule from Month 1). So for "scroll to row 14 of 200", you keep <b>one</b> ref holding a <code>Map</code> from id to node, and fill it with a callback ref. This is the docs' pattern, typed:</p>
+
+  <pre><code>const rowsRef = useRef&lt;Map&lt;string, HTMLLIElement&gt; | null&gt;(null);
+
+function getMap() {
+  if (!rowsRef.current) {
+    rowsRef.current = new Map();   <span class="cmt">// lazy init — allowed, always the same result</span>
+  }
+  return rowsRef.current;
+}
+
+function scrollTo(id: string) {
+  getMap().get(id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+<span class="cmt">// …in the JSX:</span>
+&lt;li
+  key={note.id}
+  ref={node =&gt; {
+    const map = getMap();
+    map.set(note.id, node!);
+    return () =&gt; {
+      map.delete(note.id);         <span class="cmt">// ✓ React 19 cleanup: the row left the screen</span>
+    };
+  }}
+&gt;
+  {note.title}
+&lt;/li&gt;</code></pre>
+
+  <div class="tip">
+    <span class="label">Why the cleanup matters more than it looks</span>
+    Without it, the Map keeps a DOM node for every row that has ever been rendered — a genuine memory leak in a long list, and a source of the strangest bug in this area: <code>scrollTo</code> succeeding on a node that is no longer in the document, so nothing moves and nothing errors.
+  </div>
+
+  <h2>A ref to your own component</h2>
+
+  <p>Put a ref on a component you wrote and it does not reach the DOM by itself — your component has to pass it on. In React 19 that is now the boring answer: <code>ref</code> arrives as an ordinary prop.</p>
+
+  <div class="note">
+    <span class="label">React 19 release notes · ref as a prop</span>
+    "Starting in React 19, you can now access <code>ref</code> as a prop for function components:"
+    <pre><code>function MyInput({placeholder, ref}) {
+  return &lt;input placeholder={placeholder} ref={ref} /&gt;
+}
+
+<span class="cmt">//...</span>
+&lt;MyInput ref={ref} /&gt;</code></pre>
+    "New function components will no longer need <code>forwardRef</code>, and we will be publishing a codemod to automatically update your components to use the new <code>ref</code> prop. <b>In future versions we will deprecate and remove <code>forwardRef</code>.</b>"
+  </div>
+
+  <p>Typed, in the two versions you will meet in real codebases:</p>
+
+  <pre><code><span class="cmt">// ── React 19+ — ref is a normal prop ──────────────────────────</span>
+type TextFieldProps = {
+  label: string;
+  value: string;
+  onValueChange: (next: string) =&gt; void;
+  ref?: React.Ref&lt;HTMLInputElement&gt;;
+};
+
+export function TextField({ label, value, onValueChange, ref }: TextFieldProps) {
+  return (
+    &lt;label&gt;
+      {label}
+      &lt;input ref={ref} value={value} onChange={e =&gt; onValueChange(e.target.value)} /&gt;
+    &lt;/label&gt;
+  );
+}
+
+<span class="cmt">// ── React 18 — the same thing with forwardRef ─────────────────</span>
+export const TextField18 = forwardRef&lt;HTMLInputElement, Omit&lt;TextFieldProps, 'ref'&gt;&gt;(
+  function TextField18({ label, value, onValueChange }, ref) {
+    return (
+      &lt;label&gt;
+        {label}
+        &lt;input ref={ref} value={value} onChange={e =&gt; onValueChange(e.target.value)} /&gt;
+      &lt;/label&gt;
+    );
+  }
+);</code></pre>
+
+  <p>Note the shape of the older one: <code>forwardRef</code> exists because <code>ref</code> used to be pulled out of props before your function ever saw it, so it had to be handed back as a second argument. Nothing about it was ever clever. React 19 simply stopped taking it away.</p>
+
+  <div class="trap">
+    <span class="label">The pitfall the docs flag, and you should quote</span>
+    "Refs are an escape hatch. <b>Manually manipulating <em>another</em> component's DOM nodes can make your code fragile.</b>" Exposing a node means every parent can now do anything to it — including the things in the dangerous column. Expose a ref because a real feature needs it (focus, scroll, measure, play), not because it might be handy.
+  </div>
+
+  <h3><code>useImperativeHandle</code> — hand out a remote control, not the node</h3>
+
+  <p>When you want the parent to be able to do exactly one thing, do not give away the element. Give away an object with one method:</p>
+
+  <pre><code>import { useRef, useImperativeHandle } from 'react';
+
+export type NoteInputHandle = { focus: () =&gt; void };
+
+type Props = { value: string; onValueChange: (next: string) =&gt; void; ref?: React.Ref&lt;NoteInputHandle&gt; };
+
+export function NoteInput({ value, onValueChange, ref }: Props) {
+  const realInputRef = useRef&lt;HTMLInputElement&gt;(null);
+
+  useImperativeHandle(ref, () =&gt; ({
+    focus() {
+      realInputRef.current?.focus();   <span class="cmt">// only expose focus, nothing else</span>
+    },
+  }));
+
+  return &lt;input ref={realInputRef} value={value} onChange={e =&gt; onValueChange(e.target.value)} /&gt;;
+}</code></pre>
+
+  <div class="note">
+    <span class="label">React docs · Exposing a subset of the API with an imperative handle</span>
+    "Here, <code>realInputRef</code> inside <code>MyInput</code> holds the actual input DOM node. However, <b><code>useImperativeHandle</code> instructs React to provide your own special object as the value of a ref to the parent component.</b> So <code>inputRef.current</code> inside the <code>Form</code> component will only have the <code>focus</code> method."
+  </div>
+
+  <p>This is the right tool for design-system components and for a media player (next lesson but one). It is the wrong tool when the "handle" grows methods like <code>setValue</code> or <code>submit</code> — at that point you have rebuilt props out of function calls, and the data no longer flows one way.</p>
+
+  <h2><code>flushSync</code> — when your scroll lags one item behind</h2>
+
+  <p>Here is a bug that feels like a React bug and is actually a lesson-2 fact you already know: state updates are queued, so the DOM has not changed yet on the next line.</p>
+
+  <pre><code>function handleAdd() {
+  setNotes([...notes, newNote]);
+  listRef.current.lastChild.scrollIntoView();   <span class="cmt">// ✕ scrolls to the PREVIOUS last item</span>
+}</code></pre>
+
+  <div class="note">
+    <span class="label">React docs · Flushing state updates synchronously with flushSync</span>
+    "In React, state updates are queued. Usually, this is what you want. However, here it causes a problem because <code>setTodos</code> does not immediately update the DOM. So the time you scroll the list to its last element, the todo has not yet been added. <b>This is why scrolling always 'lags behind' by one item.</b>" … "This will instruct React to update the DOM synchronously right after the code wrapped in <code>flushSync</code> executes. As a result, the last todo will already be in the DOM by the time you try to scroll to it."
+  </div>
+
+  <pre><code>import { flushSync } from 'react-dom';
+
+function handleAdd() {
+  flushSync(() =&gt; {
+    setText('');
+    setNotes([...notes, newNote]);
+  });
+  listRef.current?.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}</code></pre>
+
+  <p><code>flushSync</code> is a real escape hatch: it throws away batching for that update, so React renders and commits in the middle of your handler. Use it when you must read or command the DOM in the same handler that changed it. Do not sprinkle it around — every call is a re-render you have forced the browser to take immediately.</p>
+
+  <div class="tip">
+    <span class="label">The alternative worth knowing</span>
+    Often you do not need <code>flushSync</code> at all, because "scroll to the thing that just appeared" can be expressed as "when the list changes, scroll to the last row" — which is an effect. Reach for <code>flushSync</code> when the action must finish inside one user event (focus is the common case: browsers only allow focus moves in response to a real interaction on some platforms).
+  </div>
+
+  <h2>Build it for real — a notes panel that behaves</h2>
+
+  <p>One small feature, four separate DOM commands. Create the files as you read.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/types.ts</b></p>
+  <pre><code>export type Note = { id: string; title: string; body: string };</code></pre>
+
+  <h3>Stage 1 — the three bugs, on purpose</h3>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/NotesPanel.tsx</b> — stage 1, broken</p>
+  <pre><code>import { useRef, useState } from 'react';
+import type { Note } from './types';
+
+let nextId = 1;
+
+export function NotesPanel() {
+  const [notes, setNotes] = useState&lt;Note[]&gt;([]);
+  const [title, setTitle] = useState('');
+  const listRef = useRef&lt;HTMLUListElement&gt;(null);
+
+  function handleAdd() {
+    if (title.trim() === '') return;
+    setNotes([...notes, { id: String(nextId++), title, body: '' }]);
+    setTitle('');
+    listRef.current!.lastElementChild!.scrollIntoView();   <span class="cmt">// ✕ bug 1: one behind</span>
+    <span class="cmt">// ✕ bug 2: focus is lost — the user has to click the input again</span>
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;input value={title} onChange={e =&gt; setTitle(e.target.value)} /&gt;
+      &lt;button onClick={handleAdd}&gt;Add note&lt;/button&gt;
+      &lt;ul ref={listRef} style={{ height: 160, overflowY: 'auto' }}&gt;
+        {notes.map(note =&gt; (
+          &lt;li key={note.id}&gt;{note.title}&lt;/li&gt;   <span class="cmt">// ✕ bug 3: no way to scroll to a specific one</span>
+        ))}
+      &lt;/ul&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Add six notes with the list scrolled to the bottom. The view always stops one row short of the note you just typed, the input loses focus every time so adding six notes takes twelve interactions, and there is no way to jump to note #2 later. Three separate problems, three separate tools.</p>
+
+  <h3>Stage 2 — <code>flushSync</code> for "the thing I just added", and focus that stays</h3>
+
+  <pre><code>import { flushSync } from 'react-dom';
+
+const inputRef = useRef&lt;HTMLInputElement&gt;(null);
+
+function handleAdd() {
+  const trimmed = title.trim();
+  if (trimmed === '') {
+    inputRef.current?.focus();          <span class="cmt">// ✓ point at the problem, don't just refuse</span>
+    return;
+  }
+
+  flushSync(() =&gt; {
+    setNotes([...notes, { id: String(nextId++), title: trimmed, body: '' }]);
+    setTitle('');
+  });
+
+  <span class="cmt">// After flushSync the new &lt;li&gt; is really in the DOM.</span>
+  listRef.current?.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  inputRef.current?.focus();            <span class="cmt">// ✓ keep the keyboard where the user is working</span>
+}</code></pre>
+
+  <p>Both fixes are non-destructive commands from the safe column: scroll and focus. Nothing about the DOM's contents was touched by hand.</p>
+
+  <h3>Stage 3 — a Map of row refs, so any row can be reached</h3>
+
+  <pre><code>const rowsRef = useRef&lt;Map&lt;string, HTMLLIElement&gt; | null&gt;(null);
+
+function getRowMap() {
+  if (!rowsRef.current) rowsRef.current = new Map();
+  return rowsRef.current;
+}
+
+function scrollToNote(id: string) {
+  getRowMap().get(id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+<span class="cmt">// …in the JSX:</span>
+&lt;ul ref={listRef} style={{ height: 160, overflowY: 'auto' }}&gt;
+  {notes.map(note =&gt; (
+    &lt;li
+      key={note.id}
+      ref={node =&gt; {
+        const map = getRowMap();
+        if (node) map.set(note.id, node);
+        return () =&gt; { map.delete(note.id); };   <span class="cmt">// braces, not parentheses</span>
+      }}
+    &gt;
+      {note.title}
+    &lt;/li&gt;
+  ))}
+&lt;/ul&gt;
+
+&lt;nav&gt;
+  {notes.map(note =&gt; (
+    &lt;button key={note.id} onClick={() =&gt; scrollToNote(note.id)}&gt;{note.title}&lt;/button&gt;
+  ))}
+&lt;/nav&gt;</code></pre>
+
+  <p>Delete a note and watch the Map shrink in the debugger. That is the cleanup earning its place.</p>
+
+  <h3>Stage 4 — a component that exposes only <code>focus()</code></h3>
+
+  <p>Replace the bare <code>&lt;input&gt;</code> with the <code>NoteInput</code> from earlier in the lesson. The parent's ref type changes from <code>HTMLInputElement</code> to <code>NoteInputHandle</code>, and every call site keeps working because the only thing the parent ever did was focus:</p>
+
+  <pre><code>const inputRef = useRef&lt;NoteInputHandle&gt;(null);
+
+<span class="cmt">// …</span>
+&lt;NoteInput ref={inputRef} value={title} onValueChange={setTitle} /&gt;</code></pre>
+
+  <p>Now try to write <code>inputRef.current.value = 'x'</code> in the parent. TypeScript stops you, which is the entire point: the surface is one method wide, so no future teammate can reach through the component and edit its insides.</p>
+
+  <h2>Anti-patterns — with the symptom each one produces</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What people write</th><th>What goes wrong</th><th>Do this instead</th></tr></thead>
+    <tbody>
+      <tr><td>Reading <code>ref.current</code> during render to size or position something</td><td><code>null</code> on the first render, and stale afterwards — React never re-renders when a ref changes</td><td>Measure in a layout effect and put the measurement in state (next lesson)</td></tr>
+      <tr><td><code>ref.current.innerHTML = html</code> to render rich text</td><td>React overwrites it on the next update, or crashes trying to reconcile children it did not create</td><td>Render the content as JSX; if it truly must be raw HTML, <code>dangerouslySetInnerHTML</code> on an element with no JSX children</td></tr>
+      <tr><td>A ref to a child input so the parent can read its value on submit</td><td>The parent now has two sources of truth and no validation until submit</td><td>Lift the value into state (lesson 9). Keep the ref for focus only</td></tr>
+      <tr><td><code>useRef&lt;HTMLDivElement&gt;(null!)</code> to avoid null checks</td><td>A crash the day the element becomes conditional, in a file nobody has touched for a year</td><td>Keep the nullable type and use <code>?.</code></td></tr>
+      <tr><td>A ref inside <code>.map()</code>, one per row</td><td>Hooks cannot run in a loop — the app breaks as soon as the count changes</td><td>One ref holding a <code>Map</code>, filled by a callback ref</td></tr>
+      <tr><td><code>document.querySelector('.row')</code> instead of a ref</td><td>Finds a node from another component, or one React is about to remove; silently breaks when a class name changes</td><td>A ref. It is scoped, typed, and detached for you</td></tr>
+      <tr><td><code>flushSync</code> in a scroll or resize handler</td><td>A synchronous render per event — visible jank</td><td>An effect, or plain state and let React batch</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>A ref is a borrow permit, not ownership</td><td>The safe / dangerous two-column table</td></tr>
+      <tr><td>Non-destructive actions only</td><td>Every command in the build: <code>focus</code>, <code>scrollIntoView</code></td></tr>
+      <tr><td><code>.current</code> is <code>null</code> until commit</td><td>The timeline figure, and <code>?.</code> at every call site</td></tr>
+      <tr><td>Object ref for one known element</td><td><code>inputRef</code>, <code>listRef</code></td></tr>
+      <tr><td>Callback ref for many elements</td><td>The <code>&lt;li ref={node =&gt; …}&gt;</code> in stage 3</td></tr>
+      <tr><td>React 19 ref-callback cleanup</td><td><code>return () =&gt; { map.delete(note.id); }</code> — braces, not parentheses</td></tr>
+      <tr><td>One ref holding a <code>Map</code></td><td><code>rowsRef</code> + <code>getRowMap()</code> lazy init</td></tr>
+      <tr><td><code>ref</code> is a plain prop in React 19</td><td><code>TextField</code>; <code>forwardRef</code> shown as the React 18 form</td></tr>
+      <tr><td>Narrow the surface with <code>useImperativeHandle</code></td><td><code>NoteInputHandle</code> exposing only <code>focus()</code></td></tr>
+      <tr><td>State updates are queued, so the DOM lags one step</td><td>Bug 1 — scrolling to the previous last row</td></tr>
+      <tr><td><code>flushSync</code> forces the commit inside the handler</td><td>Stage 2, wrapping both setters</td></tr>
+      <tr><td>Prefer an effect when the action need not be inside the event</td><td>The tip after <code>flushSync</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Select the text instead of just focusing.</b> On "Rename", focus the input and call <code>select()</code> so typing replaces the old title. Then try it with <code>setSelectionRange(0, 0)</code> and feel the difference — this is why "focus" is not one behaviour.</li>
+    <li><b>Add a "scroll to first unsaved note" button</b> that finds the id in your data first and only then touches the Map. Say out loud why searching the data is right and <code>querySelectorAll('li')[i]</code> is wrong, even though both work today.</li>
+    <li><b>Delete the <code>flushSync</code></b> and make the scroll work as an effect that depends on <code>notes.length</code> instead. Both versions are defensible; write down the one sentence that decides between them for this feature. (Hint: does anything else in the app add notes?)</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate's chat feature works locally and breaks in production. The code keeps a <code>messagesRef</code> to the scroll container and, in <code>handleSend</code>, does three things: <code>messagesRef.current.insertAdjacentHTML('beforeend', renderBubble(text))</code> so the message "appears instantly", then <code>setMessages([...messages, msg])</code>, then <code>messagesRef.current.scrollTop = messagesRef.current.scrollHeight</code>. QA reports duplicated bubbles, and sometimes <code>NotFoundError: The object can not be found here</code> in the console. They ask you whether adding <code>flushSync</code> would fix it.</p>
+    Work out, in order: which of the three lines is the actual defect and by which documented rule; why duplicates appear <em>and</em> why a browser exception can appear from the same cause; whether <code>flushSync</code> helps at all here; and what the two-line correct version looks like. Then decide which of the three DOM touches is legitimate to keep.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/manipulating-the-dom-with-refs">"Manipulating the DOM with Refs"</a>, the <a href="https://react.dev/reference/react/useImperativeHandle">useImperativeHandle</a> reference, <a href="https://react.dev/reference/react-dom/flushSync">flushSync</a>, and the <a href="https://react.dev/blog/2024/12/05/react-19">React 19 release notes</a> for <code>ref</code> as a prop and ref cleanup functions.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>give you six DOM operations and one second each</b> — safe or dangerous — then to defend the two you hesitate on. Or ask for the "focus the input after adding a row" task as a live-coding drill, with the scroll bug included.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>A DOM ref is a borrow permit.</b> React still owns the node. Non-destructive commands only: focus, blur, scroll, measure, select, play, pause, <code>showModal</code>.</li>
+      <li><b>Never rewrite what React renders.</b> Setting <code>innerHTML</code>, adding or removing children, or deleting a node React created gives you a wrong screen or a browser exception. You <em>may</em> safely touch parts of the DOM React has no reason to update.</li>
+      <li><b><code>ref.current</code> is <code>null</code> during render</b> and gets its node at commit, before any effect. So read it in handlers and effects, never while rendering.</li>
+      <li><b>Type it from the tag, keep it nullable:</b> <code>useRef&lt;HTMLInputElement&gt;(null)</code> and <code>ref.current?.focus()</code>. <code>null!</code> is a promise you cannot keep.</li>
+      <li><b>Three ways to attach:</b> an object ref for one element, a callback ref for many or for appear/disappear work, and a <code>ref</code> prop to reach into a component you wrote.</li>
+      <li><b>Since React 19 a callback ref can return a cleanup function</b> — and because of that, TypeScript rejects implicit returns. Write <code>{ … }</code>, not <code>( … )</code>.</li>
+      <li><b>Hooks cannot run in a loop</b>, so a list of refs is one ref holding a <code>Map</code> from id to node, filled and emptied by a callback ref.</li>
+      <li><b>In React 19 <code>ref</code> is an ordinary prop</b>; <code>forwardRef</code> is the React 18 way and is on its way out.</li>
+      <li><b><code>useImperativeHandle</code> hands out a remote control instead of the node.</b> Good for one or two verbs (focus, play); a smell once it grows setters.</li>
+      <li><b>"My scroll lags one item behind" is not a React bug</b> — state updates are queued, so the DOM has not changed yet. <code>flushSync</code> forces the commit inside your handler; an effect is often the better answer.</li>
+      <li><b>Never use <code>querySelector</code> where a ref belongs.</b> A ref is scoped, typed, and detached for you.</li>
+      <li><b>Real use case (built &amp; run):</b> a notes panel that scrolled to the wrong row and lost focus on every add, fixed with <code>flushSync</code> + <code>focus()</code>, a Map of row refs for jump-to-note, and an input that exposes only <code>focus()</code>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>use a ref to command a node, never to rewrite one — focus and scroll are always safe, and touching what React renders never is.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Manipulating the DOM with Refs" (getting a ref to a node, the ref-callback <code>Map</code> pattern, accessing another component's DOM nodes, <code>useImperativeHandle</code>, <code>flushSync</code>, and "Best practices for DOM manipulation with refs"), the <code>useRef</code> reference, the <code>flushSync</code> reference, and the React 19 release notes ("ref as a prop", "Cleanup functions for refs", including the TypeScript implicit-return note).</p>
+
+  <div class="footer-nav">
+    <a href="./0019-refs-memory-that-does-not-render.html">← Previous: Refs — memory that does not render</a>
+    <a href="./0021-measuring-timing-and-the-browser.html">Next: Measuring, timing &amp; the browser →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "You add a row and immediately call `listRef.current.lastElementChild.scrollIntoView()` in the same click handler. It always scrolls to the second-to-last row. Why?",
+      options: [
+        "State updates are queued, so the new row is not in the DOM yet when that line runs — wrap the setters in `flushSync`, or do the scroll in an effect",
+        "`lastElementChild` skips the most recent node until the browser repaints",
+        "The ref is stale and points at the previous version of the list element",
+        "`scrollIntoView` needs `behavior: 'instant'` to see newly added nodes"
+      ],
+      answer: 0,
+      why: "This is lesson 2's snapshot rule showing up in the DOM. Calling `setNotes` queues an update; React renders and commits afterwards, so on the very next line the list still contains the old rows. The documented fixes are `flushSync(() => { … })`, which makes React update the DOM synchronously right after the wrapped code, or moving the scroll into an effect that runs after the commit. The ref itself is fine — a ref to a `<ul>` keeps pointing at the same node across updates, because React mutates that node's children rather than replacing it."
+    },
+    {
+      q: "Which of these uses of a DOM ref is the one the React docs call out as likely to cause inconsistent results or a crash?",
+      options: [
+        "`containerRef.current.insertAdjacentHTML('beforeend', markup)` where the container's children come from JSX",
+        "`inputRef.current.focus()` after the user clicks Clear",
+        "`rowRef.current.scrollIntoView({ block: 'nearest' })`",
+        "`videoRef.current.play()` in a click handler"
+      ],
+      answer: 0,
+      why: "Focus, scroll, and calling a media API are the documented safe cases — non-destructive commands to a node whose contents React still controls. Inserting HTML into a container React renders is the documented dangerous case: React holds its own picture of that child list, so its next update can duplicate your node, overwrite it, or throw a browser error while removing a child that is no longer where React left it. The docs do allow manual DOM work in one narrow case — parts of the DOM React has no reason to update, such as a `<div>` that is always empty in the JSX."
+    },
+    {
+      q: "You need to scroll to any row in a 500-row list. What is the correct structure?",
+      options: [
+        "One ref holding a `Map` from row id to node, filled by a callback ref that returns a cleanup deleting the entry",
+        "`useRef` called once per row inside `.map()`",
+        "An array in state that collects each node as it mounts",
+        "`document.querySelectorAll('li')` and index into the result"
+      ],
+      answer: 0,
+      why: "Hooks must run in the same order on every render, so calling `useRef` inside `.map()` breaks the moment the row count changes. Storing nodes in state is wrong for a different reason: nodes are not rendered data, so every attach would trigger a render for nothing. The documented pattern is a single ref holding a `Map`, populated by a callback ref — and since React 19 that callback can return a cleanup function, so a removed row deletes its own entry instead of leaving a detached node in the Map forever. `querySelectorAll` happens to work until someone reorders the list, renders a second list on the page, or renames a class."
+    },
+    {
+      q: "In React 19, how do you let a parent focus an input that lives inside your `TextField` component — and what should you expose?",
+      options: [
+        "Accept `ref` as a normal prop and either pass it to the `<input>`, or use `useImperativeHandle` to expose only a `focus()` method",
+        "Wrap the component in `forwardRef` — it is still the only supported way",
+        "Read `props.ref` during render and store the node in state",
+        "Give the input an id and call `document.getElementById(id).focus()` from the parent"
+      ],
+      answer: 0,
+      why: "React 19 made `ref` an ordinary prop for function components, so `function TextField({ label, ref })` and `<input ref={ref} />` is all it takes; `forwardRef` still works but the release notes say it will be deprecated and removed in a future version. Which of the two you pick is a design decision: passing the ref through hands the parent the whole element, and the docs warn that manipulating another component's DOM node makes code fragile. `useImperativeHandle` narrows that to exactly the verbs your feature needs, so nobody can reach through and set `value` or `className` later."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “When is it acceptable to reach into the DOM from React?”",
+      answer: "When the thing I need is a <b>command to an existing node</b> rather than a description of the screen — and React exposes no prop for it. Focus and blur, scroll position, measuring with <code>getBoundingClientRect</code>, text selection, media playback, <code>showModal</code> on a <code>&lt;dialog&gt;</code>, canvas drawing, and wiring a third-party library that expects a node. The rule I keep is the docs' one: <b>non-destructive actions are safe; modifying the DOM is not.</b> I must never set <code>innerHTML</code>, add or remove children, or delete a node whose contents come from JSX, because React holds its own picture of that subtree and its next update will either overwrite my change or throw while reconciling children that moved. The one carve-out the docs allow is a part of the DOM React has no reason to touch — a div that is always empty in the JSX. And before I reach for a ref at all, I ask whether the thing is really state: a ref to read a child input's value on submit is usually a lifting-state problem wearing a ref costume."
+    },
+    {
+      prompt: "Interviewer: “How do you get refs for a list of items?”",
+      answer: "Not with one <code>useRef</code> per item — hooks have to run in the same order on every render, so a hook inside <code>.map()</code> breaks as soon as the list length changes. The documented pattern is <b>one ref holding a <code>Map</code></b> from item id to DOM node, filled by a callback ref on each row. I initialise the Map lazily inside a <code>getMap()</code> helper, which is the allowed exception to \"don't write a ref during render\" because it runs once and always gives the same result. Each row's callback does <code>map.set(id, node)</code> and, since React 19, <b>returns a cleanup function that deletes the entry</b> — without that, the Map accumulates detached nodes for every row that has ever rendered, which is both a leak and the cause of a confusing bug where scrolling to a node succeeds and nothing moves because the node is no longer in the document. One TypeScript detail from the same release: because a returned value is now interpreted as a cleanup function, an arrow function with an implicit return is a type error, so callback refs need braces."
+    },
+    {
+      prompt: "Interviewer: “What changed about refs in React 19?”",
+      answer: "Two things I use constantly. First, <b><code>ref</code> is now an ordinary prop for function components</b>: <code>function MyInput({ placeholder, ref })</code> works, so new components no longer need <code>forwardRef</code>. The release notes say a codemod ships for the migration and that <code>forwardRef</code> will be deprecated and removed in a future version — so I read <code>forwardRef</code> in an existing codebase as \"React 18 era\", not as wrong. It helps to know why it existed at all: <code>ref</code> used to be stripped out of props before the component function saw it, so it had to be handed back as a second argument. Second, <b>a callback ref can return a cleanup function</b>, which React calls when the element is removed, instead of calling the callback again with <code>null</code>. That is what makes the Map-of-refs pattern tidy. The knock-on effect is the TypeScript one — returning anything else from a callback ref is now rejected, so <code>ref={n =&gt; (x = n)}</code> has to become <code>ref={n =&gt; {x = n}}</code>."
+    },
+    {
+      prompt: "Interviewer: “What is useImperativeHandle for, and when is it the wrong choice?”",
+      answer: "It replaces the node in the parent's ref with an object I design. Instead of the parent receiving an <code>HTMLInputElement</code> and being able to do anything to it, it receives something like <code>{ focus() {} }</code> and can do exactly one thing. I reach for it in shared components — a design-system field that exposes <code>focus</code>, or a media player that exposes <code>play</code>, <code>pause</code> and <code>seek</code> — because it keeps the escape hatch as narrow as the feature. It is the wrong choice when the handle starts growing methods that move data: <code>setValue</code>, <code>getValue</code>, <code>submit</code>, <code>reset</code>. At that point I have rebuilt props and callbacks out of imperative calls, the parent and child have two sources of truth, and I have lost one-way data flow — the thing that makes React predictable. The test I apply is whether the method is a <b>verb the DOM already has</b>. Focus, scroll and play are; setValue is not."
+    }
+  ]);
+</script>

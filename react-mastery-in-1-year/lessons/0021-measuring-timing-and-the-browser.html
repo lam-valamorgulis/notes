@@ -1,0 +1,708 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measuring, timing &amp; the browser — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 5 · Lesson 3</p>
+  <h1>Measuring, timing &amp; the browser</h1>
+  <p class="subtitle">Some work has to finish before the user sees anything. That single sentence is the whole difference between <code>useEffect</code> and <code>useLayoutEffect</code> — and it decides whether your tooltip flickers.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can measure a real element and reposition it with no visible flicker, watch a size with <code>ResizeObserver</code>, and write a countdown that is still correct after twenty minutes in a background tab — plus the sentence that explains why <code>useLayoutEffect</code> is a last resort and not a better <code>useEffect</code>.
+  </div>
+
+  <p>Lesson 20 gave you the node. Now you want to know something about it: how tall is this tooltip, how wide is this container, has this row scrolled into view. Measuring is easy — <code>getBoundingClientRect()</code> and you are done. <b>Doing something with the measurement without the user seeing the before-and-after</b> is the hard part, and it is a timing problem, not a DOM problem.</p>
+
+  <h2>First principle — there is a moment when the screen is decided</h2>
+
+  <p>Extend the render loop one more time. You know it up to the commit: React renders, compares, and writes to the DOM. Then two things happen in a fixed order that you can hook into.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Step</th><th>What happens</th><th>Your hook</th></tr></thead>
+    <tbody>
+      <tr><td>render</td><td>Your function runs and returns JSX. No DOM exists for this render yet.</td><td>—</td></tr>
+      <tr><td>commit</td><td>React writes the changes to the real DOM and attaches refs.</td><td>—</td></tr>
+      <tr><td><b>before paint</b></td><td>The DOM is updated but the user has not seen it. React runs layout effects here — and any state you set is rendered and committed <em>before</em> the pixels are drawn.</td><td><code>useLayoutEffect</code></td></tr>
+      <tr><td>paint</td><td>The browser draws the frame. This is the first moment the user sees anything.</td><td>—</td></tr>
+      <tr><td><b>after paint</b></td><td>Everything that does not need to beat the frame.</td><td><code>useEffect</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">React docs · useLayoutEffect</span>
+    "<code>useLayoutEffect</code> is a version of <code>useEffect</code> that <b>fires before the browser repaints the screen.</b>" … "React guarantees that the code inside <code>useLayoutEffect</code> and any state updates scheduled inside it will be processed <b>before the browser repaints the screen.</b> This lets you render the tooltip, measure it, and re-render the tooltip again <b>without the user noticing the first extra render.</b> In other words, <code>useLayoutEffect</code> blocks the browser from painting."
+  </div>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 272" role="img" aria-labelledby="fig21-title" width="640" height="272">
+      <title id="fig21-title">Two timelines for measure-then-reposition. With useEffect the browser paints the wrong position first and then repaints, which the user sees as a flicker. With useLayoutEffect the measurement and the second render both happen before the first paint, so only the correct position is ever drawn.</title>
+      <defs>
+        <marker id="a21" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a21b" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <text x="12" y="16" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✕ useEffect — the wrong frame is painted first</text>
+
+      <rect x="12" y="26" width="88" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="56" y="46" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px;">render</text>
+
+      <line x1="100" y1="42" x2="122" y2="42" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a21b)"></line>
+
+      <rect x="124" y="26" width="88" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="168" y="46" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px;">commit</text>
+
+      <line x1="212" y1="42" x2="234" y2="42" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a21b)"></line>
+
+      <rect x="236" y="26" width="112" height="32" rx="3" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.5;"></rect>
+      <text x="292" y="46" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">PAINT — wrong</text>
+
+      <line x1="348" y1="42" x2="370" y2="42" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a21b)"></line>
+
+      <rect x="372" y="26" width="132" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="438" y="41" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9px;">useEffect: measure,</text>
+      <text x="438" y="53" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9px;">setState</text>
+
+      <line x1="504" y1="42" x2="526" y2="42" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a21b)"></line>
+
+      <rect x="528" y="26" width="100" height="32" rx="3" style="fill: var(--paper); stroke: var(--accent);"></rect>
+      <text x="578" y="46" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">PAINT — right</text>
+
+      <text x="292" y="74" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-style: italic;">the user sees this frame → flicker / jump</text>
+
+      <line x1="12" y1="92" x2="628" y2="92" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="118" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✓ useLayoutEffect — only the right frame is ever painted</text>
+
+      <rect x="12" y="128" width="82" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="53" y="148" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px;">render</text>
+
+      <line x1="94" y1="144" x2="112" y2="144" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a21)"></line>
+
+      <rect x="114" y="128" width="82" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="155" y="148" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px;">commit</text>
+
+      <line x1="196" y1="144" x2="214" y2="144" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a21)"></line>
+
+      <rect x="216" y="128" width="126" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="279" y="143" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">useLayoutEffect:</text>
+      <text x="279" y="155" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px;">measure, setState</text>
+
+      <line x1="342" y1="144" x2="360" y2="144" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a21)"></line>
+
+      <rect x="362" y="128" width="150" height="32" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="437" y="143" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9px;">re-render + commit</text>
+      <text x="437" y="155" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">still no paint</text>
+
+      <line x1="512" y1="144" x2="530" y2="144" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a21)"></line>
+
+      <rect x="532" y="128" width="96" height="32" rx="3" style="fill: var(--paper); stroke: var(--accent);"></rect>
+      <text x="580" y="148" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">PAINT — right</text>
+
+      <text x="279" y="176" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-style: italic;">the browser is blocked here — that is the cost</text>
+
+      <line x1="12" y1="196" x2="628" y2="196" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="218" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight: 700;">The test:</text>
+      <text x="78" y="218" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">would the user see a wrong frame if this ran after paint?</text>
+      <text x="30" y="238" style="fill: var(--accent); font-family: sans-serif; font-size: 10px;">Yes → useLayoutEffect. Measuring to position, scroll restoration, sizing to fit.</text>
+      <text x="30" y="258" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px;">No → useEffect. Fetching, subscriptions, logging, timers, the document title.</text>
+    </svg>
+  </div>
+
+  <h2>The flicker, in code</h2>
+
+  <p>A tooltip that must appear above the target when there is no room below. You cannot know if there is room until you know how tall the tooltip is, and you cannot know that until it is in the DOM. So the first render is always a guess.</p>
+
+  <pre><code>function Tooltip() {
+  const ref = useRef(null);
+  const [tooltipHeight, setTooltipHeight] = useState(0);
+
+  useLayoutEffect(() =&gt; {
+    const { height } = ref.current.getBoundingClientRect();
+    setTooltipHeight(height);
+  }, []);
+
+  <span class="cmt">// ...use tooltipHeight in the rendering logic below...</span>
+}</code></pre>
+
+  <p>Swap that one word to <code>useEffect</code> and the docs describe exactly what you get: "React will let the browser paint the screen before it processes the state update inside <code>useEffect</code>. <b>As a result, the tooltip flickers.</b>"</p>
+
+  <p>Notice what is <em>not</em> different: the measurement is identical, the state update is identical, the final screen is identical. The only difference is whether the user sees the intermediate frame. That is why "it works but it flashes" is the signature of a measurement in the wrong hook.</p>
+
+  <h2>The price, and the two warnings</h2>
+
+  <div class="note">
+    <span class="label">React docs · Pitfall</span>
+    "<code>useLayoutEffect</code> <b>can hurt performance.</b> Prefer <code>useEffect</code> when possible."
+  </div>
+
+  <p>Blocking paint means the browser is sitting idle while your JavaScript runs, and if you set state you have forced a second render into that same gap. On one tooltip nobody notices. On a hundred rows that each measure themselves, you have built a frame budget problem that no amount of <code>memo</code> will fix later.</p>
+
+  <div class="note">
+    <span class="label">React docs · useLayoutEffect does nothing on the server</span>
+    "When you or your framework uses server rendering, your React app renders to HTML on the server for the initial render… <b>on the server, there is no layout information.</b>"
+  </div>
+
+  <p>That one matters from Month 10, when the course moves to Next.js: a component that measures itself cannot produce correct HTML on the server, because there is no layout to measure. The documented options are to use <code>useEffect</code> instead, to mark the component as client-only, or to render the simple version first and swap after hydration.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Task</th><th>Hook</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Measure a node, then position or size something from that measurement</td><td><code>useLayoutEffect</code></td><td>The first guess would be painted.</td></tr>
+      <tr><td>Restore a saved scroll position when a view opens</td><td><code>useLayoutEffect</code></td><td>Otherwise the user sees the top of the list, then a jump.</td></tr>
+      <tr><td>Read a size to decide how many items fit</td><td><code>useLayoutEffect</code></td><td>Same reason — the wrong count would be drawn.</td></tr>
+      <tr><td>Fetch data</td><td><code>useEffect</code></td><td>The answer arrives in a later frame no matter what.</td></tr>
+      <tr><td>Subscribe to a socket, a store, an event</td><td><code>useEffect</code></td><td>Nothing about the first frame depends on it.</td></tr>
+      <tr><td>Set <code>document.title</code>, log analytics, start a timer</td><td><code>useEffect</code></td><td>Invisible or off-screen work.</td></tr>
+      <tr><td>Animate <em>from</em> a measured value</td><td><code>useLayoutEffect</code></td><td>The starting frame must be right or the animation jumps.</td></tr>
+      <tr><td>Inject CSS rules from a styling library</td><td><code>useInsertionEffect</code></td><td>A third, rarer hook that runs before layout effects. If you are not writing a CSS-in-JS library, you will never need it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Measuring is not free</h2>
+
+  <p>Two facts about the browser that React cannot hide from you:</p>
+
+  <ol>
+    <li><b>Reading layout after changing styles forces the browser to compute layout early.</b> <code>getBoundingClientRect()</code>, <code>offsetHeight</code>, <code>scrollTop</code> and friends must return a truthful answer, so the browser stops and recalculates. Do it once and cache it; do it in a loop over 200 rows, alternating with style writes, and you have built the slowest possible version of your feature.</li>
+    <li><b>A measurement is a fact about one moment.</b> The value you stored is wrong the instant the window resizes, a font loads, or a sibling grows. If the size can change while the component is on screen, one measurement is not enough — you need to be told when it changes.</li>
+  </ol>
+
+  <p>Being told is what <code>ResizeObserver</code> is for. It is an outside system, so it is textbook effect work: setup, cleanup, and a dependency that says which node to watch.</p>
+
+  <pre><code>import { useLayoutEffect, useRef, useState } from 'react';
+
+type Size = { width: number; height: number };
+
+export function ChartBox() {
+  const boxRef = useRef&lt;HTMLDivElement&gt;(null);
+  const [size, setSize] = useState&lt;Size&gt;({ width: 0, height: 0 });
+
+  useLayoutEffect(() =&gt; {
+    const node = boxRef.current;
+    if (node === null) return;
+
+    const observer = new ResizeObserver(entries =&gt; {
+      const entry = entries[0];
+      if (entry === undefined) return;
+      const { width, height } = entry.contentRect;
+      setSize({ width, height });          <span class="cmt">// React skips the re-render if both are unchanged</span>
+    });
+
+    observer.observe(node);                <span class="cmt">// fires once immediately with the current size</span>
+    return () =&gt; observer.disconnect();    <span class="cmt">// ✓ the cleanup half of the pair</span>
+  }, []);
+
+  return (
+    &lt;div ref={boxRef} style={{ resize: 'both', overflow: 'auto', border: '1px solid' }}&gt;
+      &lt;p&gt;{Math.round(size.width)} × {Math.round(size.height)}&lt;/p&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p>Three details that are easy to get wrong:</p>
+
+  <ul>
+    <li><b>Copy the node into a local variable</b> at the top of the effect. The cleanup runs later, and <code>boxRef.current</code> may already be <code>null</code> by then. This is the ref version of the stale-closure discipline from lesson 17.</li>
+    <li><b><code>observer.observe()</code> fires straight away</b> with the current size, so you do not need a separate first measurement.</li>
+    <li><b>Never resize the observed element inside its own callback.</b> That is the cause of the console message "ResizeObserver loop completed with undelivered notifications" — you asked to be told about a change, and your reaction caused another change.</li>
+  </ul>
+
+  <div class="tip">
+    <span class="label">Which observer for which question</span>
+    <b>ResizeObserver</b> — "how big is this?" <b>IntersectionObserver</b> — "is this visible?" (lazy loading, infinite scroll, tracking impressions). <b>MutationObserver</b> — "did this subtree change?", which in a React app almost always means you are watching something you should have rendered yourself. All three are the same effect shape: create, observe, disconnect in the cleanup.
+  </div>
+
+  <h2>Timers, honestly</h2>
+
+  <p>You have the two failure modes already: a timer with no cleanup leaks, and a timer that reads state directly freezes on one render's values (lesson 17). This lesson adds the third, which nobody warns you about until a user does.</p>
+
+  <div class="trap">
+    <span class="label">A counter of ticks is not a clock</span>
+    <code>setInterval</code> does not promise to run on time. The callback is queued, so a busy main thread delays it — and in a <b>background tab</b> browsers clamp timers to roughly once per second or slower, and stop <code>requestAnimationFrame</code> entirely. So <code>setSeconds(s =&gt; s - 1)</code> once per interval drifts, and after twenty minutes in another tab your countdown can be minutes wrong. The fix is not a better timer. <b>Store the deadline and compute the remaining time from <code>Date.now()</code>;</b> let the timer only decide how often you re-read the clock.
+  </div>
+
+  <pre><code><span class="cmt">// ✕ counts ticks — drifts, and loses time in a background tab</span>
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setSeconds(s =&gt; s - 1), 1000);
+  return () =&gt; clearInterval(id);
+}, []);
+
+<span class="cmt">// ✓ reads the clock — correct no matter when the callback actually runs</span>
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setNow(Date.now()), 250);
+  return () =&gt; clearInterval(id);
+}, []);
+
+const remainingMs = Math.max(0, deadline - now);   <span class="cmt">// derive, don't store</span></code></pre>
+
+  <p>The same principle covers "why did my animation stutter": <code>setInterval(…, 16)</code> is not a frame. Use <code>requestAnimationFrame</code> for anything visual, because the browser then calls you when it is actually about to paint, and it stops calling when the tab is hidden.</p>
+
+  <pre><code>useEffect(() =&gt; {
+  let frame = 0;
+
+  function loop() {
+    setNow(Date.now());
+    frame = requestAnimationFrame(loop);   <span class="cmt">// re-schedule from inside</span>
+  }
+  frame = requestAnimationFrame(loop);
+
+  return () =&gt; cancelAnimationFrame(frame);
+}, []);</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Job</th><th>Tool</th><th>Cleanup</th></tr></thead>
+    <tbody>
+      <tr><td>Do something once, later</td><td><code>setTimeout</code></td><td><code>clearTimeout</code></td></tr>
+      <tr><td>Re-read a clock or poll a value</td><td><code>setInterval</code></td><td><code>clearInterval</code></td></tr>
+      <tr><td>Anything the eye follows</td><td><code>requestAnimationFrame</code></td><td><code>cancelAnimationFrame</code></td></tr>
+      <tr><td>Wait for the typing to stop</td><td><code>setTimeout</code> in an effect keyed on the value (lesson 18)</td><td><code>clearTimeout</code> in the cleanup</td></tr>
+      <tr><td>Re-sync when the user comes back to the tab</td><td>a <code>visibilitychange</code> listener</td><td><code>removeEventListener</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Listening to things React does not own</h2>
+
+  <p><code>window</code>, <code>document</code>, <code>matchMedia</code>, the network status — none of them have JSX props, so all of them are effects. The shape never changes:</p>
+
+  <pre><code>useEffect(() =&gt; {
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape') onClose();
+  }
+  document.addEventListener('keydown', handleKeyDown);
+  return () =&gt; document.removeEventListener('keydown', handleKeyDown);
+}, [onClose]);</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Rule</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td><b>Use a JSX prop if one exists.</b> <code>onKeyDown</code> on the element beats <code>addEventListener</code> on the node.</td><td>React attaches and removes it for you, and it cannot outlive the element.</td></tr>
+      <tr><td><b>Remove the same function you added.</b> A new inline arrow in <code>removeEventListener</code> removes nothing.</td><td>The browser matches listeners by identity.</td></tr>
+      <tr><td><b>Keep the handler's dependencies honest</b>, or read the latest value through a ref / Effect Event.</td><td>A document listener lives across many renders — prime stale-closure territory.</td></tr>
+      <tr><td><b><code>{ passive: true }</code> for <code>scroll</code> / <code>touchmove</code> you do not cancel.</b></td><td>Tells the browser it need not wait for you before scrolling.</td></tr>
+      <tr><td><b><code>{ capture: true }</code> when you must act before a child does</b> — and know it changes the order, not just the timing.</td><td>Capture runs top-down before the target; bubbling runs bottom-up after.</td></tr>
+      <tr><td><b>For an external <em>store</em> of values, prefer <code>useSyncExternalStore</code></b> over an effect that copies into state.</td><td>No extra render, no tearing, and it is the documented tool (lesson 16).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Build it for real — three timing problems</h2>
+
+  <h3>Stage 1 — the tooltip that flips</h3>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Tooltip.tsx</b></p>
+  <pre><code>import { useLayoutEffect, useRef, useState } from 'react';
+
+type Props = { targetRect: { top: number; bottom: number; left: number } | null; children: React.ReactNode };
+
+const GAP = 8;
+
+export function Tooltip({ targetRect, children }: Props) {
+  const ref = useRef&lt;HTMLDivElement&gt;(null);
+  const [tooltipHeight, setTooltipHeight] = useState(0);
+
+  useLayoutEffect(() =&gt; {
+    const node = ref.current;
+    if (node === null) return;
+    const { height } = node.getBoundingClientRect();
+    setTooltipHeight(height);            <span class="cmt">// measured before the user sees anything</span>
+  }, [children]);                        <span class="cmt">// re-measure when the content changes</span>
+
+  let top = 0;
+  let left = 0;
+  if (targetRect !== null) {
+    top = targetRect.bottom + GAP;
+    left = targetRect.left;
+    if (top + tooltipHeight &gt; window.innerHeight) {
+      top = targetRect.top - tooltipHeight - GAP;   <span class="cmt">// no room below → flip above</span>
+    }
+  }
+
+  return (
+    &lt;div ref={ref} style={{ position: 'fixed', top, left, pointerEvents: 'none' }}&gt;
+      {children}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p><b>Run it twice.</b> Hover a target near the bottom of the window and watch closely. With <code>useLayoutEffect</code> the tooltip appears above, once. Change the import to <code>useEffect</code> and the same tooltip appears below for one frame and then jumps. Nothing else in the file changes. Keep both versions open in two tabs — this is the clearest demonstration of "before paint" you will get.</p>
+
+  <div class="trap">
+    <span class="label">The dependency that catches people</span>
+    <code>[children]</code>, not <code>[]</code>. A tooltip whose text changes is a tooltip whose height changed, and an empty array means you keep positioning by yesterday's measurement. If the content can also change size <em>without</em> a re-render — a font finishing loading, an image arriving — then a measurement is not enough and you want <code>ResizeObserver</code>.
+  </div>
+
+  <h3>Stage 2 — a size you can build on</h3>
+
+  <p>Use the <code>ChartBox</code> effect from earlier, then render something that genuinely depends on the number: a bar chart drawn with <code>width: size.width / data.length</code>, or a label that switches from "compact" to "full" below 320 pixels. The point is to feel the difference between a CSS media query (about the <em>viewport</em>) and a measurement (about <em>this element</em>) — which is the whole reason container queries exist.</p>
+
+  <h3>Stage 3 — a countdown that survives a background tab</h3>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Countdown.tsx</b></p>
+  <pre><code>import { useEffect, useState } from 'react';
+
+type Props = { deadline: number };   <span class="cmt">// a timestamp, not a duration</span>
+
+export function Countdown({ deadline }: Props) {
+  const [now, setNow] = useState(() =&gt; Date.now());
+
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; setNow(Date.now()), 250);
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  <span class="cmt">// Come back from another tab and re-read the clock immediately,</span>
+  <span class="cmt">// instead of waiting for the next throttled tick.</span>
+  useEffect(() =&gt; {
+    function handleVisibility() {
+      if (document.visibilityState === 'visible') setNow(Date.now());
+    }
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () =&gt; document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
+
+  const remaining = Math.max(0, deadline - now);
+  const mm = String(Math.floor(remaining / 60000)).padStart(2, '0');
+  const ss = String(Math.floor((remaining % 60000) / 1000)).padStart(2, '0');
+
+  return &lt;time&gt;{mm}:{ss}&lt;/time&gt;;
+}</code></pre>
+
+  <p><b>The test that proves it.</b> Start a five-minute countdown, switch to another tab for two minutes, come back. The tick-counting version is roughly two minutes behind — sometimes far worse. This version is exact, because the timer never decided the answer; it only decided how often to ask.</p>
+
+  <p>Two more things this file quietly gets right. <code>useState(() =&gt; Date.now())</code> uses the lazy initialiser, so the clock is read once rather than on every render. And <code>remaining</code>, <code>mm</code> and <code>ss</code> are derived — the only state is <code>now</code>, which is the smallest complete answer (Month 3's rule).</p>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>There is a moment before paint</td><td>The five-step table and the two-timeline figure</td></tr>
+      <tr><td><code>useLayoutEffect</code> blocks painting</td><td>The tooltip: measured and re-rendered before the first frame</td></tr>
+      <tr><td><code>useEffect</code> lets the browser paint first</td><td>The same tooltip with one word changed — the flicker</td></tr>
+      <tr><td>Layout effects cost performance and do nothing on the server</td><td>The two documented warnings</td></tr>
+      <tr><td>Measuring forces the browser to compute layout</td><td>Why one cached measurement beats a loop of reads and writes</td></tr>
+      <tr><td>A measurement is one moment; a size needs an observer</td><td><code>ChartBox</code> with <code>ResizeObserver</code></td></tr>
+      <tr><td>Copy <code>ref.current</code> into a local at the top of the effect</td><td>Both the observer effect and the tooltip</td></tr>
+      <tr><td>Setup / cleanup pairs, again</td><td><code>observe</code> → <code>disconnect</code>, <code>addEventListener</code> → <code>removeEventListener</code></td></tr>
+      <tr><td>Counting ticks is not telling time</td><td>The countdown: <code>deadline - Date.now()</code>, not <code>s - 1</code></td></tr>
+      <tr><td>Background tabs throttle timers and stop animation frames</td><td>The two-minute test, and the <code>visibilitychange</code> re-sync</td></tr>
+      <tr><td>Lazy state initialiser</td><td><code>useState(() =&gt; Date.now())</code></td></tr>
+      <tr><td>Derive, don't store</td><td><code>remaining</code>, <code>mm</code>, <code>ss</code> — one piece of state in the whole component</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Make the tooltip flip sideways too.</b> Measure the width as well and mirror it to the left of the target when it would leave the viewport. Then say why both measurements belong in the same layout effect and the same state object.</li>
+    <li><b>Add "N items fit" to <code>ChartBox</code>.</b> Divide the observed width by a fixed item width and render only that many. Then resize slowly and watch the render count in the React DevTools profiler — this is the exact place where a measurement-driven layout becomes a performance question (Month 11).</li>
+    <li><b>Break the countdown two ways.</b> First replace <code>250</code> with <code>1000</code> and describe the symptom precisely (it is not "less accurate" — it is a visible pause of up to one second). Then switch to counting ticks and run the background-tab test again, writing down the drift you measure. Numbers you produced yourself are the ones you remember in an interview.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A colleague reports two problems in the same table component. First, on open, the first row is briefly shown at the top and then the view jumps to the previously selected row — the scroll restoration lives in a <code>useEffect</code>. Second, the header cell widths are computed by a <code>useLayoutEffect</code> inside <b>every</b> <code>&lt;Row&gt;</code>, which each read <code>getBoundingClientRect()</code> and then set a style on themselves; with 400 rows, opening the table freezes for about a second. Their proposed fix is to convert the scroll restoration to <code>useLayoutEffect</code> and to memoise every row with <code>React.memo</code>.</p>
+    Work out, in order: whether the first half of their fix is right and why; why <code>React.memo</code> will not help the second problem at all; what the per-row layout effects should be replaced with; and which of the two problems you would fix first if you could only ship one today.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/reference/react/useLayoutEffect">useLayoutEffect</a> (including "Measuring layout before the browser repaints the screen"), <a href="https://react.dev/reference/react/useEffect">useEffect</a>, <a href="https://react.dev/reference/react/useInsertionEffect">useInsertionEffect</a>, and MDN on <a href="https://developer.mozilla.org/docs/Web/API/ResizeObserver">ResizeObserver</a> and <a href="https://developer.mozilla.org/docs/Web/API/Window/requestAnimationFrame">requestAnimationFrame</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>name eight side effects and give you three seconds each</b> — <code>useEffect</code>, <code>useLayoutEffect</code>, or neither. Or ask for the flickering tooltip as a live debugging drill: I hand you the broken version, you find it by reasoning rather than by swapping hooks at random.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>The order is render → commit → layout effects → paint → effects.</b> Everything the user must not see has to finish before paint.</li>
+      <li><b><code>useLayoutEffect</code> fires before the browser repaints</b>, and any state you set inside it is rendered and committed before the frame is drawn — so the extra render is invisible.</li>
+      <li><b><code>useEffect</code> lets the browser paint first.</b> That is why measuring in it makes a tooltip flicker: the wrong frame is real, it is just brief.</li>
+      <li><b>One test decides it:</b> would the user see a wrong frame if this ran after paint? Yes → layout effect. No → effect.</li>
+      <li><b>It is a last resort, not a better <code>useEffect</code>.</b> It blocks painting, the docs say it can hurt performance, and it does nothing on the server — which matters the moment you move to Next.js.</li>
+      <li><b>Measuring forces the browser to compute layout.</b> Measure once and cache; never alternate reads and style writes over a long list.</li>
+      <li><b>A measurement is a fact about one moment.</b> If the size can change while on screen, use <code>ResizeObserver</code> — observe in the setup, <code>disconnect</code> in the cleanup, and never resize the observed element from its own callback.</li>
+      <li><b>Copy <code>ref.current</code> into a local variable</b> at the top of an effect, because the cleanup runs later and may find <code>null</code>.</li>
+      <li><b>Counting ticks is not telling time.</b> Timers are delayed by a busy thread and throttled hard in background tabs. Store the deadline, compute from <code>Date.now()</code>, and let the timer only decide how often you look.</li>
+      <li><b><code>requestAnimationFrame</code> for anything the eye follows</b>; it is called right before a paint and stops when the tab is hidden. Always <code>cancelAnimationFrame</code> in the cleanup.</li>
+      <li><b>Outside listeners are effects</b>: add and remove the same function, prefer a JSX prop when one exists, and prefer <code>useSyncExternalStore</code> for an external store of values.</li>
+      <li><b>Real use case (built &amp; run):</b> a tooltip that flips above the target with no flicker, a box that reports its own size through <code>ResizeObserver</code>, and a countdown that stayed exact after two minutes in a background tab.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b><code>useLayoutEffect</code> buys you the frame before the user sees anything — pay for it only when a wrong frame would be visible.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <code>useLayoutEffect</code> (definition, "blocks the browser from painting", the Tooltip measuring example, the performance pitfall, and the server-rendering note), <code>useEffect</code>, <code>useInsertionEffect</code>, <code>useSyncExternalStore</code>; MDN — <code>ResizeObserver</code>, <code>IntersectionObserver</code>, <code>requestAnimationFrame</code>, <code>Document.visibilityState</code>, and the reasons timers are clamped in background tabs.</p>
+
+  <div class="footer-nav">
+    <a href="./0020-reaching-the-dom-with-refs.html">← Previous: Reaching the DOM with refs</a>
+    <a href="./0022-build-a-modal-and-a-media-player.html">Next: Build it — a modal &amp; a media player →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A tooltip measures its own height in a `useEffect` and uses the value to decide whether to sit above or below its target. It works, but it visibly jumps on first appearance. What is the fix and why?",
+      options: [
+        "Use `useLayoutEffect` — it runs before the browser repaints, so the measurement and the corrected position happen before the first frame is drawn",
+        "Add the height to the dependency array so the effect re-runs until the position is stable",
+        "Wrap the state update in `flushSync` inside the effect",
+        "Measure during render instead, so the value is available immediately"
+      ],
+      answer: 0,
+      why: "The jump is a real frame: React committed the guessed position, the browser painted it, and only then did the effect measure and set state, causing a second paint. `useLayoutEffect` fires before that first paint, and the docs guarantee that state updates scheduled inside it are processed before the browser repaints — so the intermediate frame never exists. Measuring during render is impossible: the node does not exist yet, and render must stay pure. Re-running the effect more times just adds more visible frames. `flushSync` inside an effect does not help either, because the paint has already happened by then."
+    },
+    {
+      q: "A countdown uses `setInterval(() => setSeconds(s => s - 1), 1000)`. A user leaves the tab open in the background for two minutes and comes back to find the timer roughly two minutes behind. Why, and what is the correct design?",
+      options: [
+        "Background tabs throttle timers, so far fewer ticks ran — store the deadline and compute the remaining time from `Date.now()` instead of counting ticks",
+        "The updater function was stale, so it kept subtracting from the same value",
+        "React paused the component while the tab was hidden and resumed it on return",
+        "`setInterval` drifts by a few milliseconds per tick, which accumulates to two minutes"
+      ],
+      answer: 0,
+      why: "Browsers clamp timers in hidden tabs — often to about one call per second, sometimes much less — so a design where every tick subtracts one second loses exactly as much time as the browser withheld. Nothing was stale: the updater form did its job on each tick that actually ran. The reliable design stores the deadline as a timestamp and derives the remaining time from the clock, so the interval only controls how often you re-read `Date.now()`, never the answer. A short interval like 250ms keeps the display responsive, and a `visibilitychange` listener re-reads the clock the moment the user returns rather than waiting for the next tick."
+    },
+    {
+      q: "Which statement about `useLayoutEffect` is true?",
+      options: [
+        "It does nothing on the server, because there is no layout information during server rendering",
+        "It is the safer default because it runs earlier and therefore avoids race conditions",
+        "It runs after paint but before the next render, unlike `useEffect`",
+        "It cannot set state, because that would cause an infinite loop"
+      ],
+      answer: 0,
+      why: "The docs are explicit that `useLayoutEffect` does nothing on the server — server rendering produces HTML with no layout to measure — which is why a component that measures itself needs `useEffect`, a client-only boundary, or a simple first render that is corrected after hydration. It is not a safer default: it blocks the browser from painting, and the docs' own pitfall says it can hurt performance and to prefer `useEffect` when possible. Setting state inside it is not only allowed but the main use, and React processes that update before painting — which is exactly what removes the flicker."
+    },
+    {
+      q: "You need to know a container's width whenever it changes, including when a sibling grows and no re-render happens. What do you use?",
+      options: [
+        "A `ResizeObserver` created in an effect, `observe(node)` in the setup and `disconnect()` in the cleanup",
+        "`getBoundingClientRect()` in a layout effect with an empty dependency array",
+        "A `resize` listener on `window`",
+        "A `useState` that every child updates when it renders"
+      ],
+      answer: 0,
+      why: "A single measurement is a fact about one moment, and an empty dependency array means you keep using it forever. A `window` resize listener misses every change that is not caused by the viewport — a sibling growing, a font loading, a panel collapsing, content wrapping. `ResizeObserver` reports the element's own size changes whatever caused them, fires once immediately when you start observing, and follows the ordinary effect shape with `disconnect` in the cleanup. The one rule to remember with it: never change the observed element's size inside its own callback, which produces the 'loop completed with undelivered notifications' error."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is the difference between useEffect and useLayoutEffect?”",
+      answer: "Timing relative to <b>paint</b>. Both run after React has committed changes to the DOM, but <code>useLayoutEffect</code> runs <b>before the browser repaints the screen</b>, and any state I set inside it is rendered and committed before that first frame — so an extra render is invisible. <code>useEffect</code> runs after paint, so the same work produces a visible intermediate frame. The test I apply is one question: would the user see a wrong frame if this ran after painting? Measuring an element and then positioning or sizing something from that measurement, or restoring a scroll position, both fail that test, so they need a layout effect. Fetching, subscriptions, logging, timers and setting the document title all pass it, so they belong in <code>useEffect</code>. And I say the cost out loud, because it is the part people forget: a layout effect blocks the browser from painting, the docs explicitly say it can hurt performance, and it does nothing on the server — so on a server-rendered app it either moves to <code>useEffect</code> or the component becomes client-only."
+    },
+    {
+      prompt: "Interviewer: “How do you measure a DOM element in React?”",
+      answer: "With a ref plus a layout effect, and the measurement stored in <b>state</b> so the screen can use it. During render the node does not exist and reading a ref then is against the rules, so the first render is always a guess — I render with a neutral value, measure in <code>useLayoutEffect</code> via <code>getBoundingClientRect()</code>, and set state, which React processes before painting so the guess is never seen. Two follow-ups I mention. First, a measurement is a fact about one moment: if the size can change while the component is on screen — a font loading, a sibling growing, the user dragging a splitter — one measurement is not enough and I use a <code>ResizeObserver</code>, created in the effect and disconnected in the cleanup. Second, measuring is not free: reading layout after style changes forces the browser to recompute layout, so measuring inside a loop over hundreds of rows is a real freeze, and the fix is usually to measure once at the container level rather than per row. I also copy <code>ref.current</code> into a local variable at the top of the effect, since the cleanup runs later and may find <code>null</code>."
+    },
+    {
+      prompt: "Interviewer: “Why can a setInterval-based countdown be wrong, and how would you build one that is right?”",
+      answer: "Because <code>setInterval</code> makes no promise about when it runs. The callback is queued behind whatever else the main thread is doing, and in a <b>background tab</b> browsers clamp timers hard — often to about one call per second or fewer — while <code>requestAnimationFrame</code> stops altogether. So a design where each tick does <code>setSeconds(s =&gt; s - 1)</code> loses exactly as much time as the browser withheld: two minutes in another tab can mean two minutes of missing countdown. The correct design separates the <b>answer</b> from the <b>refresh</b>: I store the deadline as a timestamp, keep only <code>now</code> in state, derive the remaining time as <code>deadline - now</code>, and use a short interval — say 250ms — purely to re-read <code>Date.now()</code>. Then no tick can change the answer, only how fresh the display is. I also add a <code>visibilitychange</code> listener that re-reads the clock the instant the tab becomes visible, so the user never sees a stale value while waiting for the next throttled tick. And for anything animated I use <code>requestAnimationFrame</code> with <code>cancelAnimationFrame</code> in the cleanup, because it is called right before a paint instead of on a fixed schedule."
+    },
+    {
+      prompt: "Interviewer: “How do you handle a keydown on the whole document in React, and what goes wrong?”",
+      answer: "In an effect, because <code>document</code> is an outside system with no JSX prop: add the listener in the setup, remove <b>the same function</b> in the cleanup. Three things go wrong in practice. First, removing a different function — an inline arrow in <code>removeEventListener</code> removes nothing, because the browser matches by identity, and you end up with one listener per render. Second, the stale closure from lesson 17: a document listener outlives many renders, so if it reads props or state directly and the dependency array is a lie, it keeps acting on old values; the honest fixes are to list the dependencies, or to read the latest value through an Effect Event or a ref. Third, reaching for <code>document</code> when a JSX prop exists — if the key press happens inside an element I render, <code>onKeyDown</code> on that element is better, because React attaches and removes it for me and it cannot outlive the element. I also pick the options deliberately: <code>passive: true</code> for scroll and touch handlers I do not cancel, and <code>capture: true</code> only when I genuinely need to act before a child, since capture changes the order rather than just the timing."
+    }
+  ]);
+</script>

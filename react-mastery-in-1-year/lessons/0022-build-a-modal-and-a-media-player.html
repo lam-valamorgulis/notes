@@ -1,0 +1,854 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build it — a click-outside modal &amp; a custom media player — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 5 · Lesson 4 · The real build</p>
+  <h1>Build it — a click-outside modal &amp; a custom media player</h1>
+  <p class="subtitle">Two features that look like UI work and are really ownership work: who owns focus, and who owns the truth about whether the video is playing.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a modal that closes on Escape and on an outside click, moves focus in, traps it, and gives it back — and a media player whose buttons never disagree with the video, even when the user drives it with the native controls. Plus the two sentences that get you through the "build a modal, live" interview task.</div>
+
+  <p>This is the month's headline build, and the most requested live-coding task that involves refs. Both halves are the same lesson wearing different clothes: <b>something outside React already has state, and your job is to command it without lying about it.</b></p>
+
+  <h2>Part A — a modal is eight requirements, not one component</h2>
+
+  <p>Most people build the first row of this table and stop. The rest is what separates a modal from a floating div.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Requirement</th><th>Tool</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>It appears above everything, whatever its parent's <code>overflow</code> or <code>z-index</code>.</td><td><code>createPortal</code></td></tr>
+      <tr><td>2</td><td>Assistive tech knows it is a dialog and what it is called.</td><td><code>role="dialog"</code>, <code>aria-modal="true"</code>, <code>aria-labelledby</code></td></tr>
+      <tr><td>3</td><td>Escape closes it.</td><td>a <code>keydown</code> effect</td></tr>
+      <tr><td>4</td><td>Clicking outside closes it.</td><td>a <code>pointerdown</code> effect + <code>node.contains()</code></td></tr>
+      <tr><td>5</td><td>Focus moves into it when it opens.</td><td>a ref + <code>focus()</code></td></tr>
+      <tr><td>6</td><td>Tab cannot escape while it is open.</td><td><code>onKeyDown</code> on the panel + a focusable-elements query</td></tr>
+      <tr><td>7</td><td>Focus returns to whatever opened it.</td><td><code>document.activeElement</code> saved in a ref, restored in the cleanup</td></tr>
+      <tr><td>8</td><td>The page behind does not scroll.</td><td><code>document.body.style.overflow</code> in an effect, restored in the cleanup</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Read the right-hand column again. Requirements 3, 4, 7 and 8 are all <b>setup / cleanup pairs</b> — Month 4's shape. Requirements 5 and 6 are <b>non-destructive DOM commands</b> — lesson 20's safe column. You already have every tool. What is new is the discipline of not forgetting six of the eight.</p>
+
+  <h3>Stage 1 — the version everybody writes first</h3>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Modal.tsx</b> — stage 1, five bugs</p>
+  <pre><code>type Props = { open: boolean; onClose: () =&gt; void; children: React.ReactNode };
+
+export function Modal({ open, onClose, children }: Props) {
+  if (!open) return null;
+
+  return (
+    &lt;div className="overlay" onClick={onClose}&gt;
+      &lt;div className="panel" onClick={e =&gt; e.stopPropagation()}&gt;
+        {children}
+        &lt;button onClick={onClose}&gt;Close&lt;/button&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Bug</th><th>How to see it in ten seconds</th></tr></thead>
+    <tbody>
+      <tr><td><b>1. Escape does nothing.</b></td><td>Open it and press Escape. Every other dialog on the web closes; this one does not.</td></tr>
+      <tr><td><b>2. Focus never moves.</b></td><td>Open it and press Tab. You are tabbing through the page <em>behind</em> the modal, invisibly.</td></tr>
+      <tr><td><b>3. Focus never comes back.</b></td><td>Close it with the Close button and press Tab. You are at the top of the document, not at the button you clicked.</td></tr>
+      <tr><td><b>4. Select text and release outside → it closes.</b></td><td>Drag to select a sentence in the panel and let go over the dark area. <code>click</code> fires on the common ancestor, so the modal closes and takes your selection with it.</td></tr>
+      <tr><td><b>5. The page behind scrolls.</b></td><td>Scroll with the wheel over the overlay. On a long page, the content moves behind the dialog.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Bug 4 is the interesting one, because <code>stopPropagation</code> looks like it handles the inside/outside question and does not. A <code>click</code> event fires on the nearest common ancestor of where the pointer went down and where it came up. Press inside, release outside, and the "click" belongs to the overlay. The user's own text selection closed the dialog.</p>
+
+  <h3>Stage 2 — a portal and the right roles</h3>
+
+  <pre><code>import { createPortal } from 'react-dom';
+
+export function Modal({ open, onClose, title, children }: Props) {
+  if (!open) return null;
+
+  return createPortal(
+    &lt;div className="overlay"&gt;
+      &lt;div
+        className="panel"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+        tabIndex={-1}          <span class="cmt">// so stage 5 can move focus onto the panel itself</span>
+        onKeyDown={handleKeyDown}
+      &gt;
+        &lt;h2 id="modal-title"&gt;{title}&lt;/h2&gt;
+        {children}
+      &lt;/div&gt;
+    &lt;/div&gt;,
+    document.body,
+  );
+}</code></pre>
+
+  <p><b>Why a portal.</b> A modal nested inside a card with <code>overflow: hidden</code> gets clipped; inside a <code>transform</code>ed ancestor, <code>position: fixed</code> stops meaning "the viewport"; and any ancestor <code>z-index</code> can trap it below a sticky header. Rendering into <code>document.body</code> removes all three problems at once. Events still bubble through your React tree, which is the part people expect to break and it does not — <code>onClose</code> handlers, context, and state all keep working exactly as if the JSX were where you wrote it.</p>
+
+  <h3>Stage 3 — Escape</h3>
+
+  <pre><code>useEffect(() =&gt; {
+  if (!open) return;
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape') onClose();
+  }
+
+  document.addEventListener('keydown', handleKeyDown);
+  return () =&gt; document.removeEventListener('keydown', handleKeyDown);
+}, [open, onClose]);</code></pre>
+
+  <p>Two decisions in five lines. <code>if (!open) return</code> keeps the effect honest — no listener exists while the modal is closed, which is better than one listener that checks a flag. And <code>onClose</code> is in the dependency array because it is a function prop, so the array is a true statement (lesson 17). If the parent passes an inline arrow the effect re-subscribes on every parent render; that is cheap here, and if it ever is not, the fix is an Effect Event, not a shorter array.</p>
+
+  <h3>Stage 4 — clicking outside, without the text-selection bug</h3>
+
+  <pre><code>const panelRef = useRef&lt;HTMLDivElement&gt;(null);
+
+useEffect(() =&gt; {
+  if (!open) return;
+
+  function handlePointerDown(event: PointerEvent) {
+    const panel = panelRef.current;
+    if (panel !== null &amp;&amp; !panel.contains(event.target as Node)) {
+      onClose();
+    }
+  }
+
+  document.addEventListener('pointerdown', handlePointerDown);
+  return () =&gt; document.removeEventListener('pointerdown', handlePointerDown);
+}, [open, onClose]);</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Approach</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td><code>onClick</code> on the overlay + <code>stopPropagation</code> on the panel</td><td>Simple, and wrong for drag-select. Also breaks if any child stops propagation itself.</td></tr>
+      <tr><td><code>click</code> listener on <code>document</code> + <code>contains()</code></td><td>Same drag-select problem — <code>click</code> is reported on the common ancestor — plus a real risk of closing on the very click that opened it.</td></tr>
+      <tr><td><b><code>pointerdown</code> on <code>document</code> + <code>contains()</code></b></td><td>What to use. It asks the right question ("did the press <em>start</em> outside?"), and the press that opened the modal happened before this listener existed.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The "it closes the instant I open it" bug</span>
+    If you listen for <code>click</code> on <code>document</code>, the same click that opened the modal can still be travelling up the tree when your listener is attached — so it is seen as an outside click and the modal shuts immediately. Whether it happens depends on exactly when React commits and runs the effect, which is a terrible thing for a feature to depend on. Listening for <code>pointerdown</code> removes the question entirely, because the press that opened the dialog finished before the listener existed. Guard flags and <code>setTimeout(…, 0)</code> both "work" and both are the wrong answer.
+  </div>
+
+  <p>One more detail worth knowing: <code>panel.contains(event.target)</code> is what makes the portal safe. The panel is in <code>document.body</code>, so a click inside it is genuinely inside that DOM subtree — a check based on the React tree would have to be much cleverer for no gain.</p>
+
+  <h3>Stage 5 — focus in, focus trapped, focus back</h3>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 216" role="img" aria-labelledby="fig22a-title" width="640" height="216">
+      <title id="fig22a-title">The focus journey when a modal opens and closes: the trigger button has focus, the effect saves it in a ref and moves focus into the panel, Tab cycles inside the panel only, and the cleanup returns focus to the saved trigger</title>
+      <defs>
+        <marker id="a22" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+      </defs>
+
+      <rect x="14" y="34" width="120" height="46" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="74" y="54" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">trigger button</text>
+      <text x="74" y="68" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">has focus</text>
+
+      <line x1="134" y1="57" x2="172" y2="57" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a22)"></line>
+      <text x="153" y="48" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">open</text>
+
+      <rect x="174" y="20" width="150" height="74" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="249" y="38" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">effect setup</text>
+      <text x="249" y="54" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">saved = activeElement</text>
+      <text x="249" y="68" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">panel.focus()</text>
+      <text x="249" y="84" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">saved lives in a ref</text>
+
+      <line x1="324" y1="57" x2="362" y2="57" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a22)"></line>
+
+      <rect x="364" y="20" width="140" height="74" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="434" y="38" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">open — Tab loops</text>
+      <text x="434" y="54" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8.5px;">first ⇄ … ⇄ last</text>
+      <text x="434" y="70" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8.5px;">inside the panel only</text>
+      <text x="434" y="86" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">onKeyDown intercepts Tab</text>
+
+      <line x1="504" y1="57" x2="542" y2="57" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a22)"></line>
+      <text x="523" y="48" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">close</text>
+
+      <rect x="544" y="34" width="82" height="46" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="585" y="52" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">cleanup</text>
+      <text x="585" y="68" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">saved.focus()</text>
+
+      <path d="M585,84 C585,132 74,120 74,84" style="fill: none; stroke: var(--accent-2); stroke-width: 1.5; stroke-dasharray: 4 3;" marker-end="url(#a22)"></path>
+      <text x="330" y="126" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-style: italic;">focus goes back exactly where it was — this is the requirement people forget</text>
+
+      <line x1="14" y1="146" x2="626" y2="146" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="14" y="168" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Why a ref and not state for the saved element:</text>
+      <text x="14" y="186" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">nothing on the screen shows it, so a render would be pure waste — and it must survive</text>
+      <text x="14" y="202" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">every render between open and close. Lesson 19's rule, applied without thinking about it.</text>
+    </svg>
+  </div>
+
+  <pre><code>const restoreFocusRef = useRef&lt;HTMLElement | null&gt;(null);
+
+useEffect(() =&gt; {
+  if (!open) return;
+
+  restoreFocusRef.current = document.activeElement as HTMLElement | null;
+  panelRef.current?.focus();          <span class="cmt">// the panel has tabIndex={-1} so it can receive focus</span>
+
+  return () =&gt; {
+    restoreFocusRef.current?.focus(); <span class="cmt">// ✓ give it back on the way out</span>
+  };
+}, [open]);</code></pre>
+
+  <p>And the trap itself. Keep it on the panel with <code>onKeyDown</code> — a JSX prop, because one exists (lesson 21's rule) — rather than another document listener:</p>
+
+  <pre><code>const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])';
+
+function handleKeyDown(event: React.KeyboardEvent&lt;HTMLDivElement&gt;) {
+  if (event.key !== 'Tab') return;
+
+  const panel = panelRef.current;
+  if (panel === null) return;
+
+  const items = Array.from(panel.querySelectorAll&lt;HTMLElement&gt;(FOCUSABLE));
+  if (items.length === 0) return;
+
+  const first = items[0];
+  const last = items[items.length - 1];
+
+  if (!event.shiftKey &amp;&amp; document.activeElement === last) {
+    event.preventDefault();
+    first.focus();                    <span class="cmt">// wrap forwards</span>
+  } else if (event.shiftKey &amp;&amp; document.activeElement === first) {
+    event.preventDefault();
+    last.focus();                     <span class="cmt">// wrap backwards</span>
+  }
+}</code></pre>
+
+  <p>Query the focusable elements <b>at the moment Tab is pressed</b>, not once when the modal opens. A dialog's contents change — a validation error appears, a button becomes enabled — and a list captured at open time sends focus to a node that is no longer there.</p>
+
+  <h3>Stage 6 — stop the page behind from scrolling</h3>
+
+  <pre><code>useEffect(() =&gt; {
+  if (!open) return;
+
+  const previous = document.body.style.overflow;
+  document.body.style.overflow = 'hidden';
+  return () =&gt; {
+    document.body.style.overflow = previous;   <span class="cmt">// ✓ restore, don't assume it was ''</span>
+  };
+}, [open]);</code></pre>
+
+  <p>This is a legitimate manual DOM change, and it is worth knowing exactly why: <code>document.body</code> is not rendered by React, so React has no reason to touch its inline style. That is precisely the carve-out the docs allow. Saving and restoring the previous value rather than setting <code>''</code> is what makes it safe to nest — two modals, or a modal inside a drawer, and the last cleanup puts back what was really there.</p>
+
+  <h3>The honest alternative: the browser already has a modal</h3>
+
+  <p>Everything above is worth building once, because it teaches refs, portals, and setup/cleanup pairs at the same time. But you should know what you are competing with. A native <code>&lt;dialog&gt;</code> opened with <code>showModal()</code> gives you the top layer, the focus move, the focus trap, Escape, and a styleable backdrop — for free.</p>
+
+  <pre><code>export function NativeModal({ open, onClose, title, children }: Props) {
+  const dialogRef = useRef&lt;HTMLDialogElement&gt;(null);
+
+  <span class="cmt">// The dialog's open/closed state lives in the DOM, so this is a sync — an effect.</span>
+  useEffect(() =&gt; {
+    const dialog = dialogRef.current;
+    if (dialog === null) return;
+
+    if (open &amp;&amp; !dialog.open) dialog.showModal();
+    if (!open &amp;&amp; dialog.open) dialog.close();
+  }, [open]);
+
+  return (
+    &lt;dialog ref={dialogRef} onClose={onClose} aria-labelledby="modal-title"&gt;
+      &lt;h2 id="modal-title"&gt;{title}&lt;/h2&gt;
+      {children}
+    &lt;/dialog&gt;
+  );
+}</code></pre>
+
+  <p>Look at what that effect is: <b>"make the DOM's state match my prop"</b> — the definition of an effect from lesson 15, with two guards because <code>showModal()</code> on an already-open dialog throws. The <code>onClose</code> prop of <code>&lt;dialog&gt;</code> is the element's own <code>close</code> event, so Escape and <code>close()</code> both flow back into React through one path.</p>
+
+  <div class="tip">
+    <span class="label">What to actually ship</span>
+    Use <code>&lt;dialog&gt;</code> when it fits, and a maintained library (React Aria, Radix, Headless UI) when the design needs more — nested dialogs, animated exits, scroll containers inside. Full accessible dialog behaviour includes cases this lesson does not cover, such as making the rest of the page <code>inert</code> for screen readers. Build the hand-rolled version to <em>understand</em> it; do not defend it in a code review as better than the platform.
+  </div>
+
+  <h2>Part B — a media player, and two versions of the truth</h2>
+
+  <p>Now the second half, and a different flavour of the same problem. A <code>&lt;video&gt;</code> element is a state machine that exists whether or not React is watching: it knows if it is playing, where the playhead is, how long the media runs, whether it is muted. Your React component wants to draw all of that.</p>
+
+  <p>So there are two copies of the truth, and the whole design is deciding which one wins.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 232" role="img" aria-labelledby="fig22b-title" width="640" height="232">
+      <title id="fig22b-title">Commands flow down from React to the video element through a ref, while the truth flows up from the video element to React state through media events. The wrong design instead treats React state as the source of truth and pushes it into the element with an effect.</title>
+      <defs>
+        <marker id="a22b" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a22r" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <rect x="200" y="16" width="240" height="44" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="320" y="34" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">React component</text>
+      <text x="320" y="50" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">isPlaying · currentTime · duration — all mirrors</text>
+
+      <path d="M256,60 L256,140" style="fill: none; stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a22b)"></path>
+      <text x="248" y="86" text-anchor="end" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">commands down</text>
+      <text x="248" y="100" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">ref.current.play()</text>
+      <text x="248" y="114" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">ref.current.pause()</text>
+      <text x="248" y="128" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">ref.current.currentTime = t</text>
+
+      <path d="M384,140 L384,60" style="fill: none; stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a22r)"></path>
+      <text x="392" y="86" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">truth up</text>
+      <text x="392" y="100" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">onPlay / onPause</text>
+      <text x="392" y="114" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">onTimeUpdate</text>
+      <text x="392" y="128" style="fill: var(--ink-soft); font-family: monospace; font-size: 8.5px;">onLoadedMetadata / onEnded</text>
+
+      <rect x="200" y="140" width="240" height="46" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="320" y="159" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">&lt;video&gt; — the real state machine</text>
+      <text x="320" y="175" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">paused · currentTime · duration · muted — the source of truth</text>
+
+      <text x="14" y="208" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">✕ The wrong design:</text>
+      <text x="128" y="208" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">React state is the truth, an effect pushes it into the element.</text>
+      <text x="128" y="224" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Then the native controls, autoplay blocking, or the end of the file all disagree with you.</text>
+    </svg>
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Direction</th><th>How</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td><b>Commands down</b> — you tell the element to do something</td><td>Imperatively, through a ref, inside an event handler</td><td><code>play()</code>, <code>pause()</code>, <code>currentTime = 30</code>, <code>volume = 0.5</code>, <code>playbackRate = 1.5</code></td></tr>
+      <tr><td><b>Truth up</b> — the element tells you what happened</td><td>Media events → <code>setState</code>, so the screen can draw it</td><td><code>onPlay</code>, <code>onPause</code>, <code>onTimeUpdate</code>, <code>onLoadedMetadata</code>, <code>onEnded</code>, <code>onVolumeChange</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Stage 1 — the wrong version, and why it breaks in the demo</h3>
+
+  <pre><code>const [isPlaying, setIsPlaying] = useState(false);
+
+useEffect(() =&gt; {
+  if (isPlaying) videoRef.current?.play();     <span class="cmt">// ✕ React state pretends to be the truth</span>
+  else videoRef.current?.pause();
+}, [isPlaying]);
+
+&lt;button onClick={() =&gt; setIsPlaying(p =&gt; !p)}&gt;{isPlaying ? 'Pause' : 'Play'}&lt;/button&gt;</code></pre>
+
+  <p>It works when you only ever use your own button. Then reality arrives:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What the user does</th><th>What breaks</th></tr></thead>
+    <tbody>
+      <tr><td>Uses the browser's own controls, or the media keys on the keyboard</td><td>The video pauses, your <code>isPlaying</code> stays <code>true</code>, and the button now says "Pause" over a paused video. Pressing it does nothing, because the effect's state did not change.</td></tr>
+      <tr><td>Loads the page and the browser blocks autoplay</td><td><code>play()</code> returns a rejected promise (<code>NotAllowedError</code>) that nobody handled. Your state says playing; nothing is playing; the console has an unhandled rejection.</td></tr>
+      <tr><td>Clicks Play then Pause quickly</td><td><code>pause()</code> interrupts the pending <code>play()</code> promise, which rejects with <code>AbortError</code>: "The play() request was interrupted by a call to pause()".</td></tr>
+      <tr><td>Lets the video reach the end</td><td>The element pauses itself. Your button still says "Pause". Clicking it calls <code>pause()</code> on an already-paused video and nothing happens — the classic "the play button is dead" report.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>All four are one mistake: <b>you made a mirror the source of truth.</b> The element is going to change state without asking you, so any design that assumes otherwise has to be wrong eventually.</p>
+
+  <h3>Stage 2 — commands in handlers, truth from events</h3>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/formatTime.ts</b></p>
+  <pre><code>export function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds)) return '--:--';   <span class="cmt">// duration is NaN before metadata loads</span>
+  const total = Math.floor(seconds);
+  const mm = String(Math.floor(total / 60)).padStart(2, '0');
+  const ss = String(total % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Player.tsx</b> — stage 2</p>
+  <pre><code>import { useRef, useState } from 'react';
+import { formatTime } from './formatTime';
+
+export function Player({ src }: { src: string }) {
+  const videoRef = useRef&lt;HTMLVideoElement&gt;(null);
+
+  <span class="cmt">// All three are MIRRORS of the element, updated only by its events.</span>
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(NaN);
+
+  async function handleToggle() {
+    const video = videoRef.current;
+    if (video === null) return;
+
+    if (video.paused) {              <span class="cmt">// ✓ ask the element, never our own state</span>
+      try {
+        await video.play();          <span class="cmt">// ✓ a promise: it can be refused</span>
+      } catch (error) {
+        if ((error as DOMException).name !== 'AbortError') {
+          console.warn('play was refused', error);   <span class="cmt">// autoplay policy, missing file…</span>
+        }
+      }
+    } else {
+      video.pause();
+    }
+    <span class="cmt">// Note what is NOT here: no setIsPlaying. The play/pause events do that.</span>
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;video
+        ref={videoRef}
+        src={src}
+        playsInline
+        onPlay={() =&gt; setIsPlaying(true)}
+        onPause={() =&gt; setIsPlaying(false)}
+        onEnded={() =&gt; setIsPlaying(false)}
+        onTimeUpdate={e =&gt; setCurrentTime(e.currentTarget.currentTime)}
+        onLoadedMetadata={e =&gt; setDuration(e.currentTarget.duration)}
+        style={{ width: '100%' }}
+      /&gt;
+
+      &lt;button onClick={handleToggle} aria-label={isPlaying ? 'Pause' : 'Play'}&gt;
+        {isPlaying ? '❙❙' : '▶'}
+      &lt;/button&gt;
+
+      &lt;output&gt;{formatTime(currentTime)} / {formatTime(duration)}&lt;/output&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p><b>Test it the way the last version failed.</b> Right-click the video, turn on the native controls, and play from there — your button flips to pause on its own, because the element told it to. Let the video end and the button goes back to "Play". Nothing you wrote handles those cases specifically; they work because there is only one truth and React is reading it.</p>
+
+  <div class="tip">
+    <span class="label">Use the JSX props, not addEventListener</span>
+    Every media event has a React prop, so there is no effect and no cleanup to forget — React attaches and removes them with the element (lesson 21's rule). Reach for <code>addEventListener</code> on the node only for the handful of media events React has no prop for, and then it is an effect with a cleanup like any other.
+  </div>
+
+  <h3>Stage 3 — the seek bar, and the fight with the playhead</h3>
+
+  <p>A range input showing <code>currentTime</code> is easy. The bug appears when the user drags it: <code>timeupdate</code> keeps firing four to sixty times a second and keeps resetting the thumb under their finger.</p>
+
+  <pre><code>const [scrubTime, setScrubTime] = useState&lt;number | null&gt;(null);   <span class="cmt">// null = not scrubbing</span>
+
+const shownTime = scrubTime ?? currentTime;   <span class="cmt">// derived: one line instead of a branch everywhere</span>
+
+&lt;input
+  type="range"
+  min={0}
+  max={Number.isFinite(duration) ? duration : 0}
+  step={0.1}
+  value={shownTime}
+  aria-label="Seek"
+  onChange={e =&gt; setScrubTime(e.currentTarget.valueAsNumber)}   <span class="cmt">// while dragging: UI only</span>
+  onPointerUp={() =&gt; commitScrub()}
+  onKeyUp={() =&gt; commitScrub()}
+  onBlur={() =&gt; commitScrub()}
+/&gt;
+
+function commitScrub() {
+  const video = videoRef.current;
+  if (video === null || scrubTime === null) return;
+  video.currentTime = scrubTime;     <span class="cmt">// ✓ the command, sent once, at the end</span>
+  setScrubTime(null);                <span class="cmt">// hand control back to timeupdate</span>
+}</code></pre>
+
+  <p>Three decisions to be able to defend:</p>
+
+  <ul>
+    <li><b>Why <code>scrubTime</code> is state, not a ref.</b> The thumb's position is drawn from it. Lesson 19's question answers itself.</li>
+    <li><b>Why <code>null</code> rather than a separate <code>isScrubbing</code> boolean.</b> Two states that must agree are a chance for them to disagree — Month 3's "no contradictions in state". One nullable value cannot contradict itself.</li>
+    <li><b>Why the command is sent on release, not on every move.</b> Setting <code>currentTime</code> makes the element seek, which decodes frames and fires more events. Sixty seeks per second is how you make a video player stutter. If you want the picture to follow the drag, seek on move but throttle it — and then say out loud that you chose to pay for it.</li>
+  </ul>
+
+  <h3>Stage 4 — a player handle the parent can use</h3>
+
+  <p>The last piece ties lesson 20 back in. A page with several players needs "pause everyone else when this one starts". Do not expose the <code>&lt;video&gt;</code> — expose three verbs:</p>
+
+  <pre><code>export type PlayerHandle = {
+  play: () =&gt; Promise&lt;void&gt;;
+  pause: () =&gt; void;
+  seek: (seconds: number) =&gt; void;
+};
+
+type Props = { src: string; onStarted?: () =&gt; void; ref?: React.Ref&lt;PlayerHandle&gt; };
+
+export function Player({ src, onStarted, ref }: Props) {
+  const videoRef = useRef&lt;HTMLVideoElement&gt;(null);
+
+  useImperativeHandle(ref, () =&gt; ({
+    play: async () =&gt; { await videoRef.current?.play(); },
+    pause: () =&gt; { videoRef.current?.pause(); },
+    seek: (seconds: number) =&gt; {
+      if (videoRef.current !== null) videoRef.current.currentTime = seconds;
+    },
+  }));
+
+  <span class="cmt">// …onPlay={() =&gt; { setIsPlaying(true); onStarted?.(); }}</span>
+}</code></pre>
+
+  <p>The parent keeps a <code>Map</code> of player handles — the pattern from lesson 20 — and on <code>onStarted</code> it pauses every other one. Three verbs the DOM already has, and no way for a future teammate to reach in and set <code>src</code> behind the component's back.</p>
+
+  <h2>Concept → code — the whole month in one table</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Lesson</th><th>Where it showed up here</th></tr></thead>
+    <tbody>
+      <tr><td>A value the screen never reads goes in a ref</td><td>19</td><td><code>restoreFocusRef</code>, <code>panelRef</code>, <code>videoRef</code></td></tr>
+      <tr><td>A value the screen draws is state</td><td>19</td><td><code>isPlaying</code>, <code>currentTime</code>, <code>duration</code>, <code>scrubTime</code></td></tr>
+      <tr><td>Non-destructive DOM commands only</td><td>20</td><td><code>focus()</code>, <code>play()</code>, <code>pause()</code>, <code>currentTime =</code>, <code>showModal()</code></td></tr>
+      <tr><td><code>node.contains(target)</code> to answer inside-or-outside</td><td>20</td><td>The <code>pointerdown</code> listener</td></tr>
+      <tr><td>A ref to a component, narrowed with <code>useImperativeHandle</code></td><td>20</td><td><code>PlayerHandle</code> — play, pause, seek</td></tr>
+      <tr><td>A <code>Map</code> of handles for a list</td><td>20</td><td>The parent that pauses the other players</td></tr>
+      <tr><td>Prefer a JSX prop over <code>addEventListener</code></td><td>21</td><td>All media events; <code>onKeyDown</code> for the focus trap</td></tr>
+      <tr><td>Outside listeners are effects with cleanups</td><td>21</td><td><code>keydown</code> for Escape, <code>pointerdown</code> for outside clicks</td></tr>
+      <tr><td>Setup / cleanup pairs</td><td>15</td><td>Focus save/restore, body overflow, both listeners</td></tr>
+      <tr><td>An effect is a sync, not a "then"</td><td>15</td><td><code>NativeModal</code>: make <code>dialog.open</code> match the <code>open</code> prop</td></tr>
+      <tr><td>Don't put in an effect what an event caused</td><td>16</td><td><code>play()</code> lives in the click handler, not in an effect on <code>isPlaying</code></td></tr>
+      <tr><td>Function props belong in the dependency array</td><td>17</td><td><code>[open, onClose]</code> on both listener effects</td></tr>
+      <tr><td>No contradictions in state</td><td>12</td><td><code>scrubTime: number | null</code> instead of a value plus a boolean</td></tr>
+      <tr><td>Derive, don't store</td><td>11–14</td><td><code>shownTime = scrubTime ?? currentTime</code>; formatted times</td></tr>
+      <tr><td>An async command can be refused</td><td>new</td><td><code>await video.play()</code> in a <code>try/catch</code>, ignoring <code>AbortError</code></td></tr>
+      <tr><td>A mirror must never be the source of truth</td><td>new</td><td><code>if (video.paused)</code>, never <code>if (!isPlaying)</code></td></tr>
+      <tr><td>The platform may already have your component</td><td>new</td><td><code>&lt;dialog&gt;</code> with <code>showModal()</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The four skills of this month</h2>
+
+  <p>These are the Month 5 checkboxes from the <a href="../reference/12-month-plan.html">12-month plan</a>. Tick one only if you can do it without looking.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Skill</th><th>Your proof</th></tr></thead>
+    <tbody>
+      <tr><td><b>m5a</b> — ref vs state, renders vs no renders</td><td>You can sort ten values into the two lanes in one pass, and you have seen the ref counter show <code>0</code> after five clicks.</td></tr>
+      <tr><td><b>m5b</b> — read and focus a DOM node; forward a ref to a child</td><td>The notes panel focuses its input after every add; <code>NoteInput</code> and <code>Player</code> expose narrow handles instead of nodes.</td></tr>
+      <tr><td><b>m5c</b> — timers with no leaks and no stale values</td><td>The stopwatch clears its interval in both the Stop handler and the unmount cleanup; the countdown survived two minutes in a background tab.</td></tr>
+      <tr><td><b>m5d</b> — measure the DOM safely and clean up listeners</td><td>The tooltip flips with no flicker; <code>ResizeObserver</code> is disconnected; every <code>addEventListener</code> in this lesson has its removal one line below it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Look at what is not here</h2>
+
+  <p>Same exercise as last month — the absences are the plan, not oversights.</p>
+
+  <ul>
+    <li><b>No custom hooks.</b> The modal has four effects that obviously want to be <code>useOnEscape</code>, <code>useClickOutside</code>, <code>useFocusTrap</code> and <code>useScrollLock</code>. Extracting them is Month 6, on purpose: you can only judge a good hook boundary once you have seen the effects written out.</li>
+    <li><b>No <code>memo</code>, no <code>useCallback</code>.</b> The player re-renders on every <code>timeupdate</code> — several times a second. That is fine here and it is exactly the kind of measured decision Months 6 and 11 are about.</li>
+    <li><b>No animation.</b> An animated exit means the modal must stay mounted after <code>open</code> becomes false, which is a real design problem the platform now helps with. Later.</li>
+    <li><b>No global modal state.</b> Every modal here is controlled by its parent's <code>useState</code>. "Open a dialog from anywhere" needs Context (Month 6) or a route (Month 8).</li>
+    <li><b>No streaming, captions, or analytics.</b> A real player adds HLS, text tracks, and playback telemetry. All three sit on top of what you just built without changing it.</li>
+  </ul>
+
+  <h2>Extend it — four reps</h2>
+  <ol>
+    <li><b>Volume and mute.</b> Add a volume slider and a mute button. Decide which direction each piece of information travels, and use <code>onVolumeChange</code> so the native controls stay in agreement. Then say why <code>volume</code> is a command <em>and</em> a mirror.</li>
+    <li><b>Keyboard shortcuts.</b> Space toggles play, arrows seek five seconds. Put them on the player container with <code>onKeyDown</code> and <code>tabIndex={0}</code> — not on <code>document</code> — then explain the difference to yourself in one sentence.</li>
+    <li><b>Confirm-before-close.</b> Give the modal an <code>onRequestClose</code> that can refuse — for a form with unsaved changes. Notice that the Escape effect and the outside-click effect now both go through one function, which is a hint about where a custom hook's boundary belongs.</li>
+    <li><b>Rebuild the modal on <code>&lt;dialog&gt;</code>.</b> Delete six of your eight requirements and check what still works. Write down what you lost and what you gained. That list is the honest answer to "why not just use the platform?" in a code review.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">You are given a design review for a "quick preview" feature: clicking a thumbnail in a grid opens a modal with a video player inside it. The developer's plan is: a <code>previewOpen</code> boolean in the grid component; the modal rendered inline (no portal) inside the clicked card, since "it is position: fixed anyway"; the player receiving an <code>autoPlay</code> prop and an <code>isPlaying</code> state that an effect pushes into the element; Escape handled with a <code>keydown</code> listener added in the card's <code>onClick</code>; and the outside click handled by an <code>onClick</code> on the overlay. They also mention the grid has <code>overflow: hidden</code> on each card and a sticky toolbar with <code>z-index: 10</code>.</p>
+    Work out, in order: which two of those decisions produce a visibly broken feature and why the card's own CSS is enough to prove it; which one is a listener that will never be removed; what will break the first time a user pauses with the native controls; and which single change fixes the most problems at once. Then write the three-line review comment you would leave.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/reference/react-dom/createPortal">createPortal</a>, <a href="https://react.dev/learn/manipulating-the-dom-with-refs">"Manipulating the DOM with Refs"</a>, <a href="https://react.dev/reference/react/useImperativeHandle">useImperativeHandle</a>, <a href="https://react.dev/learn/synchronizing-with-effects">"Synchronizing with Effects"</a>. Platform: MDN on <a href="https://developer.mozilla.org/docs/Web/HTML/Element/dialog">&lt;dialog&gt;</a>, <a href="https://developer.mozilla.org/docs/Web/API/HTMLMediaElement">HTMLMediaElement</a>, and the <a href="https://www.w3.org/WAI/ARIA/apg/patterns/dialog-modal/">ARIA Authoring Practices dialog pattern</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to run <b>"build a modal, live"</b> as a timed interview task — I will play the interviewer, interrupt with "what about keyboard users?", and score the eight requirements. Or ask for the player with the native-controls desync bug already in it, and debug it out loud.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>A modal is eight requirements:</b> portal, dialog roles, Escape, outside click, focus in, focus trapped, focus restored, background locked. Four of them are setup/cleanup pairs; two are DOM commands.</li>
+      <li><b>Portal it into <code>document.body</code></b> so no ancestor's <code>overflow</code>, <code>transform</code> or <code>z-index</code> can clip or bury it. React events still bubble through your component tree.</li>
+      <li><b>Use <code>pointerdown</code> for outside clicks, not <code>click</code>.</b> A <code>click</code> is reported on the common ancestor of press and release, so drag-selecting text closes the dialog — and a document <code>click</code> listener can even catch the click that opened it.</li>
+      <li><b>Save <code>document.activeElement</code> in a ref on open and focus it in the cleanup.</b> Nobody notices this until they use a keyboard, and then it is the first thing they notice.</li>
+      <li><b>Query focusable elements at the moment Tab is pressed</b>, not once at open — a dialog's contents change while it is open.</li>
+      <li><b>Restore the previous <code>body.style.overflow</code></b> instead of setting <code>''</code>, so nesting still works. Touching <code>document.body</code> by hand is safe precisely because React does not render it.</li>
+      <li><b>The platform has a modal.</b> <code>&lt;dialog&gt;</code> + <code>showModal()</code> gives the top layer, focus handling, the trap and Escape for free; syncing it to a prop is a two-guard effect. Build your own to learn, ship the platform or a library.</li>
+      <li><b>A <code>&lt;video&gt;</code> is a state machine outside React.</b> Commands go down through a ref inside handlers; the truth comes up through media events into state. React state is a mirror, never the source.</li>
+      <li><b>Never branch on your mirror.</b> Ask <code>video.paused</code>, not <code>!isPlaying</code> — otherwise the native controls, the end of the file, and blocked autoplay all leave you out of sync.</li>
+      <li><b><code>play()</code> returns a promise that can be refused</b> — <code>NotAllowedError</code> for autoplay policy, <code>AbortError</code> when a <code>pause()</code> interrupts it. Await it in a <code>try/catch</code> and ignore <code>AbortError</code>.</li>
+      <li><b>A scrub is one command at the end, not sixty per second.</b> Keep the dragged value in nullable state, draw <code>scrubTime ?? currentTime</code>, and set <code>currentTime</code> on release.</li>
+      <li><b>Real use case (built &amp; run):</b> a modal that went from five bugs to eight satisfied requirements, and a player whose button stayed correct when the video was driven from the native controls or ran to the end.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>when something outside React already has state — focus, or a video — your job is to command it and mirror it, never to keep a second copy of the truth.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <code>createPortal</code>, "Manipulating the DOM with Refs" (best practices, <code>useImperativeHandle</code>), "Synchronizing with Effects" (setup/cleanup), <code>useRef</code>. Platform documentation — MDN <code>&lt;dialog&gt;</code> (<code>showModal</code>, the <code>close</code> and <code>cancel</code> events, the top layer), MDN <code>HTMLMediaElement</code> (<code>play()</code> returning a promise, <code>NotAllowedError</code> and <code>AbortError</code>, <code>timeupdate</code> firing only a few times per second, <code>duration</code> being <code>NaN</code> before metadata loads), MDN <code>Node.contains()</code> and pointer-event ordering, and the W3C ARIA Authoring Practices modal-dialog pattern.</p>
+
+  <div class="footer-nav">
+    <a href="./0021-measuring-timing-and-the-browser.html">← Previous: Measuring, timing &amp; the browser</a>
+    <a href="../reference/12-month-plan.html">Next: Month 6 — context, re-renders &amp; custom hooks →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Your modal closes when a user drags to select a sentence inside it and releases the mouse over the dark overlay. What is the cause, and what is the fix?",
+      options: [
+        "A `click` event is reported on the common ancestor of the press and the release, so the overlay receives it — listen for `pointerdown` on the document and test `panel.contains(event.target)` instead",
+        "The panel is missing `stopPropagation` on its `onMouseUp` handler",
+        "Text selection cancels React's synthetic events, so the overlay handler runs as a fallback",
+        "The overlay needs `pointer-events: none` while a selection is active"
+      ],
+      answer: 0,
+      why: "The browser fires `click` on the nearest common ancestor of where the pointer went down and where it came up. Press inside the panel, release over the overlay, and the overlay is that ancestor — so an overlay `onClick` sees a click that was never really on it, and `stopPropagation` on the panel cannot help because the event never travelled through the panel. Switching to `pointerdown` changes the question to \"did the press start outside?\", which is what \"click outside\" actually means. The same change removes a second problem: a document `click` listener can catch the very click that opened the modal, closing it immediately, and that depends on commit timing you should never rely on."
+    },
+    {
+      q: "A video player's button says \"Pause\" but the video is paused, because the user paused it with the browser's own controls. What is the design error?",
+      options: [
+        "React state was treated as the source of truth and pushed into the element by an effect — the element's events must be the source, with state as a mirror",
+        "The `onPause` handler needs `event.preventDefault()`",
+        "Native controls should be disabled so React stays in charge",
+        "`isPlaying` should have been a ref so it could be updated without a render"
+      ],
+      answer: 0,
+      why: "The `<video>` element has real state that changes without asking React: the native controls, the media keys, the end of the file, and a blocked autoplay attempt all change it. So any design where an effect pushes `isPlaying` into the element must eventually disagree with reality. The correct direction is commands down and truth up: the click handler asks the element (`if (video.paused)`) and calls `play()` or `pause()`, and `onPlay`, `onPause` and `onEnded` set the state that the button draws. Disabling the native controls hides one symptom and leaves the others. A ref would be worse: the button's label is on screen, so it is state by definition."
+    },
+    {
+      q: "Why render a modal through `createPortal(…, document.body)` rather than inline where you use it?",
+      options: [
+        "An ancestor's `overflow: hidden`, `transform`, or `z-index` can clip or bury it — and a portal keeps React events bubbling through your component tree anyway",
+        "Because React cannot attach event handlers to fixed-position elements",
+        "Because effects do not run for deeply nested components",
+        "Because `aria-modal` is only honoured on direct children of `body`"
+      ],
+      answer: 0,
+      why: "Portals solve a CSS containment problem, not a React problem. A dialog inside a card with `overflow: hidden` gets clipped; inside a transformed ancestor, `position: fixed` is measured against that ancestor instead of the viewport; and any ancestor with a `z-index` can put the whole subtree below a sticky header. Rendering into `document.body` removes all three at once. The part that surprises people is what does *not* change: the portal's contents stay in your React tree, so context, state, and bubbling React events all behave as if the JSX were written where you put it."
+    },
+    {
+      q: "While the user drags the seek bar, the thumb keeps snapping back. What is happening and what is the standard fix?",
+      options: [
+        "`timeupdate` keeps firing and overwriting the value — keep the dragged value in nullable state, render `scrubTime ?? currentTime`, and set `video.currentTime` once on release",
+        "The range input needs `step={1}` so intermediate values are ignored",
+        "The input should be uncontrolled, with the value read from the DOM on release",
+        "`onChange` should be replaced with `onInput`, which React does not re-render for"
+      ],
+      answer: 0,
+      why: "The input is controlled by `currentTime`, and the element fires `timeupdate` several times a second while playing, so every tick overwrites the position the user's finger is at. Holding the dragged value in a separate nullable state means the UI follows the finger while dragging and follows the playhead otherwise, and `scrubTime ?? currentTime` expresses that in one derived line — no boolean that could contradict the value. Sending the command once on release also avoids asking the element to seek sixty times a second, which is what makes a player stutter. An uncontrolled input would work but gives up the ability to reflect the playhead at all."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Build me a modal that closes on outside click and Escape. Talk me through it.”",
+      answer: "I start by naming the requirements, because the closing behaviour is only two of eight: <b>portal, dialog roles, Escape, outside click, focus in, focus trapped, focus restored, background scroll locked</b>. Structurally: the parent owns an <code>open</code> boolean, and the modal renders through <code>createPortal</code> into <code>document.body</code> so no ancestor's <code>overflow</code>, <code>transform</code> or <code>z-index</code> can clip or bury it. Escape is an effect that adds a <code>keydown</code> listener on <code>document</code> and removes the same function in the cleanup, with <code>onClose</code> in the dependency array. Outside click is a second effect, and here I make a point of using <b><code>pointerdown</code>, not <code>click</code></b>, testing <code>!panelRef.current.contains(event.target)</code> — because a <code>click</code> is reported on the common ancestor of press and release, so drag-selecting text inside and releasing outside would close the dialog, and a document <code>click</code> listener can even catch the click that opened it. Focus: on open I save <code>document.activeElement</code> in a ref and focus the panel, which has <code>tabIndex={-1}</code>; the cleanup focuses the saved element again. The trap is <code>onKeyDown</code> on the panel — a JSX prop since one exists — querying focusable children <em>at the moment Tab is pressed</em>, because the contents change while it is open. Scroll lock saves and restores the previous <code>body.style.overflow</code> so nesting works. Then I say the honest part: in production I would use <code>&lt;dialog&gt;</code> with <code>showModal()</code> or a library like React Aria, because they give the top layer, the trap and Escape for free and cover screen-reader cases like making the rest of the page inert."
+    },
+    {
+      prompt: "Interviewer: “How do you wrap a native element like <video> in a React component?”",
+      answer: "I treat it as an <b>outside system that already has state</b>, and I fix the direction of each piece of information. <b>Commands go down</b>: <code>play()</code>, <code>pause()</code>, <code>currentTime = t</code>, <code>volume = v</code> — always imperatively through a ref, inside an event handler, never from an effect that watches my own state. <b>Truth comes up</b>: <code>onPlay</code>, <code>onPause</code>, <code>onEnded</code>, <code>onTimeUpdate</code>, <code>onLoadedMetadata</code> set React state, which is a mirror I draw from. The rule that keeps it correct is that I never branch on the mirror — the handler asks <code>if (video.paused)</code>, not <code>if (!isPlaying)</code> — because the element changes state without me: native controls, media keys, the end of the file, blocked autoplay. I also handle <code>play()</code> being a promise that can be refused: <code>NotAllowedError</code> when autoplay policy blocks it, and <code>AbortError</code> when a quick <code>pause()</code> interrupts it, which I swallow because it is not a real failure. I prefer the JSX media props over <code>addEventListener</code>, since React attaches and removes them with the element. And if a parent needs control, I expose a narrow handle through <code>useImperativeHandle</code> — <code>play</code>, <code>pause</code>, <code>seek</code> — instead of handing out the element."
+    },
+    {
+      prompt: "Interviewer: “What is the hardest part of a modal, in your experience?”",
+      answer: "Focus, and it is not close. The visual part — an overlay and a panel — takes five minutes and looks finished, which is exactly why it ships broken. Four things go wrong. Focus never moves in, so a keyboard user is tabbing invisibly through the page behind the dialog. Focus is not trapped, so Tab walks out of the dialog while it is still covering the screen. Focus is not restored, so closing the dialog drops the user at the top of the document instead of the button they pressed. And the focusable list is captured once at open time, so it goes stale the moment a validation error adds a button. In React terms, three of those four are <b>setup/cleanup pairs</b>: save and restore <code>document.activeElement</code>, add and remove listeners, set and restore <code>body.style.overflow</code>. That framing is what stops me forgetting the second half of each pair. It is also the strongest argument for the platform: <code>&lt;dialog&gt;</code> with <code>showModal()</code> handles the top layer, the focus move, the trap and Escape, so the code I have to get right shrinks to a two-guard effect that syncs <code>dialog.open</code> with my prop."
+    },
+    {
+      prompt: "Interviewer: “When would you use useImperativeHandle instead of props?”",
+      answer: "When the parent needs to trigger a <b>verb the DOM already has</b>, and there is no sensible way to express it as data. Focus an input, play or pause a video, seek to a timestamp, scroll a row into view — none of those are states the parent can describe; they are moments. So the child accepts a <code>ref</code> — an ordinary prop since React 19 — and uses <code>useImperativeHandle</code> to expose a small object like <code>{ play, pause, seek }</code> instead of the element itself. That matters because handing over the node lets any parent do anything to it, and the docs warn that manipulating another component's DOM makes code fragile. The line I do not cross is data: the moment the handle grows <code>setValue</code>, <code>getValue</code>, <code>submit</code> or <code>reset</code>, I have rebuilt props and callbacks out of imperative calls, there are two sources of truth, and one-way data flow is gone. Those belong in props and in a lifted state owner. A useful pairing I have actually needed: a page of players where the parent keeps a <code>Map</code> of handles and, when one reports that it started, pauses all the others."
+    }
+  ]);
+</script>

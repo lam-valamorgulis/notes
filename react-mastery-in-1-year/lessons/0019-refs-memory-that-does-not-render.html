@@ -1,0 +1,701 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refs — memory that does not cause a render — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 5 · Lesson 1</p>
+  <h1>Refs — memory that does not cause a render</h1>
+  <p class="subtitle">State is memory React watches. A ref is memory React ignores. Choosing the wrong one is how you get a component that is either wasteful or haunted.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a two-second rule for deciding between <code>useState</code> and <code>useRef</code>, a stopwatch you can write from memory with no leaking interval, and the one rule that stops a ref from making your screen lie.
+  </div>
+
+  <p>Month 4 was about talking to the outside world. Every one of those effects needed a value that the user never sees: a timer id, an <code>AbortController</code>, a socket. We stored them in plain local variables inside the effect, which worked because they died with the effect.</p>
+
+  <p>This month those values have to outlive the effect. A stopwatch is started by a button and stopped by another button — two separate handlers, one shared timer id. That is memory. And it is memory of a kind we have not had yet.</p>
+
+  <h2>First principle — a component needs two kinds of memory</h2>
+
+  <p>Start from what you already know. A component function runs from the top on every render. So a plain <code>let</code> inside it is not memory at all — it is born and dies with one render.</p>
+
+  <pre><code>function Stopwatch() {
+  let intervalId = null;        <span class="cmt">// ✕ back to null on every single render</span>
+
+  function handleStart() {
+    intervalId = setInterval(tick, 10);
+  }
+  function handleStop() {
+    clearInterval(intervalId);  <span class="cmt">// ✕ always null here — the timer never stops</span>
+  }
+}</code></pre>
+
+  <p>Moving it up to module scope makes it survive, and creates a worse bug: now every <code>&lt;Stopwatch /&gt;</code> on the page shares one box.</p>
+
+  <pre><code>let intervalId = null;          <span class="cmt">// ✕ shared by every instance of the component</span>
+
+function Stopwatch() { /* ... */ }</code></pre>
+
+  <p>So the thing we need is a box that is <b>per component instance</b> and <b>kept between renders</b>. React already has exactly one of those: state. But state has a second job bolted onto it — writing to it schedules a render. And a timer id is not on screen. Re-rendering because it changed is pure waste, and if an effect depends on it you get the loop from lesson 15.</p>
+
+  <p>That is the whole reason refs exist. Two kinds of memory, split by one question: <b>does the screen need to follow this value?</b></p>
+
+  <div class="note">
+    <span class="label">React docs · Referencing Values with Refs</span>
+    "When you want a component to <b>remember</b> some information, but you don't want that information to trigger new renders, you can use a <em>ref</em>." … "Like state, refs are retained by React between re-renders. However, setting state re-renders a component. <b>Changing a ref does not!</b>"
+  </div>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 268" role="img" aria-labelledby="fig19-title" width="640" height="268">
+      <title id="fig19-title">Two write paths: setting state goes through React and re-renders the screen, while writing to a ref changes the value directly and React is never told, so the screen does not change</title>
+
+      <text x="12" y="16" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">state — memory React watches</text>
+
+      <rect x="12" y="26" width="120" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="72" y="47" text-anchor="middle" style="fill: var(--ink); font-family: monospace; font-size: 10px;">setCount(5)</text>
+
+      <line x1="132" y1="43" x2="186" y2="43" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a19)"></line>
+      <defs>
+        <marker id="a19" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a19f" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+      </defs>
+
+      <rect x="188" y="26" width="96" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="236" y="47" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">React knows</text>
+
+      <line x1="284" y1="43" x2="338" y2="43" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a19)"></line>
+
+      <rect x="340" y="26" width="96" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="388" y="47" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px;">re-render</text>
+
+      <line x1="436" y1="43" x2="490" y2="43" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a19)"></line>
+
+      <rect x="492" y="26" width="136" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--accent);"></rect>
+      <text x="560" y="47" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">screen shows 5</text>
+
+      <line x1="12" y1="82" x2="628" y2="82" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="108" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">ref — memory React ignores</text>
+
+      <rect x="12" y="118" width="140" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="82" y="139" text-anchor="middle" style="fill: var(--ink); font-family: monospace; font-size: 10px;">idRef.current = 5</text>
+
+      <line x1="152" y1="135" x2="206" y2="135" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a19)"></line>
+
+      <rect x="208" y="118" width="120" height="34" rx="4" style="fill: var(--card-bg); stroke: var(--accent-2);"></rect>
+      <text x="268" y="139" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">value is now 5</text>
+
+      <line x1="328" y1="135" x2="382" y2="135" style="stroke: var(--ink-faint); stroke-width: 1.5; stroke-dasharray: 4 3;" marker-end="url(#a19f)"></line>
+      <text x="355" y="128" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">nothing</text>
+
+      <rect x="384" y="118" width="120" height="34" rx="4" style="fill: var(--paper); stroke: var(--rule); stroke-dasharray: 4 3;"></rect>
+      <text x="444" y="139" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">no re-render</text>
+
+      <rect x="510" y="118" width="118" height="34" rx="4" style="fill: var(--paper); stroke: var(--rule); stroke-dasharray: 4 3;"></rect>
+      <text x="569" y="139" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">screen unchanged</text>
+
+      <text x="12" y="182" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight: 700;">The question that picks the lane:</text>
+      <text x="12" y="200" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Does the user read this value on the screen?</text>
+      <text x="30" y="220" style="fill: var(--accent); font-family: sans-serif; font-size: 10px;">Yes → state. The screen must follow it, so React must be told.</text>
+      <text x="30" y="240" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px;">No → ref. Telling React would only cost a render for nothing.</text>
+      <text x="12" y="260" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-style: italic;">A ref that the screen reads is a screen that lies. That is the entire failure mode.</text>
+    </svg>
+  </div>
+
+  <h2>A ref is a state variable without a setter</h2>
+
+  <p>This is the sentence that makes refs stop feeling magical. The React docs spell it out — <code>useRef</code> could be written on top of <code>useState</code>:</p>
+
+  <div class="note">
+    <span class="label">React docs · Deep Dive: How does useRef work inside?</span>
+    "Although both <code>useState</code> and <code>useRef</code> are provided by React, in principle <code>useRef</code> could be implemented <em>on top of</em> <code>useState</code>. You can imagine that inside of React, <code>useRef</code> is implemented like this:"
+    <pre><code><span class="cmt">// Inside of React</span>
+function useRef(initialValue) {
+  const [ref, unused] = useState({ current: initialValue });
+  return ref;
+}</code></pre>
+    "React provides a built-in version of <code>useRef</code> because it is common enough in practice. But <b>you can think of it as a regular state variable without a setter.</b> If you're familiar with object-oriented programming, refs might remind you of instance fields — but instead of <code>this.something</code> you write <code>somethingRef.current</code>."
+  </div>
+
+  <p>Three consequences fall straight out of that code, and each one shows up in real work:</p>
+
+  <ol>
+    <li><b>The object is the same object on every render.</b> It is held in state and never replaced. That is why a ref object is not a reactive value and never belongs in a dependency array — the fact you memorised in lesson 17.</li>
+    <li><b>The value lives in <code>.current</code>, and it is yours to mutate.</b> The box is stable; the contents are not. This is the one place in React where mutation is normal and correct.</li>
+    <li><b>Writing <code>.current</code> tells React nothing.</b> No render, no <code>Object.is</code> comparison, no batching, no queue. It is a plain JavaScript assignment to a plain JavaScript object.</li>
+  </ol>
+
+  <h2>The table to be able to draw from memory</h2>
+
+  <p>Straight from the docs, because in an interview this is asked almost word for word:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>refs</th><th>state</th></tr></thead>
+    <tbody>
+      <tr><td><code>useRef(initialValue)</code> returns <code>{ current: initialValue }</code></td><td><code>useState(initialValue)</code> returns the current value and a setter (<code>[value, setValue]</code>)</td></tr>
+      <tr><td>Doesn't trigger re-render when you change it.</td><td>Triggers re-render when you change it.</td></tr>
+      <tr><td><b>Mutable</b> — you can modify and update <code>current</code>'s value outside of the rendering process.</td><td><b>"Immutable"</b> — you must use the state setting function to modify state variables to queue a re-render.</td></tr>
+      <tr><td>You <b>shouldn't</b> read (or write) the <code>current</code> value during rendering.</td><td>You can read state at any time. However, each render has its own <b>snapshot</b> of state which does not change.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>And the practical version — the one you actually run in your head while typing:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The value</th><th>On screen?</th><th>Lane</th></tr></thead>
+    <tbody>
+      <tr><td>The elapsed seconds in a stopwatch</td><td>Yes</td><td><code>useState</code></td></tr>
+      <tr><td>The <code>setInterval</code> id that produces those seconds</td><td>No</td><td><code>useRef</code></td></tr>
+      <tr><td>Whether a modal is open</td><td>Yes</td><td><code>useState</code></td></tr>
+      <tr><td>Which element had focus before the modal opened</td><td>No</td><td><code>useRef</code></td></tr>
+      <tr><td>The current search text</td><td>Yes</td><td><code>useState</code></td></tr>
+      <tr><td>The <code>AbortController</code> for the request it triggered</td><td>No</td><td><code>useRef</code> (or a local variable, if it dies with the effect)</td></tr>
+      <tr><td>A cache of results already fetched</td><td>No — the rendered result comes from state</td><td><code>useRef</code></td></tr>
+      <tr><td>Whether the user is mid-drag on a slider</td><td>Usually no — it only changes how events are handled</td><td><code>useRef</code>, unless the handle changes appearance</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Look at the last row. "Unless it changes appearance" is not hedging — it is the rule doing its job. The same fact can belong in either lane depending on whether the screen reads it.</p>
+
+  <h2>The one rule: never read or write a ref during render</h2>
+
+  <p>Render must be a pure calculation of the screen from props and state (lesson 15). A ref is a value React does not track, so touching it during render breaks that promise in both directions: write to it and you have made rendering do something; read from it and your output depends on a value React never compared.</p>
+
+  <div class="note">
+    <span class="label">React docs · useRef caveats</span>
+    "Do not write <em>or read</em> <code>ref.current</code> during rendering, except for initialization. This makes your component's behavior unpredictable." … "You can read or write refs <b>from event handlers or effects instead</b>." … "If you <em>have to</em> read or write something during rendering, use state instead."
+  </div>
+
+  <p>The exception is worth memorising, because it is the standard way to create one expensive object per component:</p>
+
+  <pre><code>function Video() {
+  const playerRef = useRef(null);
+  if (playerRef.current === null) {
+    playerRef.current = new VideoPlayer();   <span class="cmt">// ✓ allowed: runs once, always the same result</span>
+  }
+  <span class="cmt">// ...</span>
+}</code></pre>
+
+  <div class="note">
+    <span class="label">React docs · Avoiding recreating the ref contents</span>
+    "Normally, writing or reading <code>ref.current</code> during render is not allowed. However, it's fine in this case because <b>the result is always the same, and the condition only executes during initialization</b> so it's fully predictable."
+  </div>
+
+  <p>Why not <code>useRef(new VideoPlayer())</code>? Because that argument is evaluated on <em>every</em> render and then thrown away on all but the first. With a cheap value like <code>null</code> or <code>0</code> nobody cares. With a constructor that opens a connection, you have just opened one per render.</p>
+
+  <h2>Build it for real — part 1: make the screen lie</h2>
+
+  <p>Before the correct build, spend four minutes proving to yourself what "React is not told" means. Create a component with a counter kept in a ref.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/RefLie.tsx</b></p>
+  <pre><code>import { useRef, useState } from 'react';
+
+export function RefLie() {
+  const countRef = useRef(0);
+  const [note, setNote] = useState('');
+
+  function handleClick() {
+    countRef.current = countRef.current + 1;
+    console.log('the ref really is', countRef.current);   <span class="cmt">// the value is correct</span>
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;button onClick={handleClick}&gt;Clicked {countRef.current} times&lt;/button&gt;
+      &lt;input value={note} onChange={e =&gt; setNote(e.target.value)} placeholder="type anything" /&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p><b>Click the button five times.</b> The console counts to 5. The button still says <code>0</code>. Now type one letter in the input — the button jumps to <code>5</code>.</p>
+
+  <p>Nothing here is broken and nothing is racing. The ref was correct the entire time. What was wrong was asking the screen to display a value React was never told about. The letter you typed set state, which caused a render, and that render happened to read the ref again.</p>
+
+  <div class="trap">
+    <span class="label">The symptom to recognise</span>
+    "The value updates, but only when I click something else." Nine times out of ten that is a value that should be in state, being kept in a ref — or an object being mutated instead of replaced, which is the same mistake wearing lesson 8's clothes. Both are "React was never told".
+  </div>
+
+  <h2>Build it for real — part 2: a stopwatch with no leaks</h2>
+
+  <p>Now the real thing, and the canonical use of a ref. Two buttons, two handlers, one shared timer id that the screen never sees.</p>
+
+  <p>Plan the state first, the habit from Month 3:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Value</th><th>Lane</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>startTime</code></td><td>state</td><td>The elapsed time is computed from it, and the elapsed time is on screen.</td></tr>
+      <tr><td><code>now</code></td><td>state</td><td>Updated ten times a second <em>in order to</em> redraw. Re-rendering is the point.</td></tr>
+      <tr><td><code>secondsPassed</code></td><td>neither — derived</td><td><code>(now - startTime) / 1000</code>. Derive, don't store.</td></tr>
+      <tr><td><code>intervalRef</code></td><td>ref</td><td>Written by Start, read by Stop, never drawn. A render would be waste.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Stopwatch.tsx</b></p>
+  <pre><code>import { useEffect, useRef, useState } from 'react';
+
+export function Stopwatch() {
+  const [startTime, setStartTime] = useState&lt;number | null&gt;(null);
+  const [now, setNow] = useState&lt;number | null&gt;(null);
+  const intervalRef = useRef&lt;ReturnType&lt;typeof setInterval&gt; | null&gt;(null);
+
+  function handleStart() {
+    setStartTime(Date.now());
+    setNow(Date.now());
+
+    if (intervalRef.current !== null) clearInterval(intervalRef.current);
+    intervalRef.current = setInterval(() =&gt; {
+      setNow(Date.now());          <span class="cmt">// the only reason this component re-renders</span>
+    }, 10);
+  }
+
+  function handleStop() {
+    if (intervalRef.current !== null) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;  <span class="cmt">// ✓ leave the box in an honest state</span>
+    }
+  }
+
+  <span class="cmt">// The component being removed is not a user action, so it is not a handler's job.</span>
+  useEffect(() =&gt; {
+    return () =&gt; {
+      if (intervalRef.current !== null) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  let secondsPassed = 0;
+  if (startTime !== null &amp;&amp; now !== null) {
+    secondsPassed = (now - startTime) / 1000;
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;h1&gt;Time passed: {secondsPassed.toFixed(3)}&lt;/h1&gt;
+      &lt;button onClick={handleStart}&gt;Start&lt;/button&gt;
+      &lt;button onClick={handleStop}&gt;Stop&lt;/button&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Four things in that file are worth saying out loud, because each is a decision and not a detail.</p>
+
+  <h3>1. The timer is started by a click, so it lives in a handler</h3>
+
+  <p>This is the lesson-16 question, answered: the interval exists <em>because the user pressed Start</em>, not because the component is on screen. So it does not belong in an effect. The cleanup effect at the bottom is the other half of the same answer — unmounting is not a user action, so <em>that</em> is effect work.</p>
+
+  <div class="tip">
+    <span class="label">This is the pair to memorise</span>
+    A timer <b>started by an event</b>: create it in the handler, keep the id in a ref, and clear it in an unmount-only cleanup. A timer that exists <b>because the component is on screen</b>: create it in an effect and clear it in that effect's cleanup — no ref needed, because a local variable already survives long enough.
+  </div>
+
+  <h3>2. The docs' version of this example leaks, and yours should not</h3>
+
+  <p>The React docs show this stopwatch without the cleanup effect, which is fine in a sandbox that never unmounts. In a real app, start the stopwatch and navigate away: the interval keeps firing, calling <code>setNow</code> on a component that is gone. React 18 and later will not warn you about this — the old "can't perform a state update on an unmounted component" warning was removed as a false alarm — so nothing on your screen tells you it is happening. It is a real leak all the same: the callback holds the component's closure alive, and on a page that mounts the stopwatch many times you accumulate timers.</p>
+
+  <h3>3. The TypeScript type of a timer id is not <code>number</code></h3>
+
+  <p>In the browser <code>setInterval</code> returns a number. But if <code>@types/node</code> is anywhere in your project — and with Vite it is — TypeScript may resolve the Node overload, which returns a <code>Timeout</code> object. Two honest fixes:</p>
+
+  <pre><code><span class="cmt">// Option A — let TypeScript work it out. Correct in both environments.</span>
+const intervalRef = useRef&lt;ReturnType&lt;typeof setInterval&gt; | null&gt;(null);
+
+<span class="cmt">// Option B — say explicitly that you mean the browser's timer.</span>
+const intervalRef = useRef&lt;number | null&gt;(null);
+intervalRef.current = window.setInterval(tick, 10);   <span class="cmt">// window.setInterval returns number</span></code></pre>
+
+  <p>Do not reach for <code>as any</code> or <code>NodeJS.Timeout</code>. Both are people guessing at the wrong environment.</p>
+
+  <h3>4. Strict Mode creates every ref twice</h3>
+
+  <div class="note">
+    <span class="label">React docs · useRef caveats</span>
+    "In Strict Mode, React will <b>call your component function twice</b> in order to help you find accidental impurities. This is development-only behavior and does not affect production. <b>Each ref object will be created twice, but one of the versions will be discarded.</b> If your component function is pure (as it should be), this should not affect the behavior."
+  </div>
+
+  <p>Read the last sentence as a test you can run. If your component behaves differently in Strict Mode, the ref is not the problem — you are doing something during render that should not be there.</p>
+
+  <h2>The six real jobs of a ref</h2>
+
+  <p>The docs describe refs as an escape hatch for "rare situations", and the list really is short. If your ref is not doing one of these six jobs, look again.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Job</th><th>Typical shape</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><b>Timer and animation ids</b> — <code>setTimeout</code>, <code>setInterval</code>, <code>requestAnimationFrame</code>.</td><td><code>useRef&lt;ReturnType&lt;typeof setTimeout&gt; | null&gt;(null)</code></td></tr>
+      <tr><td>2</td><td><b>Cancellation handles</b> — an <code>AbortController</code> that must survive past the function that made it.</td><td><code>useRef&lt;AbortController | null&gt;(null)</code></td></tr>
+      <tr><td>3</td><td><b>DOM nodes</b> — the whole of the next lesson.</td><td><code>useRef&lt;HTMLInputElement&gt;(null)</code></td></tr>
+      <tr><td>4</td><td><b>The latest-value box</b> — read fresh data from a long-lived callback without re-subscribing.</td><td>a ref updated in an effect on every commit</td></tr>
+      <tr><td>5</td><td><b>Facts about the past</b> — the previous value, "has this already run", "is the user mid-drag".</td><td><code>useRef(value)</code> / <code>useRef(false)</code></td></tr>
+      <tr><td>6</td><td><b>One expensive object per component</b> — an observer, a parser, a player, a cache.</td><td>the <code>if (ref.current === null)</code> initialisation above</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Job 4 in code — the latest-value box</h3>
+
+  <p>You met this in lesson 17 as the React 18 stand-in for <code>useEffectEvent</code>. Now you can see why it works: a ref is not reactive, so reading it inside a long-lived callback never restarts anything.</p>
+
+  <pre><code>const onMessageRef = useRef(onMessage);
+
+useEffect(() =&gt; {
+  onMessageRef.current = onMessage;   <span class="cmt">// no dependency array: keep it fresh on every commit</span>
+});
+
+useEffect(() =&gt; {
+  const socket = createConnection(roomId);
+  socket.on('message', msg =&gt; onMessageRef.current(msg));  <span class="cmt">// always the latest fn</span>
+  return () =&gt; socket.disconnect();
+}, [roomId]);                          <span class="cmt">// ✓ honest, and does not react to onMessage</span></code></pre>
+
+  <p>On React 19.2 and later, prefer <code>useEffectEvent</code> — it says the intent out loud. Keep this pattern for older versions and for reading the latest value from something that is not an effect at all, such as a DOM listener you attached yourself.</p>
+
+  <h3>Job 5 in code — and the trap inside it</h3>
+
+  <pre><code>const prevQueryRef = useRef(query);
+
+useEffect(() =&gt; {
+  prevQueryRef.current = query;        <span class="cmt">// after the commit, so during render it is the OLD value</span>
+});</code></pre>
+
+  <p>This is genuinely useful for logging, analytics, and "did this change?" decisions inside effects. But notice what you must not do with it: <b>read it during render to draw something</b>. That breaks the one rule, and it is also subtly wrong — the ref is updated after the commit, so a render triggered by something else will see a "previous" value that is now the current one.</p>
+
+  <div class="trap">
+    <span class="label">If the screen needs the previous value</span>
+    Use the tool from lesson 16 instead: keep the previous value in <b>state</b> and adjust it during render (<code>if (items !== prevItems) { setPrevItems(items); … }</code>). A ref is for facts your <em>code</em> needs. State is for facts the <em>screen</em> needs. The word "previous" does not decide the lane; the reader does.
+  </div>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>A plain <code>let</code> resets every render</td><td>The first broken <code>Stopwatch</code> — <code>handleStop</code> always read <code>null</code></td></tr>
+      <tr><td>Module scope is shared by all instances</td><td>The second broken version</td></tr>
+      <tr><td>A ref is a state variable without a setter</td><td>The docs' <code>useRef</code>-on-<code>useState</code> implementation</td></tr>
+      <tr><td>Writing a ref tells React nothing</td><td><code>RefLie</code> — five clicks, the button still says <code>0</code></td></tr>
+      <tr><td>A ref object's identity is stable</td><td>Why it is never a dependency (lesson 17), and why the latest-value box works</td></tr>
+      <tr><td>Don't read or write a ref during render</td><td>The rule; the button label in <code>RefLie</code> is the violation</td></tr>
+      <tr><td>…except to initialise it once</td><td><code>if (playerRef.current === null) playerRef.current = new VideoPlayer()</code></td></tr>
+      <tr><td>Derive, don't store</td><td><code>secondsPassed</code> is a calculation, not a third state</td></tr>
+      <tr><td>Event-caused work goes in a handler</td><td><code>handleStart</code> creates the interval; no effect involved</td></tr>
+      <tr><td>Unmount cleanup is effect work</td><td>The <code>[]</code> effect that clears the interval on the way out</td></tr>
+      <tr><td>Strict Mode is a purity test</td><td>Every ref created twice, one discarded — harmless if render is pure</td></tr>
+      <tr><td>Timer ids are not typed <code>number</code> everywhere</td><td><code>ReturnType&lt;typeof setInterval&gt;</code> or <code>window.setInterval</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Add laps.</b> A <code>Lap</code> button pushes the current <code>secondsPassed</code> into a list. Decide the lane before you type: the list is drawn, so it is state — and it must be replaced, not pushed into (lesson 8). Then ask why the <em>lap count</em> needs no separate state at all.</li>
+    <li><b>Survive a reload.</b> On Start, write <code>startTime</code> to <code>localStorage</code>; on mount, read it back and resume. Note which parts are handler work and which are effect work, and that the resumed elapsed time comes from <code>Date.now()</code> arithmetic rather than from a count of ticks.</li>
+    <li><b>Break it on purpose.</b> Move <code>now</code> from state into a ref. Predict the exact symptom in writing first, then run it. You should get a clock frozen at <code>0.000</code> that suddenly displays the truth the moment you press Stop — because <code>handleStop</code> does not re-render either, but pressing a button that calls <code>setState</code> anywhere would.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A colleague opens a pull request titled "reduce re-renders". It changes three things in a form component: <code>const [isSaving, setIsSaving] = useState(false)</code> becomes <code>const isSavingRef = useRef(false)</code>; the submit button now reads <code>disabled={isSavingRef.current}</code>; and a new <code>const validationErrorsRef = useRef&lt;string[]&gt;([])</code> replaces the errors state, with the error list rendered from <code>validationErrorsRef.current</code>. The PR description says "these values do not need to trigger renders". Locally, the author says it works.</p>
+    Work out, in order: which of the three changes are wrong and by what rule; the exact user-visible symptom of each; why it can look fine when clicked slowly by the author; and whether <em>any</em> value in this component legitimately belongs in a ref. Then write the one-sentence review comment you would actually leave.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/referencing-values-with-refs">"Referencing Values with Refs"</a> and the <a href="https://react.dev/reference/react/useRef">useRef</a> reference. Next lesson takes the same hook to the DOM.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>give you ten values and one second each</b> — state or ref — and to argue back on the two you get wrong. Or ask for the stopwatch as a live-coding drill: I name the requirement, you narrate the lane for each value before typing.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>A component needs two kinds of memory.</b> A local <code>let</code> dies with the render; a module variable is shared by every instance. Refs and state are the two per-instance boxes React keeps.</li>
+      <li><b>State is memory React watches. A ref is memory React ignores.</b> Setting state re-renders; changing a ref does not.</li>
+      <li><b>One question picks the lane: does the user read this value on the screen?</b> Yes → state. No → ref.</li>
+      <li><b>A ref is a state variable without a setter.</b> <code>useRef</code> could be built on <code>useState({current: value})</code> and never calling the setter — which is why the object identity is stable forever.</li>
+      <li><b>A ref that the screen reads is a screen that lies</b>, and it lies quietly until an unrelated render happens to reveal the truth.</li>
+      <li><b>Never read or write <code>ref.current</code> during render.</b> Handlers and effects only. The single exception is one-time initialisation: <code>if (ref.current === null) ref.current = new Thing()</code>.</li>
+      <li><b><code>useRef(new Thing())</code> builds the thing on every render</b> and throws it away. Pass <code>null</code> and initialise inside the guard.</li>
+      <li><b>The six jobs:</b> timer ids, cancellation handles, DOM nodes, the latest-value box, facts about the past, and one expensive object per component.</li>
+      <li><b>Timer started by a click → handler + a ref for the id + an unmount cleanup.</b> Timer that exists because the component is on screen → effect + its own cleanup, no ref needed.</li>
+      <li><b>A timer id is not typed <code>number</code> when <code>@types/node</code> is present.</b> Use <code>ReturnType&lt;typeof setInterval&gt;</code>, or <code>window.setInterval</code> and <code>number</code>.</li>
+      <li><b>Strict Mode creates each ref twice and discards one.</b> If that changes your behaviour, your render is impure.</li>
+      <li><b>Real use case (built &amp; run):</b> a ref counter that showed <code>0</code> after five clicks, then a stopwatch where the interval id is a ref, the elapsed time is derived, and the interval is cleared both by the Stop button and on the way out.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>put a value in a ref when the screen must not follow it — and the moment the screen needs it, that value was always state.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Referencing Values with Refs" (including the "How does useRef work inside?" deep dive and the Stopwatch example), the <code>useRef</code> reference (caveats, "Avoiding recreating the ref contents", Strict Mode behaviour), "Synchronizing with Effects" (cleanup), "You Might Not Need an Effect" (adjusting state during render for previous values).</p>
+
+  <div class="footer-nav">
+    <a href="./0018-build-a-live-search-with-debounce-and-cancellation.html">← Previous: Build it — a live search</a>
+    <a href="./0020-reaching-the-dom-with-refs.html">Next: Reaching the DOM with refs →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A counter is kept in `useRef(0)` and rendered as `Clicked {countRef.current} times`. You click five times and the label still says 0, then you type one letter in a nearby input and it jumps to 5. What happened?",
+      options: [
+        "Writing a ref does not tell React anything, so no render happened — the letter set state, that render read the ref, and it had been correct all along",
+        "Refs update asynchronously and are batched, so the five clicks were flushed together when the input changed",
+        "The ref was reset to 0 on each render and the input restored it",
+        "React only commits ref changes when a form element loses focus"
+      ],
+      answer: 0,
+      why: "Nothing raced and nothing was batched. `countRef.current = countRef.current + 1` is a plain assignment to a plain object, and React has no way to know it happened — no setter was called, so no render was scheduled. The value really was 5 the whole time, which the console proves. What was broken was the decision to display it: the screen can only change when something causes a render, and here nothing did until `setNote` ran. This is the single failure mode of refs, and the reason the rule is phrased as a question about the reader: if the user reads the value, it is state."
+    },
+    {
+      q: "Which of these belongs in a ref rather than state?",
+      options: [
+        "The `setInterval` id used by a stopwatch's Start and Stop buttons",
+        "Whether a save request is in flight, used to disable the submit button",
+        "The list of validation errors shown under the form",
+        "The current value of a controlled text input"
+      ],
+      answer: 0,
+      why: "The interval id is written by one handler and read by another, is never drawn, and re-rendering because it changed would be pure waste — that is the ref job description. The other three are all read by the screen: a disabled button, a list of errors, and an input's value are all things the user sees, so React must be told when they change. The in-flight flag is the tempting one because it feels like plumbing, but `disabled={isSavingRef.current}` gives you a button that stays enabled until some unrelated render happens — a double-submit bug that only appears under fast clicking."
+      },
+    {
+      q: "Why is `useRef(new IntersectionObserver(cb))` a bug, and what is the fix?",
+      options: [
+        "The argument is evaluated on every render, so you build a new observer each time and discard all but the first — initialise inside `if (ref.current === null)` instead",
+        "`useRef` only accepts primitives, so an object must be assigned to `.current` later",
+        "It is not a bug; React memoises the initial value after the first render",
+        "Observers must be created in an effect because they are side effects, and any other placement throws"
+      ],
+      answer: 0,
+      why: "`useRef` keeps the value from the first render and ignores the argument afterwards — but JavaScript still evaluates that argument every time the component function runs. With `0` or `null` that is free. With a constructor that registers an observer, opens a socket, or parses a file, you are paying for one per render and throwing it away. The documented fix is lazy initialisation guarded by a null check, which the docs explicitly allow during render because the result is always the same and only runs once. Creating it in an effect is also valid and is the right call when it needs cleanup — but then the observer does not exist during the first commit, which sometimes matters."
+    },
+    {
+      q: "Your effect reads a fresh `onMessage` prop from `onMessageRef.current`. Which dependency array is correct, and why?",
+      options: [
+        "`[roomId]` — a ref object is not a reactive value, so neither the ref nor `ref.current` is ever listed",
+        "`[roomId, onMessageRef]` — every value read inside the effect must be declared",
+        "`[roomId, onMessageRef.current]` — the current value is what the effect actually reads",
+        "`[]` — refs make the effect non-reactive, so nothing needs declaring"
+      ],
+      answer: 0,
+      why: "`useRef` returns the identical object on every render, so listing it changes nothing — and listing `ref.current` is worse than useless: reading it during render to build the array breaks the purity rule, and mutating `.current` never triggers a render for React to compare against. `roomId` is genuinely reactive and must stay, which is also the point of the pattern: the socket re-syncs when the room changes and does not re-sync when the callback identity changes. An empty array would be a lie, because the effect really does read `roomId`."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is the difference between useRef and useState?”",
+      answer: "Both are per-component memory that React keeps between renders. The difference is who is told: <b>setting state schedules a re-render, changing a ref does not.</b> So <code>useState</code> is for values the screen follows, and <code>useRef</code> is for values my code needs but the user never reads — a timer id, an <code>AbortController</code>, a DOM node, the previous value. Mechanically, <code>useRef(initial)</code> returns the same <code>{ current: initial }</code> object on every render, and I mutate <code>.current</code> directly; state is replaced through a setter and each render sees its own snapshot. The framing I find most useful is the one from the docs: a ref is <b>a state variable without a setter</b> — you could build <code>useRef</code> out of <code>useState({current: value})</code> and simply never call the setter. That immediately explains two things: the ref object's identity is stable forever, which is why it never belongs in a dependency array, and React has no idea when the contents change, which is why a ref must never be the source of anything drawn on screen."
+    },
+    {
+      prompt: "Interviewer: “When would you reach for a ref?”",
+      answer: "I treat it as an escape hatch with a short list of jobs. <b>Timer and animation ids</b>, when a handler creates a timer and another handler or a cleanup has to clear it. <b>Cancellation handles</b> like an <code>AbortController</code> that must outlive the function that created it. <b>DOM nodes</b>, to focus, scroll, measure, or drive a media element. <b>A latest-value box</b>, so a long-lived subscription can read fresh props without re-subscribing — that is the pre-19.2 stand-in for <code>useEffectEvent</code>. <b>Facts about the past</b>, like the previous value or \"is the user mid-drag\". And <b>one expensive object per component</b>, created with the lazy <code>if (ref.current === null)</code> guard so I am not constructing it on every render. If a ref I am about to write does not do one of those jobs, that is my signal to check whether the value is really state. And the reverse test is even quicker: if anything in the JSX reads it, it is state."
+    },
+    {
+      prompt: "Interviewer: “Why shouldn't you read or write a ref during rendering?”",
+      answer: "Because rendering must be a pure calculation of the screen from props and state. Writing to a ref during render makes rendering do something, which breaks that promise and makes Strict Mode's double invocation visible. Reading one is just as bad in a quieter way: my output then depends on a value React never tracked or compared, so the same props and state can produce two different screens and React has no reason to re-render when the value changes. The practical symptom is a screen that shows a stale value until some unrelated update happens to redraw it — very hard to reproduce, because whether it looks correct depends on what else the user clicked. So refs are read and written in event handlers and effects. The one documented exception is lazy initialisation — <code>if (ref.current === null) ref.current = new Thing()</code> — which is allowed because it runs once and always produces the same result. And if I genuinely need to read or write something during render, that is the definition of state."
+    },
+    {
+      prompt: "Interviewer: “How do you run a setInterval in a component without leaking it?”",
+      answer: "First I decide why the timer exists, because that decides where it goes. If it exists <b>because the user pressed a button</b>, it belongs in the handler — I create it there, store the id in a ref so the Stop handler can find it, and add an unmount-only effect whose cleanup clears it, because the component being removed is not a user action. If it exists <b>because the component is on screen</b>, it belongs in an effect: create it in the setup, clear it in the cleanup, and no ref is needed since a plain local variable already lives exactly as long as one setup-cleanup pair. Two failure modes to name. The leak: no cleanup, so the callback keeps firing and keeps the component's closure alive after unmount — and React 18 removed the \"state update on an unmounted component\" warning, so nothing tells you. And the stale closure from lesson 17: the callback keeps one render's values forever, so I either use the updater form, or an Effect Event, or accept the re-sync. One more thing I mention for clocks: <code>setInterval</code> drifts and is throttled in background tabs, so I compute elapsed time from <code>Date.now()</code> rather than counting ticks."
+    }
+  ]);
+</script>

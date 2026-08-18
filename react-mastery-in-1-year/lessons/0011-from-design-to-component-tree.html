@@ -1,0 +1,625 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From design to component tree — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 3 · Lesson 1 · Thinking in React</p>
+  <h1>From design to component tree</h1>
+  <p class="subtitle">React's own method, steps 1 and 2: split a design into components, then build it static — props only, no state.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will be able to <b>(1)</b> look at any mockup and name the components before you type, <b>(2)</b> say <em>why</em> each split exists, and <b>(3)</b> build a working static version that renders real data with no state at all.
+  </div>
+
+  <p>Months 1 and 2 gave you the parts: state, props, events, lists, immutable updates. But interviews and real work do not start with parts. They start with a picture. Someone hands you a design and says "build this".</p>
+
+  <p>That gap is what this month closes. React has an official method for it, and it has five steps. This lesson does the first two.</p>
+
+  <h2>First principle — a component is a responsibility, not a rectangle</h2>
+  <p>Coming from HTML and CSS, your eye sees <b>boxes</b>. A grey panel, a left column, a header strip. It is tempting to make one component per box.</p>
+  <p>That instinct is wrong, and here is why. A component is a <b>function from data to UI</b>. So the useful question is not "which rectangles do I see?" but:</p>
+
+  <div class="soundbite">
+    <span class="label">The question that produces the tree</span>
+    <p><b>Which part of the screen is a function of which part of the data?</b> Each answer is one component. Its job is to turn that slice of data into that slice of screen — and nothing else.</p>
+  </div>
+
+  <p>A left column is not a function of anything. It is a layout decision. But "one row of the table" <em>is</em> a function of one product. That is a component.</p>
+
+  <h2>The method — five steps, and where you learn each one</h2>
+  <p>This is React's own recipe, straight from the official docs. It never changes, whatever the app.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Step</th><th>What you actually do</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 ·</b> Break the UI into a component hierarchy</td><td>Draw boxes on the design, name them, arrange them as a tree.</td><td>this lesson</td></tr>
+      <tr><td><b>2 ·</b> Build a static version</td><td>Render the data with props only. No state, no handlers.</td><td>this lesson</td></tr>
+      <tr><td><b>3 ·</b> Find the minimal complete state</td><td>Decide what changes, and delete everything you can compute.</td><td>Lesson 2</td></tr>
+      <tr><td><b>4 ·</b> Decide where state lives</td><td>Find the one component that should own each piece.</td><td>Lesson 3</td></tr>
+      <tr><td><b>5 ·</b> Add inverse data flow</td><td>Pass functions down so children can ask for changes.</td><td>Lesson 3</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Lesson 4 is the real build: all five steps, end to end, on the classic exercise — a filterable product data table.</p>
+
+  <h2>Step 1 — break the design into a component hierarchy</h2>
+  <p>Here is the design we will use all month. A search box, a checkbox, and a table of products grouped by category:</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 330" role="img" aria-labelledby="fig11-title" width="640" height="330">
+      <title id="fig11-title">A product table mockup on the left with dashed boxes drawn around the search area and the table; on the right the same split shown as a component tree of FilterableProductTable, SearchBar, ProductTable, ProductCategoryRow and ProductRow</title>
+
+      <text x="16" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">1 · the design</text>
+      <text x="336" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">2 · the same thing, as a tree</text>
+
+      <rect x="14" y="30" width="286" height="284" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+
+      <rect x="34" y="48" width="180" height="19" rx="4" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="42" y="62" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">Search…</text>
+      <rect x="34" y="76" width="10" height="10" rx="2" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="50" y="85" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Only show products in stock</text>
+
+      <rect x="26" y="40" width="248" height="56" rx="5" style="fill: none; stroke: var(--accent-2); stroke-width: 1.4; stroke-dasharray: 4 3;"></rect>
+      <text x="278" y="52" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">A</text>
+
+      <text x="34" y="120" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Name</text>
+      <text x="200" y="120" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Price</text>
+      <line x1="34" y1="126" x2="266" y2="126" style="stroke: var(--rule); stroke-width: 1;"></line>
+
+      <text x="34" y="142" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Fruits</text>
+      <rect x="28" y="132" width="244" height="14" rx="3" style="fill: none; stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 2;"></rect>
+      <text x="276" y="143" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">C</text>
+
+      <text x="42" y="160" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Apple</text>
+      <text x="200" y="160" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">$1</text>
+      <rect x="28" y="150" width="244" height="14" rx="3" style="fill: none; stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 2;"></rect>
+      <text x="276" y="161" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">R</text>
+
+      <text x="42" y="178" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Dragonfruit</text>
+      <text x="200" y="178" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">$1</text>
+      <text x="42" y="196" style="fill: var(--warn); font-family: sans-serif; font-size: 9.5px;">Passionfruit</text>
+      <text x="200" y="196" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">$2</text>
+
+      <text x="34" y="216" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Vegetables</text>
+      <text x="42" y="234" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Spinach</text>
+      <text x="200" y="234" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">$2</text>
+      <text x="42" y="252" style="fill: var(--warn); font-family: sans-serif; font-size: 9.5px;">Pumpkin</text>
+      <text x="200" y="252" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">$4</text>
+
+      <rect x="26" y="106" width="248" height="158" rx="5" style="fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 4 3;"></rect>
+      <text x="278" y="118" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">B</text>
+
+      <text x="34" y="286" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-style: italic;">red = out of stock</text>
+      <text x="34" y="302" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-style: italic;">the whole screen is one dashed box too</text>
+
+      <rect x="336" y="34" width="288" height="30" rx="6" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="480" y="53" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 11.5px; font-weight: 700;">FilterableProductTable</text>
+
+      <line x1="410" y1="64" x2="410" y2="96" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a11)"></line>
+      <line x1="550" y1="64" x2="550" y2="96" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a11)"></line>
+
+      <rect x="336" y="100" width="148" height="30" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.5;"></rect>
+      <text x="410" y="119" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">SearchBar &#160;A</text>
+
+      <rect x="490" y="100" width="134" height="30" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="557" y="119" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">ProductTable &#160;B</text>
+
+      <line x1="557" y1="130" x2="557" y2="160" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a11)"></line>
+      <line x1="557" y1="130" x2="470" y2="160" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a11)"></line>
+
+      <rect x="386" y="164" width="176" height="28" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="474" y="182" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">ProductCategoryRow &#160;C</text>
+
+      <rect x="500" y="200" width="124" height="28" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="562" y="218" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">ProductRow &#160;R</text>
+
+      <text x="336" y="252" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Five components. Two of them repeat,</text>
+      <text x="336" y="266" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">because the data repeats.</text>
+      <text x="336" y="288" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-style: italic;">The tree matches the shape of the data,</text>
+      <text x="336" y="302" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-style: italic;">not the shape of the layout.</text>
+
+      <defs>
+        <marker id="a11" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Step 1 done on paper. Draw the boxes, name them, then read the nesting off the picture — a box inside a box is a child.</figcaption>
+  </div>
+
+  <p>Notice what decided the split: <b>the data</b>. The product list repeats, so <code>ProductRow</code> exists. Products come grouped by category, so <code>ProductCategoryRow</code> exists. There is no <code>LeftColumn</code>, because no piece of data is called a left column.</p>
+
+  <h3>Three lenses that give the same answer</h3>
+  <ol>
+    <li><b>One job each</b> (the single responsibility principle). If a component both filters a list and formats a price, it has two jobs. Split it.</li>
+    <li><b>The shape of the data.</b> Look at the JSON your API returns. A well-shaped data model and a well-shaped component tree usually look the same, because both describe the same problem.</li>
+    <li><b>The design's own repeats and names.</b> Designers already grouped things into layers and gave them names. If the design file says "product row", that is a component.</li>
+  </ol>
+
+  <p>When the three lenses agree, you are done. When they disagree, trust the data model.</p>
+
+  <h3>How small is too small?</h3>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Split it out when…</th><th>Leave it inline when…</th></tr></thead>
+    <tbody>
+      <tr><td>It repeats — you will render many of them.</td><td>It appears exactly once and is three lines long.</td></tr>
+      <tr><td>You can name it in domain words: <code>ProductRow</code>, <code>PriceTag</code>.</td><td>The only name you can think of is <code>Wrapper</code> or <code>Box2</code>.</td></tr>
+      <tr><td>It will own private state later (an editable row, a dropdown).</td><td>It is pure layout — a <code>&lt;div&gt;</code> with a class.</td></tr>
+      <tr><td>A reader has to scroll to see the whole function.</td><td>Splitting would mean passing six props just to keep it working.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The trap — splitting by visual nesting</span>
+    One component per <code>&lt;div&gt;</code> gives you thirty components that each pass their props straight through. It reads worse than the version you started with, and every prop change now touches four files. Layout markup can stay inside the component that owns the job. <b>Components are units of behaviour and data, not units of markup.</b>
+  </div>
+
+  <h2>Step 2 — build a static version</h2>
+  <p>A <b>static version</b> renders the data and does nothing else. No <code>useState</code>. No <code>onClick</code>. Every component takes props and returns JSX.</p>
+  <p>This feels like a waste of a step. It is the opposite. Here is the honest description from the React docs, and it is worth memorising:</p>
+
+  <div class="soundbite">
+    <span class="label">Why static first</span>
+    <p><b>Building a static version needs a lot of typing and no thinking. Adding interactivity needs a lot of thinking and not much typing.</b> So do them separately. Mixing them is how you end up debugging your layout and your state at the same time.</p>
+  </div>
+
+  <p>One rule holds the whole step together: <b>state is only for data that changes over time</b>. A static version has no data that changes yet, so it has no state. If you catch yourself adding <code>useState</code> here, you have skipped ahead to step 3.</p>
+
+  <h3>In TypeScript, model the data first</h3>
+  <p>Your props types are not decoration. They are the contract between components, and they come from the data model. So type the data first, and the props follow for free.</p>
+
+  <h2>Build it for real — the static product table</h2>
+  <p>Fresh Vite app if you need one: <code>npm create vite@latest product-table -- --template react-ts</code>. Then create these files in <code>src/</code>, in this order.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/types.ts</b> — the data model, written once</p>
+  <pre><code>export interface Product {
+  id: string;            <span class="cmt">// a stable identity — this becomes our key</span>
+  name: string;
+  category: string;
+  price: number;         <span class="cmt">// a NUMBER, not "$1" — see the note below</span>
+  inStock: boolean;
+}</code></pre>
+
+  <div class="note">
+    <span class="label">Store data, format at the edge</span>
+    The React docs' version of this exercise stores <code>price: "$1"</code> as a string. Do not copy that. A price is a number; the dollar sign is <em>presentation</em>. Store the number, and format it in the component that shows it. If you store <code>"$10"</code> you cannot sort by price, add up a total, or change currency — and Lesson 4 sorts by price.
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/data.ts</b> — stand-in for the API</p>
+  <pre><code>import type { Product } from './types';
+
+export const PRODUCTS: Product[] = [
+  { id: 'p1', name: 'Apple',        category: 'Fruits',     price: 1, inStock: true  },
+  { id: 'p2', name: 'Dragonfruit',  category: 'Fruits',     price: 1, inStock: true  },
+  { id: 'p3', name: 'Passionfruit', category: 'Fruits',     price: 2, inStock: false },
+  { id: 'p4', name: 'Spinach',      category: 'Vegetables', price: 2, inStock: true  },
+  { id: 'p5', name: 'Pumpkin',      category: 'Vegetables', price: 4, inStock: false },
+  { id: 'p6', name: 'Peas',         category: 'Vegetables', price: 1, inStock: true  },
+];</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/ProductRow.tsx</b> — one product in, one row out</p>
+  <pre><code>import type { Product } from './types';
+
+const money = new Intl.NumberFormat('en-US', {
+  style: 'currency', currency: 'USD',
+});                                   <span class="cmt">// built once, outside the component</span>
+
+export function ProductRow({ product }: { product: Product }) {
+  return (
+    &lt;tr&gt;
+      &lt;td style={{ color: product.inStock ? 'inherit' : 'crimson' }}&gt;
+        {product.name}
+      &lt;/td&gt;
+      &lt;td&gt;{money.format(product.price)}&lt;/td&gt;
+    &lt;/tr&gt;
+  );
+}</code></pre>
+
+  <p>One job: turn one product into one row. It does not know about search, categories, or the table around it. That is why you could drop it into a different screen tomorrow.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/ProductCategoryRow.tsx</b></p>
+  <pre><code>export function ProductCategoryRow({ category }: { category: string }) {
+  return (
+    &lt;tr&gt;
+      &lt;th colSpan={2}&gt;{category}&lt;/th&gt;
+    &lt;/tr&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/ProductTable.tsx</b> — the grouping happens here</p>
+  <pre><code>import type { ReactNode } from 'react';
+import type { Product } from './types';
+import { ProductRow } from './ProductRow';
+import { ProductCategoryRow } from './ProductCategoryRow';
+
+export function ProductTable({ products }: { products: Product[] }) {
+  <span class="cmt">// Build the list of rows before returning. This is still pure:</span>
+  <span class="cmt">// same products in, same rows out, nothing outside is touched.</span>
+  const rows: ReactNode[] = [];
+  let lastCategory: string | null = null;
+
+  for (const product of products) {
+    if (product.category !== lastCategory) {
+      rows.push(
+        &lt;ProductCategoryRow
+          key={product.category}          <span class="cmt">// category names are unique here</span>
+          category={product.category}
+        /&gt;
+      );
+      lastCategory = product.category;
+    }
+    rows.push(&lt;ProductRow key={product.id} product={product} /&gt;);
+  }
+
+  return (
+    &lt;table&gt;
+      &lt;thead&gt;
+        &lt;tr&gt;&lt;th&gt;Name&lt;/th&gt;&lt;th&gt;Price&lt;/th&gt;&lt;/tr&gt;
+      &lt;/thead&gt;
+      &lt;tbody&gt;{rows}&lt;/tbody&gt;
+    &lt;/table&gt;
+  );
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">A loop inside render is allowed — a side effect is not</span>
+    Pushing into a local array you created in the same render is fine. The rule for a render is <b>purity</b>: no touching anything that lives outside the call. A local <code>rows</code> array is born and dies inside this one render, so it breaks nothing. Pushing into an array declared <em>outside</em> the component would be a real bug, because a second render would append to the first render's leftovers.
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/SearchBar.tsx</b> — static on purpose</p>
+  <pre><code>export function SearchBar() {
+  return (
+    &lt;form&gt;
+      &lt;input type="text" placeholder="Search…" /&gt;
+      &lt;label&gt;
+        &lt;input type="checkbox" /&gt; Only show products in stock
+      &lt;/label&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p>No <code>value</code>, no <code>onChange</code>, no props. You can type in the box and it does nothing to the table — correct for now. This is an <b>uncontrolled</b> input: the DOM holds the text, React does not know it exists. Lesson 3 hands the value to React.</p>
+
+  <div class="tip">
+    <span class="label">Do not half-do it</span>
+    Writing <code>value=""</code> without <code>onChange</code> would freeze the box and React would warn you in the console. That is the read-only bug from Month 2, Lesson 1. In a static version, pass <em>neither</em>.
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/FilterableProductTable.tsx</b> — the parent that will hold state later</p>
+  <pre><code>import type { Product } from './types';
+import { SearchBar } from './SearchBar';
+import { ProductTable } from './ProductTable';
+
+export function FilterableProductTable({ products }: { products: Product[] }) {
+  return (
+    &lt;div&gt;
+      &lt;SearchBar /&gt;
+      &lt;ProductTable products={products} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { PRODUCTS } from './data';
+import { FilterableProductTable } from './FilterableProductTable';
+
+export default function App() {
+  return &lt;FilterableProductTable products={PRODUCTS} /&gt;;
+}</code></pre>
+
+  <p>Run <code>npm run dev</code>. You should see the whole design, filled with real data, grouped by category, with out-of-stock names in red — and nothing that reacts to you. That is a finished step 2.</p>
+
+  <h2>What the static version already told you</h2>
+  <p>This is the part people skip, so they never get the payoff. A finished static version answers three questions for free:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Question</th><th>Where the answer showed up</th></tr></thead>
+    <tbody>
+      <tr><td><b>Is my data model right?</b></td><td>Any value you had to invent while writing JSX is missing from the model. Grouping needed <code>category</code>; the red name needed <code>inStock</code>.</td></tr>
+      <tr><td><b>What is the contract between components?</b></td><td>The props types. <code>ProductTable</code> needs a list; <code>ProductRow</code> needs one product. Written down, checked by the compiler.</td></tr>
+      <tr><td><b>What does <em>not</em> change?</b></td><td>Everything you rendered without state. Whatever is left over when you ask "what changes?" is the answer to step 3 — next lesson.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Data flowed one way the whole time: <code>App</code> → <code>FilterableProductTable</code> → <code>ProductTable</code> → <code>ProductRow</code>. You built a working app with no state at all. Remember that the next time you reach for a state library on line one.</p>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A designer hands you a settings page: a left sidebar with three tab names, and a right panel that shows one of three forms. A teammate builds <code>SettingsPage</code>, <code>LeftSidebar</code>, <code>RightPanel</code>, <code>PanelHeader</code>, <code>PanelBody</code>, <code>PanelFooter</code>, and one component per form — ten components. Eight of them take the same three props and pass them straight down.</p>
+    Say which of those components you would keep and which you would delete, using the data model as your argument. Then say what data model you would ask the backend for.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: React docs — <a href="https://react.dev/learn/thinking-in-react">"Thinking in React"</a>, steps 1 and 2. Also useful: <a href="https://react.dev/learn/your-first-component">"Your First Component"</a> and <a href="https://react.dev/learn/keeping-components-pure">"Keeping Components Pure"</a> for why the loop inside <code>ProductTable</code> is allowed.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>give you a mockup in words and grade your component tree</b>, or to hand you a JSON payload and have you name the components before you see the design. Both are real interview openers.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>A component is a responsibility, not a rectangle.</b> Ask which part of the screen is a function of which part of the data.</li>
+      <li><b>Five steps:</b> tree → static version → minimal state → who owns it → inverse data flow. The order matters more than the speed.</li>
+      <li><b>Three lenses for splitting:</b> one job each, the shape of the data, the design's own repeats and names. When they disagree, trust the data model.</li>
+      <li><b>Repeating data creates components.</b> <code>ProductRow</code> and <code>ProductCategoryRow</code> exist because the list repeats and comes grouped.</li>
+      <li><b>A static version has no state and no handlers</b> — props only. State is for data that changes over time, and nothing changes yet.</li>
+      <li><b>Static first because it separates typing from thinking:</b> lots of typing and no thinking now, lots of thinking and little typing later.</li>
+      <li><b>Type the data model first</b> — <code>interface Product</code> — and the props types fall out of it.</li>
+      <li><b>Store data, format at the edge.</b> <code>price: 1</code> plus <code>Intl.NumberFormat</code>, never <code>price: "$1"</code>.</li>
+      <li><b>Loops inside render are fine; side effects are not.</b> A local <code>rows</code> array is created and thrown away in the same render.</li>
+      <li><b>Real use case (built &amp; run):</b> a five-component static product table rendering typed data, grouped by category, out-of-stock names in red — zero state.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>draw the tree from the data, then build it dead — interactivity is a separate, later decision.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Thinking in React" (steps 1–2), "Your First Component", "Passing Props to a Component", "Keeping Components Pure", "Rendering Lists".</p>
+
+  <div class="footer-nav">
+    <a href="./0010-build-a-filterable-task-list.html">← Previous: Build it — a filterable task list</a>
+    <a href="./0012-minimal-complete-state.html">Next: Minimal, complete state →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "You are splitting a design into components. Which reason is the weakest for creating a new component?",
+      options: [
+        "It is a visually separate box in the design — a grey panel with padding",
+        "The same thing appears once per item in a list",
+        "It has one clear job you can name in domain words",
+        "It will need its own private state soon"
+      ],
+      answer: 0,
+      why: "A visual box is a layout fact, not a data fact. Grey panels, columns and padding wrappers can stay as markup inside the component that owns the job. The strong reasons are all about data and behaviour: it repeats (so it is a function of one item), it has one nameable job, or it will hold its own state. Splitting per div gives you a tree of components that only forward props, which is harder to read and change than the code you started with."
+    },
+    {
+      q: "Why does step 2 forbid useState, even though you know the search box will need it?",
+      options: [
+        "So layout problems and state problems never get debugged at the same time — and so step 3 can find the real minimal state",
+        "Because useState cannot be used in a component that receives props",
+        "Because state must always live in the top-level App component",
+        "Because static versions are rendered on the server"
+      ],
+      answer: 0,
+      why: "Two reasons. Practical: building the markup is typing, wiring the state is thinking — mixed together, every bug could be either. Structural: the static version shows you exactly what you can render from props alone, so what is left over is the true list of things that change. People who add state while laying out almost always end up with extra state they did not need, because they never saw the props-only version work."
+    },
+    {
+      q: "In the static ProductTable, why is it safe to push JSX into a `rows` array during render?",
+      options: [
+        "The array is created inside this render call, so nothing outside the component is touched — the render stays pure",
+        "React allows any code inside render as long as it runs before the return",
+        "Because pushing to an array does not trigger a re-render",
+        "It is not safe — it works by luck and should use map()"
+      ],
+      answer: 0,
+      why: "Purity means a render must not change anything that existed before it started. `const rows = []` is born in this render and thrown away after it, so mutating it is invisible to everyone else. The same push into an array declared at module level WOULD be a bug: the second render would append to the first render's rows, and React renders components more than once (StrictMode does it on purpose in development). map() is the usual tool, but grouping needs to emit two different row types per iteration, which a plain loop expresses more clearly."
+    },
+    {
+      q: "The SearchBar in the static version renders `<input type=\"text\" placeholder=\"Search…\" />` with no value and no onChange. What is true?",
+      options: [
+        "It is an uncontrolled input — the DOM holds the text, and that is the right choice until state exists",
+        "React will warn in the console that the input has no handler",
+        "It is a controlled input with an empty value",
+        "Typing in it will throw an error because there is no state"
+      ],
+      answer: 0,
+      why: "No `value` prop means React never sets the input's value, so the DOM node keeps its own — that is an uncontrolled input, and it needs no handler. React only warns when you pass `value` WITHOUT `onChange`, because then you have told React to own the value and given it no way to change it, which freezes the box. So in a static version pass neither, and in step 5 pass both together."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Here is a mockup. How do you decide what the components are?”",
+      answer: "I do not start from the boxes I can see — I start from the data. For each part of the screen I ask which slice of the data it is a function of, and each answer is a component with one job. Three lenses give me the same answer: <b>single responsibility</b> — if a thing both filters a list and formats a price it is two components; <b>the shape of the data</b> — the JSON from the API and a good component tree usually look alike, because both describe the same problem; and <b>the design's own repeats and names</b> — anything that appears once per item is a component, and the name the designer used is usually the right name. Then I read the nesting straight off the picture: a box inside a box is a child. What I deliberately do <em>not</em> create is a component per div. Layout wrappers are markup, not components — a tree of pass-through components is harder to read than the original."
+    },
+    {
+      prompt: "Interviewer: “What is a static version, and why bother?”",
+      answer: "A static version renders the real data model with props only — no <code>useState</code>, no event handlers, so every component is a pure function of its props. I bother for two reasons. First, it separates typing from thinking: building the markup is a lot of typing and no thinking, while adding interactivity is a lot of thinking and very little typing, and doing both at once means any bug could be either. Second, it produces the input to the next step. Whatever I could render from props alone is not state, so the leftovers are the true minimal state. It also flushes out gaps in the data model — every value I had to invent while writing JSX is a field the API should be sending, and in TypeScript the props types I write become the contract the compiler checks."
+    },
+    {
+      prompt: "Interviewer: “Your ProductTable builds an array of rows with a loop instead of using map. Is that okay?”",
+      answer: "Yes, and for a good reason. Grouping means one iteration can emit <em>two</em> rows — a category header plus the product row — which a plain loop says more clearly than a chain of maps. It stays pure because the <code>rows</code> array is created inside that render call: nothing that existed before the render is touched, so nobody else can observe it. The version that would be a bug is an array declared outside the component, because React can render the same component many times — StrictMode double-renders in development on purpose — and the second render would append to the first one's leftovers. I also give every row a key: <code>product.id</code> for products, and the category name for the header rows, since categories are unique in this list."
+    },
+    {
+      prompt: "Interviewer: “The API returns price as the string ‘$1’. Fine?”",
+      answer: "No, I would change it, or convert it at the boundary. A price is a number; the currency symbol is presentation. If I store <code>\"$1\"</code> I cannot sort the table by price, cannot total a basket, and cannot switch currency or locale without string surgery — and sorting is the very next feature this table gets. So the model holds <code>price: number</code> and the component that displays it formats it, with one <code>Intl.NumberFormat</code> created outside the component so it is not rebuilt on every render. The general habit: store the data in its truest form and format at the edge, where it is shown."
+    }
+  ]);
+</script>

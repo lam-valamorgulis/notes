@@ -1,0 +1,684 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Effects &amp; the outside world — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 4 · Lesson 1</p>
+  <h1>Effects &amp; the outside world</h1>
+  <p class="subtitle">Render must stay pure — so anything that touches a network, a timer or the browser needs its own door. <code>useEffect</code> is that door, and cleanup is what keeps it from leaking.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can say what an effect is <em>for</em> in one sentence, write the setup + cleanup pair without thinking, and answer the question that catches most candidates — <b>"why does my effect run twice in development, and why is that good?"</b>
+  </div>
+
+  <p>Everything in Months 1–3 stayed inside React. Props came in, state changed, a function returned JSX. Nothing left the building.</p>
+  <p>Real apps leave the building constantly. They open network requests, subscribe to sockets, start timers, read <code>localStorage</code>, listen for <code>resize</code>, hand a DOM node to a chart library, send analytics. None of that is a calculation. All of it has to happen somewhere.</p>
+  <p>This lesson is about <em>where</em>. And the answer starts with a rule you already learned, taken seriously.</p>
+
+  <h2>First principle — render must be pure</h2>
+
+  <p>A component is a function from props and state to JSX. React reserves the right to call it whenever it likes, twice in a row, or to throw the result away. That is only safe if the function is <b>pure</b>:</p>
+
+  <ul>
+    <li>Same props and state in → same JSX out.</li>
+    <li>It changes nothing outside itself while it runs.</li>
+  </ul>
+
+  <p>So this is broken, even though it "works" the first time:</p>
+
+  <pre><code>function Profile({ userId }: { userId: string }) {
+  const [user, setUser] = useState&lt;User | null&gt;(null);
+
+  <span class="cmt">// ✕ A side effect during render. React may call this function twice,</span>
+  <span class="cmt">//   or call it and throw the result away. Now you have two requests</span>
+  <span class="cmt">//   and a setState in the middle of rendering.</span>
+  fetch(`/api/users/${userId}`).then(r =&gt; r.json()).then(setUser);
+
+  return &lt;h1&gt;{user?.name}&lt;/h1&gt;;
+}</code></pre>
+
+  <p>The fix is not "do it more carefully". The fix is to <b>move it out of render</b>. React gives you exactly three places for code to live, and knowing which is which is most of this month:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Where</th><th>What belongs there</th><th>Caused by</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><b>The body of the component</b> (render)</td><td>Pure calculations from props and state.</td><td>Nothing — it just describes the screen.</td><td><code>const visible = items.filter(…)</code></td></tr>
+      <tr><td><b>An event handler</b></td><td>Side effects caused by <em>a specific user action</em>.</td><td>A click, a submit, a keystroke.</td><td>Buying a ticket, sending a message, showing an alert.</td></tr>
+      <tr><td><b>An effect</b> (<code>useEffect</code>)</td><td>Side effects caused by <em>the component being on the screen</em>.</td><td>Rendering itself.</td><td>The chat is open, so a connection must exist.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The sentence to remember</span>
+    <p>An event handler runs because <b>the user did something</b>. An effect runs because <b>the component is on the screen</b> — and its job is to keep an outside system in sync with what the screen says.</p>
+  </div>
+
+  <p>That word <b>sync</b> is the whole idea. An effect is not "run this after render". It is: <em>this outside thing should match my current props and state; go make that true, and undo it when it stops being true.</em></p>
+
+  <h2>The anatomy — three parts, and one of them is optional</h2>
+
+  <pre><code>useEffect(() =&gt; {
+  <span class="cmt">// 1. SETUP — start syncing with the outside system.</span>
+  const connection = createConnection(serverUrl, roomId);
+  connection.connect();
+
+  return () =&gt; {
+    <span class="cmt">// 2. CLEANUP — stop syncing. Undo exactly what setup did.</span>
+    connection.disconnect();
+  };
+}, [serverUrl, roomId]);
+  <span class="cmt">// 3. DEPENDENCIES — the values this effect reads from render.</span>
+  <span class="cmt">//    Change any of them and React re-syncs: cleanup, then setup again.</span></code></pre>
+
+  <p>The dependency array is the part people treat as a config knob. It is not. It is an <b>answer to a question React asks</b>: "which values from the render does this code read?" Get it wrong and you have lied to React — which is Lesson 3 of this month.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>You write</th><th>React re-runs setup</th><th>Use it for</th></tr></thead>
+    <tbody>
+      <tr><td><code>useEffect(fn)</code> — no array</td><td>After <b>every</b> render.</td><td>Almost never. Usually a mistake, and a common infinite-loop source.</td></tr>
+      <tr><td><code>useEffect(fn, [])</code></td><td>Once after the first render, then never again while the component stays mounted.</td><td>Setup that reads <em>nothing</em> from props or state.</td></tr>
+      <tr><td><code>useEffect(fn, [a, b])</code></td><td>When <code>a</code> or <code>b</code> changed since the last render, compared with <code>Object.is</code>.</td><td>The normal case.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Notice <code>Object.is</code> again — the same comparison from Lesson 8. A new object or a new array literal is a new identity every render, so <code>[{ id }]</code> in a dependency array re-runs the effect forever. Same rule, new place.</p>
+
+  <h2>When it actually runs</h2>
+
+  <p>Extend the render loop you learned in Lesson 2. An effect is not part of rendering. It happens <b>after</b> React has put things on the screen.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig15-title" width="640" height="250">
+      <title id="fig15-title">The render loop extended: trigger, render (pure), diff, commit to the DOM, the browser paints, and only then does the effect run — with cleanup running before the next setup</title>
+      <defs>
+        <marker id="a15" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a15o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <rect x="12" y="40" width="86" height="38" rx="6" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="55" y="57" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9.5px; font-weight: 700;">state change</text>
+      <text x="55" y="69" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 8.5px; opacity: .9;">or first mount</text>
+
+      <line x1="98" y1="59" x2="112" y2="59" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a15)"></line>
+
+      <rect x="114" y="40" width="86" height="38" rx="6" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="157" y="57" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">render</text>
+      <text x="157" y="69" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">pure · no effects</text>
+
+      <line x1="200" y1="59" x2="214" y2="59" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a15)"></line>
+
+      <rect x="216" y="40" width="86" height="38" rx="6" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="259" y="57" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">commit</text>
+      <text x="259" y="69" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">the DOM changes</text>
+
+      <line x1="302" y1="59" x2="316" y2="59" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a15)"></line>
+
+      <rect x="318" y="40" width="86" height="38" rx="6" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="361" y="57" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">paint</text>
+      <text x="361" y="69" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">the user sees it</text>
+
+      <line x1="404" y1="59" x2="418" y2="59" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a15o)"></line>
+
+      <rect x="420" y="34" width="206" height="50" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="523" y="52" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">the effect runs</text>
+      <text x="523" y="65" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">cleanup of the old one first,</text>
+      <text x="523" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">then setup — if a dependency changed</text>
+
+      <text x="12" y="112" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">two consequences worth saying out loud:</text>
+
+      <rect x="12" y="124" width="300" height="52" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="24" y="142" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">1. Too late to decide what to draw.</text>
+      <text x="24" y="156" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">A frame is already on screen. Setting state in an</text>
+      <text x="24" y="168" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">effect means the user saw the wrong thing first.</text>
+
+      <rect x="326" y="124" width="300" height="52" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="338" y="142" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">2. It will run again.</text>
+      <text x="338" y="156" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">So every "start" needs a matching "stop", or the</text>
+      <text x="338" y="168" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">second run stacks on top of the first.</text>
+
+      <rect x="12" y="190" width="614" height="44" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.4; stroke-dasharray: 5 3;"></rect>
+      <text x="24" y="208" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">The mental model that keeps you out of trouble:</text>
+      <text x="24" y="224" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">an effect is not "then do this". It is "while this is true, keep that in sync" — start, and stop.</text>
+    </svg>
+  </div>
+
+  <p>One precise note for interviews: <code>useEffect</code> runs after the browser has painted that frame, which is why it never blocks what the user sees. React also has a <em>before paint</em> version, <code>useLayoutEffect</code>, for the rare case where you must measure the DOM and adjust before anyone sees it. That is Month 5.</p>
+
+  <h2>The infinite loop you will write once</h2>
+
+  <p>Every React developer writes this exactly once, and then never forgets it:</p>
+
+  <pre><code>function TodoList() {
+  const [todos, setTodos] = useState&lt;Todo[]&gt;([]);
+
+  useEffect(() =&gt; {
+    fetch('/api/todos')
+      .then(r =&gt; r.json())
+      .then(setTodos);       <span class="cmt">// ← sets state…</span>
+  });                        <span class="cmt">// ← …and no dependency array, so it runs after every render</span>
+
+  <span class="cmt">// render → effect → setState → render → effect → setState → …</span>
+  <span class="cmt">// Your network tab becomes a waterfall. Your API owner finds you.</span>
+}</code></pre>
+
+  <p>The cycle is worth tracing by hand, because the same shape causes subtler loops later: <b>the effect changes state, the state change causes a render, the render re-runs the effect.</b> The dependency array is what breaks the cycle — here, <code>[]</code>, because the effect reads nothing from render.</p>
+
+  <div class="trap">
+    <span class="label">The same loop in disguise</span>
+    <code>useEffect(() =&gt; { setUser(buildUser(data)); }, [data, user])</code> — the effect sets <code>user</code>, and <code>user</code> is in its own dependency list. It loops for the same reason. If an effect sets a value it also depends on, stop and ask whether that value should be state at all. That question is the whole of Lesson 2 this month.
+  </div>
+
+  <h2>Cleanup — the half everyone forgets</h2>
+
+  <p>Cleanup is not a tidy-up nicety for unmount. It is the other half of a pair, and React calls it in <b>two</b> situations:</p>
+
+  <ol>
+    <li>Before running setup again, because a dependency changed.</li>
+    <li>When the component is removed from the screen.</li>
+  </ol>
+
+  <p>So the test for a correct cleanup is simple: <b>if setup ran twice in a row with your cleanup in between, would the world be the same as running it once?</b> If yes, you are done. If no, your cleanup is incomplete.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Setup does</th><th>Cleanup must do</th><th>What a missing cleanup looks like</th></tr></thead>
+    <tbody>
+      <tr><td><code>connection.connect()</code></td><td><code>connection.disconnect()</code></td><td>Ten open sockets after ten room switches; duplicate messages.</td></tr>
+      <tr><td><code>window.addEventListener('resize', h)</code></td><td><code>window.removeEventListener('resize', h)</code></td><td>Handlers pile up; each resize does the work N times; the component can never be garbage collected.</td></tr>
+      <tr><td><code>setInterval(tick, 1000)</code></td><td><code>clearInterval(id)</code></td><td>A counter that speeds up every time you change a filter.</td></tr>
+      <tr><td><code>observer.observe(node)</code></td><td><code>observer.disconnect()</code></td><td>Callbacks firing for nodes that are gone.</td></tr>
+      <tr><td><code>fetch(url)</code></td><td>Ignore the result, and abort the request</td><td>A slow old response overwriting a fresh one. That is Lesson 4's build.</td></tr>
+      <tr><td><code>chart = new Chart(node)</code></td><td><code>chart.destroy()</code></td><td>Two charts drawn on top of each other.</td></tr>
+      <tr><td>Show a modal / lock scrolling</td><td>Hide it / unlock scrolling</td><td>A page that can never scroll again.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Some setups genuinely need no cleanup — <code>document.title = title</code> just gets overwritten by the next run, and a one-off analytics event is meant to fire once per view. But "I don't need cleanup" should be a decision you can defend, not a blank you left.</p>
+
+  <h2>Why your effect runs twice in development</h2>
+
+  <p>Wrap your app in <code>&lt;StrictMode&gt;</code> — Vite's React template does this for you — and React deliberately does something strange in development only. From the React documentation:</p>
+
+  <div class="note">
+    <span class="label">React docs · useEffect caveats</span>
+    "When Strict Mode is on, React will <b>run one extra development-only setup+cleanup cycle</b> before the first real setup. This is a stress-test that ensures that your cleanup logic 'mirrors' your setup logic and that it stops or undoes whatever the setup is doing. If this causes a problem, implement the cleanup function."
+  </div>
+
+  <p>Read the order carefully, because candidates get it backwards. It is <b>setup → cleanup → setup</b>. Not setup twice.</p>
+
+  <p>This is a free bug detector. Bugs that would otherwise appear in production the first time a user switches rooms, navigates away and back, or opens the same page twice, appear on your machine on the first load instead.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Symptom under StrictMode</th><th>What it is really telling you</th></tr></thead>
+    <tbody>
+      <tr><td>Two connections in the log, one never closed</td><td>Missing cleanup.</td></tr>
+      <tr><td>Two network requests</td><td>Usually fine and expected in dev — but it also proves you have no protection against two responses racing. Fix the race, not the double-run.</td></tr>
+      <tr><td>A counter that jumps by 2</td><td>Your effect mutates something outside instead of syncing it. Setup + cleanup + setup should equal setup.</td></tr>
+      <tr><td>An animation that plays twice</td><td>The cleanup does not reset the animation to its starting point.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The wrong fix</span>
+    Turning off <code>StrictMode</code>, or guarding with <code>const didRun = useRef(false)</code>. Both hide the message instead of reading it. The double-run is not the bug — it is the alarm. In production the setup runs once, and the bug it was warning you about is still there, waiting for the first user who switches tabs.
+  </div>
+
+  <h2>Build it for real — a room connection that leaks, then does not</h2>
+
+  <p>New Vite + React + TS project, or a new folder in the one you have. The point is to <em>see</em> the leak in the console, then see cleanup close it, then see StrictMode prove it.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/chat.ts</b> — a fake outside system, so the log is the whole truth</p>
+  <pre><code>let openConnections = 0;
+
+export interface Connection {
+  connect: () =&gt; void;
+  disconnect: () =&gt; void;
+}
+
+export function createConnection(serverUrl: string, roomId: string): Connection {
+  <span class="cmt">// A real one would open a WebSocket. This one only tells the truth about counts.</span>
+  return {
+    connect() {
+      openConnections++;
+      console.log(`✅ connect "${roomId}" — open: ${openConnections}`);
+    },
+    disconnect() {
+      openConnections--;
+      console.log(`❌ disconnect "${roomId}" — open: ${openConnections}`);
+    },
+  };
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/RoomPanel.tsx</b> — step 1: the version with the leak</p>
+  <pre><code>import { useEffect } from 'react';
+import { createConnection } from './chat';
+
+const SERVER_URL = 'wss://example.test/chat';
+
+export function RoomPanel({ roomId }: { roomId: string }) {
+  useEffect(() =&gt; {
+    const connection = createConnection(SERVER_URL, roomId);
+    connection.connect();
+    <span class="cmt">// ✕ No cleanup, and no dependency array either.</span>
+  });
+
+  return &lt;h2&gt;Room: {roomId}&lt;/h2&gt;;
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { useState } from 'react';
+import { RoomPanel } from './RoomPanel';
+
+const ROOMS = ['general', 'travel', 'music'];
+
+export default function App() {
+  const [roomId, setRoomId] = useState('general');
+  const [show, setShow] = useState(true);
+
+  return (
+    &lt;main style={{ fontFamily: 'system-ui', padding: '2rem', maxWidth: 520 }}&gt;
+      &lt;label&gt;
+        Room:{' '}
+        &lt;select value={roomId} onChange={e =&gt; setRoomId(e.target.value)}&gt;
+          {ROOMS.map(r =&gt; (
+            &lt;option key={r} value={r}&gt;{r}&lt;/option&gt;
+          ))}
+        &lt;/select&gt;
+      &lt;/label&gt;
+
+      &lt;button type="button" onClick={() =&gt; setShow(s =&gt; !s)} style={{ marginLeft: '.6rem' }}&gt;
+        {show ? 'Close chat' : 'Open chat'}
+      &lt;/button&gt;
+
+      {show &amp;&amp; &lt;RoomPanel roomId={roomId} /&gt;}
+      &lt;p style={{ color: '#666' }}&gt;Watch the console, not the screen.&lt;/p&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+
+  <p><b>Run it and read the console.</b> Switch rooms three times, then close and open the chat. The <code>open:</code> number only ever goes up — 1, 2, 3, 4… Every connection you opened is still open, and nothing on screen tells you. This is the shape of a real production leak: invisible, and paid for by someone else's server.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/RoomPanel.tsx</b> — step 2: setup and cleanup as a pair</p>
+  <pre><code>import { useEffect } from 'react';
+import { createConnection } from './chat';
+
+const SERVER_URL = 'wss://example.test/chat';
+
+export function RoomPanel({ roomId }: { roomId: string }) {
+  useEffect(() =&gt; {
+    const connection = createConnection(SERVER_URL, roomId);   <span class="cmt">// setup</span>
+    connection.connect();
+
+    return () =&gt; connection.disconnect();                      <span class="cmt">// cleanup: undo exactly that</span>
+  }, [roomId]);   <span class="cmt">// re-sync when the room changes — that is the only value it reads</span>
+
+  return &lt;h2&gt;Room: {roomId}&lt;/h2&gt;;
+}</code></pre>
+
+  <p>Now the log tells a story that matches reality. On first mount, with StrictMode on, you see the stress-test:</p>
+
+  <pre><code>✅ connect "general" — open: 1
+❌ disconnect "general" — open: 0     <span class="cmt">← the extra dev-only cleanup</span>
+✅ connect "general" — open: 1        <span class="cmt">← the real setup</span></code></pre>
+
+  <p>And switching to <code>travel</code> shows a re-sync, in the right order:</p>
+
+  <pre><code>❌ disconnect "general" — open: 0     <span class="cmt">← old effect cleaned up first</span>
+✅ connect "travel" — open: 1         <span class="cmt">← then the new one starts</span></code></pre>
+
+  <p><b>The number never exceeds 1.</b> That is the invariant your cleanup buys, and it is exactly what you would say in a code review: "switch rooms twenty times and there is still one connection."</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/WindowSize.tsx</b> — the same shape on a browser API</p>
+  <pre><code>import { useEffect, useState } from 'react';
+
+export function WindowSize() {
+  const [width, setWidth] = useState(window.innerWidth);
+
+  useEffect(() =&gt; {
+    function handleResize() {
+      setWidth(window.innerWidth);
+    }
+
+    window.addEventListener('resize', handleResize);      <span class="cmt">// setup</span>
+    return () =&gt; window.removeEventListener('resize', handleResize);  <span class="cmt">// cleanup</span>
+  }, []);   <span class="cmt">// reads nothing from render — and it really reads nothing, so [] is honest</span>
+
+  return &lt;p&gt;Window width: {width}px&lt;/p&gt;;
+}</code></pre>
+
+  <p>Two very different outside systems — a socket and a browser event — and the same four lines of shape. That is the point of learning effects as <em>syncing</em> rather than as a list of recipes.</p>
+
+  <div class="tip">
+    <span class="label">Prove the cleanup, don't trust it</span>
+    Break it on purpose: delete the <code>return</code> line from <code>WindowSize</code>, then <code>console.log('resize handler')</code> inside <code>handleResize</code>. Toggle the component off and on five times, then resize the window once. Five logs from one resize — with the component not even on screen. Put the cleanup back and it drops to one.
+  </div>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>In the build</th></tr></thead>
+    <tbody>
+      <tr><td>Render must be pure</td><td><code>connection.connect()</code> is nowhere in the component body — only inside the effect.</td></tr>
+      <tr><td>An effect syncs, it does not "run after"</td><td>"The panel is showing room X" → "a connection to room X must exist."</td></tr>
+      <tr><td>Setup</td><td><code>createConnection(...)</code> + <code>connect()</code>.</td></tr>
+      <tr><td>Cleanup</td><td><code>return () =&gt; connection.disconnect()</code> — the exact inverse.</td></tr>
+      <tr><td>Dependencies as an answer</td><td><code>[roomId]</code> because <code>roomId</code> is the only render value the effect reads. <code>SERVER_URL</code> is a module constant, so it cannot change.</td></tr>
+      <tr><td>Cleanup runs on dependency change too</td><td>The <code>disconnect "general"</code> line before <code>connect "travel"</code>.</td></tr>
+      <tr><td>StrictMode as a stress test</td><td>The extra connect/disconnect/connect trio on first mount.</td></tr>
+      <tr><td>A missing cleanup is invisible</td><td>The screen looked perfect while <code>open:</code> climbed to 4.</td></tr>
+      <tr><td>Same shape, different system</td><td><code>addEventListener</code> / <code>removeEventListener</code> in <code>WindowSize</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Show the connection state on screen.</b> Add <code>status: 'connecting' | 'open'</code> in <code>RoomPanel</code> and have the fake connection call a callback. Question to answer as you do it: is <code>status</code> state, or is it derived? (State — it comes from outside, and cannot be computed from props.)</li>
+    <li><b>Make the server URL a prop.</b> Then fix the dependency array. If you did not add it, you lied to React — Lesson 3 covers exactly what that lie costs.</li>
+    <li><b>Log a page view.</b> <code>useEffect(() =&gt; { logVisit(roomId); }, [roomId])</code>. Now argue with yourself: is this really caused by rendering, or by a user action? (Caused by rendering — the visit happens because the room is on screen, no matter how the user got there.)</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate opens a pull request titled "fix: stop effect running twice". The diff adds a <code>useRef(false)</code> guard around the body of every effect in the app, so each one runs only on the very first setup. The PR description says: "React 18 StrictMode runs effects twice, which double-fires our analytics and opens two sockets. This makes dev match production."</p>
+    You have to reply. Decide: what is actually true in that description, what is false, and what will happen in production if this merges? Name the one change you <em>would</em> accept, and the console evidence you would ask for.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/synchronizing-with-effects">"Synchronizing with Effects"</a> and the <a href="https://react.dev/reference/react/useEffect">useEffect reference</a> (read the Caveats list — it is short and it is where the interview questions come from). Then, before Lesson 2: <a href="https://react.dev/learn/you-might-not-need-an-effect">"You Might Not Need an Effect"</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>break your effect in one line</b> and have you find it from the console alone — or to drill you on the "why does it run twice" answer until it comes out in under twenty seconds.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Render must be pure</b>, so side effects need another door. There are only three doors: render (calculations), event handlers (caused by a user), effects (caused by being on screen).</li>
+      <li><b>An effect is a sync, not a "then".</b> "While this is true, keep that outside thing matching it — and stop when it stops being true."</li>
+      <li><b>Three parts:</b> setup, an optional cleanup it returns, and a dependency array that answers "which render values do you read?"</li>
+      <li><b>It runs after commit and after paint</b>, so it is too late to decide what to draw. <code>useLayoutEffect</code> is the before-paint version — Month 5.</li>
+      <li><b>No dependency array = after every render.</b> An effect that sets state with no array loops forever.</li>
+      <li><b>Cleanup runs twice over:</b> before every re-run <em>and</em> on unmount. The test — setup, cleanup, setup should leave the world the same as one setup.</li>
+      <li><b>StrictMode runs an extra setup + cleanup before the first real setup</b>, in development only. Order: setup → cleanup → setup.</li>
+      <li><b>The double-run is the alarm, not the fire.</b> A <code>useRef</code> guard silences the alarm and ships the leak.</li>
+      <li><b>Object.is again:</b> a fresh object or array in the dependency array is a new identity every render, so the effect never stops re-running.</li>
+      <li><b>Real use case (built &amp; run):</b> a room panel that leaked one socket per room switch, then held at exactly one open connection forever — plus a <code>resize</code> listener with the identical setup/cleanup shape.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>every "start" in an effect needs a "stop" next to it, because the effect will run again — and React will prove that in development before your users prove it in production.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Synchronizing with Effects", <code>useEffect</code> reference (Caveats: the Strict Mode extra setup+cleanup cycle), <code>&lt;StrictMode&gt;</code> reference (the connection example with and without cleanup), "You Might Not Need an Effect".</p>
+
+  <div class="footer-nav">
+    <a href="./0014-build-the-filterable-product-table.html">← Previous: Build it — the filterable product table</a>
+    <a href="./0016-you-might-not-need-an-effect.html">Next: You might not need an effect →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What is the difference between code in an event handler and code in an effect?",
+      options: [
+        "An event handler runs because the user did a specific thing; an effect runs because the component is on the screen and something outside needs to match it",
+        "Event handlers are synchronous and effects are asynchronous",
+        "Effects can set state and event handlers cannot",
+        "Event handlers run before paint and effects run after — that is the only difference"
+      ],
+      answer: 0,
+      why: "The question to ask about any side effect is: what caused this? If the answer names a user action — they clicked Buy, they submitted the form, they pressed Escape — it belongs in the handler, because it should happen once, when that happened. If the answer is 'because this component is showing X', it belongs in an effect, because it must keep being true for as long as X is showing and must be undone when it stops. Both can set state and both can be async, so those are not the dividing line. Timing is a consequence, not the reason."
+    },
+    {
+      q: "You wrote `useEffect(() => { fetch('/api/todos').then(r => r.json()).then(setTodos); });` with no dependency array. What happens?",
+      options: [
+        "An infinite loop: the effect sets state, the state change renders, the render runs the effect again",
+        "It fetches once, because React remembers the URL",
+        "Nothing — an effect with no array never runs",
+        "It fetches twice in development and once in production"
+      ],
+      answer: 0,
+      why: "No array means 'after every render'. The effect calls setTodos, which triggers a render, which runs the effect, which fetches again — your network tab fills up and the server takes the hit. The dependency array is the brake: here the effect reads nothing from props or state, so `[]` is the honest answer and it fetches once per mount. Watch for the same cycle in disguise: an effect that both sets a value and lists that value as a dependency loops for exactly the same reason, and usually means the value should not be state at all."
+    },
+    {
+      q: "Under StrictMode in development, what exactly does React do to your effect, and why?",
+      options: [
+        "It runs one extra setup + cleanup cycle before the first real setup, to test that your cleanup undoes your setup",
+        "It runs setup twice in a row, to test that setup is idempotent",
+        "It runs the effect twice as fast to catch timing bugs",
+        "It runs cleanup twice on unmount, to test for leaks"
+      ],
+      answer: 0,
+      why: "The order matters and candidates reverse it: setup → cleanup → setup, not setup → setup. It is a stress test for one specific thing — does your cleanup mirror your setup? — and it front-loads bugs that would otherwise appear the first time a real user changes a filter, navigates away and back, or re-opens a page. If the log shows two connections and only one disconnect, the cleanup is missing or incomplete. In production, setup runs once, so silencing the warning with a ref guard does not fix anything; it just moves the discovery date to after release."
+    },
+    {
+      q: "Which cleanup is genuinely unnecessary?",
+      options: [
+        "`useEffect(() => { document.title = title; }, [title])` — the next run overwrites the title, so there is nothing to undo",
+        "`useEffect(() => { window.addEventListener('scroll', onScroll); }, [])`",
+        "`useEffect(() => { const id = setInterval(tick, 1000); }, [delay])`",
+        "`useEffect(() => { const c = createConnection(roomId); c.connect(); }, [roomId])`"
+      ],
+      answer: 0,
+      why: "Setting the title is a one-slot write: run it again and the new value replaces the old, so setup + cleanup + setup already equals setup. Apply that same test to the others and they all fail. The scroll listener accumulates — every re-run adds another handler, and the component can never be freed. The interval keeps ticking after the delay changes, so you end up with two timers and a counter that speeds up. The connection stays open, one leak per room switch. 'I don't need cleanup here' is a defensible decision for a small class of setups, but it should be a sentence you can say, not an empty line where a return used to go."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is useEffect for?”",
+      answer: "It is for <b>synchronising React with a system outside React</b> — a network connection, a browser API, a timer, a third-party widget. The reason it has to exist is purity: a component is a function from props and state to JSX, React may call it twice or throw the result away, so I cannot start a socket or fire a request in the body. There are only three places code can live. Pure calculations go in render. Side effects caused by a specific user action go in the event handler. Side effects caused by <em>the component being on the screen</em> go in an effect. I try to say it as a sync, not as a sequence: not \"after render, connect\", but \"while this panel is showing room 3, a connection to room 3 should exist, and when that stops being true it should be closed\". That phrasing is what makes the cleanup obvious instead of an afterthought, and it also tells me when I do <em>not</em> need an effect — if I am only computing something from props and state, that is render's job."
+    },
+    {
+      prompt: "Interviewer: “Why does my effect run twice, and why is that good?”",
+      answer: "Because you are in development with <code>StrictMode</code> on. React runs one extra setup-and-cleanup cycle before the first real setup — the order is setup, cleanup, setup — and it only does this in development. It is a stress test with one target: does your cleanup undo your setup? It is good because those bugs are otherwise invisible until a user does something ordinary — switching rooms, navigating away and back, opening a second tab of the same page. The double-run pulls that forward to your first page load, on your machine, where the console shows it. The wrong response is to disable StrictMode or add a <code>useRef</code> guard so the body runs once; that silences the alarm and ships the leak, because in production setup runs once and the missing cleanup is still missing. The right response is to read what it caught. Two connects and one disconnect means the cleanup is incomplete. Two fetches usually means nothing is broken, but it does prove I have no protection against two responses arriving out of order — so I fix the race, not the double-run."
+    },
+    {
+      prompt: "Interviewer: “When does cleanup run, and how do you know yours is correct?”",
+      answer: "It runs in two situations, and people only remember one. First, <b>before every re-run</b> — if a dependency changed, React cleans up the old effect and then sets up the new one, in that order. Second, <b>when the component unmounts</b>. So my test is: if setup ran, then cleanup, then setup again, is the outside world in the same state as after a single setup? If yes the cleanup mirrors the setup; if no it is incomplete. In practice that means every start has a stop right next to it: connect and disconnect, addEventListener and removeEventListener, setInterval and clearInterval, observe and disconnect, a fetch and an ignore flag. The evidence I look for is a counter that stops growing — in the room-switching demo the number of open connections holds at one no matter how many times I change rooms, and that is the sentence I would put in the pull request."
+    },
+    {
+      prompt: "Interviewer: “Your component needs to show a filtered list. Would you use an effect for that?”",
+      answer: "No — and this is the mistake I actively watch for. Filtering is a pure calculation from props and state, so it belongs in the body of the component: <code>const visible = items.filter(...)</code>. Putting it in an effect means React renders once with the old or empty list, commits it, the browser paints it, then the effect sets state and everything renders again — so the user sees a wrong frame first, and I have added a dependency array I can get wrong and a second copy of the truth that can go stale. The rule I use is the causation test: is this side work caused by a user action, or by the component being on the screen, or is it not a side effect at all? Filtering is the third case. Effects are for stepping outside React, and if nothing outside React is involved, an effect is the wrong tool. Next lesson is the full catalogue of that mistake."
+    }
+  ]);
+</script>

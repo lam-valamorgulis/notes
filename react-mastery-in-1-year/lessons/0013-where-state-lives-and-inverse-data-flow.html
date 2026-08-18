@@ -1,0 +1,612 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where state lives &amp; inverse data flow — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 3 · Lesson 3 · Thinking in React</p>
+  <h1>Where state lives &amp; inverse data flow</h1>
+  <p class="subtitle">Steps 4 and 5: the procedure that finds the one owner of each piece of state, and the callback contract that lets children ask for changes.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will be able to <b>(1)</b> run a three-step procedure that names the owner of any piece of state, <b>(2)</b> design a child's props as a contract — <code>value</code> down, <code>onChange</code> up — with types that do not leak the parent's implementation, and <b>(3)</b> say when to invent a component just to hold state, and when prop drilling has gone too far.
+  </div>
+
+  <p>You have the tree, and you know the two things that change. One question is left before the app works: <b>who owns them?</b></p>
+  <p>Month 2 taught the mechanics of lifting state up. This lesson turns that into a procedure you can run on a design you have never seen, plus the part nobody teaches — how to design the child's props so it stays reusable.</p>
+
+  <h2>First principle — one owner, and props only travel down</h2>
+  <p>Props flow one way. A component reads what its parent passed, and nothing else: no reaching sideways to a sibling, no reaching up. That single constraint decides ownership for you.</p>
+
+  <div class="soundbite">
+    <span class="label">The rule</span>
+    <p><b>A piece of state must live in a component that is above everyone who reads it</b> — and the useful choice is the <em>closest</em> such component. Higher than necessary re-renders more of the app than necessary and hides who changed what.</p>
+  </div>
+
+  <p>So "where does state live?" is not taste. It is arithmetic on the tree.</p>
+
+  <h2>Step 4 — the procedure, three moves</h2>
+  <p>Straight from the React docs. For <b>each</b> piece of state, separately:</p>
+  <ol>
+    <li><b>List every component that renders something based on it.</b> Reading it to show it counts. Reading it to filter with it counts.</li>
+    <li><b>Find their closest common parent</b> — the lowest component that has all of them somewhere beneath it.</li>
+    <li><b>Put the state there.</b> Or higher, if something above also needs it. Or, if no existing component is a sensible owner, <b>create a new component just to hold it</b> and place it above the common parent.</li>
+  </ol>
+
+  <p>Run it on <code>filterText</code> in the product table:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Move</th><th>Answer for <code>filterText</code></th></tr></thead>
+    <tbody>
+      <tr><td>Who renders something from it?</td><td><code>SearchBar</code> — it displays the text in the box. <code>ProductTable</code> — it decides which rows to show.</td></tr>
+      <tr><td>Closest common parent?</td><td><code>FilterableProductTable</code>. Both are its direct children.</td></tr>
+      <tr><td>Owner</td><td><code>FilterableProductTable</code>. Same answer for <code>inStockOnly</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 320" role="img" aria-labelledby="fig13-title" width="640" height="320">
+      <title id="fig13-title">Two trees. On the left SearchBar owns filterText and ProductTable cannot reach it. On the right FilterableProductTable owns it, passes it down to both children as props, and SearchBar sends changes back up through a callback.</title>
+
+      <text x="14" y="18" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✕ state too low</text>
+      <text x="352" y="18" style="fill: var(--good); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✓ state at the closest common parent</text>
+
+      <rect x="14" y="30" width="290" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="159" y="51" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">FilterableProductTable — no state</text>
+
+      <line x1="80" y1="64" x2="80" y2="94" style="stroke: var(--ink-faint); stroke-width: 1.4;" marker-end="url(#a13f)"></line>
+      <line x1="238" y1="64" x2="238" y2="94" style="stroke: var(--ink-faint); stroke-width: 1.4;" marker-end="url(#a13f)"></line>
+
+      <rect x="14" y="98" width="132" height="46" rx="6" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.6;"></rect>
+      <text x="80" y="116" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">SearchBar</text>
+      <text x="80" y="132" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">state: filterText</text>
+
+      <rect x="172" y="98" width="132" height="46" rx="6" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.6;"></rect>
+      <text x="238" y="116" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">ProductTable</text>
+      <text x="238" y="132" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">needs filterText…</text>
+
+      <path d="M150,121 L168,121" style="fill: none; stroke: var(--warn); stroke-width: 1.6;"></path>
+      <line x1="152" y1="112" x2="166" y2="130" style="stroke: var(--warn); stroke-width: 2;"></line>
+      <line x1="166" y1="112" x2="152" y2="130" style="stroke: var(--warn); stroke-width: 2;"></line>
+
+      <text x="14" y="168" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">Siblings cannot see each other.</text>
+      <text x="14" y="182" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">No prop, no context, no trick inside</text>
+      <text x="14" y="196" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">SearchBar can fix this. The state is</text>
+      <text x="14" y="210" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">in the wrong place.</text>
+
+      <rect x="352" y="30" width="274" height="46" rx="6" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="489" y="48" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10.5px; font-weight: 700;">FilterableProductTable — the owner</text>
+      <text x="489" y="65" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px; opacity: .9;">state: filterText · inStockOnly</text>
+
+      <line x1="412" y1="76" x2="412" y2="112" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a13)"></line>
+      <line x1="566" y1="76" x2="566" y2="112" style="stroke: var(--accent); stroke-width: 1.6;" marker-end="url(#a13)"></line>
+      <text x="418" y="98" style="fill: var(--accent); font-family: sans-serif; font-size: 8.5px;">value down</text>
+      <text x="500" y="98" style="fill: var(--accent); font-family: sans-serif; font-size: 8.5px;">value down</text>
+
+      <rect x="352" y="116" width="126" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="415" y="134" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">SearchBar</text>
+      <text x="415" y="150" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">no state at all</text>
+
+      <rect x="500" y="116" width="126" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="563" y="134" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">ProductTable</text>
+      <text x="563" y="150" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">gets the rows to draw</text>
+
+      <path d="M356,162 L330,162 L330,54 L348,54" style="fill: none; stroke: var(--accent-2); stroke-width: 1.7; stroke-dasharray: 4 3;" marker-end="url(#a13o)"></path>
+      <text x="352" y="180" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">onFilterTextChange(next) — events up</text>
+      <text x="352" y="196" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">the child asks; the owner decides and re-renders</text>
+
+      <line x1="14" y1="232" x2="626" y2="232" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <text x="14" y="254" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">The procedure:</text>
+      <text x="14" y="272" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">1 · list every component that renders something from this value</text>
+      <text x="14" y="288" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">2 · find their closest common parent</text>
+      <text x="14" y="304" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">3 · put the state there — or higher, or in a new component made only to hold it</text>
+
+      <defs>
+        <marker id="a13" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a13f" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+        <marker id="a13o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>The same two components, twice. On the left the state sits inside one reader, so the other reader is stuck. On the right it sits above both, and the child gets a function to ask for changes.</figcaption>
+  </div>
+
+  <h2>The third option people forget — a component whose only job is to hold state</h2>
+  <p>Sometimes the closest common parent is a bad owner. Two panels halfway down a big page need the same value, and their nearest shared ancestor is a 300-line layout component, or <code>App</code> itself.</p>
+  <p>Putting app-wide plumbing into <code>App</code> is how <code>App</code> becomes a 500-line file that nobody wants to open. The docs' third option is better: <b>create a component that exists only to own that state</b> and wrap the readers in it.</p>
+
+  <pre><code><span class="cmt">// Before: App owns things it does not care about.</span>
+function App() {
+  const [filterText, setFilterText] = useState('');
+  const [inStockOnly, setInStockOnly] = useState(false);
+  return (
+    &lt;Layout&gt;
+      &lt;SearchBar filterText={filterText} … /&gt;
+      &lt;ProductTable products={PRODUCTS} filterText={filterText} … /&gt;
+      &lt;Footer /&gt;
+    &lt;/Layout&gt;
+  );
+}
+
+<span class="cmt">// After: one small component owns the feature's state, App just places it.</span>
+function App() {
+  return (
+    &lt;Layout&gt;
+      &lt;FilterableProductTable products={PRODUCTS} /&gt;   <span class="cmt">// self-contained</span>
+      &lt;Footer /&gt;
+    &lt;/Layout&gt;
+  );
+}</code></pre>
+
+  <p>That new component is not overhead. It is the <b>name of the feature</b>, and it gives you a unit you can move, reuse, and test on its own.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Choose…</th><th>When</th><th>Cost if you get it wrong</th></tr></thead>
+    <tbody>
+      <tr><td>The closest common parent</td><td>The default. It already exists and it already renders both readers.</td><td>—</td></tr>
+      <tr><td>Something higher up</td><td>A third reader will appear above, or a sibling feature needs the same value.</td><td>Lifting too high re-renders a large tree on every keystroke and makes ownership hard to find.</td></tr>
+      <tr><td>A brand-new component made to hold it</td><td>The common parent is a layout shell or <code>App</code>, and the state belongs to one feature.</td><td>Skipping this is how <code>App</code> collects unrelated state until nobody can change it safely.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Step 5 — inverse data flow</h2>
+  <p>Data goes down. Now the child needs to change something above it. It cannot — so the parent hands it a <b>function</b>, and calling that function is the child's way of asking.</p>
+  <p>That is the whole of "inverse data flow". Nothing flows up except a function call.</p>
+
+  <h3>Pass the setter, or pass a handler?</h3>
+  <pre><code><span class="cmt">// A · the setter itself — fine when the parent has nothing to add</span>
+&lt;SearchBar onFilterTextChange={setFilterText} /&gt;
+
+<span class="cmt">// B · a named handler — when the parent does more than store the value</span>
+function handleFilterTextChange(next: string) {
+  setFilterText(next);
+  setPage(1);                      <span class="cmt">// a new search starts on page one</span>
+}
+&lt;SearchBar onFilterTextChange={handleFilterTextChange} /&gt;</code></pre>
+
+  <p>Start with A. Move to B the moment the parent has a second thing to do. The child never notices the difference, which is the point.</p>
+
+  <div class="tip">
+    <span class="label">The naming convention, and why it is worth following</span>
+    The <b>prop</b> is named for the event: <code>onFilterTextChange</code>, <code>onSelect</code>, <code>onDelete</code>. The <b>function inside the parent</b> is named for the work: <code>handleFilterTextChange</code>. When you read a component's props you then see its whole API at a glance: values coming in, and <code>on…</code> events going out. React's own DOM components do exactly this.
+  </div>
+
+  <h3>Type the contract, not the implementation</h3>
+  <p>Here is a TypeScript decision that separates a junior from a senior component API.</p>
+
+  <pre><code><span class="cmt">// ✕ Leaks how the parent stores the value</span>
+interface SearchBarProps {
+  onFilterTextChange: React.Dispatch&lt;React.SetStateAction&lt;string&gt;&gt;;
+}
+
+<span class="cmt">// ✓ Says only what the child is allowed to ask for</span>
+interface SearchBarProps {
+  filterText: string;
+  inStockOnly: boolean;
+  onFilterTextChange: (next: string) =&gt; void;
+  onInStockOnlyChange: (next: boolean) =&gt; void;
+}</code></pre>
+
+  <p>Two reasons the second one is better:</p>
+  <ul>
+    <li><b>It keeps the parent free.</b> With <code>Dispatch&lt;SetStateAction&lt;string&gt;&gt;</code> you have promised the child that a <code>useState</code> setter sits behind the prop. Swap the parent to <code>useReducer</code>, add validation, or put the value in the URL later, and the type no longer matches — even though the child's needs never changed.</li>
+    <li><b>It keeps the child honest.</b> That type also lets the child call <code>onFilterTextChange(prev =&gt; prev + '!')</code> — reaching into the parent's previous state. A child should report what happened, not run updates on the owner's data.</li>
+  </ul>
+  <p><code>(next: string) =&gt; void</code> is still satisfied by passing <code>setFilterText</code> directly, so you lose nothing. That is the sweet spot: strict contract, flexible implementation.</p>
+
+  <h2>The component contract — controlled, uncontrolled, or both</h2>
+  <p>Steps 4 and 5 have a consequence people miss. Once a child takes <code>value</code> + <code>onChange</code>, the child no longer decides where the state lives — and that is what makes it reusable.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Shape</th><th>Props</th><th>Who owns the value</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><b>Controlled</b></td><td><code>value</code> + <code>onChange</code></td><td>the parent</td><td>Anyone else needs to read it, reset it, or react to it. Default for shared UI.</td></tr>
+      <tr><td><b>Uncontrolled</b></td><td><code>defaultValue</code> only</td><td>the child</td><td>Nobody outside cares until submit — a simple form field, a search box that only searches on Enter.</td></tr>
+      <tr><td><b>Both</b></td><td><code>value?</code> + <code>defaultValue?</code> + <code>onChange?</code></td><td>whoever passed props</td><td>A library component. More code, so only for components with many users.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><code>&lt;input&gt;</code> is the proof this is a real pattern, not a theory: pass <code>value</code> and React owns it, pass <code>defaultValue</code> and the DOM owns it. Your components can offer the same choice, and the naming is already familiar to every React developer.</p>
+
+  <div class="trap">
+    <span class="label">The half-controlled trap</span>
+    Taking <code>value</code> as a prop <em>and</em> keeping a copy in state "so typing feels fast" gives you two owners and a race between them. If you accept <code>value</code>, render <code>value</code>. If you want a private draft — an edit form that can be cancelled — say so in the API: take <code>defaultValue</code>, keep your own state, and report the result with <code>onSubmit</code>.
+  </div>
+
+  <h2>How far down is too far — prop drilling</h2>
+  <p>Passing a prop through three components that do not use it is a smell, not a crime. Try the cheap fixes before the expensive one.</p>
+
+  <ol>
+    <li><b>Move the component, not the data.</b> If the middle layer only forwards props, pass the finished JSX instead. The data never travels:
+      <pre><code><span class="cmt">// Drilling: Layout does not care about user, but must carry it.</span>
+&lt;Layout user={user} /&gt;      <span class="cmt">// → &lt;Sidebar user={user} /&gt; → &lt;UserBadge user={user} /&gt;</span>
+
+<span class="cmt">// Composition: Layout takes a hole to fill. It never sees user.</span>
+&lt;Layout sidebar={&lt;UserBadge user={user} /&gt;} /&gt;</code></pre>
+    </li>
+    <li><b>Pass one object instead of six props</b> — <code>&lt;ProductRow product={product} /&gt;</code> rather than name, price, category, inStock. Fewer joints to change when the model changes.</li>
+    <li><b>Then Context</b> — for values a whole subtree needs and nobody wants to thread: theme, current user, locale. That is Month 6, together with the re-render cost it brings. Context is a delivery mechanism, not a state manager, and reaching for it to avoid two levels of props usually makes the app harder to follow.</li>
+  </ol>
+
+  <h2>Build it for real — wire the table up</h2>
+  <p>Same project as Lesson 1. Two files change, and the app comes alive.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/SearchBar.tsx</b> — fully controlled, owns nothing</p>
+  <pre><code>interface SearchBarProps {
+  filterText: string;
+  inStockOnly: boolean;
+  onFilterTextChange: (next: string) =&gt; void;
+  onInStockOnlyChange: (next: boolean) =&gt; void;
+}
+
+export function SearchBar({
+  filterText, inStockOnly, onFilterTextChange, onInStockOnlyChange,
+}: SearchBarProps) {
+  return (
+    &lt;form onSubmit={e =&gt; e.preventDefault()}&gt;   <span class="cmt">// nothing to submit: filtering is live</span>
+      &lt;input
+        type="text"
+        placeholder="Search…"
+        value={filterText}                       <span class="cmt">// value comes from above…</span>
+        onChange={e =&gt; onFilterTextChange(e.target.value)}   <span class="cmt">// …changes go back up</span>
+      /&gt;
+      &lt;label&gt;
+        &lt;input
+          type="checkbox"
+          checked={inStockOnly}                  <span class="cmt">// checkboxes use checked, not value</span>
+          onChange={e =&gt; onInStockOnlyChange(e.target.checked)}
+        /&gt;{' '}
+        Only show products in stock
+      &lt;/label&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p>Read the props type out loud: two values in, two events out, no state. This component works the same whether the owner is a parent, a reducer, or the URL — it cannot tell, and it does not care.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/FilterableProductTable.tsx</b> — the owner does the deriving</p>
+  <pre><code>import { useState } from 'react';
+import type { Product } from './types';
+import { SearchBar } from './SearchBar';
+import { ProductTable } from './ProductTable';
+
+export function FilterableProductTable({ products }: { products: Product[] }) {
+  <span class="cmt">// Step 4: both children read these, so they live here.</span>
+  const [filterText, setFilterText] = useState('');
+  const [inStockOnly, setInStockOnly] = useState(false);
+
+  <span class="cmt">// Step 3's leftovers: derived during render, never stored.</span>
+  const needle = filterText.trim().toLowerCase();
+  const visible = products.filter(p =&gt;
+    p.name.toLowerCase().includes(needle) &amp;&amp; (!inStockOnly || p.inStock)
+  );
+
+  return (
+    &lt;div&gt;
+      &lt;SearchBar
+        filterText={filterText}
+        inStockOnly={inStockOnly}
+        onFilterTextChange={setFilterText}       <span class="cmt">// the setter fits (next: string) =&gt; void</span>
+        onInStockOnlyChange={setInStockOnly}
+      /&gt;
+      &lt;p&gt;Showing {visible.length} of {products.length}&lt;/p&gt;
+      &lt;ProductTable products={visible} /&gt;       <span class="cmt">// the table just draws what it is given</span>
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p><code>ProductTable</code> from Lesson 1 does not change at all. It already took a list of products and drew them, and that is still its whole job.</p>
+
+  <div class="note">
+    <span class="label">A real design choice — filter in the owner, or in the table?</span>
+    The React docs pass <code>filterText</code> and <code>inStockOnly</code> <em>into</em> <code>ProductTable</code> and filter inside it. Both versions work. Passing the finished list is the better default: <code>ProductTable</code> keeps one job — "draw these rows" — so it can be reused for search results, a category page, or a saved list, and it needs no new prop when a third filter arrives. Filtering inside the table only pays off when the table also owns paging or virtual scrolling and needs the full list itself. Either way, say which one you chose and why — that sentence is what an interviewer is listening for.
+  </div>
+
+  <p>Run it. Type "fruit", tick the checkbox, watch the count. Every keystroke goes child → parent → state → render → both children. One direction, one owner, no surprises.</p>
+
+  <h3>What just became easy</h3>
+  <ul>
+    <li><b>A "clear filters" button</b> anywhere in the owner: <code>setFilterText(''); setInStockOnly(false)</code>. The search box updates because it renders the value it was given.</li>
+    <li><b>Deep-linking later.</b> Because <code>SearchBar</code> never owned the text, swapping <code>useState</code> for a URL search param in the owner changes one file (Month 8).</li>
+    <li><b>Testing.</b> <code>SearchBar</code> takes plain values and plain functions — render it with a spy and assert what it called. No app needed (Month 9).</li>
+  </ul>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A dashboard has a global header with a date-range picker, and three cards further down the page — revenue, orders, refunds — that must all obey that range. The nearest component containing both the header and the cards is <code>App</code>, which also holds routing, the theme, and the current user. A teammate's plan: put <code>dateRange</code> in <code>App</code> and drill it through <code>Header</code>, <code>Page</code>, and <code>CardGrid</code> to each card. A second teammate says "just use Context for everything".</p>
+    Give your own answer, using step 4's three moves. Say what you would name any new component, what each card's props look like, and what would change your mind toward Context.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/thinking-in-react">"Thinking in React"</a> steps 4 and 5, <a href="https://react.dev/learn/sharing-state-between-components">"Sharing State Between Components"</a>, and <a href="https://react.dev/learn/passing-data-deeply-with-context">"Passing Data Deeply with Context"</a> — read the "before you use context" section now, and the rest in Month 6.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>drill you on ownership</b>: I describe a screen, you name the owner of every piece of state and the props of every child, out loud, in under a minute.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>One-way data flow decides ownership.</b> State must live above everyone who reads it — and the closest such component is the right one.</li>
+      <li><b>Step 4, three moves:</b> list every component that renders from the value · find their closest common parent · put it there, higher, or in a new component made only to hold it.</li>
+      <li><b>Inventing a component to own state is a real option</b> — it names the feature and keeps <code>App</code> from collecting everyone's plumbing.</li>
+      <li><b>Too high is a real cost:</b> bigger re-renders and ownership nobody can find. Do not lift past the closest common parent "just in case".</li>
+      <li><b>Inverse data flow is just a function call.</b> Pass the setter when the parent adds nothing; pass <code>handleX</code> when it does more.</li>
+      <li><b>Naming:</b> the prop is the event (<code>onFilterTextChange</code>), the parent's function is the work (<code>handleFilterTextChange</code>).</li>
+      <li><b>Type the contract, not the implementation:</b> <code>(next: string) =&gt; void</code>, never <code>Dispatch&lt;SetStateAction&lt;string&gt;&gt;</code> — the child should not know the parent uses <code>useState</code>.</li>
+      <li><b>Controlled means the child owns nothing</b> — <code>value</code> + <code>onChange</code>. Never accept <code>value</code> and keep a copy in state as well.</li>
+      <li><b>Against prop drilling, in order:</b> pass JSX instead of data (composition) · pass one object instead of six props · then Context, in Month 6.</li>
+      <li><b>Real use case (built &amp; run):</b> the product table wired up — two states in the owner, a stateless controlled <code>SearchBar</code>, a derived visible list, and a live "showing N of M" count.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>find the closest component above every reader, put the state there, and give the children a function — the tree tells you the answer.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Thinking in React" (steps 4–5), "Sharing State Between Components", "Passing Props to a Component", "Responding to Events", "Passing Data Deeply with Context" (the "before you use context" section).</p>
+
+  <div class="footer-nav">
+    <a href="./0012-minimal-complete-state.html">← Previous: Minimal, complete state</a>
+    <a href="./0014-build-the-filterable-product-table.html">Next: Build it — the filterable product table →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A value is read by a component on the left of the page and one on the right. Their closest common parent is App, which is already 400 lines and holds routing and the theme. What is the best move?",
+      options: [
+        "Create a small component that owns this state and wraps both readers, then place it in App",
+        "Put the state in App — it is the closest common parent, so the procedure says so",
+        "Put the state in both readers and keep them in sync",
+        "Reach for Context, since the components are far apart"
+      ],
+      answer: 0,
+      why: "This is the docs' third option, and it is the one people forget. The procedure says the state must live above both readers — it does not say the existing common parent has to be the owner. A new component named after the feature owns the state, keeps it close to its readers, keeps App small, and gives you something you can move and test on its own. Context is for values a whole subtree needs (theme, user, locale) and it brings its own re-render questions; using it to avoid one wrapper is a bigger change than the problem deserves."
+    },
+    {
+      q: "Which prop type should a reusable SearchBar declare for reporting a text change?",
+      options: [
+        "onFilterTextChange: (next: string) => void",
+        "onFilterTextChange: React.Dispatch<React.SetStateAction<string>>",
+        "setFilterText: (value: string) => void",
+        "onFilterTextChange: (e: React.ChangeEvent<HTMLInputElement>) => void"
+      ],
+      answer: 0,
+      why: "It says exactly what the child can ask for and nothing about how the parent stores it — so the parent can use useState today, a reducer or a URL param tomorrow, with no change to the child. Passing setFilterText directly still satisfies it. The Dispatch type leaks the parent's implementation and lets the child call the updater form on the parent's state. Naming the prop setFilterText tells the child there is a setter behind it. Passing the raw event forces every parent to know about DOM events and makes the component impossible to reuse outside an input."
+    },
+    {
+      q: "A component takes `value` as a prop, and also keeps `const [text, setText] = useState(value)` so typing feels instant. What is wrong?",
+      options: [
+        "There are now two owners for one value, so the prop and the copy drift apart",
+        "Nothing — this is the standard controlled pattern",
+        "useState cannot take a prop as its initial value",
+        "It will re-render twice per keystroke"
+      ],
+      answer: 0,
+      why: "Accepting `value` is a promise to render what you were given; keeping a copy breaks the promise. The copy is seeded once, on the first render, so any later value from the parent is ignored — the frozen-copy bug — and a 'clear filters' button in the parent will not clear the box. Typing through a controlled prop is already fast; React batches and re-renders one small subtree. If you genuinely want a private draft, design for it: take `defaultValue`, own the state, and report the result with onSubmit."
+    },
+    {
+      q: "In the wired-up version, why does ProductTable receive the already-filtered list instead of filterText and inStockOnly?",
+      options: [
+        "It keeps ProductTable to one job — draw these rows — so it needs no new prop when a third filter appears",
+        "Because filtering cannot be done inside a child component",
+        "Because passing arrays is faster than passing strings",
+        "Because the docs require the parent to filter"
+      ],
+      answer: 0,
+      why: "It is a design choice, not a rule — the React docs filter inside the table and that works. Passing the finished list is the better default: the table stops knowing what a search is, so it is reusable for a category page or a saved list, and each new filter changes only the owner. Filtering inside the table earns its keep when the table needs the full list for something else, such as paging or virtual scrolling. Either way the answer an interviewer wants is the trade-off, said out loud."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you decide which component owns a piece of state?”",
+      answer: "I run three moves for each piece separately. <b>One:</b> I list every component that renders something based on it — showing it counts, and so does filtering with it. <b>Two:</b> I find their closest common parent, the lowest component with all of them beneath it. <b>Three:</b> I put the state there, unless there is a reason to go higher — another reader appearing above — or a reason to make a new component: if the common parent is just a layout shell or <code>App</code>, I create a component named after the feature whose only job is to own that state, and wrap the readers in it. I deliberately do not lift higher than needed, because a value that lives too high re-renders a big tree on every keystroke and makes it hard to answer 'who changed this?'. On the product table, <code>filterText</code> is read by <code>SearchBar</code>, which displays it, and by the filtering, which uses it — so their parent <code>FilterableProductTable</code> owns it."
+    },
+    {
+      prompt: "Interviewer: “What is inverse data flow, and how do you type it?”",
+      answer: "Props only travel down, so a child cannot change state above it. The parent instead passes a <b>function</b>, and the child calls it — that call is the only thing that travels up. I name the prop after the event, <code>onFilterTextChange</code>, and the parent's function after the work, <code>handleFilterTextChange</code>, so reading a component's props shows its whole API: values in, events out. For the type I write <code>(next: string) =&gt; void</code> and never <code>Dispatch&lt;SetStateAction&lt;string&gt;&gt;</code>. The narrow type says what the child may ask for without promising that a <code>useState</code> setter sits behind it — so the parent can add validation, switch to a reducer, or move the value into the URL, and the child never changes. It also stops the child passing an updater function and reaching into the parent's previous state. Passing <code>setFilterText</code> straight through still satisfies it, so the strictness costs nothing."
+    },
+    {
+      prompt: "Interviewer: “When should a component be controlled, and when uncontrolled?”",
+      answer: "Controlled — <code>value</code> plus <code>onChange</code>, the parent owns the data — whenever anything outside the component reads it, resets it, or reacts to it. That is the default for shared UI, and it is what makes the component reusable: it no longer decides where the app's state lives. Uncontrolled — only <code>defaultValue</code>, the component owns its own value — is right when nobody outside cares until submit, like a plain form field. A library component can offer both, the way <code>&lt;input&gt;</code> does, at the cost of more code. The mistake to avoid is half-controlled: accepting <code>value</code> and also keeping a copy in state. That creates two owners, ignores later values from the parent, and quietly breaks anything the parent does — a 'clear filters' button, for example. If I want a private draft I say so in the API: take <code>defaultValue</code>, keep local state, report with <code>onSubmit</code>."
+    },
+    {
+      prompt: "Interviewer: “This prop is passed through four components that don't use it. What do you do?”",
+      answer: "First I check it is actually a problem — passing a prop through two layers is fine and completely traceable. If the middle layers only forward it, my first fix is <b>composition</b>: pass finished JSX instead of data, so <code>&lt;Layout sidebar={&lt;UserBadge user={user} /&gt;} /&gt;</code> means <code>Layout</code> never sees <code>user</code> at all. That solves most drilling, because the layers in the middle are usually layout, not logic. Second, I check whether six props want to be one object — <code>&lt;ProductRow product={product} /&gt;</code> — which cuts the number of joints that change when the model changes. Only then Context, and only for values a whole subtree genuinely needs, like theme, locale or the current user. Context is a delivery mechanism, not a state manager, and it brings re-render costs I would rather understand before I use it — which is Month 6."
+    }
+  ]);
+</script>

@@ -1,0 +1,787 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>You might not need an effect — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 4 · Lesson 2</p>
+  <h1>You might not need an effect</h1>
+  <p class="subtitle">Most effects in most codebases should not exist. Here is the full catalogue of the mistake, why each one is slower <em>and</em> buggier, and the one-line replacement for each.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can look at any <code>useEffect</code> and answer "should this exist?" in about five seconds — and delete four of them from a working app without changing what the user sees.
+  </div>
+
+  <p>Lesson 1 gave you a door to the outside world. This lesson is about not walking through it for no reason.</p>
+  <p>The React documentation has a whole page called "You Might Not Need an Effect", and it exists because this is <em>the</em> most common way React code goes wrong. Not a subtle bug — a habit. Something changes, so people reach for an effect to react to it.</p>
+
+  <div class="soundbite">
+    <span class="label">The test, in two questions</span>
+    <p>Is this caused by <b>a specific user action</b>? → event handler. Is this <b>synchronising with a system outside React</b>? → effect. <b>Neither?</b> → it is a calculation, and it belongs in render.</p>
+  </div>
+
+  <h2>First principle — an effect is a detour</h2>
+
+  <p>Nothing about an effect makes it a neutral choice. Compare the two timelines for "show a filtered list".</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 260" role="img" aria-labelledby="fig16-title" width="640" height="260">
+      <title id="fig16-title">Two timelines compared: calculating during render paints the correct screen once, while calculating in an effect paints a wrong frame first, then sets state, then renders and paints again</title>
+      <defs>
+        <marker id="a16" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a16o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <text x="12" y="20" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✕ filtering inside an effect — two renders, and the user sees the wrong one</text>
+
+      <rect x="12" y="30" width="76" height="34" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.4;"></rect>
+      <text x="50" y="51" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">render</text>
+
+      <line x1="88" y1="47" x2="100" y2="47" style="stroke: var(--accent-2); stroke-width: 1.4;" marker-end="url(#a16o)"></line>
+
+      <rect x="102" y="30" width="96" height="34" rx="6" style="fill: var(--accent-2); stroke: none;"></rect>
+      <text x="150" y="45" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px; font-weight: 700;">paint</text>
+      <text x="150" y="57" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 8px; opacity: .92;">empty list — wrong</text>
+
+      <line x1="198" y1="47" x2="210" y2="47" style="stroke: var(--accent-2); stroke-width: 1.4;" marker-end="url(#a16o)"></line>
+
+      <rect x="212" y="30" width="82" height="34" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.4;"></rect>
+      <text x="253" y="51" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">effect</text>
+
+      <line x1="294" y1="47" x2="306" y2="47" style="stroke: var(--accent-2); stroke-width: 1.4;" marker-end="url(#a16o)"></line>
+
+      <rect x="308" y="30" width="86" height="34" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.4;"></rect>
+      <text x="351" y="51" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">setState</text>
+
+      <line x1="394" y1="47" x2="406" y2="47" style="stroke: var(--accent-2); stroke-width: 1.4;" marker-end="url(#a16o)"></line>
+
+      <rect x="408" y="30" width="76" height="34" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.4;"></rect>
+      <text x="446" y="51" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">render again</text>
+
+      <line x1="484" y1="47" x2="496" y2="47" style="stroke: var(--accent-2); stroke-width: 1.4;" marker-end="url(#a16o)"></line>
+
+      <rect x="498" y="30" width="128" height="34" rx="6" style="fill: var(--accent-2); stroke: none;"></rect>
+      <text x="562" y="45" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px; font-weight: 700;">paint</text>
+      <text x="562" y="57" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 8px; opacity: .92;">filtered list — right</text>
+
+      <text x="12" y="88" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">plus: a dependency array to get wrong, and a second copy of the list that can disagree with the source</text>
+
+      <line x1="12" y1="104" x2="626" y2="104" style="stroke: var(--rule); stroke-width: 1;"></line>
+
+      <text x="12" y="128" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">✓ filtering during render — one render, correct on the first frame</text>
+
+      <rect x="12" y="138" width="150" height="34" rx="6" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="87" y="153" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">render</text>
+      <text x="87" y="165" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">const visible = items.filter(…)</text>
+
+      <line x1="162" y1="155" x2="174" y2="155" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a16)"></line>
+
+      <rect x="176" y="138" width="128" height="34" rx="6" style="fill: var(--accent); stroke: none;"></rect>
+      <text x="240" y="153" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px; font-weight: 700;">paint</text>
+      <text x="240" y="165" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 8px; opacity: .92;">filtered list — right</text>
+
+      <text x="320" y="152" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">no effect · no dependency array ·</text>
+      <text x="320" y="165" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">no second copy · nothing to keep in sync</text>
+
+      <rect x="12" y="192" width="614" height="52" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 5 3;"></rect>
+      <text x="24" y="211" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">The cost is never only speed.</text>
+      <text x="24" y="227" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">Storing a derived value makes a second truth. Two truths need syncing. Syncing needs an effect. The effect</text>
+      <text x="24" y="239" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">needs a dependency array. That is the bug factory — and the whole chain disappears if you just compute it.</text>
+    </svg>
+  </div>
+
+  <h2>The catalogue</h2>
+
+  <p>Every row below is a real pattern from real code. The left column is what people write; the right is what it should be.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The habit</th><th>What to do instead</th></tr></thead>
+    <tbody>
+      <tr><td>An effect that computes state from props or other state</td><td>Compute it during render. No state, no effect.</td></tr>
+      <tr><td>An effect that caches an expensive calculation</td><td><code>useMemo</code> — <em>after</em> measuring. It caches without making a second truth.</td></tr>
+      <tr><td>An effect that resets <b>all</b> state when a prop changes</td><td>Give the component a <code>key</code>. React resets it for you.</td></tr>
+      <tr><td>An effect that resets <b>some</b> state when a prop changes</td><td>Compare with the previous prop and set state during render.</td></tr>
+      <tr><td>An effect that runs shared logic for two handlers</td><td>A plain function, called from both handlers.</td></tr>
+      <tr><td>An effect that sends a POST because state changed</td><td>Send it in the handler that caused it.</td></tr>
+      <tr><td>A chain of effects, each setting the next value</td><td>One calculation during render, or one handler that sets everything.</td></tr>
+      <tr><td>An effect with <code>[]</code> for app startup work</td><td>Module scope — it runs once when the module loads.</td></tr>
+      <tr><td>An effect that tells the parent about a state change</td><td>Call <code>setState</code> and <code>onChange</code> in the same handler.</td></tr>
+      <tr><td>An effect that pushes data <em>up</em> to the parent</td><td>Lift the state. Data flows down, not up.</td></tr>
+      <tr><td>An effect that subscribes to a browser or third-party store</td><td><code>useSyncExternalStore</code>.</td></tr>
+      <tr><td>An effect that fetches data</td><td>This one is legitimate — but it needs the race fix, and a library does it better. Lesson 4, then Month 7.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Now the six worth writing out, because each one has a bug you will meet.</p>
+
+  <h2>1. Computing state from props or state</h2>
+
+  <pre><code><span class="cmt">// ✕ Redundant state and an unnecessary effect</span>
+function Form({ firstName, lastName }: Props) {
+  const [fullName, setFullName] = useState('');
+
+  useEffect(() =&gt; {
+    setFullName(firstName + ' ' + lastName);
+  }, [firstName, lastName]);
+  <span class="cmt">// Renders with the OLD name, paints it, then fixes it. And if a third</span>
+  <span class="cmt">// name field is added and forgotten here, fullName is silently wrong.</span>
+}
+
+<span class="cmt">// ✓ One line, always correct, no frame in between</span>
+function Form({ firstName, lastName }: Props) {
+  const fullName = firstName + ' ' + lastName;
+}</code></pre>
+
+  <p>This is Month 3's "minimal state" rule showing up again. If you can calculate it during render, it is not state — and an effect that keeps a copy in sync is just the maintenance bill for storing it.</p>
+
+  <div class="tip">
+    <span class="label">Expensive? Measure before you cache</span>
+    Wrap the calculation in <code>console.time('filter')</code> / <code>console.timeEnd('filter')</code> and look. Under about 1&#8239;ms, do nothing. If it is genuinely slow, <code>useMemo(() =&gt; getFiltered(todos, filter), [todos, filter])</code> caches the result between renders <em>without</em> turning it into state. Same single truth, just remembered.
+  </div>
+
+  <h2>2. Resetting all state when a prop changes — use a key</h2>
+
+  <pre><code><span class="cmt">// ✕ The effect approach: manual, incomplete, and one render late</span>
+function Profile({ userId }: { userId: string }) {
+  const [comment, setComment] = useState('');
+  const [draftTitle, setDraftTitle] = useState('');
+
+  useEffect(() =&gt; {
+    setComment('');
+    setDraftTitle('');     <span class="cmt">// every new state you add must be remembered here</span>
+  }, [userId]);
+}
+
+<span class="cmt">// ✓ Split the component and hand React an identity</span>
+export default function ProfilePage({ userId }: { userId: string }) {
+  return &lt;Profile userId={userId} key={userId} /&gt;;
+}
+
+function Profile({ userId }: { userId: string }) {
+  <span class="cmt">// This and every state below it resets automatically on a key change.</span>
+  const [comment, setComment] = useState('');
+  const [draftTitle, setDraftTitle] = useState('');
+}</code></pre>
+
+  <p>You already know why this works — Lesson 9. A different <code>key</code> means a different component to React, so it throws the old state away. The effect version forgets one state variable the day someone adds a third field; the key version cannot.</p>
+
+  <h2>3. Resetting <em>some</em> state when a prop changes</h2>
+
+  <p>Sometimes only part of the state should reset. The docs' answer surprises people: set state <b>during render</b>, guarded by a comparison with the previous prop.</p>
+
+  <pre><code>function List({ items }: { items: Item[] }) {
+  const [isReverse, setIsReverse] = useState(false);
+  const [selection, setSelection] = useState&lt;Item | null&gt;(null);
+
+  <span class="cmt">// Better: adjust the state while rendering</span>
+  const [prevItems, setPrevItems] = useState(items);
+  if (items !== prevItems) {
+    setPrevItems(items);
+    setSelection(null);     <span class="cmt">// isReverse survives; only the selection resets</span>
+  }
+}</code></pre>
+
+  <p>It looks illegal and it is not. React re-renders the component immediately after it exits, before rendering children and before touching the DOM, so nothing is painted in between. That is strictly better than an effect, which paints first and fixes second. It is still the second-best option though — the best is not needing it:</p>
+
+  <pre><code><span class="cmt">// ✓ Best: calculate everything during rendering</span>
+function List({ items }: { items: Item[] }) {
+  const [isReverse, setIsReverse] = useState(false);
+  const [selectedId, setSelectedId] = useState&lt;string | null&gt;(null);
+
+  <span class="cmt">// Nothing to reset: if the item is gone, the lookup is null on its own.</span>
+  const selection = items.find(item =&gt; item.id === selectedId) ?? null;
+}</code></pre>
+
+  <p>Store the id, look up the object — Month 3, Principle 4. The reset problem <em>vanishes</em>, rather than being handled.</p>
+
+  <h2>4. Logic shared between event handlers</h2>
+
+  <pre><code><span class="cmt">// ✕ A bug, not just a smell</span>
+function ProductPage({ product, addToCart }: Props) {
+  useEffect(() =&gt; {
+    if (product.isInCart) {
+      showNotification(`Added ${product.name} to the cart!`);
+    }
+  }, [product]);
+  <span class="cmt">// Reload the page with something already in the cart and the toast fires</span>
+  <span class="cmt">// again — the user did nothing. Worse in a real app: this shape is how</span>
+  <span class="cmt">// "buy" ends up firing on a page refresh.</span>
+}
+
+<span class="cmt">// ✓ The action caused it, so the handler owns it</span>
+function ProductPage({ product, addToCart }: Props) {
+  function buyProduct() {
+    addToCart(product);
+    showNotification(`Added ${product.name} to the cart!`);
+  }
+
+  function handleBuyClick()  { buyProduct(); }
+  function handleCheckout()  { buyProduct(); navigateTo('/checkout'); }
+}</code></pre>
+
+  <p>The causation test settles it. The notification happens because <em>the user clicked buy</em>, not because the cart contains something. Effects run whenever the component shows up, including on a refresh — so anything that should happen once per action must not live in one.</p>
+
+  <h2>5. Chains of effects</h2>
+
+  <pre><code><span class="cmt">// ✕ Four renders, and a chain that is hard to change safely</span>
+const [card, setCard] = useState(null);
+const [goldCardCount, setGoldCardCount] = useState(0);
+const [round, setRound] = useState(1);
+
+useEffect(() =&gt; { if (card?.gold) setGoldCardCount(c =&gt; c + 1); }, [card]);
+useEffect(() =&gt; { if (goldCardCount &gt; 3) { setRound(r =&gt; r + 1); setGoldCardCount(0); } }, [goldCardCount]);
+
+<span class="cmt">// ✓ One handler, one pass: the event knows everything already</span>
+function handlePlaceCard(nextCard: Card) {
+  setCard(nextCard);
+  if (nextCard.gold) {
+    if (goldCardCount &lt;= 3) {
+      setGoldCardCount(goldCardCount + 1);
+    } else {
+      setGoldCardCount(0);
+      setRound(round + 1);
+    }
+  }
+}</code></pre>
+
+  <p>Each effect in a chain triggers a render that triggers the next effect. The app is slower, and — worse — you can no longer read the rules in one place. Anything caused by one user action should be decided in one handler.</p>
+
+  <h2>6. Telling the parent about a change</h2>
+
+  <pre><code><span class="cmt">// ✕ Parent finds out one render late</span>
+function Toggle({ onChange }: { onChange: (on: boolean) =&gt; void }) {
+  const [isOn, setIsOn] = useState(false);
+  useEffect(() =&gt; { onChange(isOn); }, [isOn, onChange]);
+}
+
+<span class="cmt">// ✓ Both updates in the event that caused them — one render pass</span>
+function Toggle({ onChange }: { onChange: (on: boolean) =&gt; void }) {
+  const [isOn, setIsOn] = useState(false);
+
+  function updateToggle(nextIsOn: boolean) {
+    setIsOn(nextIsOn);
+    onChange(nextIsOn);
+  }
+
+  function handleClick() { updateToggle(!isOn); }
+}</code></pre>
+
+  <p>And if the parent needs that value anyway — <b>lift it</b>. A fully controlled <code>Toggle</code> that takes <code>isOn</code> and <code>onChange</code> deletes the problem instead of solving it. Data flows down; an effect that pushes data up is a sign the state is in the wrong component.</p>
+
+  <h2>Two more worth knowing by name</h2>
+
+  <pre><code><span class="cmt">// App startup — not an effect. Module scope runs once, when the module loads.</span>
+if (typeof window !== 'undefined') {
+  checkAuthToken();
+  loadDataFromLocalStorage();
+}
+
+function App() { <span class="cmt">/* … */</span> }</code></pre>
+
+  <pre><code><span class="cmt">// Subscribing to something outside React: the purpose-built hook, not an effect</span>
+function subscribe(callback: () =&gt; void) {
+  window.addEventListener('online', callback);
+  window.addEventListener('offline', callback);
+  return () =&gt; {
+    window.removeEventListener('online', callback);
+    window.removeEventListener('offline', callback);
+  };
+}
+
+function useOnlineStatus() {
+  return useSyncExternalStore(
+    subscribe,               <span class="cmt">// same function identity ⇒ no resubscribe</span>
+    () =&gt; navigator.onLine,  <span class="cmt">// value on the client</span>
+    () =&gt; true,              <span class="cmt">// value on the server</span>
+  );
+}</code></pre>
+
+  <p><code>useSyncExternalStore</code> exists because the effect version of a subscription can read a value that changed between render and the effect firing. It is also the hook every state library uses under the hood — which is why it appears again in Month 6.</p>
+
+  <h2>Build it for real — delete four effects from a working app</h2>
+
+  <p>This app works. Every feature is correct on screen. It also has four effects that should not exist. Type it, run it, then remove them one at a time and watch the file get shorter.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/types.ts</b></p>
+  <pre><code>export interface Member {
+  id: string;
+  name: string;
+  role: string;
+  active: boolean;
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/TeamPanel.tsx</b> — the "before". Four effects, four bugs waiting.</p>
+  <pre><code>import { useEffect, useState } from 'react';
+import type { Member } from './types';
+
+interface TeamPanelProps {
+  members: Member[];
+  onVisibleCountChange: (n: number) =&gt; void;
+}
+
+export function TeamPanel({ members, onVisibleCountChange }: TeamPanelProps) {
+  const [query, setQuery] = useState('');
+  const [activeOnly, setActiveOnly] = useState(false);
+  const [selectedId, setSelectedId] = useState&lt;string | null&gt;(null);
+
+  <span class="cmt">// ✕ 1. Derived data stored in state</span>
+  const [visible, setVisible] = useState&lt;Member[]&gt;(members);
+  useEffect(() =&gt; {
+    setVisible(
+      members.filter(
+        m =&gt;
+          m.name.toLowerCase().includes(query.toLowerCase()) &amp;&amp;
+          (!activeOnly || m.active),
+      ),
+    );
+  }, [members, query, activeOnly]);
+
+  <span class="cmt">// ✕ 2. A chain: this one waits for the effect above to finish</span>
+  const [summary, setSummary] = useState('');
+  useEffect(() =&gt; {
+    setSummary(`Showing ${visible.length} of ${members.length}`);
+  }, [visible, members]);
+
+  <span class="cmt">// ✕ 3. Pushing a value up to the parent, one render late</span>
+  useEffect(() =&gt; {
+    onVisibleCountChange(visible.length);
+  }, [visible, onVisibleCountChange]);
+
+  <span class="cmt">// ✕ 4. Resetting state when a prop changes</span>
+  useEffect(() =&gt; {
+    setSelectedId(null);
+  }, [members]);
+
+  const selected = visible.find(m =&gt; m.id === selectedId);
+
+  return (
+    &lt;section&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} placeholder="Search…" /&gt;
+      &lt;label&gt;
+        &lt;input type="checkbox" checked={activeOnly} onChange={e =&gt; setActiveOnly(e.target.checked)} /&gt;{' '}
+        Active only
+      &lt;/label&gt;
+
+      &lt;p&gt;{summary}&lt;/p&gt;
+
+      &lt;ul&gt;
+        {visible.map(m =&gt; (
+          &lt;li key={m.id} onClick={() =&gt; setSelectedId(m.id)}&gt;
+            {m.name} — {m.role}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+
+      {selected &amp;&amp; &lt;p&gt;Selected: {selected.name}&lt;/p&gt;}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p><b>Find the bugs before you fix the code.</b> Three are reachable right now:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Do this</th><th>What you see</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Type one letter in the search box</td><td>The list and the summary update on <em>different</em> renders. With a long list you can catch the summary showing the old count.</td><td>Effect 2 waits for effect 1 to commit. A chain paints intermediate states.</td></tr>
+      <tr><td>Load the page</td><td><code>summary</code> is empty on the very first paint.</td><td>The effects have not run yet — the user sees a blank line that should say "Showing 5 of 5".</td></tr>
+      <tr><td>Add a member from the parent, keeping the search text</td><td>The selection clears even though the selected person is still on screen.</td><td>Effect 4 resets on any <code>members</code> change, including ones that do not affect the selection.</td></tr>
+      <tr><td>Pass an inline <code>onVisibleCountChange={n =&gt; setCount(n)}</code></td><td>Depending on what the parent does with it, an update loop.</td><td>Effect 3 depends on a function prop that is a new identity every parent render.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/TeamPanel.tsx</b> — the "after". Same features, zero effects.</p>
+  <pre><code>import { useState } from 'react';
+import type { Member } from './types';
+
+interface TeamPanelProps {
+  members: Member[];
+  onSelect: (id: string | null) =&gt; void;   <span class="cmt">// the parent asked for a fact; give it one on the event</span>
+}
+
+export function TeamPanel({ members, onSelect }: TeamPanelProps) {
+  const [query, setQuery] = useState('');
+  const [activeOnly, setActiveOnly] = useState(false);
+  const [selectedId, setSelectedId] = useState&lt;string | null&gt;(null);
+
+  <span class="cmt">// ✓ 1 + 2. Derived during render: correct on the first frame, always in step.</span>
+  const visible = members.filter(
+    m =&gt;
+      m.name.toLowerCase().includes(query.toLowerCase()) &amp;&amp;
+      (!activeOnly || m.active),
+  );
+  const summary = `Showing ${visible.length} of ${members.length}`;
+
+  <span class="cmt">// ✓ 4. No reset needed: an id that is gone simply finds nothing.</span>
+  const selected = visible.find(m =&gt; m.id === selectedId) ?? null;
+
+  <span class="cmt">// ✓ 3. Told in the event that caused it — one render, no dependency array.</span>
+  function handleSelect(id: string) {
+    setSelectedId(id);
+    onSelect(id);
+  }
+
+  return (
+    &lt;section&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} placeholder="Search…" /&gt;
+      &lt;label&gt;
+        &lt;input type="checkbox" checked={activeOnly} onChange={e =&gt; setActiveOnly(e.target.checked)} /&gt;{' '}
+        Active only
+      &lt;/label&gt;
+
+      &lt;p&gt;{summary}&lt;/p&gt;
+
+      &lt;ul&gt;
+        {visible.map(m =&gt; (
+          &lt;li key={m.id} onClick={() =&gt; handleSelect(m.id)}&gt;
+            {m.name} — {m.role}
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+
+      {selected &amp;&amp; &lt;p&gt;Selected: {selected.name}&lt;/p&gt;}
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p>Two state variables removed, four effects removed, four dependency arrays that no longer exist to get wrong — and the summary is right on the first paint. Note what replaced effect 3: not another effect, but a change of contract. The parent wanted to know about a selection, so the child reports the <em>event</em>, not the resulting state.</p>
+
+  <h2>The one effect that stays</h2>
+
+  <p>Add this to the parent, and be able to defend it:</p>
+
+  <pre><code>function App() {
+  const [members, setMembers] = useState(INITIAL_MEMBERS);
+  const activeCount = members.filter(m =&gt; m.active).length;
+
+  <span class="cmt">// ✓ A real effect: document.title is a system outside React.</span>
+  <span class="cmt">//   Not a calculation, not caused by one user action — it must simply</span>
+  <span class="cmt">//   match what is on the screen, whenever that changes.</span>
+  useEffect(() =&gt; {
+    document.title = `Team (${activeCount} active)`;
+  }, [activeCount]);
+
+  <span class="cmt">// …</span>
+}</code></pre>
+
+  <p>Run the two questions over it. Caused by a specific user action? No — the tab title must be right however the count changed. Synchronising with something outside React? Yes: the browser tab. So it is an effect, and it needs no cleanup, because the next run overwrites the same single slot.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Effect removed</th><th>Replaced by</th><th>Bug that disappeared with it</th></tr></thead>
+    <tbody>
+      <tr><td>Store the filtered list</td><td><code>members.filter(…)</code> in render</td><td>An empty first paint, and a stored list that can disagree with the props.</td></tr>
+      <tr><td>Build the summary from the list</td><td>One template string in render</td><td>An intermediate frame where the count did not match the rows.</td></tr>
+      <tr><td>Report the count upward</td><td><code>onSelect</code> called in the handler</td><td>A one-render lag, and a loop risk from an unstable function prop.</td></tr>
+      <tr><td>Clear the selection on new props</td><td><code>find</code> on an id</td><td>Losing the selection when an unrelated member was added.</td></tr>
+      <tr><td><b>Kept:</b> <code>document.title</code></td><td>—</td><td>Nothing. It is genuinely outside React.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Persist the filters.</b> Save <code>query</code> and <code>activeOnly</code> to <code>localStorage</code> so a refresh keeps them. Decide first: which part is an effect and which part is not? (Writing is an effect — <code>localStorage</code> is outside React. Reading the initial value is not: pass it to <code>useState</code> as an initial value instead.)</li>
+    <li><b>Reset everything for a new team.</b> The parent can now switch between two teams. Reset the whole panel with <code>key={teamId}</code> and delete any code you were tempted to write.</li>
+    <li><b>Reset only the checkbox.</b> Keep <code>query</code>, clear <code>activeOnly</code> when the team changes. Use the <code>prevTeamId</code> comparison during render, and say out loud why that beats an effect.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A pull request adds a feature to a settings form: when the user changes the currency, the totals must update and the change must be saved to the server. The implementation is two effects — one that recalculates <code>totals</code> into state when <code>currency</code> changes, and one that calls <code>saveSettings(currency)</code> when <code>currency</code> changes. Both have correct dependency arrays and the feature works in the demo.</p>
+    Review it. One of those two effects should be deleted and one should be moved, and there is a specific user-visible bug in the second one that a demo will not show. Name all three things — and say what you would ask the author to test.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: React docs — <a href="https://react.dev/learn/you-might-not-need-an-effect">"You Might Not Need an Effect"</a>. Read the whole page; it is the highest-value page on the site. Then <a href="https://react.dev/reference/react/useSyncExternalStore">useSyncExternalStore</a> for the subscription case.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>show you five effects and have you judge each one</b> — keep, move to a handler, or delete and calculate. Or paste an effect from your own code and I will run the two questions on it with you.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Two questions decide everything.</b> Caused by a specific user action → handler. Synchronising with an outside system → effect. Neither → it is a calculation; put it in render.</li>
+      <li><b>An effect is a detour:</b> render, paint the wrong frame, effect, setState, render, paint again. Calculating during render paints correctly the first time.</li>
+      <li><b>Storing derived data makes a second truth</b>, and a second truth needs syncing, and syncing is where the bugs live. Delete the copy, not the sync code.</li>
+      <li><b>Expensive? Measure with <code>console.time</code>, then <code>useMemo</code></b> — a cache, not a second copy of the truth.</li>
+      <li><b>Reset all state on a prop change with <code>key</code></b>, not with an effect that must remember every state variable.</li>
+      <li><b>Reset some state by comparing the previous prop and setting state during render.</b> React re-renders before painting, so nothing wrong is ever shown.</li>
+      <li><b>Shared handler logic goes in a plain function</b>, called from both handlers. An effect would fire again on a refresh, when the user did nothing.</li>
+      <li><b>Chains of effects</b> each cost a render and hide the rules. One handler decides everything the action implies.</li>
+      <li><b>Never push data up in an effect.</b> Tell the parent in the same handler, or lift the state.</li>
+      <li><b>Startup work goes in module scope</b>; subscriptions go in <code>useSyncExternalStore</code>; fetching is a real effect that needs the race fix (next lessons).</li>
+      <li><b>Real use case (built &amp; run):</b> a working team panel with four effects, reduced to zero — plus one <code>document.title</code> effect kept on purpose, with the reason spoken out loud.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>if no system outside React is involved, an effect is the wrong tool — you are describing a calculation.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "You Might Not Need an Effect" (the full catalogue: updating state based on props or state, caching with <code>useMemo</code>, resetting all state with <code>key</code>, adjusting some state during render, sharing logic between event handlers, chains of computations, initialising the application, notifying parents, passing data to the parent, subscribing to an external store, fetching data), "Synchronizing with Effects", <code>useSyncExternalStore</code> reference.</p>
+
+  <div class="footer-nav">
+    <a href="./0015-effects-and-the-outside-world.html">← Previous: Effects &amp; the outside world</a>
+    <a href="./0017-dependencies-and-the-stale-closure.html">Next: Dependencies &amp; the stale closure →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A component shows a filtered list. Where does the filtering belong?",
+      options: [
+        "In the body of the component during render — it is a calculation from props and state, so no state and no effect are involved",
+        "In an effect that depends on the list and the query, setting a `visible` state",
+        "In an effect with an empty dependency array, so it only runs once",
+        "In an event handler on the search input, setting a `visible` state"
+      ],
+      answer: 0,
+      why: "Filtering involves nothing outside React, so it is not an effect's job. The effect version renders once with a stale or empty list, commits it, paints it, then sets state and renders again — the user sees a wrong frame, and you now maintain a second copy of the list that can disagree with the props. Doing it in the change handler is the same mistake with an extra flaw: the handler only runs when the user types, so the list is wrong whenever the `members` prop changes on its own. If the filter is ever measured to be genuinely slow, `useMemo` caches the calculation without turning it into state."
+    },
+    {
+      q: "Clicking Buy shows a toast. Why is `useEffect(() => { if (product.isInCart) showNotification(...) }, [product])` a bug and not just a style problem?",
+      options: [
+        "Effects run whenever the component is on the screen, so a page refresh with the item already in the cart fires the toast again although the user did nothing",
+        "showNotification cannot be called from inside an effect",
+        "The dependency array is wrong — it should be [product.isInCart]",
+        "Effects cannot run twice, so the toast will only ever show once"
+      ],
+      answer: 0,
+      why: "The causation test catches it: the toast happens because the user clicked Buy, not because the cart happens to contain something. An effect fires on mount too, so reloading the page — or navigating back to it — replays a notification for an action that occurred minutes ago. Fixing the dependency array does not help, because the mount run is the problem. The fix is a plain function that both the Buy handler and the Checkout handler call. The same shape is far more dangerous with a POST request: an effect that submits an order will submit it again on a refresh."
+    },
+    {
+      q: "All state in a `Profile` must reset when the `userId` prop changes. What is the right approach?",
+      options: [
+        "Render `<Profile userId={userId} key={userId} />` so React treats a different user as a different component and drops the old state",
+        "One effect on [userId] that calls every setter back to its initial value",
+        "Move all the state to the parent so there is nothing to reset",
+        "Call a `resetAll()` function during render"
+      ],
+      answer: 0,
+      why: "A changed key means a different identity, so React discards the old component's state — including state inside children — with no code to maintain. The effect version works the day it is written and breaks the day someone adds a fourth state variable and forgets to reset it, and it also resets one render late, so the previous user's draft comment is briefly visible. Lifting all the state to the parent solves the reset by making the parent hold things it does not care about. Note the difference from the *partial* reset case: when only some state should reset, comparing the previous prop and setting state during render is the right tool."
+    },
+    {
+      q: "Which of these should stay an effect?",
+      options: [
+        "`useEffect(() => { document.title = `Team (${activeCount})`; }, [activeCount])`",
+        "`useEffect(() => { setFullName(first + ' ' + last); }, [first, last])`",
+        "`useEffect(() => { onChange(isOn); }, [isOn])`",
+        "`useEffect(() => { setTotal(items.reduce(sum, 0)); }, [items])`"
+      ],
+      answer: 0,
+      why: "The document title is a real system outside React — the browser tab — and it must match whatever is on screen no matter what caused the change, so no single handler owns it. It also needs no cleanup, because the next run overwrites the same one slot. The other three never touch anything outside React: two are calculations that belong in the render body, and the `onChange` one should be called in the same handler that sets the state, so the parent learns about it in the same render pass rather than one later. That last one also depends on a function prop, which is a fresh identity on every parent render unless someone remembers to keep it stable — a loop waiting to happen."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you decide whether something needs an effect?”",
+      answer: "I ask two questions in order. <b>Is this caused by a specific user action?</b> If yes it goes in the event handler — buying, submitting, showing a toast for a click — because it should happen once, at that moment, and never again on a refresh. <b>Is this synchronising with a system outside React?</b> A socket, a timer, the document title, a browser API, a chart library, a fetch — if yes, it is an effect, because it must keep matching what is on screen no matter what caused the change, and it must be undone when that stops being true. If the answer to both is no, then it is not a side effect at all; it is a calculation, and it belongs in the body of the component. Most effects I see in real code fail both questions: they compute state from other state. The cost is not just an extra render — it is a second copy of the truth, which needs syncing, which needs a dependency array, which is where the bugs come from. Deleting the copy deletes the whole chain."
+    },
+    {
+      prompt: "Interviewer: “What is wrong with storing derived data in state and syncing it with an effect?”",
+      answer: "Three things, and only one of them is speed. <b>First, the user sees a wrong frame:</b> React renders with the old value, commits, the browser paints, and only then does the effect run and set the new value, so there is a real moment where the list and the count on screen disagree. <b>Second, it creates a second truth.</b> The filtered list now exists in two places, and every code path that changes the source must remember to keep the copy in step. The first path that forgets ships a screen where the rows and the summary contradict each other, and that bug reaches production because the demo path was updated. <b>Third, chains.</b> If a second effect derives from the first effect's output, each link costs a render and the rules end up spread over several places instead of readable in one. The alternative is one line during render. If the calculation is genuinely expensive — and I would show a <code>console.time</code> measurement before claiming that — <code>useMemo</code> caches it between renders while keeping one single source of truth."
+    },
+    {
+      prompt: "Interviewer: “A child needs to tell its parent that something changed. How do you do it?”",
+      answer: "In the handler that caused the change, not in an effect watching the state. So <code>function updateToggle(next) { setIsOn(next); onChange(next); }</code> and every handler calls that. Both updates then happen in the same event, which means one render pass and the parent is never a render behind. The effect version — <code>useEffect(() =&gt; onChange(isOn), [isOn, onChange])</code> — tells the parent one render late, and it depends on a function prop, which is a brand new identity on every parent render unless someone wrapped it in <code>useCallback</code>; so it can re-run constantly, and if the parent sets state in response, that is a loop. But my first question is whether the state is in the right place at all. If the parent needs the value, the cleanest answer is to <b>lift it</b> and make the child fully controlled with <code>isOn</code> and <code>onChange</code> props. Data flows down in React, and an effect that pushes data up is usually a sign the owner is wrong — which is Month 3's step four."
+    },
+    {
+      prompt: "Interviewer: “Name the effects you would keep.”",
+      answer: "The ones that touch a system outside React and are caused by being on screen rather than by one action. <b>Connections</b> — a socket or a subscription that must exist while this component shows this room, with a disconnect in the cleanup. <b>Timers</b> — an interval that must tick while a component is visible, cleared on the way out. <b>Browser APIs I have to write to</b> — the document title, scroll locking, focus in some cases, a resize or online listener. <b>Third-party widgets</b> — a chart or a map instance created on a DOM node and destroyed in the cleanup. <b>Data fetching</b> — legitimate, but it needs an ignore flag so a slow old response cannot overwrite a fresh one, and in a real app I would use a data library or a framework's loader instead of hand-writing it, which is Month 7. And two special cases that look like effects and are not: one-time app startup work belongs in module scope, because that runs once when the module loads; and subscribing to an external store belongs in <code>useSyncExternalStore</code>, which is built for it and cannot read a value that changed between render and the effect firing."
+    }
+  ]);
+</script>

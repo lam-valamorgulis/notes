@@ -1,0 +1,683 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dependencies &amp; the stale closure — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 4 · Lesson 3</p>
+  <h1>Dependencies &amp; the stale closure</h1>
+  <p class="subtitle">The dependency array is not a setting — it is a claim about what your effect reads. This is what happens when the claim is false, and the four honest ways to shorten the list.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can explain <b>why a <code>setInterval</code> inside a component logs stale state</b>, fix it three different ways, and say which fix fits which situation. This is the single most asked React interview question after "what is a key".
+  </div>
+
+  <p>Lesson 1 said the dependency array answers a question. This lesson is about what happens when you answer it wrong — and it is never a small bug. It is the kind that survives three code reviews, cannot be reproduced on demand, and gets blamed on React.</p>
+
+  <h2>First principle — an effect is a closure over one render</h2>
+
+  <p>Month 1 taught you that state is a <b>snapshot</b>: each render gets its own <code>count</code>, frozen for that render. An effect is written inside that render, so it captures that render's values. Forever.</p>
+
+  <pre><code>function Ticker() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; {
+      setCount(count + 1);      <span class="cmt">// which count? The one from the render that made this interval.</span>
+    }, 1000);
+    return () =&gt; clearInterval(id);
+  }, []);                       <span class="cmt">// ✕ the lie: this effect DOES read count</span>
+
+  return &lt;h1&gt;{count}&lt;/h1&gt;;
+}</code></pre>
+
+  <p>Run it and the counter goes <b>0 → 1 → and stops</b>. Not slow, not flickering — stuck at 1, forever, while the interval keeps firing every second.</p>
+
+  <p>Trace it once by hand and you will never be confused by it again:</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 270" role="img" aria-labelledby="fig17-title" width="640" height="270">
+      <title id="fig17-title">Three renders each hold their own count value. The interval created during the first render keeps calling the first render's function, which always computes zero plus one, so the counter freezes at one</title>
+      <defs>
+        <marker id="a17" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a17o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <rect x="12" y="24" width="180" height="86" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.8;"></rect>
+      <text x="102" y="42" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">render 1</text>
+      <text x="102" y="58" text-anchor="middle" style="fill: var(--ink); font-family: monospace; font-size: 10px;">count = 0</text>
+      <text x="102" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">effect runs · creates the interval</text>
+      <text x="102" y="92" text-anchor="middle" style="fill: var(--accent-2); font-family: monospace; font-size: 9px;">setCount(0 + 1)</text>
+      <text x="102" y="104" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">baked in — 0 is a constant here</text>
+
+      <rect x="212" y="24" width="180" height="86" rx="8" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="302" y="42" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight: 700;">render 2</text>
+      <text x="302" y="58" text-anchor="middle" style="fill: var(--ink); font-family: monospace; font-size: 10px;">count = 1</text>
+      <text x="302" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">deps are [] and unchanged,</text>
+      <text x="302" y="88" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">so no cleanup and no new effect</text>
+      <text x="302" y="104" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">render 1's interval is still the only one</text>
+
+      <rect x="412" y="24" width="214" height="86" rx="8" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="519" y="42" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight: 700;">render 3, 4, 5 …</text>
+      <text x="519" y="58" text-anchor="middle" style="fill: var(--ink); font-family: monospace; font-size: 10px;">count = 1 (never changes)</text>
+      <text x="519" y="78" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">every tick still runs render 1's function,</text>
+      <text x="519" y="90" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">which always computes 0 + 1 = 1,</text>
+      <text x="519" y="102" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">so React sees no change and stops re-rendering</text>
+
+      <path d="M102,110 L102,136 L519,136 L519,120" style="fill: none; stroke: var(--accent-2); stroke-width: 1.6; stroke-dasharray: 5 3;" marker-end="url(#a17o)"></path>
+      <text x="300" y="150" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">the interval outlived the render that created it — and kept that render's values</text>
+
+      <rect x="12" y="166" width="300" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.4;"></rect>
+      <text x="24" y="184" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">The symptom</text>
+      <text x="24" y="199" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">a value stuck one step behind, or stuck forever</text>
+
+      <rect x="326" y="166" width="300" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.4;"></rect>
+      <text x="338" y="184" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">The cause, always</text>
+      <text x="338" y="199" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">the effect reads a value it did not declare</text>
+
+      <rect x="12" y="218" width="614" height="38" rx="6" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 5 3;"></rect>
+      <text x="24" y="234" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">The name for it: a stale closure.</text>
+      <text x="24" y="248" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">Nothing is broken in React. A function is holding variables from a render that finished long ago.</text>
+    </svg>
+  </div>
+
+  <p>The last step surprises people: <em>why does it stop at 1 instead of flickering?</em> Because <code>setCount(0 + 1)</code> keeps passing the same value, and React skips re-rendering when the new state equals the old. The interval is still running. It is just doing nothing, every second, forever.</p>
+
+  <h2>Reactive values — what must go in the array</h2>
+
+  <p>A value is <b>reactive</b> if it can be different on a later render. That is the whole rule:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Value</th><th>Reactive?</th><th>Goes in the array?</th></tr></thead>
+    <tbody>
+      <tr><td>A prop</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>A state variable</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Anything calculated from them during render</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>A function declared inside the component</td><td>Yes — a new identity every render</td><td>Yes, and that is usually a signal to move it inside the effect</td></tr>
+      <tr><td>A prop that is a function</td><td>Yes</td><td>Yes — see the removal recipes below</td></tr>
+      <tr><td>A <code>const</code> outside the component (module scope)</td><td>No — it cannot change</td><td>No</td></tr>
+      <tr><td>The setter from <code>useState</code> (<code>setCount</code>)</td><td>No — React guarantees a stable identity</td><td>No (the lint rule knows this)</td></tr>
+      <tr><td>A ref object from <code>useRef</code></td><td>No — the same object every render</td><td>No. And never list <code>ref.current</code>.</td></tr>
+      <tr><td>An imported module, <code>window</code>, <code>document</code></td><td>No</td><td>No</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>So the array is mechanical, not a judgement call: <b>list every reactive value the effect body reads.</b> Which is exactly what the lint rule checks for you.</p>
+
+  <h2>The lint rule is a fact-checker, not a style rule</h2>
+
+  <p><code>react-hooks/exhaustive-deps</code>, from <code>eslint-plugin-react-hooks</code>, compares the values your effect reads against the values you declared. When it warns, it has found a false statement in your code.</p>
+
+  <pre><code><span class="cmt">// The line that causes more "impossible" bugs than any other in React:</span>
+useEffect(() =&gt; {
+  doSomethingWith(roomId, userId);
+  <span class="cmt">// eslint-disable-next-line react-hooks/exhaustive-deps</span>
+}, [roomId]);      <span class="cmt">// ✕ userId is read but not declared — now it can never update</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Never suppress it</span>
+    A suppressed dependency warning becomes a bug report months later, with a title like "sometimes the chat shows the previous user's messages". You cannot fix a dependency array by <em>deleting</em> from it — you fix it by changing the code so the effect no longer reads that value. Four ways to do that follow. If none of them applies, the honest answer is that the effect really does depend on it, and re-running is correct.
+  </div>
+
+  <h2>Four honest ways to shorten the list</h2>
+
+  <h3>1. Use the updater form, so you do not read the state at all</h3>
+
+  <pre><code>useEffect(() =&gt; {
+  const id = setInterval(() =&gt; {
+    setCount(c =&gt; c + 1);    <span class="cmt">// ✓ asks React for the latest value; reads nothing from render</span>
+  }, 1000);
+  return () =&gt; clearInterval(id);
+}, []);                      <span class="cmt">// ✓ now [] is TRUE — the effect reads nothing reactive</span></code></pre>
+
+  <p>The counter now runs forever, and the interval is created once. This is the best fix whenever all you need is "the previous value" — and it is why Month 1 taught <code>setCount(c =&gt; c + 1)</code> before you had a use for it.</p>
+
+  <h3>2. Move the value inside the effect</h3>
+
+  <pre><code><span class="cmt">// ✕ The object is created fresh every render, so the identity always differs…</span>
+function ChatRoom({ roomId }: { roomId: string }) {
+  const [message, setMessage] = useState('');
+  const options = { serverUrl: 'wss://…', roomId };   <span class="cmt">// new object every keystroke</span>
+
+  useEffect(() =&gt; {
+    const c = createConnection(options);
+    c.connect();
+    return () =&gt; c.disconnect();
+  }, [options]);   <span class="cmt">// …so the chat reconnects on every letter you type. Object.is again.</span>
+}
+
+<span class="cmt">// ✓ Create it inside. Now the effect depends on a string, not on an identity.</span>
+useEffect(() =&gt; {
+  const options = { serverUrl: 'wss://…', roomId };
+  const c = createConnection(options);
+  c.connect();
+  return () =&gt; c.disconnect();
+}, [roomId]);</code></pre>
+
+  <p>This is the most common real-world version of the bug, and the symptom is memorable: <b>typing in the message box drops your connection</b>. Objects, arrays and functions created during render are new identities every time, so they can never be stable dependencies. Depend on the primitives inside them instead.</p>
+
+  <h3>3. Split one effect into two</h3>
+
+  <pre><code><span class="cmt">// ✕ One effect doing two unrelated jobs, so each job re-runs for the other's reasons</span>
+useEffect(() =&gt; {
+  const c = createConnection(roomId);
+  c.connect();
+  logVisit(roomId, theme);       <span class="cmt">// changing the theme now reconnects the socket</span>
+  return () =&gt; c.disconnect();
+}, [roomId, theme]);
+
+<span class="cmt">// ✓ Two effects, two lifecycles, two honest arrays</span>
+useEffect(() =&gt; {
+  const c = createConnection(roomId);
+  c.connect();
+  return () =&gt; c.disconnect();
+}, [roomId]);
+
+useEffect(() =&gt; {
+  logVisit(roomId, theme);
+}, [roomId, theme]);</code></pre>
+
+  <p>One effect should sync <em>one</em> thing. If you can describe an effect only with the word "and", it should be two.</p>
+
+  <h3>4. <code>useEffectEvent</code> — read the latest value without reacting to it</h3>
+
+  <p>Sometimes an effect must <b>read</b> a value but must not <b>restart</b> when it changes. The docs' own example: a timer that ticks every second, with an adjustable step.</p>
+
+  <pre><code><span class="cmt">// ✕ Updater form is not enough — the step must be the LATEST one</span>
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setCount(c =&gt; c + increment), 1000);
+  return () =&gt; clearInterval(id);
+}, [increment]);
+<span class="cmt">// Correct, but it destroys and recreates the interval every time the step</span>
+<span class="cmt">// changes — so the user's tick timing jumps. The array is honest; the</span>
+<span class="cmt">// re-synchronising is the problem.</span></code></pre>
+
+  <pre><code><span class="cmt">// ✓ Separate the event part from the effect part</span>
+import { useState, useEffect, useEffectEvent } from 'react';
+
+export default function Timer() {
+  const [count, setCount] = useState(0);
+  const [increment, setIncrement] = useState(1);
+
+  const onTick = useEffectEvent(() =&gt; {
+    setCount(c =&gt; c + increment);   <span class="cmt">// always sees the latest increment</span>
+  });
+
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; onTick(), 1000);
+    return () =&gt; clearInterval(id);
+  }, []);   <span class="cmt">// ✓ truly reads nothing reactive — Effect Events are excluded from deps</span>
+}</code></pre>
+
+  <p>An Effect Event behaves like an event handler that lives inside your effect: it always sees the latest props and state, and it is <em>excluded</em> from dependency arrays by design. The mental split is worth saying out loud: <b>the effect decides <em>when</em>, the Effect Event decides <em>what with the latest data</em>.</b></p>
+
+  <div class="note">
+    <span class="label">Version note — check before you type it</span>
+    <code>useEffectEvent</code> is stable from <b>React 19.2</b>; before that it existed as <code>experimental_useEffectEvent</code>. Run <code>npm ls react</code>. On React 18 the hand-rolled equivalent is a ref that you keep up to date, which is what libraries did for years:
+    <pre style="margin:.5rem 0 0;"><code>const incrementRef = useRef(increment);
+useEffect(() =&gt; { incrementRef.current = increment; }, [increment]);
+
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setCount(c =&gt; c + incrementRef.current), 1000);
+  return () =&gt; clearInterval(id);
+}, []);   <span class="cmt">// a ref object is not reactive, so [] is honest here too</span></code></pre>
+  </div>
+
+  <div class="trap">
+    <span class="label">Two rules for Effect Events</span>
+    Only call them from <b>inside</b> effects — not during render, and not as a prop passed to a child. And do not reach for one to silence a dependency you actually want to react to: if the socket <em>should</em> reconnect when the room changes, <code>roomId</code> belongs in the array.
+  </div>
+
+  <h2>An effect has its own lifecycle — not the component's</h2>
+
+  <p>The old mental model was "mount, update, unmount". Drop it. A component mounts once, but an effect can start and stop many times while that component stays on screen.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Component lifecycle</th><th>Effect lifecycle</th></tr></thead>
+    <tbody>
+      <tr><td>Mounts, updates, unmounts.</td><td><b>Starts syncing, stops syncing.</b> That is all it does.</td></tr>
+      <tr><td>Happens once, then once at the end.</td><td>Can happen twenty times for one mount — once per dependency change.</td></tr>
+      <tr><td>"Run this on mount" is a thing you say.</td><td>There is no "on mount". There is only "start syncing, because these values say so".</td></tr>
+      <tr><td>You think about the component's history.</td><td>You think about <em>one</em> start/stop pair in isolation — which is why it is testable in your head.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>This is why the reading test for an effect is a single question: <b>can I describe one start and its matching stop, without knowing anything about what happened before?</b> If yes, the effect is correct however many times it runs.</p>
+
+  <h2>Build it for real — three dependency bugs, then three fixes</h2>
+
+  <p>All three go in one small app so you can feel the difference between them. Keep the console open.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Ticker.tsx</b> — bug 1: the classic frozen counter</p>
+  <pre><code>import { useEffect, useState } from 'react';
+
+export function Ticker() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() =&gt; {
+    console.log('interval created');
+    const id = setInterval(() =&gt; {
+      console.log('tick — this closure thinks count is', count);
+      setCount(count + 1);            <span class="cmt">// ✕ reads a stale count</span>
+    }, 1000);
+    return () =&gt; clearInterval(id);
+  }, []);                             <span class="cmt">// ✕ the lie</span>
+
+  return &lt;h2&gt;Count: {count}&lt;/h2&gt;;
+}</code></pre>
+
+  <p>The console is the lesson: <code>interval created</code> appears once, and then every tick logs <code>count is 0</code> while the screen shows 1. Two facts in one log line — the interval is alive, and it is living in the past.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Ticker.tsx</b> — fix 1: stop reading the state</p>
+  <pre><code>useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setCount(c =&gt; c + 1), 1000);
+  return () =&gt; clearInterval(id);
+}, []);    <span class="cmt">// ✓ honest: nothing reactive is read</span></code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/StepTicker.tsx</b> — bug 2: the fix that restarts your timer</p>
+  <pre><code>import { useEffect, useState } from 'react';
+
+export function StepTicker() {
+  const [count, setCount] = useState(0);
+  const [increment, setIncrement] = useState(1);
+
+  useEffect(() =&gt; {
+    console.log('interval created with step', increment);
+    const id = setInterval(() =&gt; setCount(c =&gt; c + increment), 1000);
+    return () =&gt; clearInterval(id);
+  }, [increment]);   <span class="cmt">// honest — but watch what it costs</span>
+
+  return (
+    &lt;section&gt;
+      &lt;h2&gt;Count: {count}&lt;/h2&gt;
+      &lt;button type="button" onClick={() =&gt; setIncrement(i =&gt; i + 1)}&gt;
+        step +1 (now {increment})
+      &lt;/button&gt;
+    &lt;/section&gt;
+  );
+}</code></pre>
+
+  <p><b>Click the step button quickly, several times.</b> Every click logs a new <code>interval created</code>, and the count barely moves — because each new interval starts its one-second wait from zero. The dependency array is <em>correct</em> and the behaviour is still wrong. That is the exact situation <code>useEffectEvent</code> exists for.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/StepTicker.tsx</b> — fix 2: the effect owns the timing, the event owns the data</p>
+  <pre><code>import { useEffect, useEffectEvent, useState } from 'react';   <span class="cmt">// React 19.2+</span>
+
+export function StepTicker() {
+  const [count, setCount] = useState(0);
+  const [increment, setIncrement] = useState(1);
+
+  const onTick = useEffectEvent(() =&gt; {
+    setCount(c =&gt; c + increment);     <span class="cmt">// latest increment, no re-sync</span>
+  });
+
+  useEffect(() =&gt; {
+    console.log('interval created');  <span class="cmt">// now logs exactly once</span>
+    const id = setInterval(() =&gt; onTick(), 1000);
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  <span class="cmt">// …same JSX</span>
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/ChatRoom.tsx</b> — bug 3: typing disconnects the chat</p>
+  <pre><code>import { useEffect, useState } from 'react';
+import { createConnection } from './chat';   <span class="cmt">// the fake connection from Lesson 1</span>
+
+export function ChatRoom({ roomId }: { roomId: string }) {
+  const [message, setMessage] = useState('');
+
+  const options = { serverUrl: 'wss://example.test/chat', roomId };   <span class="cmt">// ✕ new object per render</span>
+
+  useEffect(() =&gt; {
+    const c = createConnection(options.serverUrl, options.roomId);
+    c.connect();
+    return () =&gt; c.disconnect();
+  }, [options]);   <span class="cmt">// ✕ compared by identity, so it changes every render</span>
+
+  return (
+    &lt;input value={message} onChange={e =&gt; setMessage(e.target.value)} placeholder="Message…" /&gt;
+  );
+}</code></pre>
+
+  <p>Type "hello" and read the console: five disconnect/connect pairs, one per letter. In a real app that is five socket handshakes, a burst of "user joined" events, and a support ticket that says "the chat is flaky when I type fast".</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/ChatRoom.tsx</b> — fix 3: depend on the value, not on the identity</p>
+  <pre><code>const SERVER_URL = 'wss://example.test/chat';   <span class="cmt">// outside the component: not reactive</span>
+
+export function ChatRoom({ roomId }: { roomId: string }) {
+  const [message, setMessage] = useState('');
+
+  useEffect(() =&gt; {
+    const c = createConnection(SERVER_URL, roomId);   <span class="cmt">// options built inside, if needed</span>
+    c.connect();
+    return () =&gt; c.disconnect();
+  }, [roomId]);   <span class="cmt">// ✓ a string — stable across keystrokes</span>
+
+  <span class="cmt">// …same JSX. Now typing does nothing to the connection.</span>
+}</code></pre>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>In the build</th></tr></thead>
+    <tbody>
+      <tr><td>An effect closes over one render</td><td><code>tick — this closure thinks count is 0</code>, logged forever.</td></tr>
+      <tr><td>A stale closure freezes rather than flickers</td><td><code>setCount(0 + 1)</code> passes the same value, so React stops re-rendering.</td></tr>
+      <tr><td>The updater form reads nothing reactive</td><td><code>setCount(c =&gt; c + 1)</code> made <code>[]</code> honest.</td></tr>
+      <tr><td>An honest array can still be the wrong behaviour</td><td><code>[increment]</code> recreated the interval on every step change.</td></tr>
+      <tr><td>Effect Events split "when" from "what"</td><td><code>onTick</code> reads the latest <code>increment</code>; the effect stays <code>[]</code> and logs once.</td></tr>
+      <tr><td>Objects are compared by identity</td><td><code>[options]</code> reconnected on every keystroke.</td></tr>
+      <tr><td>Module constants are not reactive</td><td><code>SERVER_URL</code> moved out and left the array.</td></tr>
+      <tr><td>An effect's lifecycle is start/stop, not mount/unmount</td><td>The same <code>ChatRoom</code> mount stopped and started syncing five times.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Make the interval delay adjustable</b> as well as the step. Then decide, out loud, which of the two belongs in the dependency array and which belongs in an Effect Event. (The delay <em>must</em> re-create the interval — that is a real re-sync. The step must not.)</li>
+    <li><b>Add a <code>onMessage</code> function prop</b> to <code>ChatRoom</code> and call it from inside the effect. The lint rule will demand it as a dependency, and an inline arrow in the parent will make it a new identity every render. Fix it with an Effect Event, and explain why <code>useCallback</code> in the parent is the worse answer here.</li>
+    <li><b>Break it deliberately.</b> Put <code>// eslint-disable-next-line react-hooks/exhaustive-deps</code> above one of your fixed arrays and remove a dependency. Write down the exact user-visible symptom before you run it, then check whether you predicted it. That prediction skill is what code review is.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A bug report says: "the dashboard sometimes shows data for the team I was looking at <em>before</em>." You find one effect that fetches team data. Its array is <code>[teamId]</code> and the lint rule is happy. Inside, it calls a <code>onLoaded(data)</code> prop and reads a <code>filters</code> object built during render — but a colleague already "fixed" that by adding <code>// eslint-disable-next-line</code> two months ago, so <code>filters</code> and <code>onLoaded</code> are not in the array.</p>
+    Work out, in order: which value is stale, why the symptom is intermittent rather than constant, and which of the four removal recipes applies to <code>filters</code> and which to <code>onLoaded</code>. Then say what you would delete first.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/lifecycle-of-reactive-effects">"Lifecycle of Reactive Effects"</a>, <a href="https://react.dev/learn/separating-events-from-effects">"Separating Events from Effects"</a>, <a href="https://react.dev/learn/removing-effect-dependencies">"Removing Effect Dependencies"</a>, and the <a href="https://react.dev/reference/react/useEffectEvent">useEffectEvent</a> reference.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>give you five dependency arrays to judge</b> — honest, a lie, or honest-but-wrong-behaviour — with a thirty-second clock each. Or ask for the stale-closure question as a live-coding drill: I break it, you narrate the fix.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>An effect is a closure over one render.</b> It keeps that render's props and state — so a long-lived interval or listener keeps old values forever.</li>
+      <li><b>A stale closure freezes, it does not flicker.</b> <code>setCount(0 + 1)</code> sends the same value every time, so React stops re-rendering and the timer runs on quietly.</li>
+      <li><b>The array is a claim, not a setting:</b> "these are the reactive values I read." Reactive = props, state, and anything computed from them.</li>
+      <li><b>Not reactive:</b> module constants, <code>useState</code> setters, ref objects, imports, <code>window</code>. Never list <code>ref.current</code>.</li>
+      <li><b><code>react-hooks/exhaustive-deps</code> is a fact-checker.</b> Suppressing it is how you write a bug that survives three reviews.</li>
+      <li><b>You cannot remove a dependency by deleting it</b> — you change the code so the effect stops reading it. Four ways: the updater form, move the value inside, split the effect in two, or use an Effect Event.</li>
+      <li><b>Objects, arrays and functions built during render are new identities every render</b>, so they can never be stable dependencies. Depend on the primitives inside them.</li>
+      <li><b>An honest array can still be wrong behaviour:</b> <code>[increment]</code> recreates the interval. <code>useEffectEvent</code> lets the effect keep the timing while the event reads the latest data. Stable since React 19.2; the ref pattern is the React 18 stand-in.</li>
+      <li><b>Call Effect Events only from inside effects</b> — never during render, never as a prop.</li>
+      <li><b>An effect's lifecycle is start syncing / stop syncing</b>, not mount / unmount. One mount, many start-stop pairs. Judge one pair in isolation.</li>
+      <li><b>Real use case (built &amp; run):</b> a counter frozen at 1 by a stale closure, a timer that restarted itself on every step change, and a chat that disconnected on every keystroke because of one object literal — all three fixed with a different recipe.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the dependency array is a promise about what your effect reads — keep it true by changing the code, never by shortening the list.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — "Lifecycle of Reactive Effects", "Separating Events from Effects" (the Timer/<code>increment</code> example), "Removing Effect Dependencies", <code>useEffect</code> reference ("Reading the latest props and state from an Effect"), <code>useEffectEvent</code> reference (stable in React 19.2, previously <code>experimental_useEffectEvent</code>), <code>eslint-plugin-react-hooks</code> (<code>react-hooks/exhaustive-deps</code>).</p>
+
+  <div class="footer-nav">
+    <a href="./0016-you-might-not-need-an-effect.html">← Previous: You might not need an effect</a>
+    <a href="./0018-build-a-live-search-with-debounce-and-cancellation.html">Next: Build it — a live search →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "`useEffect(() => { const id = setInterval(() => setCount(count + 1), 1000); return () => clearInterval(id); }, [])` — the counter shows 1 and never moves. Why?",
+      options: [
+        "The interval was created during the first render and keeps that render's count of 0, so it always sends 1 — and React skips re-rendering when the value is unchanged",
+        "clearInterval is called immediately, so only one tick happens",
+        "setInterval only fires once when called inside an effect",
+        "React batches the updates into a single one"
+      ],
+      answer: 0,
+      why: "The effect is a closure over render one, where `count` is the number 0 — not a live reference. The empty array tells React never to re-create the interval, so that first closure keeps running every second, computing 0 + 1 = 1 each time. After the first update React compares the new state with the old, sees 1 === 1, and stops re-rendering, which is why it freezes cleanly instead of flickering. The interval is still firing the whole time, which you can prove with a console.log. The fix is to stop reading the state: `setCount(c => c + 1)` asks React for the latest value, and then the empty array is finally a true statement."
+    },
+    {
+      q: "Typing in the message box makes the chat reconnect on every letter. The effect's array is `[options]`, where `const options = { serverUrl, roomId }` is declared in the component body. What is happening?",
+      options: [
+        "`options` is a new object on every render, and React compares dependencies with Object.is, so the effect re-syncs on every keystroke",
+        "Typing changes roomId indirectly",
+        "Objects are not allowed in a dependency array, so React re-runs the effect as a fallback",
+        "The cleanup runs on every render regardless of dependencies"
+      ],
+      answer: 0,
+      why: "Every keystroke sets state, which renders, which builds a brand new object with the same contents but a different identity — and React compares by identity, exactly as it does for state updates. So React thinks a dependency changed, cleans up, and reconnects. The fix is not `useMemo` around the object; it is to stop depending on an identity at all. Build the object inside the effect and list the primitives it needs, here `[roomId]`, or move genuinely constant parts like the server URL to module scope where they are not reactive. The same trap applies to arrays and to functions declared in the component body."
+    },
+    {
+      q: "You have `useEffect(() => { const id = setInterval(() => setCount(c => c + increment), 1000); return () => clearInterval(id); }, [increment])`. The lint rule is satisfied. What is still wrong, and what fixes it?",
+      options: [
+        "Changing the step destroys and recreates the interval, so the tick timing restarts — `useEffectEvent` lets the effect keep the timing while reading the latest increment",
+        "Nothing is wrong; an honest dependency array is always correct",
+        "The updater form is the bug — it should read `increment` directly",
+        "The array should be empty, and the lint rule should be suppressed"
+      ],
+      answer: 0,
+      why: "This is the case people miss because the array is genuinely correct: the effect does read `increment`, so listing it is honest. The problem is that re-synchronising is the wrong *response* — the user changed a step size, not the timer, so the clock should not restart. `useEffectEvent` splits the two concerns: the effect decides when things happen and keeps `[]`, while the Effect Event reads the latest props and state at the moment it is called and is excluded from dependencies. Suppressing the lint rule would produce the same behaviour by lying, which breaks the next person who reads the code. Note the contrast with a change to the *delay* — that one must re-create the interval, so it belongs in the array."
+    },
+    {
+      q: "Which of these values does NOT belong in a dependency array?",
+      options: [
+        "A ref object from `useRef` — it is the same object on every render, and `ref.current` must never be listed",
+        "A function prop passed in from the parent",
+        "A value computed from props during render",
+        "A piece of state read inside the effect"
+      ],
+      answer: 0,
+      why: "A ref is designed to be a stable box: `useRef` returns the identical object every render, so listing it changes nothing, and listing `ref.current` is worse than useless — reading it during render to build the array is itself against the rules, and mutating `.current` never triggers a render for React to compare. The other three are all reactive. A function prop is a new identity on every parent render unless someone stabilised it, which is precisely why the lint rule wants it declared — and why an Effect Event is often the right way to stop reacting to it. The complete non-reactive list worth memorising: module constants, imports, `useState` setters, ref objects, and globals like `window`."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why does a setInterval inside a component log stale state?”",
+      answer: "Because the effect is a <b>closure over one particular render</b>. State in React is a snapshot: in render one, <code>count</code> is literally the number 0, not a live reference. The interval created in that render captures that 0, and if my dependency array is empty React never re-creates the interval, so the same function keeps running every second with the same frozen value. That is a <b>stale closure</b> — nothing is broken in React, a function is just holding variables from a render that finished. The detail I make sure to mention is that it <em>freezes</em> rather than flickers: <code>setCount(0 + 1)</code> sends 1 every time, React compares the new state with the old, sees no change, and stops re-rendering — while the interval keeps firing quietly. Fixes, in the order I reach for them: use the updater form <code>setCount(c =&gt; c + 1)</code> so the effect reads nothing reactive and the empty array becomes true; add the dependency and accept a re-sync when re-syncing is actually correct; or use <code>useEffectEvent</code> when I need the latest value but must not restart the timer."
+    },
+    {
+      prompt: "Interviewer: “What does the dependency array actually mean, and what does the lint rule do?”",
+      answer: "It is not a configuration knob — it is a <b>claim</b>: \"these are all the reactive values my effect body reads.\" Reactive means it can be different on a later render: props, state, and anything computed from them during render, including functions declared in the component. Not reactive: module-level constants, imports, <code>useState</code> setters, ref objects, globals like <code>window</code>. <code>react-hooks/exhaustive-deps</code> compares what I read against what I declared, so a warning means my code contains a false statement. That is why suppressing it with an eslint-disable comment is so dangerous — the effect keeps a value from an old render forever, and the symptom shows up much later as \"sometimes it shows the previous user's data\", which is nearly impossible to reproduce. The correct way to shorten the array is to change the code until the effect genuinely stops reading the value: use the updater form, move the value inside the effect, split one effect into two if it does two jobs, or wrap the non-reactive part in an Effect Event. If none of those applies, the effect really does depend on it and re-running is the right behaviour."
+    },
+    {
+      prompt: "Interviewer: “What is useEffectEvent for, and when would you not use it?”",
+      answer: "It separates the two halves of an effect: <b>the effect decides when something happens, the Effect Event decides what to do with the latest data.</b> An Effect Event always sees the freshest props and state, like an event handler, and it is excluded from dependency arrays by design. The canonical case is a timer with an adjustable step: if I put <code>increment</code> in the array the code is honest, but every change destroys and recreates the interval and the tick timing jumps — the user changed a step size, not a clock. Wrapping the tick body in <code>useEffectEvent</code> keeps the array empty and the interval created once. Two rules: call it only from inside effects — never during render, never passed to a child — and do not use it to hide a dependency I genuinely want to react to. If the socket <em>should</em> reconnect when the room changes, then <code>roomId</code> belongs in the array and an Effect Event there would be a bug. On versions before React 19.2 it was <code>experimental_useEffectEvent</code>, and the long-standing stand-in is a ref kept up to date with the latest value, since ref objects are not reactive."
+    },
+    {
+      prompt: "Interviewer: “How do you think about an effect's lifecycle?”",
+      answer: "Not as mount and unmount — as <b>start syncing and stop syncing</b>. A component mounts once, but one effect inside it can start and stop twenty times while the component stays on screen, once per dependency change. So I never write \"run this on mount\"; I write \"while these values are what they are, this outside thing should exist\". The practical benefit is that I can judge an effect in isolation: I look at one start and its matching stop and ask whether the stop undoes the start completely. If it does, the effect is correct no matter how many times it runs — which is exactly what StrictMode's extra setup-cleanup-setup cycle in development is testing. It also changes how I split effects. If I can only describe an effect using the word \"and\" — it connects to the room <em>and</em> logs a visit — then it has two lifecycles glued together, and changing the theme will reconnect the socket. Two effects, two honest arrays."
+    }
+  ]);
+</script>
