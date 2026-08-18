@@ -1,0 +1,803 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memo, useMemo &amp; useCallback — and when they do nothing — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 6 · Lesson 3</p>
+  <h1>memo, useMemo &amp; useCallback — and when they do nothing</h1>
+  <p class="subtitle">Three tools that all do the same thing: compare, and skip. They fail in the same way too — one value that is "always new" and the whole comparison was a waste of time.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can look at a <code>memo</code> in a real codebase and say in five seconds whether it does anything at all — and you can defend, with numbers you measured yourself, the decision <em>not</em> to memoise something.</div>
+
+  <p>These three are the most cargo-culted APIs in React. People add them because a review comment said to, remove them because a blog post said to, and almost never measure. Both moves are wrong for the same reason: <b>memoisation is a trade, and you cannot judge a trade you have not priced.</b></p>
+
+  <h2>First principle — all three cache, and all three compare with <code>Object.is</code></h2>
+
+  <p>Each of these tools does exactly two things: it remembers something from the last render, and it decides whether it may reuse it. The decision is always the same shallow identity check you have met three times already — in lesson 8 for mutation bugs, in lesson 17 for effect dependencies, in lesson 24 for context values.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>Caches</th><th>Compares</th><th>Skips</th></tr></thead>
+    <tbody>
+      <tr><td><code>memo(Component)</code></td><td>The component's rendered output.</td><td>Every prop, shallowly, with <code>Object.is</code>.</td><td>The render, when a parent re-rendered but the props are equal.</td></tr>
+      <tr><td><code>useMemo(fn, deps)</code></td><td>The <b>result</b> of calling <code>fn</code>.</td><td>The dependency array, item by item.</td><td>Re-running an expensive calculation.</td></tr>
+      <tr><td><code>useCallback(fn, deps)</code></td><td>The <b>function itself</b>.</td><td>The dependency array, item by item.</td><td>Nothing on its own — it makes something <em>else</em> able to skip.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note">
+    <span class="label">React docs · useCallback — how is it related to useMemo?</span>
+    "<code>useMemo</code> caches the <b>result</b> of calling your function." … "<code>useCallback</code> caches <b>the function itself.</b> Unlike <code>useMemo</code>, it does not call the function you provide. Instead, it caches the function you provided so that the function <em>itself</em> doesn't change unless its dependencies have changed."
+    <br><br>
+    "If you're already familiar with <code>useMemo</code>, you might find it helpful to think of <code>useCallback</code> as this:"
+    <pre><code>function useCallback(fn, dependencies) {
+  return useMemo(() =&gt; fn, dependencies);
+}</code></pre>
+  </div>
+
+  <p>That four-line definition is worth memorising. <code>useCallback</code> is not a special mechanism — it is <code>useMemo</code> returning a function instead of computing a value. Which also explains something that surprises people:</p>
+
+  <div class="note">
+    <span class="label">React docs · useCallback</span>
+    "<b><code>useCallback</code> does not prevent <em>creating</em> the function.</b> You're always creating a function (and that's fine!), but React ignores it and gives you back a cached function if nothing changed."
+  </div>
+
+  <p>So <code>useCallback</code> never saves you the cost of making a function. Making functions is free. What it buys is <b>a stable identity</b>, and identity only matters to something that compares — a <code>memo</code> child, or a dependency array.</p>
+
+  <h2>The failure mode all three share</h2>
+
+  <div class="soundbite">
+    <span class="label">The sentence to keep</span>
+    <p>"Not all memoization is effective: <b>a single value that's 'always new' is enough to break memoization for an entire component.</b>"</p>
+  </div>
+
+  <p>That is from the docs, and it is the whole lesson in one line. <code>memo</code> compares <em>all</em> the props. One inline arrow function, one object literal, one <code>array.filter(...)</code> written in the JSX, and the comparison fails forever. The component still gets wrapped, the check still runs, and it never once skips a render. <b>A useless <code>memo</code> is not neutral — it is a cost plus a lie.</b> Every future reader believes the child is protected.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 288" role="img" aria-labelledby="fig25-title" width="640" height="288">
+      <title id="fig25-title">The memo gate. Props arrive and are compared shallowly with Object.is. If all are equal the previous output is reused. Four things push the component through the gate anyway: a fresh function prop, a fresh object or array prop, the component's own state changing, and a context it reads changing. The last two bypass the gate entirely.</title>
+      <defs>
+        <marker id="a25" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a25b" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <rect x="12" y="56" width="112" height="40" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="68" y="72" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 9.5px;">parent re-rendered</text>
+      <text x="68" y="86" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">props arrive</text>
+
+      <line x1="124" y1="76" x2="150" y2="76" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a25)"></line>
+
+      <rect x="152" y="50" width="128" height="52" rx="3" style="fill: var(--paper); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="216" y="70" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">the memo gate</text>
+      <text x="216" y="84" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">Object.is on every prop</text>
+      <text x="216" y="96" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">(shallow, one level)</text>
+
+      <line x1="280" y1="64" x2="330" y2="42" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a25)"></line>
+      <rect x="334" y="24" width="180" height="34" rx="3" style="fill: var(--paper); stroke: var(--accent);"></rect>
+      <text x="424" y="38" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">all equal → reuse last output</text>
+      <text x="424" y="51" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">the component is not called</text>
+
+      <line x1="280" y1="88" x2="330" y2="110" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a25b)"></line>
+      <rect x="334" y="96" width="180" height="34" rx="3" style="fill: var(--paper); stroke: var(--accent-2);"></rect>
+      <text x="424" y="110" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">one differs → render</text>
+      <text x="424" y="123" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">the whole gate was wasted</text>
+
+      <line x1="12" y1="150" x2="628" y2="150" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="170" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">Four ways it renders anyway</text>
+
+      <rect x="12" y="180" width="150" height="42" rx="3" style="fill: var(--card-bg); stroke: var(--accent-2);"></rect>
+      <text x="87" y="196" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">onClick={() =&gt; …}</text>
+      <text x="87" y="209" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">new function each render</text>
+      <text x="87" y="218" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">fix: useCallback</text>
+
+      <rect x="170" y="180" width="150" height="42" rx="3" style="fill: var(--card-bg); stroke: var(--accent-2);"></rect>
+      <text x="245" y="196" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">items={xs.filter(…)}</text>
+      <text x="245" y="209" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">new array each render</text>
+      <text x="245" y="218" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">fix: useMemo</text>
+
+      <rect x="328" y="180" width="146" height="42" rx="3" style="fill: var(--card-bg); stroke: var(--warn);"></rect>
+      <text x="401" y="196" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px; font-weight: 700;">its own state changed</text>
+      <text x="401" y="209" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">bypasses the gate</text>
+      <text x="401" y="218" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">no fix — and correct</text>
+
+      <rect x="482" y="180" width="146" height="42" rx="3" style="fill: var(--card-bg); stroke: var(--warn);"></rect>
+      <text x="555" y="196" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px; font-weight: 700;">a context it reads changed</text>
+      <text x="555" y="209" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">bypasses the gate</text>
+      <text x="555" y="218" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8px;">fix: split the context</text>
+
+      <text x="12" y="246" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">The first two are your fault and fixable. The last two are documented behaviour —</text>
+      <text x="12" y="262" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">memo is about props from the parent, and nothing else.</text>
+      <text x="12" y="282" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">One always-new prop is enough to break the whole gate.</text>
+    </svg>
+  </div>
+
+  <h2><code>memo</code>'s four caveats — read them once, quote them forever</h2>
+
+  <div class="note">
+    <span class="label">React docs · memo — Caveats</span>
+    "React may still re-render it: memoization is a performance optimization, not a guarantee."
+    <br>"Even when a component is memoized, it will still re-render <b>when its own state changes.</b>"
+    <br>"Even when a component is memoized, it will still re-render <b>when a context that it's using changes.</b>"
+    <br>"Memoization only has to do with <b>props that are passed to the component from its parent.</b>"
+  </div>
+
+  <p>The first caveat is the one that stops bugs: <b>if your code only works with <code>memo</code>, your code is broken.</b> React reserves the right to render anyway. A component that counts its own renders, or writes to a module variable during render, or assumes an effect will not re-run, will fail the day React decides differently. Memoisation is never allowed to be load-bearing for <em>correctness</em>.</p>
+
+  <h2>The broken trio you will meet in every codebase</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/RowList.tsx</b> — three memoised children, none of them working</p>
+  <pre><code>const Row = memo(function Row({ item, onSelect, style }: RowProps) {
+  console.count('render Row');
+  return &lt;li style={style} onClick={() =&gt; onSelect(item.id)}&gt;{item.name}&lt;/li&gt;;
+});
+
+export function RowList({ items }: { items: Item[] }) {
+  const [query, setQuery] = useState('');
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;
+        {items.filter(i =&gt; i.name.includes(query)).map(item =&gt; (
+          &lt;Row
+            key={item.id}
+            item={item}
+            onSelect={(id) =&gt; console.log(id)}   <span class="cmt">// 🔴 new function per row per render</span>
+            style={{ padding: 4 }}               <span class="cmt">// 🔴 new object per row per render</span>
+          /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p>Every keystroke: every <code>Row</code> re-renders. The <code>memo</code> ran a comparison for each one, found <code>onSelect</code> different, and rendered anyway. You paid for the gate and walked around it.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/RowList.tsx</b> — the version where <code>memo</code> earns its keep</p>
+  <pre><code>const ROW_STYLE = { padding: 4 };          <span class="cmt">// module scope: created once, ever</span>
+
+export function RowList({ items }: { items: Item[] }) {
+  const [query, setQuery] = useState('');
+
+  const handleSelect = useCallback((id: string) =&gt; {
+    console.log(id);
+  }, []);                                  <span class="cmt">// [] is honest — it closes over nothing</span>
+
+  const visible = useMemo(
+    () =&gt; items.filter(i =&gt; i.name.includes(query)),
+    [items, query],
+  );
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;
+        {visible.map(item =&gt; (
+          &lt;Row key={item.id} item={item} onSelect={handleSelect} style={ROW_STYLE} /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p>Three separate leaks, three different plugs, and notice that <b>one of them needed no hook at all</b>. A constant object belongs at module scope. Reaching for <code>useMemo</code> to stabilise a literal that never depends on anything is a hook you will maintain forever for no reason.</p>
+
+  <div class="trap">
+    <span class="label">The leak that survives a review</span>
+    <code>&lt;Row item={item} /&gt;</code> looks safe, and is — <code>item</code> comes from the <code>items</code> array, so it is the same object each render <b>as long as nobody rebuilds the array</b>. The day someone writes <code>items={data.map(d =&gt; ({ ...d, label: d.name }))}</code> in the parent, every <code>item</code> becomes a fresh object and all the memoisation below silently dies. Memoisation is a whole-chain property: it only works if every link holds.
+  </div>
+
+  <h2>Measure. The docs even tell you how.</h2>
+
+  <p>Before you memoise a calculation, find out whether it is expensive. The threshold in the docs is lower than most people guess, and so is the typical answer.</p>
+
+  <div class="note">
+    <span class="label">React docs · useMemo — how to tell if a calculation is expensive?</span>
+    "In general, unless you're creating or looping over <b>thousands</b> of objects, it's probably not expensive."
+    <pre><code>console.time('filter array');
+const visibleTodos = filterTodos(todos, tab);
+console.timeEnd('filter array');</code></pre>
+    "You will then see logs like <code>filter array: 0.15ms</code> in your console. If the overall logged time adds up to a significant amount (say, <b><code>1ms</code> or more</b>), it might make sense to memoize that calculation."
+    <br><br>
+    "<code>useMemo</code> won't make the <em>first</em> render faster. It only helps you skip unnecessary work on updates."
+    <br><br>
+    "Keep in mind that your machine is probably faster than your users' so it's a good idea to test the performance with an artificial slowdown." … "measuring performance in development will not give you the most accurate results. (For example, when Strict Mode is on, you will see each component render twice rather than once.)"
+  </div>
+
+  <p>Four things to take from that. <b>1ms</b> is the bar. <b>Thousands</b> of objects is the scale. The <b>first render never gets faster</b> — memoisation is purely about updates. And a number you measured on your laptop in a dev build is not a number: use Chrome's CPU throttling and a production build before you believe it.</p>
+
+  <h3>The measuring routine</h3>
+
+  <ol>
+    <li>React DevTools → <b>Highlight updates when components render</b>. Perform the interaction. If nothing you care about flashes, stop — there is no problem.</li>
+    <li><b>Profiler</b> tab → record the interaction → look at the committed renders and their durations. This tells you <em>which</em> component is slow, which is a different question from which one re-renders often.</li>
+    <li><code>console.time</code> around the suspect calculation. Under 1ms, walk away.</li>
+    <li>Apply one change. Re-measure the same way. If the number did not move, <b>revert it</b> — an optimisation that does not optimise is just code.</li>
+  </ol>
+
+  <h2>Before you memoise — the five documented alternatives</h2>
+
+  <div class="note">
+    <span class="label">React docs · useMemo &amp; memo — "you can make a lot of memoization unnecessary"</span>
+    "1. When a component visually wraps other components, let it <b>accept JSX as children.</b> This way, when the wrapper component updates its own state, React knows that its children don't need to re-render.
+    <br>2. <b>Prefer local state and don't lift state up</b> any further than necessary. For example, don't keep transient state like forms and whether an item is hovered at the top of your tree or in a global state library.
+    <br>3. <b>Keep your rendering logic pure.</b> If re-rendering a component causes a problem or produces some noticeable visual artifact, it's a bug in your component! Fix the bug instead of adding memoization.
+    <br>4. <b>Avoid unnecessary Effects that update state.</b> Most performance problems in React apps are caused by chains of updates originating from Effects that cause your components to render over and over.
+    <br>5. <b>Try to remove unnecessary dependencies from your Effects.</b>"
+  </div>
+
+  <p>You have already built all five. Number 1 and number 2 are lesson 23's two free fixes. Number 3 is Month 1. Numbers 4 and 5 are Month 4 — lessons 16 and 17 in one sentence each. <b>Month 6 does not introduce performance work; it collects it.</b></p>
+
+  <p>And read number 4 again: <em>most</em> performance problems come from effect chains. Not from missing <code>memo</code>. If you spent Month 4 deleting effects, you have already done more for this app's speed than any amount of memoisation will.</p>
+
+  <h2>When it <em>is</em> worth it</h2>
+
+  <div class="note">
+    <span class="label">React docs · useMemo — should you add it everywhere?</span>
+    "Optimizing with <code>useMemo</code> is only valuable in a few cases:
+    <br>• The calculation you're putting in <code>useMemo</code> is <b>noticeably slow</b>, and its dependencies rarely change.
+    <br>• You pass it as a prop to a component wrapped in <code>memo</code>. You want to skip re-rendering if the value hasn't changed.
+    <br>• The value you're passing is later <b>used as a dependency of some Hook.</b>"
+    <br><br>
+    "There is no benefit to wrapping a calculation in <code>useMemo</code> in other cases. There is no significant harm to doing that either, so some teams choose to not think about individual cases, and memoize as much as possible. <b>The downside of this approach is that code becomes less readable.</b>"
+  </div>
+
+  <div class="note">
+    <span class="label">React docs · memo — should you add it everywhere?</span>
+    "If your app is like a documentation site with coarse interactions (replacing pages/sections), memoization is usually unnecessary. If your app is like a drawing editor with granular interactions (moving shapes), memoization is very helpful."
+    <br><br>
+    "<code>memo</code> is only valuable when your component re-renders often with the same exact props, and its re-rendering logic is expensive." … "If there is no perceptible lag when your component re-renders, <code>memo</code> is unnecessary."
+  </div>
+
+  <p>That "documentation site versus drawing editor" line is the most useful sentence in the whole subject, because it moves the question from your component to <b>your product</b>. A settings page does not need memoisation. A canvas where dragging a node updates sixty times a second does.</p>
+
+  <h2>The case that is not a performance optimisation at all</h2>
+
+  <p>There is one use of <code>useMemo</code> that <b>changes behaviour</b>, and you already met the bug it fixes. Lesson 17, the chat that disconnected on every keystroke:</p>
+
+  <pre><code>function ChatRoom({ roomId }: { roomId: string }) {
+  const [message, setMessage] = useState('');
+
+  const options = { serverUrl: 'https://localhost:1234', roomId };  <span class="cmt">// new object every render</span>
+
+  useEffect(() =&gt; {
+    const conn = createConnection(options);
+    conn.connect();
+    return () =&gt; conn.disconnect();
+  }, [options]);                    <span class="cmt">// honest array, and it fires on every keystroke</span></code></pre>
+
+  <p>Here a memo is not saving milliseconds — it is deciding whether the socket survives typing. The docs' third bullet above covers it ("used as a dependency of some Hook"), and the honest description is: <b>when identity feeds a dependency array, memoisation stops being cosmetic.</b> Lesson 17 gave you two better fixes for this exact case — move the object inside the effect, or pass primitives — and those are still better, because they remove the dependency instead of stabilising it. But when the value must exist outside the effect and must be stable, <code>useMemo</code> is the tool, and it is not optional.</p>
+
+  <p>The same is true of a context value (lesson 24), and of an object you build once and reuse:</p>
+
+  <pre><code><span class="cmt">// Building an Intl formatter is genuinely not free, and it never changes.</span>
+const fmt = useMemo(
+  () =&gt; new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD' }),
+  [],
+);</code></pre>
+
+  <div class="trap">
+    <span class="label">But do not use <code>useMemo</code> as storage</span>
+    "React <b>will not throw away the cached value unless there is a specific reason to do that</b>" — and then the docs list several: editing the file in development, the component suspending during the initial mount, and possibly more in future. So if losing the value would be a <em>bug</em> rather than a slowdown, you need <code>useState</code> with a lazy initialiser or a <code>useRef</code>, not <code>useMemo</code>. Lesson 19's rule, restated.
+  </div>
+
+  <h2>Build it for real — five stages, measured at each one</h2>
+
+  <p>A list of 4,000 rows, a filter box, and a "selected" highlight. The goal is not to make it fast — it is to find out which of the five changes actually did anything, and to end up with the smallest version that works.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/data.ts</b></p>
+  <pre><code>export type Row = { id: string; name: string; owner: string };
+
+export const ROWS: Row[] = Array.from({ length: 4000 }, (_, i) =&gt; ({
+  id: String(i),
+  name: `Task ${i}`,
+  owner: ['ana', 'ben', 'cleo'][i % 3],
+}));</code></pre>
+
+  <h3>Stage 0 — instrument before you touch anything</h3>
+
+  <pre><code>function RowItem({ row, selected, onSelect }: RowItemProps) {
+  console.count('render RowItem');
+  return (
+    &lt;li onClick={() =&gt; onSelect(row.id)} className={selected ? 'sel' : ''}&gt;
+      {row.name} — {row.owner}
+    &lt;/li&gt;
+  );
+}
+
+export default function TaskList() {
+  const [query, setQuery] = useState('');
+  const [selectedId, setSelectedId] = useState&lt;string | null&gt;(null);
+
+  console.time('filter');
+  const visible = ROWS.filter(r =&gt; r.name.includes(query));
+  console.timeEnd('filter');
+
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;
+        {visible.map(row =&gt; (
+          &lt;RowItem
+            key={row.id}
+            row={row}
+            selected={row.id === selectedId}
+            onSelect={setSelectedId}
+          /&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+  <p><b>Type one character and read both numbers.</b> The <code>filter</code> timing will almost certainly be well under 1ms — 4,000 string checks is nothing. The <code>render RowItem</code> count jumps by thousands. <b>Write both numbers down.</b> They tell you the diagnosis before you have changed a line: this is a <em>many components</em> problem, not an <em>expensive calculation</em> problem, so the <code>useMemo</code> everyone reaches for first is the wrong tool.</p>
+
+  <h3>Stage 1 — <code>memo</code> alone (and why nothing improves)</h3>
+
+  <pre><code>const RowItem = memo(function RowItem({ row, selected, onSelect }: RowItemProps) {
+  console.count('render RowItem');
+  <span class="cmt">// …same body…</span>
+});</code></pre>
+
+  <p><b>Measure again.</b> The count barely moves. <code>onSelect={setSelectedId}</code> is actually stable — state setters are — but <code>selected={row.id === selectedId}</code> changes for two rows when the selection changes, and <code>row</code> is stable, so the props <em>are</em> mostly equal… and yet the count is still enormous while typing. Why?</p>
+
+  <p>Because typing changes <code>visible</code>, so a different <b>set</b> of rows is rendered. <code>memo</code> can skip a row that is rendered again with the same props; it cannot skip a row that is <em>newly mounted</em> because it just entered the filter, and it cannot help with 4,000 elements existing in the first place. <b>That is the real lesson of this stage: <code>memo</code> reduces re-renders, and your problem might be mounts and element count.</b></p>
+
+  <h3>Stage 2 — break it on purpose to see the gate fail</h3>
+
+  <pre><code>&lt;RowItem
+  key={row.id}
+  row={row}
+  selected={row.id === selectedId}
+  onSelect={(id) =&gt; setSelectedId(id)}      <span class="cmt">// 🔴 inline arrow</span>
+/&gt;</code></pre>
+
+  <p><b>Now click one row.</b> Before this change: two rows re-render (the old selection and the new one). After it: <b>all</b> of them, because every <code>onSelect</code> is a fresh function. Same visible behaviour, thousands of extra renders, and the diff is nine characters. Revert it, and remember the shape — this is the single most common way memoisation is lost in real pull requests.</p>
+
+  <h3>Stage 3 — <code>useCallback</code> when the handler needs an argument</h3>
+
+  <p>Passing <code>setSelectedId</code> straight through worked because the signature happened to match. It usually does not:</p>
+
+  <pre><code>const handleSelect = useCallback((id: string) =&gt; {
+  setSelectedId(current =&gt; (current === id ? null : id));   <span class="cmt">// toggle</span>
+}, []);                                                     <span class="cmt">// [] honest: updater form reads no state</span></code></pre>
+
+  <p>The updater form is what keeps the array empty, exactly as in lesson 17. If you had written <code>setSelectedId(selectedId === id ? null : id)</code> you would need <code>[selectedId]</code>, the function would change on every selection, and <code>memo</code> would break for every row on every click. <b>The dependency array is a fact — so the way to get a short one is to need less, not to write less.</b></p>
+
+  <h3>Stage 4 — the structural fix that makes the rest nearly pointless</h3>
+
+  <pre><code>function FilterBox({ onCommit }: { onCommit: (q: string) =&gt; void }) {
+  const [text, setText] = useState('');       <span class="cmt">// keystrokes live HERE now</span>
+  return (
+    &lt;input
+      value={text}
+      onChange={e =&gt; { setText(e.target.value); onCommit(e.target.value); }}
+    /&gt;
+  );
+}</code></pre>
+
+  <p>That alone is not enough — <code>onCommit</code> still lifts the query up. The real move is the one from lesson 23: decide what the smallest subtree is that must react to a keystroke, and put the state there. Two honest options for this app:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Option</th><th>What it changes</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Keep <code>query</code> local to a <code>&lt;TaskList&gt;</code> that owns the input <em>and</em> the list</td><td>Nothing outside that component re-renders. Inside, the list still redraws — because it must.</td><td>Free. This is stage 0 already, if the rest of the page is outside.</td></tr>
+      <tr><td><b>Render fewer rows</b> — paginate, or virtualise with <code>@tanstack/react-virtual</code></td><td>Thirty <code>&lt;li&gt;</code> exist instead of 4,000. Renders, reconciliation and DOM nodes all drop by two orders of magnitude.</td><td>A dependency and some scroll handling. <b>This is the actual fix.</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><b>Measure the virtualised version.</b> The <code>render RowItem</code> count per keystroke goes from thousands to about thirty, and it does so with <code>memo</code>, <code>useMemo</code> and <code>useCallback</code> all removed. That is the honest ending: <b>the winning move was not to skip work more cleverly, it was to have less work.</b></p>
+
+  <h3>What I would actually ship</h3>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Change</th><th>Ship it?</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td>Virtualise / paginate the list</td><td><b>Yes, first</b></td><td>Attacks the real cost: 4,000 elements. Everything else is downstream of this.</td></tr>
+      <tr><td><code>useCallback</code> on <code>handleSelect</code></td><td>Yes</td><td>Cheap, and it is the prop that would otherwise break <code>memo</code> for every row.</td></tr>
+      <tr><td><code>memo(RowItem)</code></td><td>Yes, after measuring</td><td>Now that the props are stable it genuinely skips the untouched rows on selection.</td></tr>
+      <tr><td><code>useMemo</code> on the filter</td><td><b>No</b></td><td>Measured at well under 1ms. The docs' own bar is 1ms. It would be noise.</td></tr>
+      <tr><td><code>ROW_STYLE</code> at module scope</td><td>Yes</td><td>Not a hook, no dependencies, no maintenance.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The anti-pattern table</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Anti-pattern</th><th>Why it does nothing (or worse)</th></tr></thead>
+    <tbody>
+      <tr><td><code>memo</code> on a component that renders one <code>&lt;span&gt;</code></td><td>The comparison costs more than the render. Pure overhead.</td></tr>
+      <tr><td><code>memo</code> on a component you always pass <code>children</code> to</td><td><code>children</code> is a new element object on every parent render, so the gate never closes.</td></tr>
+      <tr><td><code>useCallback</code> on a handler passed to a plain <code>&lt;button onClick&gt;</code></td><td>The DOM does not compare functions. Nothing downstream is memoised. Zero benefit.</td></tr>
+      <tr><td><code>useMemo(() =&gt; ({...}), [])</code> for a constant</td><td>Module scope does the same thing with no hook and no dependency array to get wrong.</td></tr>
+      <tr><td><code>useMemo</code> to hold something that must not be lost</td><td>React may throw the cache away. Use <code>useState</code> with a lazy initialiser, or <code>useRef</code>.</td></tr>
+      <tr><td>A dependency array trimmed to make the memo "work"</td><td>Now it returns a stale value. Lesson 17's rule holds here too: the array is an answer, not a setting.</td></tr>
+      <tr><td>Wrapping everything, on principle</td><td>The docs allow it and name the cost: the code becomes less readable — and one always-new value voids a whole component anyway.</td></tr>
+      <tr><td><code>memo</code> as a fix for a bug</td><td>"Memoization is a performance optimization, not a guarantee." If it breaks without <code>memo</code>, it is already broken.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The React Compiler — and what it does not fix</h2>
+
+  <div class="note">
+    <span class="label">React docs · React Compiler</span>
+    React Compiler "automatically optimizes your React application by handling memoization for you, <b>eliminating the need for manual <code>useMemo</code>, <code>useCallback</code>, and <code>React.memo</code></b>." It works at build time by "skipping cascading re-renders" and "skipping expensive calculations".
+    <br><br>
+    "React is often fast enough without optimization, but sometimes you need to manually memoize components and values to keep your app responsive. <b>This manual memoization is tedious, easy to get wrong, and adds extra code to maintain.</b> React Compiler does this optimization automatically for you."
+    <br><br>
+    "React Compiler is now stable and has been tested extensively in production" — and has "been used in production at companies like Meta", with support for React 17, 18 and 19.
+  </div>
+
+  <p>So is this lesson obsolete? No, and the docs are careful about exactly why:</p>
+
+  <div class="note">
+    <span class="label">React docs · React Compiler — existing memoisation</span>
+    For new code, "rely on the compiler for memoization and using <code>useMemo</code>/<code>useCallback</code> where needed to achieve precise control". For existing code, "we recommend either <b>leaving existing memoization in place</b> (removing it can change compilation output) or <b>carefully testing before removing</b> the memoization". The hooks remain useful as "escape hatches to provide control over which values are memoized", particularly for effect dependencies.
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The compiler fixes</th><th>The compiler does not fix</th></tr></thead>
+    <tbody>
+      <tr><td>Forgetting <code>useCallback</code> on a handler passed to a memoised child.</td><td>State living in the wrong component. It cannot move your <code>useState</code> down a level.</td></tr>
+      <tr><td>An inline object literal as a context <code>value</code>.</td><td>A context value that genuinely changed — every consumer still wakes, by design.</td></tr>
+      <tr><td>Recomputing a derived list on every render.</td><td>4,000 elements on screen. Fewer renders of too many nodes is still too many nodes.</td></tr>
+      <tr><td>The maintenance cost of hand-written memoisation.</td><td>Effect chains that cause cascading updates (the docs' "most performance problems").</td></tr>
+      <tr><td>Human error in dependency arrays for memoisation.</td><td>Impure components — it requires your code to follow the Rules of React.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><b>The interview line:</b> "The compiler removes hand-written memoisation, not bad state placement." Everything in lesson 23 still applies with the compiler on; only lesson 25's manual work goes away.</p>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>All three cache and compare with <code>Object.is</code></td><td>The three-tool table</td></tr>
+      <tr><td><code>useCallback</code> is <code>useMemo</code> returning a function</td><td>The quoted four-line definition</td></tr>
+      <tr><td><code>useCallback</code> does not avoid creating the function</td><td>The quote — it buys identity, not allocation</td></tr>
+      <tr><td>One always-new value breaks a whole component</td><td>The broken trio; stage 2's nine-character regression</td></tr>
+      <tr><td><code>memo</code> ignores own state and context</td><td>The four caveats; the figure's two "bypasses the gate" boxes</td></tr>
+      <tr><td>Memoisation is never load-bearing for correctness</td><td>Caveat 1 — "a performance optimization, not a guarantee"</td></tr>
+      <tr><td>Measure with <code>console.time</code>; 1ms is the bar</td><td>Stage 0 — the filter measured under 1ms, so no <code>useMemo</code> shipped</td></tr>
+      <tr><td>Structure beats memoisation</td><td>The five documented alternatives; stage 4's virtualised list</td></tr>
+      <tr><td>Module scope beats <code>useMemo</code> for constants</td><td><code>ROW_STYLE</code></td></tr>
+      <tr><td>The updater form keeps a dependency array empty</td><td><code>handleSelect</code> in stage 3 (lesson 17)</td></tr>
+      <tr><td>Memoisation that changes behaviour, not speed</td><td>The <code>options</code> object reconnecting the chat; the <code>Intl</code> formatter</td></tr>
+      <tr><td><code>useMemo</code> is not storage</td><td>The "may throw away the cached value" trap (lesson 19)</td></tr>
+      <tr><td>The compiler automates the hooks, not the architecture</td><td>The final two-column table</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Find a useless <code>memo</code>.</b> In any codebase you have, search for <code>memo(</code> and for each hit list the props. Mark every prop that is created during render — an arrow function, an object literal, a <code>.map</code> or <code>.filter</code>, a template string building an array. If any prop is marked, that <code>memo</code> currently does nothing. Report a count, not an opinion.</li>
+    <li><b>Prove the 1ms rule to yourself.</b> Wrap the stage-0 filter in <code>console.time</code> and grow <code>ROWS</code> — 4,000, then 40,000, then 400,000. Write down the first size at which the filter crosses 1ms. That number is your personal threshold for "is this expensive", and it is much larger than you expect.</li>
+    <li><b>Make a memoisation chain fail from three links away.</b> Keep <code>memo(RowItem)</code>, keep <code>useCallback</code>, keep everything — then in the parent of <code>TaskList</code> pass <code>rows={ROWS.map(r =&gt; ({ ...r }))}</code>. Watch every row re-render again. Say the rule out loud: memoisation is a property of the whole chain, and any link can break it.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A pull request adds 34 <code>useCallback</code>s, 12 <code>useMemo</code>s and <code>memo</code> on 19 components across a checkout flow. The description says "reduces re-renders by 60%" with no methodology. Reading it, you find: three of the <code>useMemo</code>s wrap <code>items.length</code>; one <code>useMemo</code> had its dependency array trimmed from <code>[items, taxRate]</code> to <code>[items]</code> "because it kept recalculating"; six <code>useCallback</code>s wrap handlers passed directly to <code>&lt;button onClick&gt;</code>; and one <code>memo</code> is on a component that receives <code>children</code>. Separately, the flow has a <code>useEffect</code> that recalculates a total and writes it to state whenever the cart changes, and a single <code>CheckoutContext</code> whose value is an inline object holding the cart, the shipping form fields, and eleven functions.</p>
+    Work out, in order: which of the four listed memoisation problems is a <b>correctness</b> bug rather than a waste; why the six <code>useCallback</code>s on DOM handlers cannot help; what is really causing most of the re-renders in this flow, given the last sentence; the two changes you would ask for instead of all 65; and what you would say about the "60%" claim without being unkind.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/reference/react/memo">memo</a> (caveats, "should you add memo everywhere?", "minimizing props changes"), <a href="https://react.dev/reference/react/useMemo">useMemo</a> ("how to tell if a calculation is expensive?", "should you add useMemo everywhere?"), <a href="https://react.dev/reference/react/useCallback">useCallback</a>, <a href="https://react.dev/learn/react-compiler">React Compiler</a>.
+  </div>
+
+  <div class="ask">
+    Ask me for <b>ten snippets, each with one <code>memo</code></b> — you say "works" or "does nothing" in three seconds, and name the leaking prop. Or ask me to review a performance pull request as the sceptical reviewer while you defend it with measurements.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>All three do the same two things:</b> cache something from the last render, and compare with <code>Object.is</code> to decide whether to reuse it.</li>
+      <li><b><code>memo</code> caches output and compares props; <code>useMemo</code> caches a result; <code>useCallback</code> caches a function.</b> <code>useCallback(fn, deps)</code> is just <code>useMemo(() =&gt; fn, deps)</code>.</li>
+      <li><b><code>useCallback</code> does not stop the function being created.</b> Creating functions is free — what you are buying is a stable identity, which only matters to something that compares.</li>
+      <li><b>One always-new value breaks memoisation for a whole component.</b> An inline arrow, an object literal, a <code>.filter()</code> in the JSX — the gate runs and never closes.</li>
+      <li><b><code>memo</code> only knows about props from the parent.</b> Its own state re-renders it, and a context it reads re-renders it. Both documented, both interview questions.</li>
+      <li><b>Memoisation is never load-bearing.</b> "A performance optimization, not a guarantee" — if the code breaks without it, the code is already broken.</li>
+      <li><b>Measure with <code>console.time</code>.</b> Under about <b>1ms</b>, do not memoise. Under <b>thousands</b> of objects, it is probably not expensive. And it never makes the first render faster.</li>
+      <li><b>Development numbers lie</b> — Strict Mode double-renders and dev builds are slow. Compare before and after, on a throttled CPU, in a production build.</li>
+      <li><b>Five documented alternatives come first:</b> take JSX as <code>children</code>, keep state local, keep render pure, delete effects that set state, remove effect dependencies. Most performance problems are effect chains, not missing <code>memo</code>.</li>
+      <li><b>Fewer nodes beats fewer renders.</b> Virtualising 4,000 rows down to thirty beat every hook in the build — and let all of them be deleted.</li>
+      <li><b>Two places where memoising is structural, not cosmetic:</b> a context value, and a value that feeds a dependency array. There it changes behaviour, not speed.</li>
+      <li><b><code>useMemo</code> is not storage.</b> React may throw the cache away, so anything you cannot afford to lose belongs in <code>useState</code> with a lazy initialiser, or a ref.</li>
+      <li><b>Constants belong at module scope</b>, not in a <code>useMemo</code> with an empty array.</li>
+      <li><b>React Compiler is stable and automates all three</b>, and the docs say to leave existing memoisation in place or test carefully before removing it. It fixes hand-written memoisation — not state in the wrong place, not too many nodes, not effect chains.</li>
+      <li><b>Real use case (built &amp; run):</b> a 4,000-row list where the measured filter was under 1ms, a nine-character inline arrow undid every <code>memo</code>, and the change that actually worked deleted all three hooks and rendered thirty rows instead.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>memoisation only pays when the skipped work is genuinely expensive <em>and</em> every input stays identical — measure the first, and audit the props for the second.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <code>memo</code> (the four caveats, "should you add memo everywhere?", the documentation-site-versus-drawing-editor comparison, "minimizing props changes", and the five principles that make memoisation unnecessary), <code>useMemo</code> ("how to tell if a calculation is expensive?" with the <code>console.time</code> recipe and the 1ms figure, the "won't make the first render faster" note, the CPU-throttling and development-measurement warnings, the three cases where it is valuable, the "always new" sentence, and the cache-invalidation caveat), <code>useCallback</code> (the <code>useMemo</code> equivalence, "does not prevent creating the function", and when it is valuable), <em>React Compiler</em> (what it optimises, that it is stable and used in production at Meta, and the guidance on existing memoisation).</p>
+
+  <div class="footer-nav">
+    <a href="./0024-context-sharing-state-through-the-tree.html">← Previous: Context — sharing state through the tree</a>
+    <a href="./0026-build-a-theme-and-auth-app.html">Next: Build it — a theme &amp; auth app →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "`const Row = memo(Row)` and the parent renders `<Row item={item} onSelect={(id) => pick(id)} />`. How often does the memo skip a render?",
+      options: [
+        "Never — the inline arrow is a new function on every parent render, so the shallow prop comparison always fails",
+        "Every time `item` is unchanged, because memo compares props deeply",
+        "Only when the parent's state has not changed",
+        "Always, because memo caches by component type"
+      ],
+      answer: 0,
+      why: "`memo` compares every prop shallowly with `Object.is`, and an arrow function written in JSX is a brand-new function object on each render of the parent. So the comparison runs 4,000 times, fails 4,000 times, and renders anyway — you pay for the gate and walk around it. The docs put it exactly this way: a single value that's 'always new' is enough to break memoization for an entire component, and they name inline objects and functions as the reason `memo` is 'useless' in some cases. The fix is to hoist the function with `useCallback` (with an honest dependency array, usually achievable via the state updater form) or to pass a stable setter directly."
+    },
+    {
+      q: "According to the docs, roughly when is a calculation worth wrapping in `useMemo`?",
+      options: [
+        "When you have measured it with `console.time` and it adds up to about 1ms or more, and its dependencies rarely change",
+        "Whenever it involves an array method like filter, map or sort",
+        "Whenever it runs on every render",
+        "Whenever the component has more than about 50 lines"
+      ],
+      answer: 0,
+      why: "The docs say that unless you're creating or looping over thousands of objects it's probably not expensive, and give the `console.time`/`console.timeEnd` recipe with the guidance that if the logged time adds up to a significant amount — say 1ms or more — it might make sense to memoise. They also list the two other cases where it is valuable regardless of cost: passing the value to a `memo`-wrapped component, and passing a value that later becomes a dependency of another Hook. Two footnotes protect you from fooling yourself: `useMemo` never makes the first render faster, and development measurements are unreliable because Strict Mode double-renders and dev builds are slow, so throttle the CPU and test a production build."
+    },
+    {
+      q: "Which statement about `memo` is TRUE?",
+      options: [
+        "A memoised component still re-renders when its own state changes and when a context it reads changes",
+        "A memoised component only re-renders when its props change",
+        "`memo` performs a deep comparison of object props",
+        "`memo` guarantees React will not call your component when props are equal"
+      ],
+      answer: 0,
+      why: "Three of `memo`'s four documented caveats say exactly this: even when a component is memoised it will still re-render when its own state changes, and when a context it's using changes, because memoisation only has to do with props passed from the parent. The fourth caveat rules out the last option: React may still re-render it, because memoisation is a performance optimisation and not a guarantee — which is why code that only behaves correctly with `memo` in place is already broken. The comparison is shallow, using `Object.is` per prop, not deep."
+    },
+    {
+      q: "A value is created during render and then listed in a `useEffect` dependency array. Why is memoising it different from a normal performance optimisation?",
+      options: [
+        "Because its identity decides whether the effect re-runs, so memoising changes behaviour rather than just speed",
+        "Because effects cannot read memoised values otherwise",
+        "Because `useMemo` is required for all effect dependencies by the lint rule",
+        "It is not different — it is the same micro-optimisation"
+      ],
+      answer: 0,
+      why: "Dependency arrays are compared with `Object.is`, so an object rebuilt on every render makes the effect tear down and set up on every render — the lesson-17 chat that disconnected on every keystroke. Here `useMemo` is not saving milliseconds, it is deciding whether a socket survives typing, and the docs list this as one of the three cases where `useMemo` is genuinely valuable: the value is later used as a dependency of some Hook. The better fixes usually remove the dependency instead of stabilising it — move the object inside the effect, or depend on primitives — but when the value must live outside the effect and be stable, the memo is not optional."
+    },
+    {
+      q: "React Compiler is enabled on a project. Which problem does it NOT solve for you?",
+      options: [
+        "A text input's state living at the top of the tree, so every keystroke re-renders the whole page",
+        "Forgetting `useCallback` on a handler passed to a memoised child",
+        "An inline object literal used as a context `value`",
+        "Recomputing a derived list on every render"
+      ],
+      answer: 0,
+      why: "The compiler automates memoisation — it memoises values and functions created during render and skips cascading re-renders, which covers the handler, the context value object, and the derived list. What it cannot do is move your state: if the input's value lives at the root, then the root's state genuinely changed on every keystroke, and everything reading that state must re-render. Bad state placement, too many elements on screen, and cascading updates from Effects are architectural problems, and the docs' own framing supports this — most performance problems in React apps come from chains of updates originating from Effects. The compiler also asks something of you in return: your components must follow the Rules of React."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Explain the difference between memo, useMemo and useCallback.”",
+      answer: "They all cache something from the previous render and compare with <code>Object.is</code> to decide whether to reuse it — the difference is <em>what</em> they cache. <b><code>memo</code></b> wraps a component and caches its rendered output; when a parent re-renders, it compares every prop shallowly, and if they are all equal it does not call the component at all. <b><code>useMemo</code></b> caches the <em>result</em> of a calculation, keyed on a dependency array. <b><code>useCallback</code></b> caches <em>the function itself</em> — the docs point out you can literally think of it as <code>useMemo(() =&gt; fn, deps)</code>. Two clarifications I always add. First, <code>useCallback</code> does not avoid creating the function; you create it every render and React hands back the cached one. Creating functions is free — what you are buying is a stable <b>identity</b>, and identity only matters to something that compares, which means a <code>memo</code> child or a dependency array. Second, they work as a chain: <code>useCallback</code> and <code>useMemo</code> on their own skip almost nothing, they exist to let a <code>memo</code> further down actually close its gate. Which is why one always-new prop anywhere in that chain makes all of it pointless."
+    },
+    {
+      prompt: "Interviewer: “When does memo do nothing?”",
+      answer: "Four situations, and I split them into my fault and not my fault. <b>My fault:</b> any prop that is created during render — an inline arrow function, an object or array literal, a <code>.filter()</code> or <code>.map()</code> written in the JSX, or <code>children</code>, which is a fresh element object every parent render. The docs are blunt here: a single value that's 'always new' is enough to break memoisation for an entire component, so one leaking prop makes the whole comparison a pure cost. <b>Not my fault, and documented:</b> a memoised component still re-renders when <b>its own state changes</b>, and when <b>a context it reads changes</b> — memoisation only concerns props passed from the parent. There is a fifth answer that matters in practice: <code>memo</code> does nothing useful when the component was cheap anyway. The docs say it is only valuable when a component re-renders often with the same exact props and its re-rendering logic is expensive, and that if there is no perceptible lag, <code>memo</code> is unnecessary. And it can do nothing about <b>mounts</b> — if a filter change means a different set of rows exists, those rows are new, and no gate helps."
+    },
+    {
+      prompt: "Interviewer: “A list feels laggy while typing. Walk me through what you do.”",
+      answer: "I measure before I change anything, because the two possible diseases have different cures. First, React DevTools with 'Highlight updates when components render': if the whole page flashes, I have a structural problem; if only the list flashes, the list is the subject. Then the Profiler, to see which committed renders are actually slow. Then <code>console.time</code> around any suspect calculation. That gives me the diagnosis: either <b>too many components re-rendering</b>, or <b>one component doing expensive work in its body</b>. For a 4,000-row list it is almost always the first, and the filter usually measures well under a millisecond — the docs' own bar for memoising is around 1ms — so a <code>useMemo</code> on the filter would be noise. My fixes go in order of leverage. <b>Render fewer nodes</b> — paginate or virtualise. Going from 4,000 <code>&lt;li&gt;</code> to thirty cuts renders, reconciliation and DOM work all at once, and it usually lets me delete the memoisation entirely. <b>Move the state down</b> so a keystroke cannot reach the rest of the page. <b>Then</b>, if rows still re-render for no reason, stabilise the props with <code>useCallback</code> and add <code>memo</code> — in that order, because <code>memo</code> without stable props does nothing. After each change I re-measure the same way, and if the number did not move I revert it: an optimisation that does not optimise is just code someone has to maintain."
+    },
+    {
+      prompt: "Interviewer: “Does the React Compiler mean we can stop thinking about this?”",
+      answer: "It means we can stop <em>writing</em> most of it, not stop thinking about it. The compiler is stable, has been used in production at Meta, supports React 17 through 19, and it automatically memoises values and functions at build time — the docs say it eliminates the need for manual <code>useMemo</code>, <code>useCallback</code> and <code>React.memo</code>, and they are honest about why that is worth having: hand-written memoisation is tedious, easy to get wrong, and extra code to maintain. On an existing codebase the guidance is careful — leave existing memoisation in place, or test carefully before removing it, because removing it can change the compilation output — and the hooks stay as escape hatches when you need precise control, especially over effect dependencies. What it does not do is architecture. It cannot move a text input's state out of the root of my tree, so if every keystroke updates root state, everything below still re-renders. It cannot make 4,000 DOM nodes into 30. It cannot untangle an effect that writes to state whenever another piece of state changes — and the docs say most performance problems come from exactly those chains. It also asks something in return: my components have to follow the Rules of React for it to optimise safely. So the line I use is: the compiler removes hand-written memoisation, not bad state placement."
+    }
+  ]);
+</script>

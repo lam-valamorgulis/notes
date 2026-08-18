@@ -1,0 +1,684 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What actually makes a component re-render — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 6 · Lesson 1</p>
+  <h1>What actually makes a component re-render</h1>
+  <p class="subtitle">Almost everyone answers this wrong, and the wrong answer is why teams sprinkle <code>memo</code> everywhere and get nothing back. React does not look at your props to decide whether to run your component.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can point at any component in a tree and say, in one sentence, why it just re-rendered — and you can fix the two most common over-rendering problems with <b>zero</b> memoisation, using only where you put state and where you create JSX.</div>
+
+  <p>You have spent five months learning to make the screen correct. This month is about making it correct <em>and</em> cheap, and about sharing state across a whole app without threading it through twelve components. Both of those subjects rest on one piece of machinery you have used all year without naming precisely: <b>what causes a component function to run again.</b></p>
+
+  <h2>First principle — there are exactly two reasons</h2>
+
+  <p>Not three, not "props changed". The docs are blunt about it.</p>
+
+  <div class="note">
+    <span class="label">React docs · Render and Commit</span>
+    "There are two reasons for a component to render:
+    <br>1. It's the component's <b>initial render.</b>
+    <br>2. The component's (or one of its ancestors') <b>state has been updated.</b>"
+  </div>
+
+  <p>Read reason 2 again, slowly. <b>Or one of its ancestors'.</b> Not "its props changed". Not "the data it uses changed". If state updates anywhere at or above you, you run again — even if you take no props at all, even if nothing you display has changed by one pixel.</p>
+
+  <p>And it does not stop at you:</p>
+
+  <div class="note">
+    <span class="label">React docs · Render and Commit</span>
+    "This process is recursive: if the updated component returns some other component, React will render <em>that</em> component next, and if that component also returns something, it will render <em>that</em> component next, and so on. The process will continue until there are no more nested components and React knows exactly what should be displayed on screen."
+  </div>
+
+  <p>So the default is not "React renders what changed". The default is <b>React re-renders the whole subtree below the state that changed</b>, and then works out which DOM nodes actually need touching. Two different steps, and people collapse them into one word — which is where the confusion starts.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig23-title" width="640" height="300">
+      <title id="fig23-title">A component tree. State updates in the Panel component. Panel and every component below it re-renders, including ones that take no props. App above it and Sidebar beside it do not re-render. Props changing is a consequence of an ancestor re-rendering, never a cause on its own.</title>
+      <defs>
+        <marker id="a23" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+
+      <text x="12" y="16" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">setCount() runs inside Panel</text>
+
+      <rect x="248" y="28" width="140" height="30" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="318" y="47" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">App — not re-rendered</text>
+
+      <line x1="318" y1="58" x2="318" y2="76" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <line x1="150" y1="70" x2="486" y2="70" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <line x1="150" y1="70" x2="150" y2="86" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <line x1="486" y1="70" x2="486" y2="86" style="stroke: var(--rule); stroke-width: 1;"></line>
+
+      <rect x="86" y="86" width="128" height="30" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="150" y="105" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Sidebar — untouched</text>
+
+      <rect x="418" y="86" width="136" height="30" rx="3" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="486" y="105" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">Panel — state changed</text>
+
+      <line x1="486" y1="116" x2="486" y2="134" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a23)"></line>
+      <line x1="392" y1="130" x2="580" y2="130" style="stroke: var(--accent-2); stroke-width: 1.5;"></line>
+      <line x1="392" y1="130" x2="392" y2="144" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a23)"></line>
+      <line x1="580" y1="130" x2="580" y2="144" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a23)"></line>
+
+      <rect x="330" y="150" width="124" height="34" rx="3" style="fill: var(--paper); stroke: var(--accent-2);"></rect>
+      <text x="392" y="165" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px;">Total</text>
+      <text x="392" y="177" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">props changed</text>
+
+      <rect x="520" y="150" width="112" height="34" rx="3" style="fill: var(--paper); stroke: var(--accent-2);"></rect>
+      <text x="576" y="165" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px;">Legend</text>
+      <text x="576" y="177" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">takes no props!</text>
+
+      <line x1="392" y1="184" x2="392" y2="200" style="stroke: var(--accent-2); stroke-width: 1.5;" marker-end="url(#a23)"></line>
+      <rect x="330" y="206" width="124" height="30" rx="3" style="fill: var(--paper); stroke: var(--accent-2);"></rect>
+      <text x="392" y="225" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9.5px;">FormattedNumber</text>
+
+      <line x1="12" y1="252" x2="628" y2="252" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="272" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">Everything in rose ran again.</text>
+      <text x="220" y="272" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Legend re-ran with zero props and zero state.</text>
+      <text x="12" y="290" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Total's props changed <b>because</b> Panel re-rendered. The props were the effect, not the cause.</text>
+    </svg>
+  </div>
+
+  <h2>The complete list of triggers</h2>
+
+  <p>Learn this table. It is the whole answer to "why did this render", and it is a very common interview question because it separates people who have read the docs from people who have read blog posts.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Trigger</th><th>What it is</th><th>Can you stop it?</th></tr></thead>
+    <tbody>
+      <tr><td><b>Initial render</b></td><td>The component is mounting for the first time.</td><td>No — and you would not want to.</td></tr>
+      <tr><td><b>Its own state changed</b></td><td>A <code>useState</code> setter or a <code>useReducer</code> <code>dispatch</code> ran with a different value.</td><td>Only by not changing it. <code>memo</code> does nothing here.</td></tr>
+      <tr><td><b>An ancestor re-rendered</b></td><td>The default recursive behaviour. Your props may be identical; you still run.</td><td>Yes — <code>memo</code>, or better, structure (see below).</td></tr>
+      <tr><td><b>A context it reads changed</b></td><td>The provider above it got a <code>value</code> that is not <code>Object.is</code>-equal to the last one.</td><td>No. Documented: <code>memo</code> does not stop this.</td></tr>
+      <tr><td><b>An external store it subscribes to changed</b></td><td><code>useSyncExternalStore</code> — a store outside React told React the snapshot changed.</td><td>Only with a narrower selector.</td></tr>
+      <tr><td><b>Its <code>key</code> changed</b></td><td>Not a re-render at all — React unmounts the old component and mounts a fresh one, with fresh state.</td><td>Yes, by keeping the key stable (lesson 3, lesson 9).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><b>"A prop changed" is not on that list</b>, and cannot be. A prop is a value your parent computed while rendering. For it to change, your parent must have rendered. So "props changed" is always downstream of one of the real triggers.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this in an interview</span>
+    <p>"A component re-renders because it is mounting, because its own state changed, because an ancestor re-rendered, or because a context or external store it subscribes to changed. Props changing is a symptom of the third one, not a cause."</p>
+  </div>
+
+  <h2>Four myths, and what is actually true</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Myth</th><th>The truth</th></tr></thead>
+    <tbody>
+      <tr><td>"React re-renders a child when its props change."</td><td>React re-renders a child when the parent re-renders, full stop. It does not compare props first — unless you wrapped the child in <code>memo</code>, which is opt-in.</td></tr>
+      <tr><td>"A re-render means the DOM was updated."</td><td>No. "<b>React only changes the DOM nodes if there's a difference between renders.</b>" A re-render that produces identical output writes nothing to the DOM.</td></tr>
+      <tr><td>"Re-renders are slow, so I must stop them."</td><td>Most re-renders are a function call and a shallow comparison. They become slow in bulk (hundreds of rows), or when your component body does real work. Measure before you assume.</td></tr>
+      <tr><td>"<code>memo</code> makes a component stop re-rendering."</td><td><code>memo</code> only skips renders caused by a re-rendering <em>parent</em>. Its own state and any context it reads still re-render it — both documented caveats.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Render is not paint — the two-step you keep collapsing</h2>
+
+  <p>You have known this since Month 1, but here it earns money. One "update" is really three separate costs, and the fixes for each are different.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Step</th><th>Cost</th><th>What makes it expensive</th></tr></thead>
+    <tbody>
+      <tr><td>Render</td><td>Your component function runs. React builds a description of the UI.</td><td>Real work in the body: sorting 5,000 rows, formatting dates in a loop, building objects.</td></tr>
+      <tr><td>Reconcile</td><td>React compares the new description with the old one.</td><td>The <em>number</em> of elements. 20 nodes is free; 20,000 is not.</td></tr>
+      <tr><td>Commit + paint</td><td>React writes only the differences to the DOM; the browser draws.</td><td>Actual DOM changes and layout. Zero differences means zero DOM work.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>This is why "my app re-renders too much" is rarely the real problem, and why the fix is almost never a blanket <code>memo</code>. The real problem is usually <b>a lot of components re-rendering</b> or <b>one component doing something expensive during render</b>. Two different diseases.</p>
+
+  <h2>The bail-out you get for free</h2>
+
+  <p>Setting state to the value it already has is not a re-render. React checks first.</p>
+
+  <div class="note">
+    <span class="label">React docs · useState</span>
+    "If the new value you provide is identical to the current <code>state</code>, as determined by an <code>Object.is</code> comparison, React will <b>skip re-rendering the component and its children.</b> This is an optimization. Although in some cases React may still need to call your component before skipping the children, it shouldn't affect your code."
+  </div>
+
+  <p>Two useful consequences. First, a "select the same tab again" click costs nothing — you do not need to guard it yourself. Second, the escape hatch in that quote ("may still need to call your component") explains a thing that confuses people: you can see one extra log after clicking, and then silence. React called your function to find out whether the result changed, then dropped it. Your <em>children</em> and your effects did not run.</p>
+
+  <div class="trap">
+    <span class="label">The trap that hides behind this</span>
+    <b><code>Object.is</code>, not deep equality.</b> <code>setUser({...user})</code> with identical contents is always a different object, so it always re-renders. This is the same identity rule from lesson 8 — it decides mutation bugs there and re-render counts here.
+  </div>
+
+  <h2>One event, one render — batching</h2>
+
+  <div class="note">
+    <span class="label">React docs · useState</span>
+    "React <b>batches state updates.</b> It updates the screen <b>after all the event handlers have run</b> and have called their <code>set</code> functions. This prevents multiple re-renders during a single event."
+  </div>
+
+  <p>So this handler causes <b>one</b> re-render, not three:</p>
+
+  <pre><code>function handleSubmit() {
+  setStatus('saving');   <span class="cmt">// no render yet</span>
+  setError(null);        <span class="cmt">// no render yet</span>
+  setAttempts(a =&gt; a + 1);
+}                        <span class="cmt">// handler ends → React renders once with all three applied</span></code></pre>
+
+  <p>Which means <b>"how many setStates did I call" is not a useful measure of anything.</b> Since React 18 this batching also covers updates inside promises, timeouts and native event handlers — the old "outside React events are not batched" behaviour is gone.</p>
+
+  <h2>Build it for real — a render counter you can trust</h2>
+
+  <p>You cannot reason about re-renders you cannot see. Before touching any optimisation, build the instrument. And notice that there are two different things to count.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/debug/useRenderLog.ts</b></p>
+  <pre><code>import { useEffect, useRef } from 'react';
+
+<span class="cmt">// Counts COMMITS: renders that actually reached the DOM.
+// An effect with no dependency array runs after every commit.</span>
+export function useCommitCount(label: string) {
+  const count = useRef(0);
+  useEffect(() =&gt; {
+    count.current += 1;
+    console.log(`[commit] ${label}: ${count.current}`);
+  });
+}</code></pre>
+
+  <p>And the cruder, more revealing one — a log in the component body:</p>
+
+  <pre><code>function Legend() {
+  console.count('render Legend');   <span class="cmt">// counts RENDER CALLS</span>
+  return &lt;p&gt;Totals include tax&lt;/p&gt;;
+}</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th></th><th><code>console.count</code> in the body</th><th><code>useCommitCount</code> (effect)</th></tr></thead>
+    <tbody>
+      <tr><td>Counts</td><td>Every time React <em>called</em> your function.</td><td>Every time the result was <em>committed</em>.</td></tr>
+      <tr><td>Sees a bailed-out render</td><td>Yes — this is how you catch the "extra call" from the quote above.</td><td>No.</td></tr>
+      <tr><td>Strict Mode in dev</td><td>Doubles the number. Halve it in your head.</td><td>Not doubled by the extra render, but the first mount runs setup twice.</td></tr>
+      <tr><td>Honest?</td><td>No — logging in render breaks purity. <b>Instrumentation only, delete it after.</b></td><td>Yes. An effect is the legal place for a side effect.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Now the app under test. One input, one heavy list, and a legend that takes no props at all.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b> — stage 1, the version that feels laggy</p>
+  <pre><code>import { useState } from 'react';
+
+const ROWS = Array.from({ length: 2000 }, (_, i) =&gt; ({ id: i, name: `Item ${i}` }));
+
+function Legend() {
+  console.count('render Legend');
+  return &lt;p className="legend"&gt;Showing every matching item.&lt;/p&gt;;
+}
+
+function Row({ name }: { name: string }) {
+  return &lt;li&gt;{name}&lt;/li&gt;;
+}
+
+export default function App() {
+  const [query, setQuery] = useState('');
+  console.count('render App');
+
+  const visible = ROWS.filter(r =&gt; r.name.includes(query));
+
+  return (
+    &lt;div&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;Legend /&gt;
+      &lt;ul&gt;{visible.map(r =&gt; &lt;Row key={r.id} name={r.name} /&gt;)}&lt;/ul&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p><b>Type five characters and read the console.</b> <code>render App</code> five times — correct and unavoidable, the input's value lives there. <code>render Legend</code> five times — and <code>Legend</code> has no props and no state. That is trigger 3 in the table, doing exactly what it is documented to do. And 2,000 <code>Row</code> calls per keystroke, which is where the lag actually comes from.</p>
+
+  <h3>Fix 1 — move the state down</h3>
+
+  <p>Ask the question from Month 3 again, but for a different reason. Last time: <em>who needs to read this state?</em> Now: <em>what is the smallest subtree that needs to re-render when it changes?</em></p>
+
+  <p>The input's <code>query</code> is read by the filter, so it cannot move below the list. But look at the shape again — if the filtering belongs to the list, then the input and the list are one feature and the rest of the page is not.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b> — stage 2, the state moved into its own component</p>
+  <pre><code>function SearchableList() {
+  const [query, setQuery] = useState('');
+  const visible = ROWS.filter(r =&gt; r.name.includes(query));
+  return (
+    &lt;&gt;
+      &lt;input value={query} onChange={e =&gt; setQuery(e.target.value)} /&gt;
+      &lt;ul&gt;{visible.map(r =&gt; &lt;Row key={r.id} name={r.name} /&gt;)}&lt;/ul&gt;
+    &lt;/&gt;
+  );
+}
+
+export default function App() {
+  console.count('render App');
+  return (
+    &lt;div&gt;
+      &lt;Header /&gt;
+      &lt;SearchableList /&gt;
+      &lt;Legend /&gt;
+      &lt;Footer /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p><b>Now type five characters.</b> <code>render App</code>: once. <code>render Legend</code>: once. <code>Header</code> and <code>Footer</code>: once. The keystroke no longer reaches them, because they are no longer below the state that changed. <b>No <code>memo</code>. No <code>useCallback</code>. You moved a <code>useState</code> down one level.</b></p>
+
+  <p>This is the single highest-value re-render fix in React, and it is free. It is also the third of Month 3's ownership moves seen from a new angle: <em>invent a component just to hold state</em> — lesson 13 sold it as "it keeps App small and names the feature", and it turns out to also be the performance fix.</p>
+
+  <div class="note">
+    <span class="label">React docs · memo — how to make memoisation unnecessary</span>
+    "Prefer local state and don't <b>lift state up</b> any further than necessary."
+  </div>
+
+  <h3>Fix 2 — pass the expensive part as <code>children</code></h3>
+
+  <p>Sometimes you cannot move the state down, because the state genuinely belongs to a wrapper — a sidebar's open/closed flag, a tab index, a hover state on a container. The wrapper re-renders, and everything inside it goes with it.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The problem</b></p>
+  <pre><code>function Layout() {
+  const [open, setOpen] = useState(false);
+  return (
+    &lt;div className={open ? 'wide' : 'narrow'}&gt;
+      &lt;button onClick={() =&gt; setOpen(!open)}&gt;Toggle&lt;/button&gt;
+      &lt;ExpensiveReport /&gt;   <span class="cmt">// re-renders on every toggle. Why? It is below the state.</span>
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The fix — the element is created one level up</b></p>
+  <pre><code>function Layout({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    &lt;div className={open ? 'wide' : 'narrow'}&gt;
+      &lt;button onClick={() =&gt; setOpen(!open)}&gt;Toggle&lt;/button&gt;
+      {children}          <span class="cmt">// the SAME element object as last render</span>
+    &lt;/div&gt;
+  );
+}
+
+function Page() {
+  return (
+    &lt;Layout&gt;
+      &lt;ExpensiveReport /&gt;   <span class="cmt">// created HERE, by a component that did not re-render</span>
+    &lt;/Layout&gt;
+  );
+}</code></pre>
+
+  <p><b>Why this works, precisely.</b> <code>&lt;ExpensiveReport /&gt;</code> is an object created by whoever wrote that JSX. When <code>Layout</code> re-renders because of its own state, it does not run <code>Page</code> — so <code>children</code> is <em>literally the same object</em> it was last time. React sees an identical element and can reuse the whole subtree. The element became a value that <code>Layout</code> holds, and holding a value is not the same as creating one.</p>
+
+  <div class="note">
+    <span class="label">React docs · memo — how to make memoisation unnecessary</span>
+    "When a component wraps other components, let it <b>accept JSX as children</b>. This way, when the wrapper updates its own state, React knows that children don't need re-rendering."
+  </div>
+
+  <p>You have already used this without knowing why it was fast: it is the <code>children</code> pattern from lesson 3, and the reason a well-built <code>&lt;Modal&gt;</code> or <code>&lt;Card&gt;</code> does not slow the page down.</p>
+
+  <h3>The order to try things in</h3>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Order</th><th>Move</th><th>Cost to you</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Move the state down into the smallest component that needs it.</td><td>Free. Usually makes the code clearer too.</td></tr>
+      <tr><td>2</td><td>Take the expensive subtree as <code>children</code> so a stateful wrapper cannot re-create it.</td><td>Free. Usually makes the component more reusable.</td></tr>
+      <tr><td>3</td><td>Stop the render from being expensive: fewer elements on screen, no heavy work in the body.</td><td>Real work, but it fixes the actual disease.</td></tr>
+      <tr><td>4</td><td><code>memo</code> / <code>useMemo</code> / <code>useCallback</code>.</td><td>Ongoing maintenance, easy to get wrong, silently useless if one prop leaks. <b>Lesson 25.</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Moves 1 and 2 do not just skip work — they make the wasted render <em>impossible</em>. Move 4 lets the render be requested and then declines it, which means it still costs a comparison and still breaks the moment someone adds an inline arrow function. Prefer impossible to declined.</p>
+
+  <h2>Seeing it without <code>console.count</code></h2>
+
+  <p>Install React Developer Tools, open the <b>Components</b> tab, click the gear, and tick <b>"Highlight updates when components render"</b>. Now every render draws a box around the component. Type in the stage-1 app and the whole page flashes; type in the stage-2 app and only the list does. This is the fastest way to answer "is this a re-render problem at all?" — and the honest answer is often no.</p>
+
+  <p>The <b>Profiler</b> tab is the next step: record an interaction, and it shows you each committed render, how long it took, and — in the "Why did this render?" panel, if you enable it — which of the triggers fired. Two notes so the numbers do not lie to you: Strict Mode double-renders in development, and development builds are slower than production. Use it to compare <em>before and after</em>, not to quote absolute milliseconds.</p>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>Two reasons to render: mount, and state at-or-above you</td><td>The quote, then <code>Legend</code> re-rendering with no props</td></tr>
+      <tr><td>Rendering is recursive down the tree</td><td>2,000 <code>Row</code> calls per keystroke in stage 1</td></tr>
+      <tr><td>"Props changed" is a consequence, not a trigger</td><td>The figure — <code>Total</code>'s props changed <em>because</em> <code>Panel</code> ran</td></tr>
+      <tr><td>Render ≠ DOM update</td><td>The three-cost table; identical output writes nothing</td></tr>
+      <tr><td>Identical state bails out via <code>Object.is</code></td><td>The extra call you can see with <code>console.count</code> and not with an effect</td></tr>
+      <tr><td>One event = one render</td><td>Three setters in <code>handleSubmit</code>, one render</td></tr>
+      <tr><td>Counting renders vs counting commits</td><td><code>console.count</code> in the body vs <code>useCommitCount</code></td></tr>
+      <tr><td>Move state down</td><td><code>SearchableList</code> — five keystrokes, one <code>App</code> render</td></tr>
+      <tr><td>Pass JSX as <code>children</code> so the wrapper cannot recreate it</td><td><code>Layout</code> + <code>ExpensiveReport</code></td></tr>
+      <tr><td>Context and external stores are separate triggers</td><td>The trigger table — both covered properly in lesson 24</td></tr>
+      <tr><td><code>key</code> change is a remount, not a re-render</td><td>The trigger table, tying back to lesson 9's reset trick</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Prove the bail-out.</b> Add a button that calls <code>setQuery(query)</code> — the same value. Watch <code>console.count</code> in <code>App</code> and in <code>Row</code>. Explain, out loud, why <code>App</code> can log once more and <code>Row</code> logs nothing at all.</li>
+    <li><b>Break fix 2 on purpose.</b> In the <code>Layout</code> version, change <code>Page</code> so it has its own state and re-renders on a timer. Now toggling the sidebar is still cheap, but the timer re-renders <code>ExpensiveReport</code>. Say precisely why: <code>children</code> is only stable while the component that <em>created</em> it does not re-render.</li>
+    <li><b>Find one in your own code.</b> Turn on "Highlight updates", type into any form you have written, and write down every component that flashes and should not. For each one, decide which of the four moves applies before you read lesson 25. You will find that most of them are move 1.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate opens a pull request titled "fix performance". A dashboard page has one search input at the top and eleven cards below it, and typing feels sticky. Their change wraps all eleven cards in <code>React.memo</code>, wraps every handler in <code>useCallback</code>, and adds <code>useMemo</code> around a <code>rows.length</code> expression. Typing is still sticky. In the same file you notice that the search input's state lives in the page component, that one card renders a 3,000-row table, and that each card is passed <code>config={{ dense: true }}</code> inline.</p>
+    Work out, in order: why every one of the eleven <code>memo</code> wrappers is doing nothing at all right now; which single change would remove the stickiness for ten of the eleven cards; why the eleventh card needs a different kind of fix; and what you would say in the review that is more useful than "revert this".
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/render-and-commit">Render and Commit</a>, <a href="https://react.dev/reference/react/useState">useState</a> (the <code>Object.is</code> bail-out and batching caveats), <a href="https://react.dev/reference/react/memo">memo</a> (the "how to make memoisation unnecessary" list), <a href="https://react.dev/learn/keeping-components-pure">Keeping Components Pure</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>quiz you on eight tiny trees</b>: I describe where the state changed and which components exist, you name every component that re-renders, in three seconds. Or ask for the sticky dashboard as a live debugging drill — you get "Highlight updates" and nothing else.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Two reasons to render:</b> the initial render, and state updating in this component <em>or one of its ancestors</em>. That is the whole rule.</li>
+      <li><b>Rendering is recursive.</b> When a component re-renders, React re-renders everything below it by default — props identical or not, props absent or not.</li>
+      <li><b>"Props changed" is never the cause.</b> A prop can only change because an ancestor re-rendered, so it is the symptom.</li>
+      <li><b>The other two triggers are context and external stores:</b> a context value that is not <code>Object.is</code>-equal, or a <code>useSyncExternalStore</code> snapshot that changed.</li>
+      <li><b>A <code>key</code> change is not a re-render</b> — it is an unmount and a fresh mount, with fresh state. That is why it works as a reset.</li>
+      <li><b>Render is not paint.</b> React only changes DOM nodes when there is a difference between renders, so a re-render with identical output writes nothing.</li>
+      <li><b>Setting state to the same value bails out</b> (<code>Object.is</code>) — children and effects are skipped, though React may still call your function once to find out.</li>
+      <li><b>One event is one render.</b> React batches all the setters in a handler, so counting <code>setState</code> calls tells you nothing.</li>
+      <li><b>Count two different things:</b> <code>console.count</code> in the body counts render <em>calls</em> (and reveals bail-outs); an effect with no dependency array counts <em>commits</em>. Body logging is instrumentation you delete.</li>
+      <li><b>Fix 1, free: move the state down</b> into the smallest component that needs it. A keystroke cannot re-render what is not below it.</li>
+      <li><b>Fix 2, free: take the expensive subtree as <code>children</code></b>. The element was created by a component that did not re-render, so it is the same object and React reuses the subtree.</li>
+      <li><b>Try structure before memoisation.</b> Moves 1 and 2 make the wasted render impossible; <code>memo</code> only declines it, and one inline object voids the whole thing.</li>
+      <li><b>Real use case (built &amp; run):</b> a 2,000-row list where five keystrokes re-rendered a props-less <code>Legend</code> five times — then once, after one <code>useState</code> moved down a level.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>React does not ask "did the props change?" — it asks "did state change at or above me?", and the cheapest fix is always to move the state, not to memoise the child.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <em>Render and Commit</em> (the two reasons to render, the recursive process, "React only changes the DOM nodes if there's a difference between renders"), <code>useState</code> (the <code>Object.is</code> bail-out caveat and the batching caveat), <code>memo</code> (the caveats about own state and context, and the five principles that make memoisation unnecessary), <code>useContext</code> (context as a re-render trigger), <code>useSyncExternalStore</code>; React Developer Tools — "Highlight updates when components render" and the Profiler.</p>
+
+  <div class="footer-nav">
+    <a href="./0022-build-a-modal-and-a-media-player.html">← Previous: Build it — a modal &amp; a media player</a>
+    <a href="./0024-context-sharing-state-through-the-tree.html">Next: Context — sharing state through the tree →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A component takes no props and has no state. Its parent re-renders. What happens?",
+      options: [
+        "It re-renders too — a parent re-rendering re-renders its whole subtree by default",
+        "Nothing — with no props there is nothing to compare, so React skips it",
+        "It re-renders only if it reads a context",
+        "React re-renders it but skips its children"
+      ],
+      answer: 0,
+      why: "The documented rule is that a component renders on its initial render or when its own state, or one of its ancestors' state, has been updated — and the process is recursive down the tree. React does not compare props to decide whether to call a component; comparison is opt-in through `memo`. This is exactly why a props-less `Legend` logs a render on every keystroke typed into a sibling input, and it is the trigger that structural fixes (moving state down, passing JSX as children) remove entirely."
+    },
+    {
+      q: "You call `setCount(count)` — the same number that is already in state. What does React do?",
+      options: [
+        "It compares with `Object.is`, finds them identical, and skips re-rendering the component and its children — though it may still call your component once before skipping",
+        "It re-renders normally; React does not compare state values",
+        "It throws a warning about a redundant state update",
+        "It re-renders the component but skips the effects"
+      ],
+      answer: 0,
+      why: "The `useState` docs state that if the new value is identical to the current state as determined by `Object.is`, React will skip re-rendering the component and its children, and add that in some cases React may still need to call your component before skipping the children. That escape hatch explains a confusing observation: a `console.count` in the body can log once more while children and effects stay silent. The comparison is `Object.is`, not deep equality — so `setUser({...user})` with identical contents is a different object and always re-renders."
+    },
+    {
+      q: "A sidebar wrapper has an `open` boolean in state. Inside it sits an expensive report. Every toggle re-renders the report. Which fix is free and why does it work?",
+      options: [
+        "Have the wrapper accept the report as `children` — the element is created by a component that did not re-render, so it is the same object and React reuses the subtree",
+        "Wrap the report in `memo` so it compares its props before rendering",
+        "Move the `open` state into the report so the wrapper stops re-rendering",
+        "Wrap the report element in `useMemo` inside the wrapper"
+      ],
+      answer: 0,
+      why: "`<ExpensiveReport />` is just an object. If it is written inside the wrapper, the wrapper creates a new one on every render of its own state. If it arrives as `children`, it was created by the parent — which did not re-render — so it is literally the same object, and React can reuse that subtree. The docs recommend exactly this: when a component wraps other components, let it accept JSX as children, so that when the wrapper updates its own state React knows the children don't need re-rendering. `memo` would also help, but it costs a comparison, needs every prop to stay stable, and is easy to break later; the `children` version makes the wasted render impossible instead of merely declined. Moving `open` into the report is wrong — the report does not own the sidebar's width."
+    },
+    {
+      q: "Which one of these is NOT a reason a component re-renders?",
+      options: [
+        "One of its props changed",
+        "A context it reads received a value that is not `Object.is`-equal to the previous one",
+        "Its own `useReducer` dispatch produced a new state",
+        "An external store it reads through `useSyncExternalStore` changed its snapshot"
+      ],
+      answer: 0,
+      why: "A prop is a value that the parent computed while rendering, so for a prop to change the parent must already have re-rendered — which means the real trigger was the parent's render, not the prop. The other three are genuine independent triggers: own state (from `useState` or `useReducer`), a changed context value compared with `Object.is` starting from the provider, and a changed external store snapshot. Getting this ordering right is what stops you from reaching for `memo` when the actual fix is to move the state or split the context."
+    },
+    {
+      q: "A handler calls `setStatus('saving')`, `setError(null)` and `setAttempts(a => a + 1)`. How many re-renders?",
+      options: [
+        "One — React batches the updates and renders after the handler has finished",
+        "Three — one per setter, in order",
+        "Two — React batches the first two and renders again for the updater function",
+        "It depends on whether the handler is async"
+      ],
+      answer: 0,
+      why: "React batches state updates and updates the screen after all the event handlers have run and called their set functions, specifically to prevent multiple re-renders during a single event. Since React 18 this batching also covers updates inside promises, timeouts and native event handlers, so the old 'updates outside React events are not batched' behaviour no longer applies. The practical consequence is that counting `setState` calls tells you nothing about render counts — and that if you genuinely need the DOM updated before the handler finishes, `flushSync` is the documented escape hatch."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What causes a React component to re-render?”",
+      answer: "Two things, and the second one has a wide reach. First, its <b>initial render</b>. Second, <b>state updating in that component or in one of its ancestors</b> — and rendering is recursive, so when a component re-renders, React re-renders everything below it by default. I say the negative version too, because it is the part people get wrong: <b>a prop changing is not a trigger</b>. A prop is a value the parent computed while rendering, so if a prop changed, the parent must already have re-rendered — the prop is the symptom. Two more triggers exist for components that opt into outside data: a <b>context</b> value that is not <code>Object.is</code>-equal to the previous one, which re-renders every consumer below that provider and cannot be stopped with <code>memo</code>; and an <b>external store</b> read through <code>useSyncExternalStore</code> whose snapshot changed. One special case worth naming: if a component's <code>key</code> changes, that is not a re-render at all — React unmounts the old one and mounts a fresh one with fresh state, which is why <code>key</code> works as a reset."
+    },
+    {
+      prompt: "Interviewer: “Is re-rendering bad? How do you know when it matters?”",
+      answer: "Usually it is not bad, and that is why I measure before changing anything. A re-render is three separate costs. <b>Render</b>: my function runs and returns a description of the UI. <b>Reconcile</b>: React compares that description with the previous one. <b>Commit</b>: React writes only the differences to the DOM — and the docs are explicit that React only changes DOM nodes if there is a difference between renders, so a re-render whose output is identical writes nothing and paints nothing. For a component that returns twenty elements, all of that is a fraction of a millisecond. It starts to matter in two situations: <b>a lot of components</b> re-render — hundreds or thousands of rows — or <b>one component does real work in its body</b>, like sorting a big array or formatting dates in a loop. Those are different diseases with different cures, which is why 'the app re-renders too much' is not yet a diagnosis. To find out which one I have, I turn on 'Highlight updates when components render' in React DevTools and type into the page: if the whole screen flashes, I have a structural problem; then the Profiler tells me which committed renders were actually slow. I compare before and after rather than quoting absolute numbers, because development builds are slower and Strict Mode double-renders."
+    },
+    {
+      prompt: "Interviewer: “An input at the top of a page makes the whole page re-render on every keystroke. Fix it — without memo.”",
+      answer: "Two structural moves, in this order, and they are both free. <b>Move the state down.</b> The input's value only needs to be read by the input and by whatever consumes it, so I extract those into their own component — say a <code>SearchableList</code> that owns <code>query</code> and renders the input plus the filtered list. Everything that was a sibling of the input is now <em>above</em> the state instead of below it, so a keystroke cannot reach it. This is the same move as Month 3's 'invent a component just to hold state', and it usually makes the code clearer as well as faster. If the state genuinely belongs to a wrapper — a sidebar's open flag, a tab index — I use the second move: <b>take the expensive subtree as <code>children</code></b>. The point is identity: <code>&lt;ExpensiveReport /&gt;</code> is an object, and if it is written inside the wrapper the wrapper creates a new one on every render, but if it arrives as <code>children</code> it was created by a parent that did not re-render, so it is the same object and React reuses that whole subtree. The docs recommend both of these explicitly as ways to make memoisation unnecessary. I prefer them to <code>memo</code> because they make the wasted render <b>impossible</b>, whereas <code>memo</code> lets it be requested and then declines it — which still costs a comparison and silently stops working the day someone passes an inline arrow function or object literal."
+    },
+    {
+      prompt: "Interviewer: “How would you actually count the renders of a component?”",
+      answer: "I would decide first <b>which</b> of two different numbers I want. If I want the number of times React <b>called</b> my function, I put <code>console.count('render X')</code> in the component body. That is technically impure — logging is a side effect in render — so it is instrumentation I delete afterwards, but it is the only way to see a render that React called and then discarded, which happens when a state update bails out because the new value is <code>Object.is</code>-equal to the old one. If I want the number of times a render was actually <b>committed</b>, I use an effect with no dependency array and increment a ref inside it; that is a legal side effect, it runs after every commit, and it stays silent for bailed-out renders. Two corrections I apply to whatever I see: Strict Mode double-renders in development, so I halve the body counts in my head, and development is slower than production, so I only ever compare before-and-after rather than reporting absolute timings. In practice I reach for React DevTools first — 'Highlight updates when components render' answers 'is this even a re-render problem?' in about five seconds, and the Profiler answers 'which of these renders was slow?' after that."
+    }
+  ]);
+</script>

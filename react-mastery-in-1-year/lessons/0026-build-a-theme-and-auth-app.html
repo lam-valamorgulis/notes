@@ -1,0 +1,1176 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build it — a theme &amp; auth app with reducers and custom hooks — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 6 · Lesson 4 · The real build</p>
+  <h1>Build it — a theme &amp; auth app with reducers and custom hooks</h1>
+  <p class="subtitle">Two features every app has, built so that typing a password does not re-render the header, and so the login rules live in one pure function you can test without React.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a typed reducer with a state union that cannot contradict itself, two providers whose action consumers never re-render, six custom hooks — four of which delete sixty lines from lesson 22's modal — and a re-render audit you performed yourself, before and after.</div>
+
+  <p>This is the month's headline build and the last lesson of Phase 2. Everything hard is behind you now: effects, refs, timing, context, re-renders. What is left is <b>packaging</b> — how you organise state logic so a feature stays understandable at 300 lines, and how you extract behaviour so the next component gets it for free.</p>
+
+  <h2>First principle 1 — a reducer is a list of things that can happen</h2>
+
+  <p>With <code>useState</code>, your handlers describe <em>how state should change</em>. Ten handlers means ten places that know the shape of your state, and a bug can be in any of them.</p>
+
+  <p>A reducer flips the direction. Handlers describe <em>what happened</em>; one function decides what that means.</p>
+
+  <div class="note">
+    <span class="label">React docs · Extracting State Logic into a Reducer</span>
+    A reducer function "takes two arguments—the current state and an action object—and returns the next state".
+    <br><br>
+    "Reducers are named after the <code>reduce()</code> operation performed on arrays." … "React reducers follow the same idea: they take the <em>state so far</em> and the <em>action</em>, and return the <em>next state</em>. In this way, they <b>accumulate actions over time into state.</b>"
+  </div>
+
+  <p>That analogy is worth taking literally. <code>[1,2,3].reduce((sum, n) =&gt; sum + n)</code> folds many numbers into one number. Your component folds many <em>events</em> into one state. The reducer is the folding function, and <code>dispatch</code> is how you hand it the next item.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th></th><th><code>useState</code></th><th><code>useReducer</code></th></tr></thead>
+    <tbody>
+      <tr><td><b>Code size</b></td><td>Less code up front.</td><td>More code initially, but "helps cut down code if many event handlers modify state similarly".</td></tr>
+      <tr><td><b>Readability</b></td><td>Very easy for simple updates.</td><td>Better for complex updates; "cleanly separates the <em>how</em> of update logic from the <em>what happened</em> of event handlers".</td></tr>
+      <tr><td><b>Debugging</b></td><td>Hard to tell where and why state was set wrongly.</td><td>One <code>console.log</code> in the reducer shows every update and which action caused it.</td></tr>
+      <tr><td><b>Testing</b></td><td>Needs a realistic component environment.</td><td>"The reducer is a pure function that can be exported and tested separately in isolation."</td></tr>
+      <tr><td><b>Preference</b></td><td colspan="2">The docs' own last row: it is a matter of preference, and you can mix both in one component.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The debugging and testing rows are why this build uses one. Authentication is a feature where the state graph is small but the wrong transition is expensive.</p>
+
+  <h3>The three rules</h3>
+
+  <ol>
+    <li><b>Reducers must be pure.</b> "Similar to state updater functions, reducers run during rendering." No requests, no timers, no mutation — return a new object.</li>
+    <li><b>Each action describes a single user interaction</b>, even when it changes five fields. The docs' example: a "Reset" button on a five-field form dispatches one <code>reset_form</code>, not five <code>set_field</code>s.</li>
+    <li><b>Name the action after what happened</b>, not after how you want state to change. "Choose a name that says what happened!" — <code>sign_in_failed</code>, not <code>set_error</code>.</li>
+  </ol>
+
+  <p>Rule 3 sounds like style advice. It is not. <code>set_error</code> forces every caller to know that failure means "an error string exists". <code>sign_in_failed</code> lets the reducer decide that failure also clears the password field, stops the spinner, and increments an attempt count — later, without touching a single caller.</p>
+
+  <h2>First principle 2 — a custom hook shares logic, not state</h2>
+
+  <p>This is the misconception to kill before you write one. A custom hook is <b>not</b> a store, not a singleton, not a shared variable.</p>
+
+  <div class="note">
+    <span class="label">React docs · Reusing Logic with Custom Hooks</span>
+    "<b>Custom Hooks let you share <em>stateful logic</em> but not <em>state itself.</em></b> Each call to a Hook is completely independent from every other call to the same Hook."
+    <br><br>
+    "<b>The code inside your custom Hooks should be pure, like your component's code.</b> Custom Hooks re-run during every re-render of your component and always receive the latest props and state. Think of custom Hooks' code as part of your component's body."
+  </div>
+
+  <p>That last line is the mental model: <b>a custom hook is a copy-paste that happens at call time.</b> Two components calling <code>useOnlineStatus()</code> get two separate <code>useState</code>s and two separate effects. They agree only because they read the same outside world.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig26-title" width="640" height="250">
+      <title id="fig26-title">Two components each call useOnlineStatus. Each call creates its own state cell and its own effect subscription. They agree because both read the same browser API, not because they share state. To share state you need one owner plus context.</title>
+      <defs>
+        <marker id="a26" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+      </defs>
+
+      <text x="12" y="16" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">A custom hook = logic copied in, not state shared</text>
+
+      <rect x="20" y="30" width="180" height="66" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="110" y="48" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">StatusBar</text>
+      <text x="110" y="64" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px;">useOnlineStatus()</text>
+      <text x="110" y="79" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">its own useState</text>
+      <text x="110" y="90" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">its own effect</text>
+
+      <rect x="440" y="30" width="180" height="66" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="530" y="48" text-anchor="middle" style="fill: var(--ink); font-family: sans-serif; font-size: 10px; font-weight: 700;">SaveButton</text>
+      <text x="530" y="64" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px;">useOnlineStatus()</text>
+      <text x="530" y="79" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">its own useState</text>
+      <text x="530" y="90" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">its own effect</text>
+
+      <line x1="110" y1="96" x2="270" y2="132" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a26)"></line>
+      <line x1="530" y1="96" x2="370" y2="132" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a26)"></line>
+
+      <rect x="238" y="136" width="164" height="40" rx="3" style="fill: var(--paper); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="152" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">window online / offline</text>
+      <text x="320" y="166" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">one outside world</text>
+
+      <line x1="12" y1="196" x2="628" y2="196" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="216" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">They agree because they read the same source — <b>not</b> because the hook shares anything.</text>
+      <text x="12" y="238" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">To share actual state: one owner + context. That is what this build does for the user.</text>
+    </svg>
+  </div>
+
+  <p>The naming rules matter too, and they are enforced by the linter:</p>
+
+  <div class="note">
+    <span class="label">React docs · Reusing Logic with Custom Hooks</span>
+    "<b>Hook names must start with <code>use</code> followed by a capital letter</b>" … and functions that do not call other Hooks should not use the prefix: a plain <code>getSorted(items)</code> stays a plain function, while <code>useSorted(items)</code> would be misleading.
+    <br><br>
+    "<b>Do NOT extract custom Hooks that act as alternatives to the <code>useEffect</code> API itself</b>" — avoid <code>useMount(fn)</code>, <code>useEffectOnce(fn)</code>, <code>useUpdateEffect(fn)</code>. "Keep your custom Hooks focused on <b>concrete high-level use cases</b>": <code>useData(url)</code>, <code>useOnlineStatus()</code>, <code>useChatRoom(options)</code>.
+  </div>
+
+  <p>Test any hook you are about to write against that: <code>useEscapeKey(onEscape)</code> names a concrete thing a user does. <code>useMount(fn)</code> names a React internal and will lie to you the day Strict Mode or Suspense changes the mount sequence.</p>
+
+  <h2>The file plan</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>File</th><th>Owns</th><th>Exports</th></tr></thead>
+    <tbody>
+      <tr><td><code>lib/useLocalStorage.ts</code></td><td>Reading and writing one key, safely.</td><td><code>useLocalStorage</code></td></tr>
+      <tr><td><code>theme/useSystemTheme.ts</code></td><td>The OS colour-scheme preference, as an external store.</td><td><code>useSystemTheme</code></td></tr>
+      <tr><td><code>theme/ThemeProvider.tsx</code></td><td>The preference, the resolved theme, and the <code>&lt;html&gt;</code> attribute.</td><td><code>ThemeProvider</code>, <code>useTheme</code>, <code>useThemePreference</code>, <code>useSetTheme</code></td></tr>
+      <tr><td><code>auth/authReducer.ts</code></td><td><b>All</b> the rules about which transitions are legal. No React.</td><td><code>authReducer</code>, <code>initialAuthState</code>, types</td></tr>
+      <tr><td><code>auth/api.ts</code></td><td>The fake network call.</td><td><code>signInRequest</code></td></tr>
+      <tr><td><code>auth/AuthProvider.tsx</code></td><td>Wiring the reducer to two contexts, and the async orchestration.</td><td><code>AuthProvider</code>, <code>useAuth</code>, <code>useAuthActions</code></td></tr>
+      <tr><td><code>hooks/useEscapeKey.ts</code> …<code>useOutsideClick</code>, <code>useFocusTrap</code>, <code>useScrollLock</code></td><td>One modal requirement each.</td><td>one hook each</td></tr>
+      <tr><td><code>components/Modal.tsx</code></td><td>Only the markup and the portal.</td><td><code>Modal</code></td></tr>
+      <tr><td><code>components/Header.tsx</code>, <code>SignInForm.tsx</code>, <code>ThemeMenu.tsx</code>, <code>App.tsx</code></td><td>The screen.</td><td>—</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Read the third row again. <b>The reducer file imports nothing from React.</b> That is the property that makes it testable, and it is the reason to write it first.</p>
+
+  <h2>Step 1 — the state union that cannot contradict itself</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/authReducer.ts</b></p>
+  <pre><code>export type User = { id: string; name: string; role: 'admin' | 'member' };
+
+<span class="cmt">// Month 3's rule, enforced by the type: no isLoading + error at once,
+// no user + signed-out at once. Every state below is a real screen.</span>
+export type AuthState =
+  | { status: 'signed_out' }
+  | { status: 'submitting'; name: string }
+  | { status: 'signed_in'; user: User }
+  | { status: 'failed'; message: string };
+
+<span class="cmt">// Named after what HAPPENED, never after how state should change.</span>
+export type AuthAction =
+  | { type: 'sign_in_submitted'; name: string }
+  | { type: 'sign_in_succeeded'; user: User }
+  | { type: 'sign_in_failed'; message: string }
+  | { type: 'signed_out' }
+  | { type: 'session_restored'; user: User };
+
+export const initialAuthState: AuthState = { status: 'signed_out' };
+
+export function authReducer(state: AuthState, action: AuthAction): AuthState {
+  switch (action.type) {
+    case 'sign_in_submitted':
+      <span class="cmt">// The rule lives HERE, not in the component: a second submit
+      // while one is in flight is not an error, it is a no-op.</span>
+      if (state.status === 'submitting') return state;
+      return { status: 'submitting', name: action.name };
+
+    case 'sign_in_succeeded':
+      return { status: 'signed_in', user: action.user };
+
+    case 'sign_in_failed':
+      return { status: 'failed', message: action.message };
+
+    case 'signed_out':
+      return { status: 'signed_out' };
+
+    case 'session_restored':
+      if (state.status === 'signed_in') return state;
+      return { status: 'signed_in', user: action.user };
+
+    default: {
+      <span class="cmt">// If someone adds an action and forgets a case, THIS line
+      // fails to compile. The exhaustiveness check is the whole point.</span>
+      const unhandled: never = action;
+      return state;
+    }
+  }
+}</code></pre>
+
+  <p>Four things in that file are doing real work.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Detail</th><th>What it prevents</th></tr></thead>
+    <tbody>
+      <tr><td>A <b>discriminated union</b> for state, keyed on <code>status</code></td><td>Reading <code>state.user</code> when the status is <code>'failed'</code> — TypeScript refuses. This is lesson 12's "no contradictions" rule made unrepresentable rather than merely discouraged.</td></tr>
+      <tr><td>A <b>discriminated union</b> for actions</td><td>Dispatching <code>{ type: 'sign_in_succeeded' }</code> with no user, or a typo'd type string.</td></tr>
+      <tr><td><code>const unhandled: never = action</code></td><td>Adding a sixth action next year and silently forgetting to handle it. The build breaks instead of the app.</td></tr>
+      <tr><td>Returning <b><code>state</code> itself</b> for a no-op</td><td>An unnecessary re-render — "React will <b>ignore your update if the next state is equal to the previous state,</b> as determined by an <code>Object.is</code> comparison."</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The one that looks like a no-op and is not</span>
+    <code>return { ...state }</code> is a <b>different object</b>, so it re-renders. If nothing happened, return the exact same reference. Lesson 8's identity rule, one more time, now deciding render counts.
+  </div>
+
+  <h2>Step 2 — the fake API, and where async work belongs</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/api.ts</b></p>
+  <pre><code>import type { User } from './authReducer';
+
+export async function signInRequest(name: string): Promise&lt;User&gt; {
+  await new Promise(r =&gt; setTimeout(r, 700));
+  if (name.trim().toLowerCase() === 'nobody') {
+    throw new Error('No account found for that name.');
+  }
+  return { id: crypto.randomUUID(), name: name.trim(), role: 'member' };
+}</code></pre>
+
+  <p>The reducer cannot call this. Reducers run during rendering and must be pure — so the sequence is: <b>dispatch what happened, do the async work outside, dispatch what happened next.</b> Three actions, one reducer, zero impurity.</p>
+
+  <p>And note where it does <em>not</em> go: not in a <code>useEffect</code>. Signing in is caused by a user pressing a button, which is Month 4's first door. An effect here would be lesson 16's most common mistake wearing a login form.</p>
+
+  <h2>Step 3 — the provider, and why <code>dispatch</code> makes this easy</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/AuthProvider.tsx</b></p>
+  <pre><code>import { createContext, useContext, useMemo, useReducer, useRef } from 'react';
+import { authReducer, initialAuthState, type AuthState } from './authReducer';
+import { signInRequest } from './api';
+
+type AuthActions = {
+  signIn: (name: string) =&gt; Promise&lt;void&gt;;
+  signOut: () =&gt; void;
+};
+
+const AuthStateContext = createContext&lt;AuthState&gt;(initialAuthState);
+const AuthActionsContext = createContext&lt;AuthActions | null&gt;(null);
+
+export function useAuth(): AuthState {
+  return useContext(AuthStateContext);
+}
+
+export function useAuthActions(): AuthActions {
+  const actions = useContext(AuthActionsContext);
+  if (!actions) throw new Error('useAuthActions must be used inside &lt;AuthProvider&gt;');
+  return actions;
+}
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [state, dispatch] = useReducer(authReducer, initialAuthState);
+
+  <span class="cmt">// A fact about the past that the screen never reads → a ref (lesson 19).
+  // Written in a handler, never during render.</span>
+  const inFlight = useRef(false);
+
+  const actions = useMemo&lt;AuthActions&gt;(() =&gt; ({
+    async signIn(name: string) {
+      if (inFlight.current) return;
+      inFlight.current = true;
+      dispatch({ type: 'sign_in_submitted', name });
+      try {
+        const user = await signInRequest(name);
+        dispatch({ type: 'sign_in_succeeded', user });
+      } catch (error) {
+        dispatch({
+          type: 'sign_in_failed',
+          message: error instanceof Error ? error.message : 'Sign-in failed.',
+        });
+      } finally {
+        inFlight.current = false;
+      }
+    },
+    signOut() {
+      dispatch({ type: 'signed_out' });
+    },
+  }), []);   <span class="cmt">// [] is HONEST: dispatch has a stable identity, refs never change</span>
+
+  return (
+    &lt;AuthActionsContext value={actions}&gt;
+      &lt;AuthStateContext value={state}&gt;{children}&lt;/AuthStateContext&gt;
+    &lt;/AuthActionsContext&gt;
+  );
+}</code></pre>
+
+  <div class="note">
+    <span class="label">React docs · useReducer</span>
+    "The <code>dispatch</code> function has a <b>stable identity</b>, so you will often see it omitted from Effect dependencies. Including it will not cause the Effect to fire."
+  </div>
+
+  <p>That one sentence is why the reducer-plus-context pattern is cleaner than the <code>useState</code> version from lesson 24. There, <code>login</code> and <code>logout</code> each needed a <code>useCallback</code> whose dependency array you had to keep honest. Here the actions object closes over <b>nothing that can change</b> — <code>dispatch</code> is stable by design and a ref object never changes identity — so <code>[]</code> is a fact, and <code>AuthActionsContext</code> holds one value for the app's entire life.</p>
+
+  <p><b>Consequence:</b> a sign-out button re-renders <b>zero</b> times when a user signs in. Not "fewer times". Zero.</p>
+
+  <div class="tip">
+    <span class="label">Why the actions provider is on the outside</span>
+    It never changes, so it never re-renders, so it never even asks whether the tree below it should. Put the stable channel outermost and the volatile one innermost, every time.
+  </div>
+
+  <h2>Step 4 — <code>useLocalStorage</code>, your first real custom hook</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/lib/useLocalStorage.ts</b></p>
+  <pre><code>import { useEffect, useState } from 'react';
+
+export function useLocalStorage&lt;T&gt;(key: string, initial: T) {
+  <span class="cmt">// Lazy initialiser: reads storage ONCE, not on every render (lesson 21).</span>
+  const [value, setValue] = useState&lt;T&gt;(() =&gt; {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return raw === null ? initial : (JSON.parse(raw) as T);
+    } catch {
+      return initial;   <span class="cmt">// corrupt JSON, or storage blocked entirely</span>
+    }
+  });
+
+  <span class="cmt">// Writing to storage is a side effect on an outside system → an effect.</span>
+  useEffect(() =&gt; {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      <span class="cmt">// quota exceeded, or Safari private mode. The app must still work.</span>
+    }
+  }, [key, value]);
+
+  return [value, setValue] as const;   <span class="cmt">// as const → a tuple, not (T | setter)[]</span>
+}</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Decision</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Lazy <code>useState(() =&gt; …)</code></td><td>Reading <code>localStorage</code> is synchronous disk-backed work. Doing it on every render for no reason is exactly the "expensive body" problem from lesson 25.</td></tr>
+      <tr><td>Two <code>try</code>/<code>catch</code> blocks</td><td>Storage throws in real browsers: blocked cookies, private mode, full quota, and hand-edited corrupt JSON. A theme preference must never crash the app.</td></tr>
+      <tr><td><code>as const</code> on the return</td><td>Without it TypeScript infers <code>(T | Dispatch&lt;SetStateAction&lt;T&gt;&gt;)[]</code> and destructuring gives you a union. With it you get a real 2-tuple.</td></tr>
+      <tr><td>Returns the raw setter</td><td>It is already stable, and it keeps the hook honest — this hook persists a value, it does not invent an API.</td></tr>
+      <tr><td><b>Not</b> done: cross-tab sync</td><td>A <code>storage</code> event listener would keep two tabs in step. Left out deliberately — it is a different feature, and pretending otherwise would hide a decision.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Now check it against the docs' naming rule. It calls hooks, so the <code>use</code> prefix is correct. It names a concrete use case — persisting one value — not a React lifecycle moment. It passes.</p>
+
+  <h2>Step 5 — the system theme is an external store</h2>
+
+  <p>"Follow the OS setting" is not React state. It is a value that lives in the browser and changes without asking. Lesson 16 named the right tool for that shape, and this is it.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/useSystemTheme.ts</b></p>
+  <pre><code>import { useSyncExternalStore } from 'react';
+
+const QUERY = '(prefers-color-scheme: dark)';
+
+<span class="cmt">// Module scope, so both functions have a stable identity.
+// Defined inside the hook they would be new every render → resubscribe every render.</span>
+function subscribe(onStoreChange: () =&gt; void) {
+  const mql = window.matchMedia(QUERY);
+  mql.addEventListener('change', onStoreChange);
+  return () =&gt; mql.removeEventListener('change', onStoreChange);
+}
+
+function getSnapshot(): 'light' | 'dark' {
+  return window.matchMedia(QUERY).matches ? 'dark' : 'light';
+}
+
+function getServerSnapshot(): 'light' | 'dark' {
+  return 'light';   <span class="cmt">// there is no matchMedia on the server (Month 10)</span>
+}
+
+export function useSystemTheme() {
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+}</code></pre>
+
+  <p>Six lines of hook, and it is <b>tear-free</b>: React reads the snapshot at the right moment, so no part of the screen can show light while another shows dark. The <code>useState</code>-plus-<code>useEffect</code> version of this is longer and paints the wrong value on the first frame.</p>
+
+  <p>Why the two functions live at module scope is the same identity rule as everywhere else this month: <code>subscribe</code> is compared by <code>useSyncExternalStore</code>, and a fresh function every render means unsubscribe-and-resubscribe every render.</p>
+
+  <h2>Step 6 — the theme provider, three channels</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeProvider.tsx</b></p>
+  <pre><code>import { createContext, useContext, useEffect } from 'react';
+import { useLocalStorage } from '../lib/useLocalStorage';
+import { useSystemTheme } from './useSystemTheme';
+
+export type ThemePreference = 'light' | 'dark' | 'system';
+export type ResolvedTheme = 'light' | 'dark';
+
+const ThemeContext = createContext&lt;ResolvedTheme&gt;('light');
+const PreferenceContext = createContext&lt;ThemePreference&gt;('system');
+const SetThemeContext = createContext&lt;((p: ThemePreference) =&gt; void) | null&gt;(null);
+
+export const useTheme = () =&gt; useContext(ThemeContext);
+export const useThemePreference = () =&gt; useContext(PreferenceContext);
+
+export function useSetTheme() {
+  const set = useContext(SetThemeContext);
+  if (!set) throw new Error('useSetTheme must be used inside &lt;ThemeProvider&gt;');
+  return set;
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [preference, setPreference] = useLocalStorage&lt;ThemePreference&gt;('theme', 'system');
+  const system = useSystemTheme();
+
+  <span class="cmt">// DERIVED, not stored. Month 3's rule: the resolved theme is a calculation.</span>
+  const resolved: ResolvedTheme = preference === 'system' ? system : preference;
+
+  <span class="cmt">// The &lt;html&gt; element is outside React → an effect, with the DOM as the target.</span>
+  useEffect(() =&gt; {
+    document.documentElement.dataset.theme = resolved;
+  }, [resolved]);
+
+  return (
+    &lt;SetThemeContext value={setPreference}&gt;
+      &lt;PreferenceContext value={preference}&gt;
+        &lt;ThemeContext value={resolved}&gt;{children}&lt;/ThemeContext&gt;
+      &lt;/PreferenceContext&gt;
+    &lt;/SetThemeContext&gt;
+  );
+}</code></pre>
+
+  <p>Three contexts, and each one has a different audience:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Context</th><th>Read by</th><th>Changes when</th></tr></thead>
+    <tbody>
+      <tr><td><code>ThemeContext</code> (<code>'light' | 'dark'</code>)</td><td>Anything that draws differently in dark mode.</td><td>The preference changes, <em>or</em> the OS setting changes while on <code>'system'</code>.</td></tr>
+      <tr><td><code>PreferenceContext</code></td><td>Only the theme menu, to show which of the three is selected.</td><td>The user picks a different option. <b>Not</b> when the OS flips.</td></tr>
+      <tr><td><code>SetThemeContext</code></td><td>Only the theme menu's buttons.</td><td><b>Never.</b> A <code>useState</code> setter has a stable identity, so no <code>useCallback</code> and no <code>useMemo</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Splitting the preference from the resolved theme is not over-engineering — it is the difference between "the OS went dark at 6pm" waking every button in the app or waking only the components that actually render differently.</p>
+
+  <p>And notice there is no <code>useMemo</code> anywhere in this provider. Every value is a <b>string</b> or a <b>stable setter</b>, and primitives compare by value under <code>Object.is</code>. <b>The cheapest way to avoid memoising a context value is to not put an object in it.</b></p>
+
+  <h2>Step 7 — four hooks that delete sixty lines</h2>
+
+  <p>Lesson 22 built a modal with eight requirements and left four of them tangled inside one component. They are four independent behaviours with four independent lifetimes, which is exactly the shape a custom hook is for.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/hooks/useEscapeKey.ts</b></p>
+  <pre><code>import { useEffect, useEffectEvent } from 'react';   <span class="cmt">// useEffectEvent: React 19.2+</span>
+
+export function useEscapeKey(enabled: boolean, onEscape: () =&gt; void) {
+  <span class="cmt">// The handler is not reactive — we do not want a re-subscribe when the
+  // caller passes a new arrow function (lesson 17's fourth removal recipe).</span>
+  const handleEscape = useEffectEvent(onEscape);
+
+  useEffect(() =&gt; {
+    if (!enabled) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') handleEscape();
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () =&gt; document.removeEventListener('keydown', onKeyDown);
+  }, [enabled]);
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/hooks/useOutsideClick.ts</b></p>
+  <pre><code>import { useEffect, useEffectEvent, type RefObject } from 'react';
+
+<span class="cmt">// Generic in T, not just RefObject&lt;HTMLElement | null&gt;: RefObject has a
+// mutable `current`, so it is invariant — a RefObject&lt;HTMLDivElement | null&gt;
+// would NOT be assignable to RefObject&lt;HTMLElement | null&gt;.</span>
+export function useOutsideClick&lt;T extends HTMLElement&gt;(
+  ref: RefObject&lt;T | null&gt;,
+  enabled: boolean,
+  onOutside: () =&gt; void,
+) {
+  const handleOutside = useEffectEvent(onOutside);
+
+  useEffect(() =&gt; {
+    if (!enabled) return;
+    <span class="cmt">// pointerdown, NOT click — a click fires on the common ancestor of
+    // press and release, so drag-selecting text inside the panel and
+    // releasing outside it would close the modal (lesson 22).</span>
+    function onPointerDown(event: PointerEvent) {
+      const node = ref.current;
+      if (node && !node.contains(event.target as Node)) handleOutside();
+    }
+    document.addEventListener('pointerdown', onPointerDown);
+    return () =&gt; document.removeEventListener('pointerdown', onPointerDown);
+  }, [enabled, ref]);
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/hooks/useScrollLock.ts</b></p>
+  <pre><code>import { useEffect } from 'react';
+
+export function useScrollLock(enabled: boolean) {
+  useEffect(() =&gt; {
+    if (!enabled) return;
+    const previous = document.body.style.overflow;   <span class="cmt">// save what was there</span>
+    document.body.style.overflow = 'hidden';
+    return () =&gt; { document.body.style.overflow = previous; };
+  }, [enabled]);
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/hooks/useFocusTrap.ts</b></p>
+  <pre><code>import { useEffect, type RefObject } from 'react';
+
+const FOCUSABLE = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled])',
+  'select:not([disabled])', 'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(', ');
+
+export function useFocusTrap&lt;T extends HTMLElement&gt;(
+  ref: RefObject&lt;T | null&gt;,
+  enabled: boolean,
+) {
+  useEffect(() =&gt; {
+    if (!enabled) return;
+    const panel = ref.current;    <span class="cmt">// copy to a local — cleanup runs later (lesson 21)</span>
+    if (!panel) return;
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    panel.focus();
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Tab') return;
+      <span class="cmt">// Query at the MOMENT Tab is pressed — the panel's contents
+      // can change while it is open (lesson 22).</span>
+      const items = Array.from(panel.querySelectorAll&lt;HTMLElement&gt;(FOCUSABLE));
+      if (items.length === 0) { event.preventDefault(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    panel.addEventListener('keydown', onKeyDown);
+    return () =&gt; {
+      panel.removeEventListener('keydown', onKeyDown);
+      previouslyFocused?.focus();   <span class="cmt">// give focus back to whatever opened it</span>
+    };
+  }, [enabled, ref]);
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/components/Modal.tsx</b> — the whole of lesson 22's part A, now</p>
+  <pre><code>import { useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { useEscapeKey } from '../hooks/useEscapeKey';
+import { useOutsideClick } from '../hooks/useOutsideClick';
+import { useFocusTrap } from '../hooks/useFocusTrap';
+import { useScrollLock } from '../hooks/useScrollLock';
+
+type Props = { open: boolean; onClose: () =&gt; void; title: string; children: React.ReactNode };
+
+export function Modal({ open, onClose, title, children }: Props) {
+  const panelRef = useRef&lt;HTMLDivElement&gt;(null);
+
+  useEscapeKey(open, onClose);          <span class="cmt">// requirement 3</span>
+  useOutsideClick(panelRef, open, onClose);  <span class="cmt">// requirement 4</span>
+  useFocusTrap(panelRef, open);         <span class="cmt">// requirements 5, 6, 7</span>
+  useScrollLock(open);                  <span class="cmt">// requirement 8</span>
+
+  if (!open) return null;               <span class="cmt">// AFTER the hooks — always</span>
+
+  return createPortal(
+    &lt;div className="overlay"&gt;
+      &lt;div
+        className="panel"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+        tabIndex={-1}
+      &gt;
+        &lt;h2 id="modal-title"&gt;{title}&lt;/h2&gt;
+        {children}
+      &lt;/div&gt;
+    &lt;/div&gt;,
+    document.body,
+  );
+}</code></pre>
+
+  <p><b>Four lines of behaviour.</b> The component is now about markup, and each behaviour can be read, tested and reused on its own — a dropdown wants <code>useOutsideClick</code> and <code>useEscapeKey</code> but not the trap or the lock, and now it can have exactly those two.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Detail</th><th>Why it is like that</th></tr></thead>
+    <tbody>
+      <tr><td>Every hook takes <code>enabled</code> as its first argument</td><td>Hooks cannot be called conditionally. The condition moves <em>inside</em>, as an early <code>return</code> in the effect — which reads as "when closed, sync nothing".</td></tr>
+      <tr><td><code>if (!open) return null</code> sits <b>below</b> all four hooks</td><td>Rules of hooks: same calls, same order, every render.</td></tr>
+      <tr><td><code>useEffectEvent</code> for the callbacks</td><td>So a caller writing <code>onClose={() =&gt; setOpen(false)}</code> inline does not tear down and re-add the document listener on every render.</td></tr>
+      <tr><td><code>tabIndex={-1}</code> on the panel</td><td><code>panel.focus()</code> does nothing on an element that cannot receive focus.</td></tr>
+      <tr><td>Names describe user-visible behaviour</td><td><code>useEscapeKey</code>, not <code>useKeydownEffect</code>. The docs' "concrete high-level use cases" rule.</td></tr>
+      <tr><td>The ref hooks are <b>generic in <code>T</code></b></td><td><code>RefObject</code> has a mutable <code>current</code>, so it is invariant: a <code>RefObject&lt;HTMLDivElement | null&gt;</code> is not assignable to <code>RefObject&lt;HTMLElement | null&gt;</code>. <code>&lt;T extends HTMLElement&gt;</code> lets <code>T</code> infer from the call site.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The line you must not cross</span>
+    Do not now write <code>useModal(open, onClose)</code> that calls all four. It is tempting and it is a step towards the <code>useMount</code> anti-pattern: a hook whose name describes <em>a bundle of React plumbing</em> rather than one behaviour. Four named behaviours at the call site is documentation. One <code>useModal</code> is a black box, and the first time a dropdown needs three of the four you will fork it.
+  </div>
+
+  <h2>Step 8 — the screen, and where form state lives</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/components/SignInForm.tsx</b></p>
+  <pre><code>import { useState } from 'react';
+import { useAuth, useAuthActions } from '../auth/AuthProvider';
+
+export function SignInForm() {
+  console.count('render SignInForm');
+  const [name, setName] = useState('');       <span class="cmt">// ← LOCAL. Never in context.</span>
+  const state = useAuth();
+  const { signIn } = useAuthActions();
+
+  const busy = state.status === 'submitting';
+
+  return (
+    &lt;form
+      onSubmit={e =&gt; { e.preventDefault(); signIn(name); }}
+    &gt;
+      &lt;input
+        value={name}
+        onChange={e =&gt; setName(e.target.value)}
+        disabled={busy}
+        placeholder="Your name (try &ldquo;nobody&rdquo;)"
+      /&gt;
+      &lt;button disabled={busy || name.trim() === ''}&gt;
+        {busy ? 'Signing in…' : 'Sign in'}
+      &lt;/button&gt;
+      {state.status === 'failed' && &lt;p role="alert"&gt;{state.message}&lt;/p&gt;}
+    &lt;/form&gt;
+  );
+}</code></pre>
+
+  <p><b>The most important line in this file is <code>useState('')</code>.</b> A half-typed name is transient state belonging to one component. Putting it in context would re-render every consumer in the app on every keystroke — the exact bug from lesson 24's drill, and the exact thing the docs warn about: "don't keep transient state like forms and whether an item is hovered at the top of your tree or in a global state library."</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/components/Header.tsx</b></p>
+  <pre><code>import { memo } from 'react';
+import { useAuth, useAuthActions } from '../auth/AuthProvider';
+import { ThemeMenu } from './ThemeMenu';
+
+const SignOutButton = memo(function SignOutButton() {
+  console.count('render SignOutButton');
+  const { signOut } = useAuthActions();     <span class="cmt">// actions only — never changes</span>
+  return &lt;button onClick={signOut}&gt;Sign out&lt;/button&gt;;
+});
+
+export function Header() {
+  console.count('render Header');
+  const state = useAuth();
+  return (
+    &lt;header&gt;
+      &lt;strong&gt;Console&lt;/strong&gt;
+      &lt;ThemeMenu /&gt;
+      {state.status === 'signed_in' && (
+        &lt;&gt;
+          &lt;span&gt;{state.user.name}&lt;/span&gt;   <span class="cmt">// TS knows user exists here</span>
+          &lt;SignOutButton /&gt;
+        &lt;/&gt;
+      )}
+    &lt;/header&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/components/ThemeMenu.tsx</b></p>
+  <pre><code>import { useSetTheme, useThemePreference, type ThemePreference } from '../theme/ThemeProvider';
+
+const OPTIONS: ThemePreference[] = ['light', 'dark', 'system'];
+
+export function ThemeMenu() {
+  console.count('render ThemeMenu');
+  const preference = useThemePreference();
+  const setTheme = useSetTheme();
+
+  return (
+    &lt;div role="group" aria-label="Theme"&gt;
+      {OPTIONS.map(option =&gt; (
+        &lt;button
+          key={option}
+          aria-pressed={preference === option}
+          onClick={() =&gt; setTheme(option)}
+        &gt;
+          {option}
+        &lt;/button&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { ThemeProvider } from './theme/ThemeProvider';
+import { AuthProvider } from './auth/AuthProvider';
+import { Header } from './components/Header';
+import { SignInForm } from './components/SignInForm';
+import { Dashboard } from './components/Dashboard';
+import { useAuth } from './auth/AuthProvider';
+
+function Body() {
+  const state = useAuth();
+  return state.status === 'signed_in' ? &lt;Dashboard /&gt; : &lt;SignInForm /&gt;;
+}
+
+export default function App() {
+  return (
+    &lt;ThemeProvider&gt;
+      &lt;AuthProvider&gt;
+        &lt;Header /&gt;
+        &lt;Body /&gt;
+      &lt;/AuthProvider&gt;
+    &lt;/ThemeProvider&gt;
+  );
+}</code></pre>
+
+  <p><code>App</code> itself has no state, so it renders once. Everything below reads what it needs from a channel. That is the payoff of the whole month: <b>the tree is shallow in data even though it is deep in components.</b></p>
+
+  <h2>Step 9 — the re-render audit</h2>
+
+  <p>Run it, open the console, and do each action. Halve the counts for Strict Mode. This table is the deliverable — it is what makes this a Month 6 build rather than a Month 2 build.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Action</th><th>Re-renders</th><th>Stays silent</th></tr></thead>
+    <tbody>
+      <tr><td>Typing one character in the name field</td><td><code>SignInForm</code> only</td><td><code>Header</code>, <code>ThemeMenu</code>, <code>SignOutButton</code>, <code>App</code>, <code>Body</code></td></tr>
+      <tr><td>Pressing "Sign in" (status → <code>submitting</code>)</td><td><code>Body</code>, <code>SignInForm</code>, <code>Header</code></td><td><code>ThemeMenu</code>, <code>SignOutButton</code>, <code>App</code></td></tr>
+      <tr><td>Sign-in succeeds (status → <code>signed_in</code>)</td><td><code>Body</code>, <code>Header</code>, and <code>SignOutButton</code> mounts</td><td><code>ThemeMenu</code>, <code>App</code></td></tr>
+      <tr><td>Clicking "dark" in the theme menu</td><td><code>ThemeMenu</code>, plus anything reading <code>useTheme()</code></td><td><code>Header</code>, <code>SignInForm</code>, <code>SignOutButton</code>, <code>App</code></td></tr>
+      <tr><td>The OS switches to dark while the preference is <code>system</code></td><td>Only <code>useTheme()</code> readers</td><td><code>ThemeMenu</code> — it reads the <em>preference</em>, which did not change</td></tr>
+      <tr><td>Clicking "Sign out"</td><td><code>Body</code>, <code>Header</code></td><td><code>SignOutButton</code> unmounts; <code>ThemeMenu</code> untouched</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Two rows are worth staring at. <b>Row 1:</b> the header does not know the user is typing — because the keystroke never leaves <code>SignInForm</code>. <b>Row 5:</b> the theme menu does not care that the OS changed, because the preference is still <code>'system'</code>. Both are consequences of one decision each — keep form state local, and split the preference from the resolved value.</p>
+
+  <h3>Now break it, on purpose</h3>
+
+  <p>Make this one change to <code>AuthProvider</code> and re-run the audit:</p>
+
+  <pre><code><span class="cmt">// 🔴 one context instead of two, with an inline object</span>
+return (
+  &lt;AuthContext value={{ state, signIn, signOut }}&gt;{children}&lt;/AuthContext&gt;
+);</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Action</th><th>Before</th><th>After</th></tr></thead>
+    <tbody>
+      <tr><td>Sign-in succeeds</td><td><code>SignOutButton</code>: 0</td><td><code>SignOutButton</code>: 1 — and <code>memo</code> does not help, because it reads a context</td></tr>
+      <tr><td>Any <code>AuthProvider</code> render at all</td><td>Consumers wake only if the state changed</td><td>Every consumer wakes, always — the value is a new object each time</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>That is lesson 24's rule and lesson 25's <code>memo</code> caveat, both visible in one experiment, in your own app. Put it back.</p>
+
+  <h2>Step 10 — test the reducer, with no React at all</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/authReducer.test.ts</b> — Vitest</p>
+  <pre><code>import { describe, expect, it } from 'vitest';
+import { authReducer, initialAuthState } from './authReducer';
+
+describe('authReducer', () =&gt; {
+  it('moves to submitting when a sign-in is submitted', () =&gt; {
+    const next = authReducer(initialAuthState, { type: 'sign_in_submitted', name: 'ana' });
+    expect(next).toEqual({ status: 'submitting', name: 'ana' });
+  });
+
+  it('ignores a second submit while one is in flight', () =&gt; {
+    const submitting = authReducer(initialAuthState, { type: 'sign_in_submitted', name: 'ana' });
+    const again = authReducer(submitting, { type: 'sign_in_submitted', name: 'ben' });
+    <span class="cmt">// toBe, not toEqual: the SAME object means React skips the re-render.</span>
+    expect(again).toBe(submitting);
+  });
+
+  it('clears the error when a later attempt succeeds', () =&gt; {
+    const failed = authReducer(initialAuthState, { type: 'sign_in_failed', message: 'nope' });
+    const user = { id: '1', name: 'ana', role: 'member' } as const;
+    expect(authReducer(failed, { type: 'sign_in_succeeded', user })).toEqual({
+      status: 'signed_in', user,
+    });
+  });
+});</code></pre>
+
+  <p>No render, no provider, no fake timers, no DOM. Three tests, milliseconds, and they cover the rules that actually matter. This is the docs' testing row made concrete — <b>and it is only possible because the reducer imports nothing from React.</b></p>
+
+  <p>The <code>toBe</code> in the second test is the interesting one: it asserts an <em>identity</em>, and identity is what React uses to decide whether to re-render. A test that says "returns the same object" is a test that says "does not cause a wasted render". Month 9 turns this into a habit.</p>
+
+  <div class="tip">
+    <span class="label">Strict Mode as a purity test</span>
+    "In Strict Mode, React will call your <b>reducer and initializer functions twice</b> in order to help you find accidental impurities." So if a reducer mutates its argument or increments a module counter, development shows you doubled or corrupted state immediately. Free test coverage for rule 1.
+  </div>
+
+  <h2>Concept → code — the whole month in one table</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>From</th><th>Where it is in this build</th></tr></thead>
+    <tbody>
+      <tr><td>Derive, don't store</td><td>L4, L12</td><td><code>resolved</code>, <code>busy</code> — both calculations, neither in state</td></tr>
+      <tr><td>State that cannot contradict itself</td><td>L12</td><td>The <code>AuthState</code> union — no <code>isLoading</code> + <code>error</code> pair exists</td></tr>
+      <tr><td>Identity decides re-renders</td><td>L8, L23</td><td>Returning <code>state</code> (not <code>{...state}</code>) for a no-op</td></tr>
+      <tr><td>Handlers, not effects, for user actions</td><td>L16</td><td><code>signIn</code> called from <code>onSubmit</code>; no login effect anywhere</td></tr>
+      <tr><td>Setup / cleanup pairs</td><td>L15</td><td>All four modal hooks; the <code>matchMedia</code> subscription</td></tr>
+      <tr><td>The updater form and honest dependency arrays</td><td>L17</td><td><code>[]</code> on the actions object — <code>dispatch</code> is stable, so it is a fact</td></tr>
+      <tr><td><code>useEffectEvent</code> for a non-reactive callback</td><td>L17</td><td><code>useEscapeKey</code>, <code>useOutsideClick</code></td></tr>
+      <tr><td>A ref for a fact the screen never reads</td><td>L19</td><td><code>inFlight</code> guarding a double submit</td></tr>
+      <tr><td>Copy <code>ref.current</code> to a local in an effect</td><td>L21</td><td><code>const panel = ref.current</code> in <code>useFocusTrap</code></td></tr>
+      <tr><td>Lazy <code>useState(() =&gt; …)</code></td><td>L21</td><td><code>useLocalStorage</code> reading storage once</td></tr>
+      <tr><td><code>pointerdown</code>, not <code>click</code>, for outside clicks</td><td>L22</td><td><code>useOutsideClick</code></td></tr>
+      <tr><td>Query focusables at the moment Tab is pressed</td><td>L22</td><td><code>useFocusTrap</code></td></tr>
+      <tr><td>Move state down; keep transient state local</td><td>L23</td><td><code>name</code> in <code>SignInForm</code> — row 1 of the audit</td></tr>
+      <tr><td>Providers take <code>children</code></td><td>L23</td><td>All four providers; <code>App</code> renders once</td></tr>
+      <tr><td>Split value from actions; stable channel outermost</td><td>L24</td><td><code>AuthActionsContext</code> outside <code>AuthStateContext</code></td></tr>
+      <tr><td>A throwing hook instead of a lying default</td><td>L24</td><td><code>useAuthActions</code>, <code>useSetTheme</code></td></tr>
+      <tr><td>Primitives in context need no <code>useMemo</code></td><td>L25</td><td><code>ThemeContext</code> holds a string</td></tr>
+      <tr><td><code>memo</code> cannot stop a context re-render</td><td>L25</td><td>The "break it on purpose" experiment</td></tr>
+      <tr><td>Module scope beats a hook for constants</td><td>L25</td><td><code>OPTIONS</code>, <code>FOCUSABLE</code>, <code>subscribe</code>, <code>getSnapshot</code></td></tr>
+      <tr><td>An external store, read tear-free</td><td>L16, L21</td><td><code>useSystemTheme</code> with <code>useSyncExternalStore</code></td></tr>
+      <tr><td>A reducer is a pure fold over actions</td><td>L26</td><td><code>authReducer</code> — and its three-test suite</td></tr>
+      <tr><td>A custom hook shares logic, not state</td><td>L26</td><td>Six hooks; the user is shared by <em>context</em>, not by a hook</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The four skills of this month</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Skill</th><th>Where you proved it</th></tr></thead>
+    <tbody>
+      <tr><td><b>m6a</b> — share state with <code>useContext</code> and explain when context re-renders consumers</td><td>Lesson 24's three stages; this build's audit table and the deliberate regression</td></tr>
+      <tr><td><b>m6b</b> — explain what actually triggers a re-render (it is not "props changed")</td><td>Lesson 23's trigger table; the audit rows that stay silent</td></tr>
+      <tr><td><b>m6c</b> — apply <code>memo</code>, <code>useMemo</code>, <code>useCallback</code> and know when they do nothing</td><td>Lesson 25's five measured stages; <code>memo(SignOutButton)</code> failing against a context, on purpose</td></tr>
+      <tr><td><b>m6d</b> — manage complex state with <code>useReducer</code>; extract a custom hook</td><td><code>authReducer</code> with its exhaustiveness check and tests; six hooks, four of them replacing lesson 22's tangle</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Look at what is not here</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Missing</th><th>Why, and where it arrives</th></tr></thead>
+    <tbody>
+      <tr><td><b>Real authentication</b></td><td><code>signInRequest</code> is a <code>setTimeout</code>. A real one involves tokens, refresh, expiry and CSRF — and a token in <code>localStorage</code> is readable by any script on the page, so production apps prefer an <code>httpOnly</code> cookie. <b>Do not ship this file.</b></td></tr>
+      <tr><td><b>Caching, refetching, invalidation</b></td><td>The auth state here is a session flag, not a data layer. Server state has its own rules — Month 7.</td></tr>
+      <tr><td><b>Protected routes</b></td><td>"Signed out users go to /login" is routing, not context — Month 8.</td></tr>
+      <tr><td><b>Redux / Zustand</b></td><td>Nothing here needed field-level subscriptions. When it does, an external store with selectors is the honest next step — Month 11.</td></tr>
+      <tr><td><b>Component tests</b></td><td>The reducer is tested; the form is not. React Testing Library, Month 9.</td></tr>
+      <tr><td><b>Server rendering</b></td><td><code>getServerSnapshot</code> is already there for a reason, and the theme flash on first paint is a real Next.js problem — Month 10.</td></tr>
+      <tr><td><b>The React Compiler</b></td><td>It would remove the one <code>useMemo</code> in <code>AuthProvider</code> and nothing else — because the rest of the wins here are structural. Month 11.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — four reps</h2>
+  <ol>
+    <li><b>Add "remember me" and restore the session.</b> Persist the user with <code>useLocalStorage</code>, and dispatch <code>session_restored</code> on start-up. Then answer the hard part out loud: should the restore be an effect, or the reducer's initial state? Use the <code>init</code> argument — <code>useReducer(authReducer, storedUser, buildInitialState)</code> — and say why that beats an effect (no wrong first frame, and lesson 16's rule).</li>
+    <li><b>Add a fifth action and let the compiler catch you.</b> Add <code>{ type: 'session_expired' }</code> to <code>AuthAction</code> and do <b>not</b> add a case. Read the TypeScript error on <code>const unhandled: never = action</code>. That error is the whole reason the line exists.</li>
+    <li><b>Reuse two of the four hooks.</b> Build a <code>&lt;Dropdown&gt;</code> using only <code>useOutsideClick</code> and <code>useEscapeKey</code> — no focus trap, no scroll lock. Then explain why a single <code>useModal()</code> hook would have made this harder, in one sentence.</li>
+    <li><b>Prove the custom-hook principle.</b> Render <code>useSystemTheme()</code> in two sibling components and log both. They agree. Now swap it for a <code>useState</code>-based hook that starts at <code>'light'</code> and only updates on the next OS change: they still agree, but both start wrong. Say the rule: a custom hook shares logic; agreement comes from the shared <em>source</em>, not the hook.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario · design review</span>
+    <p class="situation">A colleague submits a different version of this feature. It has one <code>AppProvider</code> holding <code>{ user, theme, isSignInModalOpen, signInFormValues, notifications }</code> in a single <code>useReducer</code>, with the value passed as an inline object. Two of the reducer's cases call <code>fetch</code> and then <code>dispatch</code> on the response. Action types are <code>SET_USER</code>, <code>SET_THEME</code>, <code>SET_FORM</code>, <code>SET_MODAL</code>. There is a <code>useAppState()</code> hook returning the whole state object, used in 31 components, and a <code>useMount(fn)</code> hook used in nine places. They mention that typing in the sign-in form feels slow and ask whether adding <code>memo</code> to the notification list would help.</p>
+    Work out, in order: which single problem in that description is a <b>correctness</b> bug rather than a performance one, and what specifically breaks; why typing is slow and why <code>memo</code> on the notification list cannot fix it; what is wrong with the four action names, using a concrete example of a change they would make painful; why <code>useMount</code> is on the docs' do-not-write list; and the three changes you would ask for, in the order you would ask for them, given that they ship on Friday.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/extracting-state-logic-into-a-reducer">Extracting State Logic into a Reducer</a>, <a href="https://react.dev/learn/scaling-up-with-reducer-and-context">Scaling Up with Reducer and Context</a>, <a href="https://react.dev/reference/react/useReducer">useReducer</a>, <a href="https://react.dev/learn/reusing-logic-with-custom-hooks">Reusing Logic with Custom Hooks</a>, <a href="https://react.dev/reference/react/useSyncExternalStore">useSyncExternalStore</a>.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>be the interviewer for a 25-minute live build</b>: a theme provider plus a reducer-driven sign-in, where I interrupt at minute 10 to ask why the header re-renders. Or ask me to hand you the colleague's version from the drill as a real file and time you fixing it in three commits.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>A reducer folds actions into state.</b> It takes the state so far and one action and returns the next state — named after <code>Array.reduce</code>, and it accumulates actions over time into state.</li>
+      <li><b>Reducers must be pure</b> and they run during rendering: no fetching, no timers, no mutation. The async work happens outside, between two dispatches.</li>
+      <li><b>One action per user interaction</b>, and <b>name it after what happened</b> — <code>sign_in_failed</code>, not <code>set_error</code>. The name decides how much you can change later without touching callers.</li>
+      <li><b>A discriminated union makes bad states unrepresentable.</b> Keyed on <code>status</code>, there is no way to hold a user and be signed out, and TypeScript narrows <code>state.user</code> for you.</li>
+      <li><b>Return <code>state</code> itself for a no-op.</b> React ignores an update when the next state is <code>Object.is</code>-equal to the previous one — so <code>{...state}</code> costs a render and <code>state</code> costs nothing.</li>
+      <li><b>End the switch with <code>const unhandled: never = action</code>.</b> Adding an action and forgetting a case then breaks the build instead of the app.</li>
+      <li><b><code>dispatch</code> has a stable identity</b>, so an actions object built from it can honestly use <code>[]</code> — which is why reducer-plus-context is cleaner than a pile of <code>useCallback</code>s.</li>
+      <li><b>Two contexts per feature:</b> the state, and the stable actions. Put the stable one outermost. Action-only components then re-render zero times.</li>
+      <li><b>Primitives in context need no <code>useMemo</code>.</b> The cheapest way to avoid memoising a context value is to not put an object in it.</li>
+      <li><b>A custom hook shares stateful logic, not state.</b> Every call gets its own state and its own effects. Two components agree because they read the same source, not because the hook joins them.</li>
+      <li><b>Name hooks after behaviour, not lifecycle.</b> <code>useEscapeKey</code>, <code>useData(url)</code>, <code>useChatRoom(options)</code> — never <code>useMount</code>, <code>useEffectOnce</code> or <code>useUpdateEffect</code>.</li>
+      <li><b>Pass <code>enabled</code> instead of calling a hook conditionally.</b> The condition becomes an early return inside the effect, which reads as "sync nothing while closed".</li>
+      <li><b>Transient state stays local.</b> A half-typed name in context re-renders the whole app; in <code>useState</code> it re-renders one component.</li>
+      <li><b>A pure reducer is testable without React</b> — no render, no provider, no DOM. And <code>expect(next).toBe(prev)</code> is a test that asserts "no wasted render".</li>
+      <li><b>Real use case (built &amp; run):</b> a theme-plus-auth app where a keystroke touches one component, the sign-out button re-renders zero times on sign-in, the OS going dark does not wake the theme menu, and four extracted hooks replaced sixty lines of modal.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a reducer turns "how do I change this state" into "what just happened", and context turns "who do I pass this to" into "who is listening" — the skill is choosing how many channels those listeners need.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <em>Extracting State Logic into a Reducer</em> (the reducer definition, the <code>reduce()</code> analogy and "accumulate actions over time into state", the <code>useState</code>-versus-<code>useReducer</code> comparison, the purity rule, "each action describes a single user interaction", and "choose a name that says what happened"), <em>Scaling Up with Reducer and Context</em> (two contexts for state and dispatch, and moving the provider plus reducer into one file with custom hooks), <code>useReducer</code> (the stable identity of <code>dispatch</code>, the <code>init</code> argument, the <code>Object.is</code> bail-out and "React will ignore your update if the next state is equal to the previous state", and the Strict Mode double-call of reducers and initialisers), <em>Reusing Logic with Custom Hooks</em> ("share stateful logic but not state itself", the <code>use</code> naming rule, hooks are pure and re-run every render, and the list of lifecycle hooks not to write), <code>useSyncExternalStore</code>, <code>useContext</code>, <code>memo</code>; MDN — <code>Window.matchMedia</code>, <code>Storage.setItem</code> and its exceptions.</p>
+
+  <div class="footer-nav">
+    <a href="./0025-memo-usememo-and-usecallback.html">← Previous: memo, useMemo &amp; useCallback</a>
+    <a href="../reference/12-month-plan.html">Next: Month 7 — server state &amp; data fetching →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A reducer case needs to fetch the user before it can return the new state. What is wrong with doing the fetch inside the reducer?",
+      options: [
+        "Reducers run during rendering and must be pure, so the async work belongs outside — dispatch what happened, do the work, then dispatch what happened next",
+        "Nothing, as long as you `await` it and return the state afterwards",
+        "It is fine for GET requests but not for POST requests",
+        "Reducers can fetch, but only in the initialiser function"
+      ],
+      answer: 0,
+      why: "The docs state that reducers run during rendering and must be pure: same inputs, same output, no requests, no timeouts, no mutation. A reducer that fetches is also unusable in Strict Mode, where React deliberately calls your reducer twice to help you find accidental impurities — you would fire two requests. The working shape is three actions and one pure function: dispatch `sign_in_submitted`, perform the request in the event handler or an action creator outside the reducer, then dispatch `sign_in_succeeded` or `sign_in_failed`. As a bonus, that shape is also the only one you can test without a network."
+    },
+    {
+      q: "Why is `useReducer` + context usually cleaner than `useState` + context when sharing state widely?",
+      options: [
+        "`dispatch` has a stable identity, so an actions context can honestly use an empty dependency array and never change value",
+        "`useReducer` batches updates while `useState` does not",
+        "Context can only hold one value, and a reducer combines them",
+        "`useReducer` skips re-renders of consumers automatically"
+      ],
+      answer: 0,
+      why: "The `useReducer` docs say the dispatch function has a stable identity, which is why it is often omitted from Effect dependencies. That means an actions object built from `dispatch` closes over nothing that can change, so `useMemo(..., [])` is a fact rather than a guess, and the actions context holds one value for the whole life of the app — components that only trigger changes then re-render zero times. With `useState` you end up hand-writing a `useCallback` per action and keeping each dependency array honest. Both hooks batch identically, and neither skips consumer re-renders on its own — that comes from splitting the contexts."
+    },
+    {
+      q: "Two sibling components each call the same custom hook `useOnlineStatus()`. What do they share?",
+      options: [
+        "Nothing except the logic — each call has its own state and its own effect; they agree because both read the same browser API",
+        "One state value, because the hook is a module-level singleton",
+        "The state, but not the effects",
+        "Nothing at all — the two values can permanently disagree"
+      ],
+      answer: 0,
+      why: "The docs are explicit: custom Hooks let you share stateful logic but not state itself, and each call to a Hook is completely independent from every other call. Think of the hook's body as being pasted into the component — two components means two `useState`s and two subscriptions. They agree because they read the same outside source, not because the hook connects them. This is the single most common misconception about custom hooks, and it explains why sharing an actual value (the current user, the cart) still needs one owner plus context, not a cleverer hook."
+    },
+    {
+      q: "Your reducer receives an action that should change nothing. What should it return?",
+      options: [
+        "The existing `state` object itself, so React ignores the update and skips the re-render",
+        "`{ ...state }`, to stay immutable",
+        "`undefined`, so React keeps the previous state",
+        "`initialState`, to be safe"
+      ],
+      answer: 0,
+      why: "React will ignore the update if the next state is equal to the previous state, as determined by an `Object.is` comparison, and skip re-rendering the component and its children. Returning `state` gives you that for free. Returning `{ ...state }` is a different object, so `Object.is` says 'changed' and everything re-renders for nothing — the same identity rule that causes mutation bugs in lesson 8 and context storms in lesson 24. Returning `undefined` would make the state `undefined`, and returning `initialState` would silently throw away the user's data."
+    },
+    {
+      q: "Why do the docs tell you not to write a `useMount(fn)` hook?",
+      options: [
+        "It is an alternative to the `useEffect` API itself rather than a concrete use case, so it hides the dependency question and lies about the real lifecycle",
+        "Hook names may not contain verbs",
+        "It cannot be typed in TypeScript",
+        "It would break the rules of hooks by calling an effect conditionally"
+      ],
+      answer: 0,
+      why: "The guidance is to avoid custom Hooks that act as alternatives to the `useEffect` API itself — `useMount`, `useEffectOnce`, `useUpdateEffect` — and instead keep custom Hooks focused on concrete high-level use cases like `useData(url)`, `useOnlineStatus()` or `useChatRoom(options)`. The reason is that a lifecycle-shaped hook hides exactly the question effects force you to answer: what is this synchronising with? It also encodes an assumption about mounting that Strict Mode's extra setup-and-cleanup cycle already violates. `useEscapeKey(onEscape)` passes the test because it names something a user does; `useMount` names a React internal."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “When would you reach for useReducer instead of useState?”",
+      answer: "When many handlers change the same state in related ways, and when getting a transition wrong is expensive. The mechanical difference is direction: with <code>useState</code> my handlers describe <em>how</em> state should change, so ten handlers means ten places that know the shape of my state; with a reducer my handlers describe <em>what happened</em> and one pure function decides what that means. The docs frame the trade-off in four rows, and two of them decide it for me. <b>Debugging:</b> one <code>console.log</code> in the reducer shows every update and the action that caused it, whereas with scattered setters I have to find which one was wrong. <b>Testing:</b> the reducer is a pure function I can export and test in isolation — no render, no provider, no DOM — so the rules of my feature get real test coverage in milliseconds. Against that, a reducer is more code up front and overkill for a single boolean, and the docs are relaxed enough to say the rest is preference and that you can mix both in one component. I also say the constraints out loud, because they are where people go wrong: reducers <b>run during rendering and must be pure</b> — no fetching, no timers, no mutation — so async work sits outside, between a <code>submitted</code> dispatch and a <code>succeeded</code> or <code>failed</code> dispatch. And Strict Mode calls the reducer twice in development precisely to catch impurity."
+    },
+    {
+      prompt: "Interviewer: “How do you type a reducer well in TypeScript?”",
+      answer: "Two discriminated unions and one exhaustiveness check. The <b>state</b> is a union keyed on a status field — <code>{status:'signed_out'} | {status:'submitting'; name} | {status:'signed_in'; user} | {status:'failed'; message}</code> — which means there is no way to represent a contradiction like holding a user while signed out, or an error at the same time as a loading flag. It also gives me narrowing for free: inside <code>state.status === 'signed_in'</code>, TypeScript knows <code>state.user</code> exists, so no optional chaining and no non-null assertions. The <b>actions</b> are a second union keyed on <code>type</code>, so dispatching a success without a user, or a typo'd type string, is a compile error. Then the <code>default</code> branch of the switch ends with <code>const unhandled: never = action;</code> — if someone adds a fifth action next year and forgets a case, that assignment fails to compile, so the build breaks instead of the app silently ignoring an event. One more habit that is about React rather than types: for an action that should change nothing, I return the <b>existing state object</b>, not a spread copy, because React ignores an update when the next state is <code>Object.is</code>-equal to the previous one — so <code>state</code> costs zero renders and <code>{...state}</code> costs one."
+    },
+    {
+      prompt: "Interviewer: “What is a custom hook, and how do you decide to extract one?”",
+      answer: "A custom hook is a function whose name starts with <code>use</code> and which calls other hooks. That is the whole definition. The critical property is what it does <em>not</em> do: <b>it shares stateful logic, not state</b>. Each call is completely independent, with its own state and its own effects — the docs suggest thinking of the hook's body as part of the calling component's body, which also explains why it re-runs on every render and always sees the latest props and state. So two components calling <code>useOnlineStatus()</code> agree because they read the same browser API, not because the hook joins them; sharing an actual value still needs one owner plus context. I extract one when I have an effect I want in more than one place, and I judge the result by its <b>name</b>. Good names describe a concrete, high-level use case — <code>useData(url)</code>, <code>useChatRoom(options)</code>, <code>useEscapeKey(onEscape)</code>. Bad names describe React's own machinery — <code>useMount</code>, <code>useEffectOnce</code>, <code>useUpdateEffect</code> — and the docs tell you not to write those, because they hide the question an effect exists to answer: what is this synchronising with? Two practical details. If the behaviour is conditional I pass an <code>enabled</code> flag and return early inside the effect, because hooks cannot be called conditionally. And if the hook takes a callback, I wrap it in an Effect Event so a caller passing an inline arrow does not tear down and re-add a document listener on every render."
+    },
+    {
+      prompt: "Interviewer: “Design the state for a theme feature that supports light, dark and follow-the-system.”",
+      answer: "Three pieces, and only one of them is state. The <b>preference</b> is <code>'light' | 'dark' | 'system'</code>, owned by a provider and persisted — that is the only stored value. The <b>system setting</b> is not React state at all: it lives in the browser and changes without asking, so I read it with <code>useSyncExternalStore</code> over <code>matchMedia('(prefers-color-scheme: dark)')</code>, with <code>subscribe</code> and <code>getSnapshot</code> defined at module scope so their identities are stable, and a <code>getServerSnapshot</code> because there is no <code>matchMedia</code> during server rendering. That gives me a tear-free read with no wrong first frame, which the <code>useState</code>-plus-<code>useEffect</code> version cannot do. The <b>resolved theme</b> is derived — <code>preference === 'system' ? system : preference</code> — never stored, because storing it would create two sources of truth that can disagree. Then I split it into three contexts, and the reason is re-renders. The resolved theme is read by everything that draws differently. The preference is read only by the theme menu, so when the OS flips to dark at 6pm the menu does not re-render — its value did not change. And the setter gets its own context, which never changes value at all because a <code>useState</code> setter has a stable identity, so buttons that only <em>set</em> the theme re-render zero times. Every one of those context values is a string or a stable function, which means no <code>useMemo</code> anywhere — the cheapest way to avoid memoising a context value is to not put an object in it. Finally, writing the theme onto <code>document.documentElement</code> is an effect, because the <code>&lt;html&gt;</code> element is outside React."
+    }
+  ]);
+</script>

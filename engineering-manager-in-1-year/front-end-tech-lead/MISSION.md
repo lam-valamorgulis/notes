@@ -1,13 +1,6 @@
 # Mission: Become a Front-End Tech Lead within 1 year
 
 ## Why
-Lam is a strong senior individual-contributor engineer (frontend + backend, TypeScript)
-with no direct reports. The goal is to be **ready and credible to step into a
-Front-End Tech Lead role within 12 months** — the person who owns the technical
-direction of a front-end team and grows the people around them through influence,
-not by being their boss. This is not "become a manager"; it is "be the obvious
-technical leader a front-end team looks to." Whether the role arrives by internal
-promotion or a move to a new company, Lam should be the natural choice.
 
 A Tech Lead is different from an Engineering Manager on purpose:
 - **Still hands-on in code** — a Tech Lead keeps writing code, roughly 30–70% of the time.
@@ -48,7 +41,7 @@ This course lives in a sub-folder of the Engineering Manager course but is **sep
 self-contained**. The two share a mindset (your impact is now through others) but aim at
 different roles: the EM track leads by **authority** and does people-ops; this track leads by
 **influence** and owns **front-end technical direction**. The mindset lessons overlap; the
-skills diverge. See `learning-records/0001-*` for the reasoning.
+skills diverge.
 
 ## Out of scope (for now — protects focus)
 - **Full people management** (hiring loops, performance reviews, PIPs, headcount, org design).

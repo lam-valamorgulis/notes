@@ -1,0 +1,860 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Context — sharing state through the tree — React Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Month 6 · Lesson 2</p>
+  <h1>Context — sharing state through the tree</h1>
+  <p class="subtitle">Props are a wire between two components. Context is a broadcast to a whole subtree. It removes the plumbing — it does not remove the owner, and it does not make anything global.</p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a typed provider that any depth of the tree can read, plus the two facts that make the difference between a provider that is fine and a provider that re-renders your entire app on every keystroke — and the sentence about <code>memo</code> and context that most candidates get wrong.</div>
+
+  <p>Every month so far has taught you to lift state to the nearest common parent. That rule is correct and it eventually hurts: the nearest common parent of "the theme toggle in the header" and "the border colour of a table cell nine levels down" is the root of your app, and now eleven components pass a <code>theme</code> prop they never read.</p>
+
+  <h2>The problem, precisely</h2>
+
+  <pre><code>&lt;App theme={theme}&gt;
+  &lt;Layout theme={theme}&gt;              <span class="cmt">// does not use it</span>
+    &lt;Content theme={theme}&gt;           <span class="cmt">// does not use it</span>
+      &lt;Panel theme={theme}&gt;           <span class="cmt">// does not use it</span>
+        &lt;Table theme={theme}&gt;         <span class="cmt">// does not use it</span>
+          &lt;Cell theme={theme} /&gt;      <span class="cmt">// ← the one component that needed it</span></code></pre>
+
+  <p>This is <b>prop drilling</b>. It is not a crime — the props are explicit and easy to trace — but four of those six components now break when you rename the prop, and none of them care about themes.</p>
+
+  <div class="note">
+    <span class="label">React docs · Passing Data Deeply with Context — before you use context</span>
+    "<b>Start by passing props.</b> If your components are not trivial, it's not unusual to pass a dozen props down through a dozen components. It makes it very clear which components use which data."
+    <br><br>
+    "<b>Extract components and pass JSX as <code>children</code> to them.</b> If you pass data through many layers of intermediate components that don't use that data, you may have forgotten to extract some components. Instead of <code>&lt;Layout posts={posts} /&gt;</code>, use <code>&lt;Layout&gt;&lt;Posts posts={posts} /&gt;&lt;/Layout&gt;</code>."
+    <br><br>
+    "If neither approach works well for you, consider context."
+  </div>
+
+  <p>Notice that the second alternative is the same move as lesson 23's free performance fix. That is not a coincidence: <b>a component that only forwards data is usually a component that should have taken <code>children</code> instead.</b> Try that first, every time. Context is the third option.</p>
+
+  <h2>First principle — context is a broadcast, not a variable</h2>
+
+  <p>A context is not storage. It holds nothing. What it gives you is a <b>channel</b>: a provider puts a value on the channel for everything inside it, and any descendant can tune in without the components in between knowing the channel exists.</p>
+
+  <p>Which means three things people get wrong:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>People assume</th><th>Actually</th></tr></thead>
+    <tbody>
+      <tr><td>Context is global state.</td><td>The state still lives in a normal component with a normal <code>useState</code>. Context only changes how it is <em>read</em>. Render two providers and you have two independent states.</td></tr>
+      <tr><td>Context replaces lifting state up.</td><td>It replaces the <em>passing</em>, not the <em>owning</em>. You still choose an owner, and choosing badly still hurts (lesson 13).</td></tr>
+      <tr><td>Context is a state manager.</td><td>There are no selectors. A consumer subscribes to the <b>whole value</b> — it cannot say "only wake me when <code>user.name</code> changes". That single limitation drives the rest of this lesson.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The three steps, typed</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeContext.ts</b> — step 1, create</p>
+  <pre><code>import { createContext } from 'react';
+
+export type Theme = 'light' | 'dark';
+
+<span class="cmt">// The argument is the DEFAULT: what a reader gets when there is
+// no provider above it. Pick a value that is actually correct alone.</span>
+export const ThemeContext = createContext&lt;Theme&gt;('light');</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeProvider.tsx</b> — step 3, provide</p>
+  <pre><code>import { useState } from 'react';
+import { ThemeContext, type Theme } from './ThemeContext';
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState&lt;Theme&gt;('light');
+  return (
+    &lt;ThemeContext value={theme}&gt;      <span class="cmt">// React 19 form</span>
+      &lt;button onClick={() =&gt; setTheme(t =&gt; (t === 'light' ? 'dark' : 'light'))}&gt;
+        Toggle
+      &lt;/button&gt;
+      {children}
+    &lt;/ThemeContext&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/Cell.tsx</b> — step 2, read</p>
+  <pre><code>import { useContext } from 'react';
+import { ThemeContext } from './theme/ThemeContext';
+
+export function Cell({ label }: { label: string }) {
+  const theme = useContext(ThemeContext);   <span class="cmt">// no props needed</span>
+  return &lt;td className={theme}&gt;{label}&lt;/td&gt;;
+}</code></pre>
+
+  <p>Note the shape of the provider: it takes <code>children</code> and puts state around it. That is the same identity trick from lesson 23 — the tree inside <code>children</code> was created by whoever rendered <code>&lt;ThemeProvider&gt;</code>, so a state change inside the provider re-renders the provider itself but React can reuse the <code>children</code> subtree, except for the parts that read this context. <b>The provider being a wrapper is what keeps this cheap.</b></p>
+
+  <div class="note">
+    <span class="label">React 19 · Context as a provider</span>
+    "In React 19, you can render <code>&lt;Context&gt;</code> as a provider instead of <code>&lt;Context.Provider&gt;</code>" … "New Context providers can use <code>&lt;Context&gt;</code> and we will be publishing a codemod to convert existing providers. <b>In future versions we will deprecate <code>&lt;Context.Provider&gt;</code>.</b>"
+  </div>
+
+  <p>So both of these are correct today, and the first is the form to write in new code:</p>
+
+  <pre><code>&lt;ThemeContext value={theme}&gt;{children}&lt;/ThemeContext&gt;          <span class="cmt">// React 19+</span>
+&lt;ThemeContext.Provider value={theme}&gt;{children}&lt;/ThemeContext.Provider&gt;  <span class="cmt">// still works</span></code></pre>
+
+  <h2>The TypeScript decision: a real default, or no default at all</h2>
+
+  <p><code>createContext</code> forces you to answer a question you might not have thought about: <b>what should a component get if nobody provided a value?</b> There are two honest answers and one dishonest one.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Approach</th><th>When it is right</th></tr></thead>
+    <tbody>
+      <tr><td><code>createContext&lt;Theme&gt;('light')</code></td><td>There is a sensible standalone value. A <code>&lt;Cell&gt;</code> with no <code>ThemeProvider</code> above it rendering in light mode is fine.</td></tr>
+      <tr><td><code>createContext&lt;Auth | null&gt;(null)</code> + a hook that throws</td><td>There is <b>no</b> sensible default. "The current user" outside a provider is a bug, and you want the error at the point of use.</td></tr>
+      <tr><td><code>createContext({} as Auth)</code></td><td><b>Never.</b> It makes TypeScript stop complaining and turns a missing provider into <code>undefined is not a function</code> in production instead of a clear error.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/AuthContext.ts</b> — the no-default pattern, and your first custom hook</p>
+  <pre><code>import { createContext, useContext } from 'react';
+
+export type User = { id: string; name: string };
+export type AuthValue = { user: User | null; login: (n: string) =&gt; void; logout: () =&gt; void };
+
+const AuthContext = createContext&lt;AuthValue | null&gt;(null);
+export { AuthContext };
+
+export function useAuth(): AuthValue {
+  const value = useContext(AuthContext);
+  if (value === null) {
+    throw new Error('useAuth must be used inside &lt;AuthProvider&gt;');
+  }
+  return value;                       <span class="cmt">// TS now knows it is AuthValue, not AuthValue | null</span>
+}</code></pre>
+
+  <p>Three wins in nine lines, and they are the reason this pattern is everywhere in real codebases:</p>
+
+  <ol>
+    <li><b>Every consumer stops writing <code>if (!auth) return null</code>.</b> The null check happens once, in the hook.</li>
+    <li><b>The error names the fix.</b> "must be used inside <code>&lt;AuthProvider&gt;</code>" is a better bug report than a crash nine frames deep.</li>
+    <li><b>The context object never leaves the module</b> if you do not export it — so no component can read it raw and skip the check.</li>
+  </ol>
+
+  <p>Lesson 26 turns this into the standard shape for a feature. For now, notice what it <em>is</em>: a function whose name starts with <code>use</code>, which calls a hook. That is the entire definition of a custom hook.</p>
+
+  <h2>Reading context conditionally — <code>use</code></h2>
+
+  <p><code>useContext</code> obeys the rules of hooks: top level only, no early returns above it. React 19 adds an escape hatch.</p>
+
+  <div class="note">
+    <span class="label">React 19 · reading context with <code>use</code></span>
+    "You can also read context with <code>use</code>, allowing you to read Context conditionally such as after early returns."
+    <pre><code>import {use} from 'react';
+import ThemeContext from './ThemeContext'
+
+function Heading({children}) {
+  if (children == null) {
+    return null;
+  }
+
+  <span class="cmt">// This would not work with useContext
+  // because of the early return.</span>
+  const theme = use(ThemeContext);
+  return (
+    &lt;h1 style={{color: theme.color}}&gt;
+      {children}
+    &lt;/h1&gt;
+  );
+}</code></pre>
+  </div>
+
+  <p>Use it when you genuinely have an early return above the read. Do not use it to justify a component with six conditional context reads — that is a component that wants splitting.</p>
+
+  <h2>The fact that decides everything: when do consumers re-render?</h2>
+
+  <div class="note">
+    <span class="label">React docs · useContext</span>
+    "React automatically re-renders all the children that use a particular context <b>starting from the provider that receives a different <code>value</code>.</b> The previous and the next values are compared with the <code>Object.is</code> comparison."
+    <br><br>
+    "React automatically re-renders all the children that use a particular context starting from the provider that receives a different <code>value</code>. <b>Skipping re-renders with <code>memo</code> does not prevent the children receiving fresh context values.</b>"
+  </div>
+
+  <p>Read the second quote twice. This is lesson 23's fourth trigger, and it is the one <code>memo</code> cannot touch. A <code>memo</code>-wrapped component with unchanged props <b>will still re-render</b> if it reads a context whose value changed — and it has to, or it would show stale data.</p>
+
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 296" role="img" aria-labelledby="fig24-title" width="640" height="296">
+      <title id="fig24-title">A provider receives a new value. Every component below it that reads the context re-renders, including one wrapped in memo. Components below it that do not read the context are unaffected by the context change itself. A component above the provider never re-renders.</title>
+      <defs>
+        <marker id="a24" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+      </defs>
+
+      <rect x="238" y="14" width="164" height="28" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="320" y="32" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Root — above the provider</text>
+
+      <line x1="320" y1="42" x2="320" y2="58" style="stroke: var(--rule); stroke-width: 1;"></line>
+
+      <rect x="216" y="58" width="208" height="34" rx="3" style="fill: var(--paper); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="72" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">&lt;ThemeContext value={next}&gt;</text>
+      <text x="320" y="85" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">next is not Object.is-equal to prev</text>
+
+      <line x1="320" y1="92" x2="320" y2="112" style="stroke: var(--accent); stroke-width: 1.5;"></line>
+      <line x1="96" y1="112" x2="556" y2="112" style="stroke: var(--accent); stroke-width: 1.5;"></line>
+
+      <line x1="96" y1="112" x2="96" y2="130" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <rect x="24" y="132" width="144" height="46" rx="3" style="fill: var(--card-bg); stroke: var(--rule);"></rect>
+      <text x="96" y="150" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9.5px;">Sidebar</text>
+      <text x="96" y="164" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">does not read context</text>
+      <text x="96" y="174" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">→ not woken by the value</text>
+
+      <line x1="320" y1="112" x2="320" y2="130" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a24)"></line>
+      <rect x="238" y="132" width="164" height="46" rx="3" style="fill: var(--paper); stroke: var(--accent);"></rect>
+      <text x="320" y="150" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">Toolbar</text>
+      <text x="320" y="164" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 8.5px;">useContext(ThemeContext)</text>
+      <text x="320" y="174" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 8.5px;">→ re-renders</text>
+
+      <line x1="556" y1="112" x2="556" y2="130" style="stroke: var(--accent); stroke-width: 1.5;" marker-end="url(#a24)"></line>
+      <rect x="466" y="132" width="164" height="46" rx="3" style="fill: var(--paper); stroke: var(--accent);"></rect>
+      <text x="548" y="150" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">memo(Cell)</text>
+      <text x="548" y="164" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 8.5px;">same props, reads context</text>
+      <text x="548" y="174" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 8.5px; font-weight: 700;">→ re-renders anyway</text>
+
+      <line x1="12" y1="202" x2="628" y2="202" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+
+      <text x="12" y="222" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px; font-weight: 700;">The rule:</text>
+      <text x="76" y="222" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">a changed value wakes every reader below the provider — memo or not.</text>
+      <text x="12" y="244" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">The bug:</text>
+      <text x="72" y="244" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">value={{ user, login }} is a NEW object every render, so “changed” is</text>
+      <text x="72" y="258" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">always true — every reader wakes on every provider render.</text>
+      <text x="12" y="280" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">The fixes:</text>
+      <text x="80" y="280" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">useMemo the value, useCallback the functions — or split the context in two.</text>
+    </svg>
+  </div>
+
+  <h2>The bug you will ship at least once</h2>
+
+  <p>The moment your context holds more than one thing, you write this:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/auth/AuthProvider.tsx</b> — the broken version</p>
+  <pre><code>export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState&lt;User | null&gt;(null);
+
+  function login(name: string) { setUser({ id: crypto.randomUUID(), name }); }
+  function logout() { setUser(null); }
+
+  <span class="cmt">// 🔴 A brand-new object on EVERY render of AuthProvider.
+  // 🔴 login and logout are brand-new functions too.</span>
+  return (
+    &lt;AuthContext value={{ user, login, logout }}&gt;
+      {children}
+    &lt;/AuthContext&gt;
+  );
+}</code></pre>
+
+  <p><b>The symptom.</b> Any state change in <code>AuthProvider</code> — or in anything above it — produces a new <code>value</code> object. <code>Object.is</code> says "different". Every single <code>useAuth()</code> consumer in the app re-renders, no matter how deep, no matter that <code>user</code> is the identical object it was before. Wrap them in <code>memo</code> and nothing improves, because of the caveat you just read.</p>
+
+  <p>The nasty version of this is a provider that holds two unrelated things. Put <code>user</code> and a <code>notifications</code> array in the same context, and every arriving notification re-renders every component that only wanted the user's name.</p>
+
+  <h3>Fix A — stabilise the value</h3>
+
+  <div class="note">
+    <span class="label">React docs · useContext — optimizing re-renders when passing objects and functions</span>
+    <pre><code>import { useCallback, useMemo } from 'react';
+
+function MyApp() {
+  const [currentUser, setCurrentUser] = useState(null);
+
+  const login = useCallback((response) =&gt; {
+    storeCredentials(response.credentials);
+    setCurrentUser(response.user);
+  }, []);
+
+  const contextValue = useMemo(() =&gt; ({
+    currentUser,
+    login
+  }), [currentUser, login]);
+
+  return (
+    &lt;AuthContext value={contextValue}&gt;
+      &lt;Page /&gt;
+    &lt;/AuthContext&gt;
+  );
+}</code></pre>
+    "As a result of this change, <code>Page</code> will not need to re-render unless <code>currentUser</code> has changed."
+  </div>
+
+  <p>Typed, in our file:</p>
+
+  <pre><code>export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState&lt;User | null&gt;(null);
+
+  const login = useCallback((name: string) =&gt; {
+    setUser({ id: crypto.randomUUID(), name });
+  }, []);                                  <span class="cmt">// [] is honest: it uses only the setter</span>
+
+  const logout = useCallback(() =&gt; setUser(null), []);
+
+  const value = useMemo&lt;AuthValue&gt;(
+    () =&gt; ({ user, login, logout }),
+    [user, login, logout],
+  );
+
+  return &lt;AuthContext value={value}&gt;{children}&lt;/AuthContext&gt;;
+}</code></pre>
+
+  <p>Two details that matter. The dependency arrays are <b>honest</b> — <code>login</code> genuinely uses nothing but <code>setUser</code>, which is stable (lesson 17's not-reactive list), so <code>[]</code> is a fact, not a shortcut. And <code>value</code> now only changes when <code>user</code> changes, which is exactly what a consumer means by "something happened".</p>
+
+  <div class="trap">
+    <span class="label">This is the one place memoising is not optional</span>
+    Lesson 25 will argue that most <code>useMemo</code> is noise. <b>A context value is the exception.</b> Here the memo does not save a few microseconds — it decides how many components in your app re-render, and there is no structural alternative that gets you the same result. Memoise context values by default.
+  </div>
+
+  <h3>Fix B — split the context in two</h3>
+
+  <p>Fix A still wakes every consumer when <code>user</code> changes, including the components that only ever call <code>logout()</code> and never read <code>user</code>. That is the missing-selector limitation biting. The answer is to stop putting both on the same channel.</p>
+
+  <pre><code><span class="cmt">// two contexts, two channels</span>
+const AuthContext = createContext&lt;User | null&gt;(null);
+const AuthActionsContext = createContext&lt;AuthActions | null&gt;(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState&lt;User | null&gt;(null);
+
+  const actions = useMemo&lt;AuthActions&gt;(() =&gt; ({
+    login: (name: string) =&gt; setUser({ id: crypto.randomUUID(), name }),
+    logout: () =&gt; setUser(null),
+  }), []);                       <span class="cmt">// [] — actions never change, for the app's whole life</span>
+
+  return (
+    &lt;AuthActionsContext value={actions}&gt;
+      &lt;AuthContext value={user}&gt;{children}&lt;/AuthContext&gt;
+    &lt;/AuthActionsContext&gt;
+  );
+}</code></pre>
+
+  <p>Now a <code>&lt;LogoutButton&gt;</code> calls <code>useAuthActions()</code>, reads a value that <b>never changes for the lifetime of the app</b>, and therefore never re-renders when a user logs in. A <code>&lt;Greeting&gt;</code> calls <code>useAuth()</code> and re-renders only when the user does change. Two channels, two audiences.</p>
+
+  <p>Put the actions provider <b>outside</b> the value provider, as above. It never changes, so it never re-renders, so it never even considers re-rendering the tree below it.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Fix</th><th>Stops</th><th>Does not stop</th></tr></thead>
+    <tbody>
+      <tr><td><code>useMemo</code> the value</td><td>Consumers waking up when nothing in the value changed.</td><td>Consumers waking up when <em>any</em> part of the value changed.</td></tr>
+      <tr><td>Split value / actions</td><td>Action-only components waking up at all.</td><td>Two value-readers waking each other when they share one channel.</td></tr>
+      <tr><td>Split by feature (theme, auth, cart…)</td><td>Unrelated features waking each other.</td><td>Fine-grained "only when <code>user.name</code> changes".</td></tr>
+      <tr><td>An external store + <code>useSyncExternalStore</code></td><td>Everything — this is where real selectors live.</td><td>Being simple. Reach for it when contexts stop being enough (Month 11).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Nesting — an inner provider wins</h2>
+
+  <p>A provider overrides any provider of the same context above it, for its own subtree only. That is a feature, not a quirk.</p>
+
+  <pre><code>&lt;ThemeContext value="light"&gt;
+  &lt;Page /&gt;                        <span class="cmt">// reads "light"</span>
+  &lt;ThemeContext value="dark"&gt;
+    &lt;PromoCard /&gt;                 <span class="cmt">// reads "dark" — a dark card on a light page</span>
+  &lt;/ThemeContext&gt;
+&lt;/ThemeContext&gt;</code></pre>
+
+  <p>The docs' own example is nicer than a theme: a <code>&lt;Section&gt;</code> reads the current heading level from context and provides <code>level + 1</code> to its children, so every <code>&lt;Heading&gt;</code> renders the right <code>&lt;h1&gt;</code>–<code>&lt;h6&gt;</code> for how deeply it is nested, with nobody passing a number anywhere. That is context used for something props genuinely cannot express: <b>a value that depends on position in the tree.</b></p>
+
+  <div class="trap">
+    <span class="label">The caveat that costs an hour</span>
+    A <code>useContext()</code> call is <b>not</b> affected by a provider returned from the <em>same</em> component. If <code>Section</code> both provides <code>level + 1</code> and reads the level, it reads the level from <em>above itself</em>. The provider must be above the reader in the tree, not beside it.
+  </div>
+
+  <h2>When context is the right tool — and when it is not</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Use context for</th><th>Why it fits</th></tr></thead>
+    <tbody>
+      <tr><td><b>Theming</b></td><td>Read by everything, changed rarely, no sensible prop path.</td></tr>
+      <tr><td><b>The current account</b></td><td>Read by many unrelated places; changes a handful of times per session.</td></tr>
+      <tr><td><b>Routing</b></td><td>The current route, and whether a link is active. This is how React Router works inside (Month 8).</td></tr>
+      <tr><td><b>Managing state</b></td><td>Passing complex state deep, usually with a reducer's <code>dispatch</code> beside it (lesson 26).</td></tr>
+      <tr><td><b>Values that depend on depth</b></td><td>Heading level, nesting level, a form's field prefix. Props cannot express "where am I".</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Do not use context for</th><th>What to do instead</th></tr></thead>
+    <tbody>
+      <tr><td>Values that change many times a second — mouse position, scroll offset, a form field being typed into.</td><td>Keep it local, or use an external store with selectors. Every change wakes every reader.</td></tr>
+      <tr><td>Data from a server.</td><td>A server-state library — caching, refetching and invalidation are the actual problem (Month 7).</td></tr>
+      <tr><td>State two nearby components share.</td><td>Lift it to the common parent. Context here is a bigger machine for a smaller job.</td></tr>
+      <tr><td>Avoiding thinking about ownership.</td><td>Nothing. This is the real failure mode: one giant <code>AppContext</code> that everything reads and everything writes.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Build it for real — a theme provider in three stages</h2>
+
+  <p>Small app, three components, and a console that tells you the truth. The point is not the theme — it is watching the re-render count change while the visible behaviour stays identical.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeProvider.tsx</b> — stage 1, the version with the bug</p>
+  <pre><code>import { createContext, useContext, useState } from 'react';
+
+export type Theme = 'light' | 'dark';
+type ThemeValue = { theme: Theme; toggle: () =&gt; void };
+
+const ThemeContext = createContext&lt;ThemeValue | null&gt;(null);
+
+export function useTheme() {
+  const v = useContext(ThemeContext);
+  if (!v) throw new Error('useTheme must be used inside &lt;ThemeProvider&gt;');
+  return v;
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState&lt;Theme&gt;('light');
+  const [clicks, setClicks] = useState(0);   <span class="cmt">// unrelated state, on purpose</span>
+
+  return (
+    &lt;ThemeContext value={{ theme, toggle: () =&gt; setTheme(t =&gt; t === 'light' ? 'dark' : 'light') }}&gt;
+      &lt;button onClick={() =&gt; setClicks(c =&gt; c + 1)}&gt;
+        Unrelated clicks: {clicks}
+      &lt;/button&gt;
+      {children}
+    &lt;/ThemeContext&gt;
+  );
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/App.tsx</b></p>
+  <pre><code>import { memo } from 'react';
+import { ThemeProvider, useTheme } from './theme/ThemeProvider';
+
+const Badge = memo(function Badge() {
+  console.count('render Badge (memo, reads theme)');
+  const { theme } = useTheme();
+  return &lt;span&gt;theme: {theme}&lt;/span&gt;;
+});
+
+const Static = memo(function Static() {
+  console.count('render Static (memo, reads nothing)');
+  return &lt;p&gt;I never change.&lt;/p&gt;;
+});
+
+function ToggleButton() {
+  console.count('render ToggleButton (actions only)');
+  const { toggle } = useTheme();
+  return &lt;button onClick={toggle}&gt;Toggle theme&lt;/button&gt;;
+}
+
+export default function App() {
+  return (
+    &lt;ThemeProvider&gt;
+      &lt;Badge /&gt;
+      &lt;Static /&gt;
+      &lt;ToggleButton /&gt;
+    &lt;/ThemeProvider&gt;
+  );
+}</code></pre>
+
+  <p><b>Click "Unrelated clicks" five times and read the console.</b> Halve everything for Strict Mode, then look at the shape:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Component</th><th>Renders on "unrelated clicks"</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>Badge</code> (memo)</td><td>Every click</td><td>New <code>value</code> object → context changed → <code>memo</code> cannot help. <b>The documented caveat, live.</b></td></tr>
+      <tr><td><code>ToggleButton</code></td><td>Every click</td><td>Reads the same context, and never even looks at <code>theme</code>.</td></tr>
+      <tr><td><code>Static</code> (memo)</td><td>Once</td><td>Arrived as <code>children</code>, created by <code>App</code>, which did not re-render — and it reads no context.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>That last row is the control in the experiment: it proves the provider's <code>children</code> trick is working, so the other two rows are caused by the context value and nothing else.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeProvider.tsx</b> — stage 2, memoise the value</p>
+  <pre><code>const toggle = useCallback(() =&gt; {
+  setTheme(t =&gt; (t === 'light' ? 'dark' : 'light'));
+}, []);                                    <span class="cmt">// updater form → no dependency on theme</span>
+
+const value = useMemo&lt;ThemeValue&gt;(() =&gt; ({ theme, toggle }), [theme, toggle]);
+
+return (
+  &lt;ThemeContext value={value}&gt;
+    &lt;button onClick={() =&gt; setClicks(c =&gt; c + 1)}&gt;Unrelated clicks: {clicks}&lt;/button&gt;
+    {children}
+  &lt;/ThemeContext&gt;
+);</code></pre>
+
+  <p><b>Click again.</b> <code>Badge</code> and <code>ToggleButton</code> now log <b>nothing</b> on unrelated clicks, and both log once when you press "Toggle theme". Same behaviour on screen, a fraction of the renders. Note why <code>toggle</code> could keep an empty dependency array: the updater form <code>setTheme(t =&gt; ...)</code> means it never reads <code>theme</code> — lesson 17's first removal recipe, paying off again.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>src/theme/ThemeProvider.tsx</b> — stage 3, split the channels</p>
+  <pre><code>const ThemeContext = createContext&lt;Theme&gt;('light');
+const ThemeActionsContext = createContext&lt;(() =&gt; void) | null&gt;(null);
+
+export function useTheme() { return useContext(ThemeContext); }
+
+export function useToggleTheme() {
+  const t = useContext(ThemeActionsContext);
+  if (!t) throw new Error('useToggleTheme must be used inside &lt;ThemeProvider&gt;');
+  return t;
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState&lt;Theme&gt;('light');
+  const toggle = useCallback(() =&gt; {
+    setTheme(t =&gt; (t === 'light' ? 'dark' : 'light'));
+  }, []);
+
+  return (
+    &lt;ThemeActionsContext value={toggle}&gt;
+      &lt;ThemeContext value={theme}&gt;{children}&lt;/ThemeContext&gt;
+    &lt;/ThemeActionsContext&gt;
+  );
+}</code></pre>
+
+  <p><b>Now press "Toggle theme" ten times.</b> <code>Badge</code> re-renders ten times, correctly — it displays the theme. <code>ToggleButton</code> re-renders <b>zero</b> times, because <code>toggle</code> is the same function it was on the first render and the button does not read the theme at all. No <code>useMemo</code> was needed for the value either, because <code>theme</code> is a string: primitives compare by value under <code>Object.is</code>.</p>
+
+  <div class="tip">
+    <span class="label">The general shape</span>
+    <b>One context per thing that changes on its own schedule, plus one context for the stable actions.</b> When you get to reducers in lesson 26 this gets even cleaner, because <code>dispatch</code> has a stable identity by design — no <code>useCallback</code>, no <code>useMemo</code>, nothing to get wrong.
+  </div>
+
+  <h2>Concept → code — where each idea showed up</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Idea</th><th>Where you saw it</th></tr></thead>
+    <tbody>
+      <tr><td>Try props, then <code>children</code>, then context</td><td>The docs' "before you use context" quote — and the link back to lesson 23's free fix</td></tr>
+      <tr><td>Context is a broadcast; the state still has an owner</td><td>Two providers = two independent states; the myths table</td></tr>
+      <tr><td>The default value is a real decision</td><td><code>createContext&lt;Theme&gt;('light')</code> vs <code>&lt;AuthValue | null&gt;(null)</code>; never <code>{} as T</code></td></tr>
+      <tr><td>A hook that throws when the provider is missing</td><td><code>useAuth</code> / <code>useTheme</code> — the null check written once</td></tr>
+      <tr><td>React 19 <code>&lt;Context value&gt;</code></td><td>Every provider in this lesson, with the <code>.Provider</code> form shown once</td></tr>
+      <tr><td><code>use(Context)</code> after an early return</td><td>The quoted <code>Heading</code> example</td></tr>
+      <tr><td>Consumers wake when the value is not <code>Object.is</code>-equal</td><td>Stage 1: a fresh object every render woke everything</td></tr>
+      <tr><td><code>memo</code> does not stop a context re-render</td><td><code>memo(Badge)</code> re-rendering on every unrelated click</td></tr>
+      <tr><td><code>useMemo</code> + <code>useCallback</code> on the value</td><td>Stage 2 — the docs' own recipe, typed</td></tr>
+      <tr><td>Splitting value from actions</td><td>Stage 3 — <code>ToggleButton</code> at zero re-renders</td></tr>
+      <tr><td>Updater form removes a dependency</td><td><code>setTheme(t =&gt; ...)</code> keeping <code>toggle</code> at <code>[]</code> (lesson 17)</td></tr>
+      <tr><td>Provider takes <code>children</code>, so the subtree is stable</td><td><code>Static</code> rendering once — the control in the experiment</td></tr>
+      <tr><td>An inner provider overrides an outer one</td><td>The dark card on a light page; the docs' heading-level example</td></tr>
+      <tr><td>No selectors — that is the real limit</td><td>The four-fix table, ending at <code>useSyncExternalStore</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Extend it — three reps</h2>
+  <ol>
+    <li><b>Put two unrelated things in one context on purpose.</b> Add a <code>notifications: string[]</code> to the stage-2 value and a button that pushes one every second. Watch <code>Badge</code> re-render once a second while the theme never changes. Then fix it by splitting, and say the rule out loud: one channel per thing that changes on its own schedule.</li>
+    <li><b>Delete the throw.</b> Change <code>useTheme</code> to return the raw <code>useContext</code> result, render <code>&lt;Badge /&gt;</code> outside the provider, and read the error you get. Compare it with the error the throwing version gives. This is why the pattern exists.</li>
+    <li><b>Build the heading-level provider.</b> A <code>&lt;Section&gt;</code> that reads the level from context and provides <code>level + 1</code>; a <code>&lt;Heading&gt;</code> that renders <code>h1</code>–<code>h6</code> from it. Nest four deep with no props anywhere. Then try to do the same thing with props and describe what breaks when someone moves one <code>&lt;Section&gt;</code>.</li>
+  </ol>
+
+  <h2>Practice: read the situation, pick the move</h2>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">An app has a single <code>AppContext</code> at the root. Its value is an inline object holding <code>user</code>, <code>theme</code>, <code>cart</code>, <code>toasts</code>, <code>isSidebarOpen</code>, and eight functions to change them. Roughly forty components call <code>useApp()</code>. A product page with a quantity input feels sluggish while typing, and someone has already wrapped every leaf in <code>React.memo</code> with no effect. A junior asks whether the fix is to switch to Redux.</p>
+    Work out, in order: exactly why the forty consumers re-render on every keystroke; why every <code>memo</code> in the app is powerless against it; the smallest change that fixes the typing lag without touching any consumer; the follow-up refactor you would do next week and how you would slice it; and the honest answer to the Redux question.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <p>Answer each <b>out loud, in full sentences</b>, then flip the card and compare.</p>
+
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: React docs — <a href="https://react.dev/learn/passing-data-deeply-with-context">Passing Data Deeply with Context</a>, <a href="https://react.dev/reference/react/useContext">useContext</a> (the re-render rule, the caveats, and "optimizing re-renders when passing objects and functions"), <a href="https://react.dev/reference/react/createContext">createContext</a>, <a href="https://react.dev/reference/react/use">use</a>, and the <a href="https://react.dev/blog/2024/12/05/react-19">React 19 release notes</a> for context as a provider.
+  </div>
+
+  <div class="ask">
+    Ask me to <b>hand you a bad provider</b> — one giant value, forty consumers — and time you fixing it in two moves. Or ask for the interview version: "when would you not use context?", where the good answer names frequency of change, not size of app.
+  </div>
+
+  <!-- REMEMBER THIS — the Feynman summary -->
+  <div class="remember">
+    <span class="label">Remember this · the Feynman summary</span>
+    <ul>
+      <li><b>Order of attack: props → <code>children</code> → context.</b> A component that only forwards data usually wanted <code>children</code> instead.</li>
+      <li><b>Context is a broadcast channel, not storage.</b> The state still lives in a component with a normal <code>useState</code>; two providers mean two independent states. Context changes how a value is read, never who owns it.</li>
+      <li><b>Three steps:</b> <code>createContext</code> with a default, <code>useContext</code> to read, and a provider above the readers. React 19 writes the provider as <code>&lt;Context value={x}&gt;</code>; <code>&lt;Context.Provider&gt;</code> still works and will be deprecated.</li>
+      <li><b>Pick the default honestly:</b> a real standalone value, or <code>null</code> plus a hook that throws. Never <code>{} as T</code> — it turns a missing provider into a crash somewhere else.</li>
+      <li><b>Consumers re-render when the value is not <code>Object.is</code>-equal</b>, starting from the provider that got the new value.</li>
+      <li><b><code>memo</code> cannot stop a context re-render.</b> Documented, and the caveat interviewers ask about — a memoised component with identical props still re-renders when a context it reads changes.</li>
+      <li><b>An inline object as <code>value</code> is the classic bug.</b> A new object every render means "changed" is always true, so every consumer in the app wakes up on every provider render.</li>
+      <li><b>So memoise context values by default</b> — <code>useMemo</code> the object, <code>useCallback</code> the functions. This is the one place memoisation is structural, not a micro-optimisation.</li>
+      <li><b>Split the channels:</b> one context for the value that changes, one for the stable actions. Action-only components then never re-render at all. With a reducer this is free, because <code>dispatch</code> is already stable.</li>
+      <li><b>Context has no selectors.</b> A consumer subscribes to the whole value, so putting two unrelated things on one channel makes them wake each other. That limit is why external stores exist.</li>
+      <li><b>An inner provider overrides an outer one</b> for its subtree — and a <code>useContext</code> call is not affected by a provider returned from the same component.</li>
+      <li><b>Good fits:</b> theme, current account, routing, deep state with a reducer, and values that depend on depth. <b>Bad fits:</b> anything changing many times a second, server data, and state two nearby components share.</li>
+      <li><b>Real use case (built &amp; run):</b> a theme provider taken from "every consumer re-renders on an unrelated click" to "the toggle button never re-renders at all", in two changes and with the screen behaving identically.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a consumer wakes up when the whole context value changes identity — so the two skills are keeping that identity stable and splitting the value so fewer people care.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> React official documentation — <em>Passing Data Deeply with Context</em> (the prop-drilling problem, the three steps, "before you use context", the use-case list, the heading-level example), <code>useContext</code> (the "starting from the provider that receives a different value" rule, the <code>Object.is</code> comparison, the caveat that <code>memo</code> does not prevent context re-renders, the caveat about a provider in the same component, and the <code>useMemo</code>/<code>useCallback</code> optimisation recipe), <code>createContext</code>, <code>use</code>; React 19 release notes — "Context as a provider" and reading context with <code>use</code>.</p>
+
+  <div class="footer-nav">
+    <a href="./0023-what-actually-makes-a-component-re-render.html">← Previous: What actually makes a component re-render</a>
+    <a href="./0025-memo-usememo-and-usecallback.html">Next: memo, useMemo &amp; useCallback →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A component wrapped in `React.memo` receives exactly the same props as last render, but it calls `useContext(ThemeContext)` and the provider above it got a new value. What happens?",
+      options: [
+        "It re-renders — `memo` only compares props, and skipping re-renders with memo does not prevent children receiving fresh context values",
+        "It does not re-render, because memo blocks the update",
+        "It re-renders only if the new context value is deeply different from the old one",
+        "React throws a warning about combining memo with context"
+      ],
+      answer: 0,
+      why: "The `useContext` docs state that React automatically re-renders all the children that use a particular context starting from the provider that receives a different value, and that skipping re-renders with `memo` does not prevent the children receiving fresh context values. The `memo` docs say the same thing from the other side: even when a component is memoised, it will still re-render when a context it's using changes. It has to — otherwise it would display stale data. The comparison is `Object.is` on the whole value, not a deep comparison, which is why an inline object as `value` makes 'changed' true on every provider render."
+    },
+    {
+      q: "`<AuthContext value={{ user, login, logout }}>` — what is wrong with it?",
+      options: [
+        "The object literal is a new object on every render of the provider, so every consumer re-renders even when `user` is unchanged",
+        "Nothing — React compares the contents of context values",
+        "Functions cannot be passed through context",
+        "It should be `<AuthContext.Provider>`, which is the only supported form"
+      ],
+      answer: 0,
+      why: "Context values are compared with `Object.is`, so an object literal written in the provider's JSX is a different value every single render — and every consumer below wakes up, however deep, and however unchanged the data inside. The documented fix is to wrap the functions in `useCallback` and the object in `useMemo`, so the value's identity only changes when the data actually changes. `<AuthContext.Provider>` still works, but React 19 also supports rendering `<AuthContext>` directly as the provider and will deprecate the `.Provider` form later, so that is not the bug here."
+    },
+    {
+      q: "You split one context into `ThemeContext` (the value) and `ThemeActionsContext` (a stable `toggle`). What does that buy you?",
+      options: [
+        "Components that only need to trigger a change never re-render when the value changes, because the actions value never changes identity",
+        "Both contexts update together, so nothing changes except code style",
+        "It removes the need for a provider at the root",
+        "It lets consumers subscribe to individual fields of the value"
+      ],
+      answer: 0,
+      why: "A consumer subscribes to a whole context value — there are no selectors — so anything sharing a channel with a frequently changing value re-renders on its schedule. Moving the actions to their own context, with a value created once and never replaced, means a logout button or a toggle button reads something that is `Object.is`-equal forever and therefore never re-renders on a value change. It does not give you field-level subscriptions; for that you need an external store read through `useSyncExternalStore`. And a provider is still required — splitting changes the channels, not the ownership."
+    },
+    {
+      q: "The React docs suggest two things to try BEFORE reaching for context. What are they?",
+      options: [
+        "Pass props explicitly, and extract components so you can pass JSX as `children` instead of forwarding data",
+        "Wrap intermediate components in `memo`, and use `useReducer`",
+        "Move the state to a module-level variable, and read it directly",
+        "Use `useSyncExternalStore`, and split the component tree"
+      ],
+      answer: 0,
+      why: "The docs say to start by passing props — it is not unusual to pass a dozen props through a dozen components, and it makes it very clear which components use which data — and then to extract components and pass JSX as children, giving `<Layout><Posts posts={posts} /></Layout>` instead of `<Layout posts={posts} />`. Only if neither works well should you consider context. The second suggestion is worth noticing twice: it is the same move that removes wasted re-renders, because a `children` element is created by a component that did not re-render. A long chain of forwarded props is often a missing component, not a missing context."
+    },
+    {
+      q: "Which of these is a genuinely bad fit for context?",
+      options: [
+        "The mouse position, updated on every `mousemove`",
+        "The current theme",
+        "The logged-in user",
+        "The current route"
+      ],
+      answer: 0,
+      why: "Context has no selectors: every change to the value wakes every consumer below the provider. A value that changes many times a second — mouse position, scroll offset, a form field being typed into — therefore turns into a storm of re-renders across everything that reads it, and no amount of `memo` will help because memo cannot block a context update. Theme, current account and routing are the docs' own example use cases: read in many unrelated places, and changing rarely. For high-frequency values, keep the state local to the component that draws with it, or put it in an external store where subscribers can select the slice they need."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is context for, and when would you not use it?”",
+      answer: "Context solves one problem: a value is needed in many places at different depths, and passing it as a prop would mean threading it through components that do not care about it. It is a <b>broadcast to a subtree</b> — a provider publishes a value, any descendant reads it with <code>useContext</code>, and the components in between never mention it. I am careful about two things when I describe it. First, it is not global state: the state still lives in a normal component with a normal <code>useState</code>, so two providers give two independent states, and I still have to choose a good owner. Second, the docs put two alternatives before it — pass props, and extract components so you can pass JSX as <code>children</code> — and I try those first, because a long chain of forwarded props is often a missing component rather than a missing context. Good fits are theme, the current account, routing, deep state paired with a reducer's <code>dispatch</code>, and values that depend on <em>where</em> a component sits in the tree, like a heading level, which props genuinely cannot express. Bad fits are anything that changes many times a second, like mouse position or a form field, because every consumer wakes on every change; server data, where the real problem is caching and refetching; and state that two nearby components share, where lifting to the common parent is smaller and clearer."
+    },
+    {
+      prompt: "Interviewer: “When does a context consumer re-render?”",
+      answer: "When the provider above it receives a <code>value</code> that is <b>not <code>Object.is</code>-equal</b> to the previous one. React then re-renders all the children that use that particular context, starting from that provider. Three consequences I always say out loud. First, the comparison is on the <b>whole value</b> — there are no selectors, so a consumer that only cares about one field still wakes when any field changes. Second, <b><code>memo</code> cannot stop it</b>: the docs are explicit that skipping re-renders with memo does not prevent children receiving fresh context values, and that a memoised component still re-renders when a context it uses changes. It has to, or it would render stale data. Third, and this is where the real-world bug lives, if the value is an object literal written in the provider's JSX, it is a brand-new object on every render of the provider, so 'changed' is always true and every consumer in the app re-renders on every provider render. The fix is the one the docs give: <code>useCallback</code> the functions, <code>useMemo</code> the object. And the better fix on top of that is to split the context — one for the value that changes, one for the stable actions — so components that only trigger changes never re-render at all."
+    },
+    {
+      prompt: "Interviewer: “How do you type a context in TypeScript when there is no sensible default?”",
+      answer: "I make the default <code>null</code>, widen the type to include it, and then hide that behind a custom hook that throws. So <code>createContext&lt;AuthValue | null&gt;(null)</code>, and a <code>useAuth()</code> that reads the context, throws <code>'useAuth must be used inside &lt;AuthProvider&gt;'</code> when it is <code>null</code>, and otherwise returns the value — at which point TypeScript has narrowed it to <code>AuthValue</code>, so no consumer writes a null check ever again. I usually do not export the raw context at all, so nobody can bypass the hook. What I never do is <code>createContext({} as AuthValue)</code>: that silences TypeScript by lying, and it converts a clear 'you forgot the provider' error into something like <code>undefined is not a function</code> several frames away, in production. The alternative shape is fine when a standalone default genuinely makes sense — <code>createContext&lt;Theme&gt;('light')</code> is honest, because a component with no theme provider above it rendering in light mode is correct behaviour, not a bug. So the question I ask is simply: is 'nobody provided this' a valid state or a mistake? Valid state gets a real default; mistake gets <code>null</code> plus a throwing hook."
+    },
+    {
+      prompt: "Interviewer: “A page with one giant AppContext lags when the user types in a form field. Walk me through the fix.”",
+      answer: "First I name the mechanism, because it decides everything else. The form field's value lives in that context, so every keystroke changes the context value, and every consumer below the provider re-renders — the docs' rule is that React re-renders all children using that context starting from the provider that got a different value. That is also why the <code>memo</code> wrappers someone already added did nothing: memo compares props, and it explicitly does not prevent a context update from reaching a component. Then I fix it in the cheapest order. <b>Move one: get the form field out of context entirely.</b> Transient state like a text input belongs to the component that draws it — that alone usually removes the lag, and it touches no consumer. <b>Move two: memoise the value</b> with <code>useMemo</code>, and the functions inside it with <code>useCallback</code>, so unrelated provider renders stop waking forty components. <b>Move three, the refactor:</b> split the one context by lifetime and by feature — a stable actions context that never changes identity, and separate value contexts for theme, user and cart, so a notification cannot re-render a price. On the Redux question I would say: no, not for this. This is not a missing library, it is one channel carrying six unrelated things. A store with selectors — Redux, Zustand, or my own store read through <code>useSyncExternalStore</code> — is the right answer only once I actually need field-level subscriptions, and I would reach for it deliberately, not as a way to avoid deciding what owns what."
+    }
+  ]);
+</script>

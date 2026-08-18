@@ -1,12 +1,5 @@
 # Mission: Become an Engineering Manager within 1 year
 
-## Why
-Lam is a strong senior individual-contributor engineer (frontend/backend, TypeScript)
-with no direct reports yet. The goal is to be **ready and credible to step into a
-front-line Engineering Manager role within 12 months** — able to lead a small team,
-grow the people on it, and own delivery — whether that happens by internal promotion
-or by moving to a new company. This is not "learn management theory"; it is "be the
-obvious choice when a team needs a manager."
 
 ## Success looks like
 - Run a useful weekly 1:1 and a productive team meeting without a script.
