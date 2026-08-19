@@ -1,0 +1,486 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC in React — the real codebase — 7-Day React Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 4 · Lesson 11 · Your strongest material</p>
+  <h1>WebRTC in React — the real codebase</h1>
+  <p class="subtitle">Most candidates have a CRUD app. You shipped video calls, screen share and device management in a React product. This lesson turns that into answers.</p>
+
+
+  <div class="win">
+    <strong>Your win today:</strong> you can draw the two-network architecture of a video call, explain the four React patterns that make it work, and answer "what would you do differently now?" with three specific, technical answers.
+  </div>
+
+  <h2>Why this is your best material</h2>
+
+  <p>A video call breaks every comfortable assumption in React. The data is a live hardware handle, not JSON. The truth lives in an engine outside React. The user's hardware changes while the app runs. Nothing can be solved by adding another <code>useState</code>. If you can talk about this calmly, the interviewer learns more about you in five minutes than a whole CRUD discussion would tell them.</p>
+
+  <h2>The architecture — two networks, not one</h2>
+
+  <p>This is the first thing to draw, and the thing most candidates get wrong. A call runs on <b>two separate connections</b>.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 700 320" role="img" aria-label="Two networks in a call: signalling over WebSocket and media over an SFU">
+      <rect x="20" y="20" width="150" height="72" rx="10" fill="none" stroke="#767676" stroke-width="2"/>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#767676">Browser A</text>
+      <text x="95" y="66" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">React + engine</text>
+      <text x="95" y="82" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">camera · mic</text>
+
+      <rect x="530" y="20" width="150" height="72" rx="10" fill="none" stroke="#767676" stroke-width="2"/>
+      <text x="605" y="46" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#767676">Browser B</text>
+      <text x="605" y="66" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">React + engine</text>
+      <text x="605" y="82" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">camera · mic</text>
+
+      <rect x="205" y="118" width="290" height="56" rx="10" fill="none" stroke="#087ea4" stroke-width="2"/>
+      <text x="350" y="141" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#087ea4">SIGNALLING SERVER</text>
+      <text x="350" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">WebSocket · "who is calling whom", accept, reject, hang up</text>
+      <line x1="120" y1="92" x2="230" y2="118" stroke="#087ea4" stroke-width="2"/>
+      <line x1="580" y1="92" x2="470" y2="118" stroke="#087ea4" stroke-width="2"/>
+
+      <rect x="205" y="212" width="290" height="66" rx="10" fill="none" stroke="#d6336c" stroke-width="2"/>
+      <text x="350" y="236" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#d6336c">MEDIA SERVER (SFU)</text>
+      <text x="350" y="255" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">receives each stream once, forwards it</text>
+      <text x="350" y="270" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#9aa">to everyone else. Audio and video only.</text>
+      <line x1="95" y1="92" x2="215" y2="215" stroke="#d6336c" stroke-width="2"/>
+      <line x1="605" y1="92" x2="485" y2="215" stroke="#d6336c" stroke-width="2"/>
+
+      <text x="350" y="303" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-style="italic" fill="#767676">Signalling carries the words. The media server carries the sound and the picture.</text>
+    </svg>
+    <figcaption>Two connections, two failure modes. Signalling can be up while media is dead — that is the "I can see they joined but I hear nothing" bug.</figcaption>
+  </figure>
+
+  <div class="soundbite">
+    <span class="label">Say this, word for word</span>
+    <p><b>"A call has two networks. Signalling — a WebSocket — carries who is calling whom, accept, reject, hang up. The media server carries the audio and video. They fail independently, which is why 'they joined but I can't hear them' is a different bug from 'the call never started'."</b></p>
+  </div>
+
+  <h2>Mesh, SFU or MCU — the scaling question</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Topology</th><th>What each browser does</th><th>Breaks at</th></tr>
+    <tr><td><b>Mesh</b> (peer to peer)</td><td>Sends its stream to every other person. 5 people = 4 uploads each.</td><td>About 4–6 people. Upload bandwidth dies first, then CPU.</td></tr>
+    <tr><td><b>SFU</b> (selective forwarding)</td><td>Sends <b>once</b> to the server; the server forwards. Still decodes N streams.</td><td>Dozens. The usual production choice.</td></tr>
+    <tr><td><b>MCU</b> (mixing)</td><td>Sends once, receives <b>one</b> mixed stream. Cheapest for the client.</td><td>Server CPU cost, and you lose per-person layout control.</td></tr>
+  </table>
+  </div>
+
+  <p>Say which one your product used and <b>why</b>: an office product with rooms of a dozen people needs an SFU — mesh cannot carry it, and an MCU takes away per-person video tiles and speaker highlighting. That sentence answers "how would you scale it?" before it is asked. (<a href="../../../backend-mastery-tree/lessons/0007-webrtc-and-realtime-media.html">Backend tree L07</a> has the server side.)</p>
+
+  <h2>Where React's job starts and stops</h2>
+
+  <div class="soundbite">
+    <span class="label">The design rule</span>
+    <p><b>"The engine owns the call. React renders a snapshot of it. Commands go down into the engine; state comes back up as events."</b></p>
+  </div>
+
+  <p>The media engine is a long-lived class with sockets, transports, producers, consumers and reconnect timers. Its life is longer than any component's. React must never become a second copy of that truth — it must <em>read</em> it. Now four patterns that make that real.</p>
+
+  <h2>Pattern 1 — a stream reaches the screen through a ref</h2>
+
+  <p>There is no <code>&lt;video src={stream}&gt;</code>. A live stream is attached through a DOM property, <code>srcObject</code>, which means a ref and an effect.</p>
+
+  <pre><code>function VideoTile({ stream, muted }: { stream: MediaStream | null; muted: boolean }) {
+  const ref = useRef&lt;HTMLVideoElement&gt;(null);
+
+  useEffect(() =&gt; {
+    const el = ref.current;
+    if (!el || !stream) return;
+    el.srcObject = stream;
+    return () =&gt; { el.srcObject = null; };   <span class="cmt">// detach when the stream changes or we unmount</span>
+  }, [stream]);
+
+  return &lt;video ref={ref} autoPlay playsInline muted={muted} /&gt;;
+}</code></pre>
+
+  <p>Three attributes carry real meaning, and naming them is a signal you have shipped this: <code>autoPlay</code> because a live call cannot wait for a play button, <code>playsInline</code> because iOS otherwise throws the video into fullscreen, and <code>muted</code> on your <b>own</b> preview so you do not hear yourself — and because browsers only allow unattended autoplay when the element is muted.</p>
+
+  <h2>Pattern 2 — <code>play()</code> returns a promise, and it rejects</h2>
+
+  <pre><code>el.onloadeddata = () =&gt; {
+  el.play().catch(err =&gt; {
+    <span class="cmt">// NotAllowedError: autoplay policy — the user has not interacted with the page yet</span>
+    setNeedsUserGesture(true);   <span class="cmt">// show an "Unmute" button and let the click start it</span>
+  });
+};</code></pre>
+
+  <div class="trap">
+    <span class="label">Trap — the silent call</span>
+    Browsers block audio playback until the user has interacted with the page. A call that starts from a notification, a deep link, or a background tab hits this, <code>play()</code> rejects with <code>NotAllowedError</code>, and the user sees a frozen video with no sound and no explanation. The production answer has two parts: <b>catch the rejection</b>, and <b>show a button</b>, because only a real user gesture can unblock it. In the case-study code this rejection was caught and logged — the honest version of the story is "we caught it; what I would add now is the recovery UI".
+  </div>
+
+  <h2>Pattern 3 — reading the engine during render is a bug waiting</h2>
+
+  <p>The tempting shortcut, and one the real code used:</p>
+
+  <pre><code>const localStream = EngineManager.get(callId)?.local_stream ?? null;   <span class="cmt">// read during render</span></code></pre>
+
+  <p>It works most of the time, and that is the problem. React does not know that value exists, so nothing re-renders when the engine swaps the stream — the component only updates when something <em>else</em> happens to re-render it. With concurrent rendering, two parts of one screen can read that mutable object at different moments and disagree. That is called <b>tearing</b>, and it is exactly the problem <code>useSyncExternalStore</code> was added to solve.</p>
+
+  <pre><code>function useLocalStream(callId: string) {
+  return useSyncExternalStore(
+    (onChange) =&gt; {                                     <span class="cmt">// subscribe</span>
+      engine.on('streamchange', onChange);
+      return () =&gt; engine.off('streamchange', onChange);
+    },
+    () =&gt; engine.get(callId)?.localStream ?? null,       <span class="cmt">// read a consistent snapshot</span>
+  );
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">This is your best senior answer of the whole week</span>
+    "We read the engine's stream directly during render. It worked, but React had no subscription to it, so updates depended on an unrelated re-render — and under concurrent rendering two components could read different values in the same pass. <b>I'd move it to <code>useSyncExternalStore</code>, which exists precisely for reading a mutable external source safely.</b>" Naming a real weakness in your own shipped code, with the correct fix, is the strongest thing you can do in a technical interview.
+  </div>
+
+  <h2>Pattern 4 — the dependency array bug that mutes the wrong person</h2>
+
+  <pre><code>useEffect(() =&gt; {
+  if (remoteStream &amp;&amp; videoRef.current) {
+    videoRef.current.srcObject = remoteStream;
+    videoRef.current.muted = micStatus === 'off';   <span class="cmt">// reads micStatus…</span>
+  }
+}, [remoteStream, callStatus]);                     <span class="cmt">// …but micStatus is not in the list</span></code></pre>
+
+  <p>Trace it out loud: the remote user mutes their microphone. <code>micStatus</code> changes. The component re-renders — but the effect does not re-run, because neither <code>remoteStream</code> nor <code>callStatus</code> changed. The element's <code>muted</code> property keeps the value from the last time the effect ran. The mute icon in the UI is correct while the audio behaviour is not.</p>
+
+  <p>This is the <a href="0002-hooks-under-pressure.html">stale-deps</a> problem in production, on real code, with a user-visible consequence. Two fixes: add <code>micStatus</code> to the array, or better — split it, because attaching a stream and setting a mute flag are two different synchronisations that happen at different times.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this</span>
+    <p><b>"One effect should synchronise one thing. When I see an effect doing two jobs, the dependency array can only be right for one of them."</b></p>
+  </div>
+
+  <h2>The hardware layer — the part nobody prepares for</h2>
+
+  <p>Devices are not configuration. They are hardware that changes while the app is running. The real product had to handle all of this, and each item is a question you can answer with a story:</p>
+
+  <div class="table-scroll">
+  <table>
+    <tr><th>Situation</th><th>What the app must do</th></tr>
+    <tr><td>User unplugs the headset mid-call</td><td>Listen for <code>devicechange</code>, notice the selected device is gone, <b>fall back to another input of the same kind</b>, and tell the user. Doing nothing means silence with no error.</td></tr>
+    <tr><td>Ten <code>devicechange</code> events in one second</td><td>One Bluetooth device produces a burst. Guard the handler with a <b>lock</b> so the re-enumeration runs once, not ten times racing each other.</td></tr>
+    <tr><td>Permission changes in the browser UI</td><td><code>navigator.permissions.query({name:'camera'})</code> gives a <code>PermissionStatus</code> with an <code>onchange</code> event. React to a revoke instead of failing on the next call.</td></tr>
+    <tr><td>Device labels are empty</td><td>Before permission is granted, <code>enumerateDevices</code> returns entries with blank labels — an anti-fingerprinting rule. So you cannot show a useful device picker until the user has granted access once.</td></tr>
+    <tr><td>The user picked a camera last week</td><td>Persist the chosen <code>deviceId</code>, but always verify it still exists on load, because ids change between machines and after some OS updates.</td></tr>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The story to tell</span>
+    <b>"The hardest bug I fixed there was not React. A Bluetooth headset connecting fires a burst of <code>devicechange</code> events, and our handler re-enumerated devices on each one — so several async updates raced and the user could end up on a microphone that no longer existed. We serialised the handler with a lock so only one re-enumeration runs at a time, and made device removal fall back to another input of the same kind."</b> Concrete, technical, and it shows you can debug something that is not in a tutorial.
+  </div>
+
+  <h2>The cleanup rule</h2>
+
+  <pre><code>return () =&gt; {
+  stream.getTracks().forEach(t =&gt; t.stop());   <span class="cmt">// ← this, and only this, releases the hardware</span>
+};</code></pre>
+
+  <p><code>track.stop()</code> is what turns the camera light off. Setting <code>srcObject = null</code>, unmounting the component, and leaving the page all fail to do it. Users forgive most bugs; a camera light that stays on after a call is not one of them.</p>
+
+  <h2>What I would change today — rehearse these three</h2>
+
+  <ol>
+    <li><b>Read the engine through <code>useSyncExternalStore</code></b> instead of during render, so React owns the subscription and concurrent rendering cannot tear.</li>
+    <li><b>One effect per synchronisation.</b> Attaching a stream, setting mute, and clearing on call end are three concerns; one effect with a shared dependency array was where our stale-mute bug lived.</li>
+    <li><b>Handle the autoplay rejection with UI, not a log.</b> Catch <code>NotAllowedError</code> and show an "Unmute" button, because only a user gesture can unblock audio.</li>
+  </ol>
+
+  <div class="drill">
+    <span class="label">Drill · out loud, 5 minutes</span>
+    <p class="situation">"Tell me about the most technically difficult thing you've built."</p>
+    Ninety seconds, no more. Structure: what the product was → the one hard constraint (React had to render state it did not own) → the design decision (engine owns the call, React renders a snapshot) → one concrete bug and its fix (the device-change race, or the stale mute) → what you would change now. Then stop and let them ask.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0006-webrtc-and-media-in-react.html">L06 · WebRTC &amp; media in React</a> — the full pattern lesson ·
+    <a href="../../lessons/0005-websockets-in-react.html">L05 · WebSockets in React</a> — the signalling half ·
+    <a href="../../lessons/0020-reaching-the-dom-with-refs.html">L20 · Reaching the DOM with refs</a> ·
+    <a href="../../lessons/0022-build-a-modal-and-a-media-player.html">L22 · Build a modal &amp; a media player</a> ·
+    <a href="../../../backend-mastery-tree/lessons/0006-websockets-at-scale.html">Backend L06 · WebSockets at scale</a> ·
+    <a href="../../../backend-mastery-tree/lessons/0007-webrtc-and-realtime-media.html">Backend L07 · WebRTC &amp; real-time media</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this</span>
+    <ul>
+      <li>A call runs on <b>two networks</b>: signalling (WebSocket) and media (SFU). They fail separately.</li>
+      <li><b>Mesh</b> dies around 5 people; an <b>SFU</b> is the production answer; an <b>MCU</b> trades layout control for client cost.</li>
+      <li><b>The engine owns the call; React renders a snapshot.</b> Commands down, state up.</li>
+      <li>A stream reaches the screen only through a <b>ref + effect + <code>srcObject</code></b>.</li>
+      <li><code>play()</code> rejects under the autoplay policy — catch it and show a button.</li>
+      <li>Reading a mutable external object during render risks <b>tearing</b>; <code>useSyncExternalStore</code> is the fix.</li>
+      <li>Hardware changes at runtime: <code>devicechange</code>, permission revokes, unplugged devices. Guard the handler with a lock.</li>
+      <li><code>track.stop()</code> is the only thing that turns the camera light off.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>React was never the source of truth in that app — it was the dashboard, and knowing the difference is the whole skill.</b></p>
+  </div>
+
+  <div class="ask">
+    Say <b>"interview me on the video-call project"</b> and you will get the three-level follow-up chain: architecture, then a specific bug, then "what would you change".
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0010-kata-03-paginated-list.html">← Kata 3</a></span>
+    <span><a href="0012-telling-the-real-time-story.html">Next: Telling the story →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why does a video call need a signalling channel separate from the media connection?",
+      options: [
+        "Peers cannot describe or negotiate a media session over a connection that does not exist yet, and call control keeps working even when media fails",
+        "Because WebRTC media cannot carry any data at all",
+        "Because browsers block audio until a WebSocket handshake completes",
+        "Because the SFU requires a second TCP port for authentication"
+      ],
+      answer: 0,
+      why: "The media path has to be negotiated before it exists — who is in the room, what codecs, which transport — and that negotiation must travel over something already connected. Keeping them separate also isolates failure: signalling can be healthy while media is blocked by a firewall, which is exactly the 'I can see they joined but I hear nothing' case. Knowing that those are two different bugs is the point of the answer."
+    },
+    {
+      q: "A five-person mesh call is fine; at eight people everyone's video stutters. Why?",
+      options: [
+        "In a mesh each browser uploads its own stream once per other participant, so upload bandwidth and encoder CPU grow with the number of people",
+        "The signalling server cannot handle more than six concurrent WebSocket connections",
+        "Browsers cap the number of video elements that can play at once",
+        "The codec falls back to software decoding above six streams"
+      ],
+      answer: 0,
+      why: "Mesh means every peer connects to every other peer, so with N people each browser sends N-1 copies of its own stream and receives N-1. Upload bandwidth is usually the first wall — home connections are asymmetric — and encoding several outbound streams saturates the CPU next. An SFU fixes the send side: each browser uploads once and the server forwards, so upload cost stops growing with room size."
+    },
+    {
+      q: "Code reads `engine.get(callId)?.localStream` directly in the component body. What is the risk?",
+      options: [
+        "React has no subscription to that mutable object, so updates depend on an unrelated re-render and concurrent rendering can tear",
+        "Reading a class property during render leaks memory",
+        "The optional chaining hides an error that should be thrown",
+        "React will freeze the object and the engine can no longer write to it"
+      ],
+      answer: 0,
+      why: "React only re-renders for state, props and context. A field on an external object is invisible to it, so when the engine swaps the stream nothing schedules a render — the UI updates only by luck, when something else re-renders. Worse, with concurrent rendering React can pause and resume work, so two components reading that same mutable object during one pass can see different values, which is tearing. useSyncExternalStore exists exactly for this: a subscribe function plus a snapshot getter gives React the subscription it was missing."
+    },
+    {
+      q: "An effect sets `el.muted = micStatus === 'off'` but lists only [remoteStream, callStatus] as dependencies. What does the user experience?",
+      options: [
+        "The remote user mutes, the icon updates, but the audio keeps playing because the effect never re-ran to change the element",
+        "The video freezes until the next state change",
+        "React throws a warning and skips the effect entirely",
+        "The stream detaches and the tile goes black"
+      ],
+      answer: 0,
+      why: "The mute icon comes from render, which does re-run when micStatus changes. The audio comes from a DOM property that is only written inside the effect, and the effect will not re-run because none of its declared dependencies changed. So the UI and the actual behaviour disagree — the hardest kind of bug to spot in review, because the screen looks right. The real lesson is structural: this effect is doing two synchronisations, and one dependency array cannot be correct for both."
+    },
+    {
+      q: "The call ends and the component unmounts, but the camera light stays on. What was missed?",
+      options: [
+        "stream.getTracks().forEach(t => t.stop()) — only stopping the tracks releases the hardware",
+        "Setting video.srcObject = null in the cleanup",
+        "Calling peerConnection.close() before unmounting",
+        "Removing the video element from the DOM"
+      ],
+      answer: 0,
+      why: "Detaching srcObject, unmounting the element, and closing the peer connection all leave the MediaStreamTrack live — the browser is still holding the device open. Only track.stop() releases it and turns off the indicator light. It is the most visible bug in the whole domain because the operating system shows the user that your app is still watching them."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Tell me about the most technically difficult thing you've built.”",
+      answer: "A virtual-office collaboration product — video calls, screen sharing, chat and presence, in React and TypeScript. The hard part was not any single feature; it was that React had to render state it did not own. A call is a long-lived machine: sockets, transports, producers, consumers, reconnect timers, hardware. Its life is much longer than any component's, and it changes for reasons that have nothing to do with React — the other person hangs up, the network drops, someone unplugs a headset. The design decision that made it work was a boundary: <b>the engine owns the call, React renders a snapshot of it</b>. Commands go down — mute, join, leave — and state comes back up as events. The moment a component keeps its own copy of, say, whether the microphone is muted, you have two truths and the button starts lying to the user. Underneath that were two networks to keep straight: signalling over a WebSocket for who is calling whom, and a media server carrying the actual audio and video. They fail independently, which is why 'they joined but I can't hear them' is a different investigation from 'the call never started'. I would rather talk about a bug than the architecture, though — ask me about device changes."
+    },
+    {
+      prompt: "Interviewer: “Give me a specific bug from that project and how you fixed it.”",
+      answer: "Two I would offer. The first is hardware. When a Bluetooth headset connects, the browser fires a burst of <code>devicechange</code> events — not one. Our handler re-enumerated devices on each event, so several async updates raced, and a user could end up selected on a microphone that no longer existed: silence, no error, nothing in the console. The fix was to serialise the handler with a lock so only one re-enumeration runs at a time, and to make device removal fall back to another input of the same kind rather than leaving a dangling id. The second is pure React. We had one effect that attached a remote stream to a video element <em>and</em> set the element's <code>muted</code> property from a mic-status prop, but the dependency array only listed the stream and the call status. So when a remote user muted, the icon updated — that comes from render — while the audio kept playing, because the effect never re-ran to touch the DOM property. The screen looked correct, which is what made it hard to catch in review. The fix was to split it: one effect per thing being synchronised, so each dependency array can actually be right. That is the rule I have taken everywhere since."
+    },
+    {
+      prompt: "Interviewer: “What would you do differently if you rebuilt it today?”",
+      answer: "Three things, in order of how much they would have saved us. <b>One: read the engine through <code>useSyncExternalStore</code>.</b> We read the media engine's stream directly during render. It worked, but React had no subscription to that mutable object, so the UI updated only when something unrelated re-rendered — and under concurrent rendering two components reading it in the same pass can disagree, which is tearing. A subscribe function plus a snapshot getter is the supported way to read an external mutable source, and it is a small change. <b>Two: one effect per synchronisation.</b> Our effects grew to do two or three jobs each, and a dependency array cannot be honest for more than one. <b>Three: treat the autoplay policy as a UI state, not a log line.</b> <code>play()</code> rejects with <code>NotAllowedError</code> when the user has not interacted with the page — a call opened from a notification hits this — and we caught it and logged it. What it needs is a visible 'Unmute' button, because only a real user gesture can unblock audio. The general lesson I took away is that in a real-time app the interesting state is never inside React, so the whole design problem is choosing the boundary and then being disciplined about never letting a second copy of the truth grow on the React side."
+    }
+  ]);
+</script>
