@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2.5 — The Shopify CLI and the Dev Workflow</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A2 · Lesson 5 · <span class="pill depth">depth</span></p>
+<h1>The Shopify CLI and the dev workflow</h1>
+<p class="subtitle">Config as code, one command for a tunnel, and a deploy that can silently do nothing.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know what the CLI actually gives you, and the two deploy behaviours that
+  succeed while not doing what you asked.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does app development need that a normal project does not?</h3>
+
+<p>Three things, and the CLI exists for exactly these:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Need</th><th>Because</th><th>CLI answer</th></tr>
+  <tr><td>A <b>public URL</b></td><td>Shopify must reach you — webhooks, callbacks, the embedded app frame</td><td><code>shopify app dev</code> creates a tunnel</td></tr>
+  <tr><td><b>Config in the repo</b></td><td>Scopes, webhooks and extensions must be reviewable, not clicked in a dashboard</td><td>TOML files, deployed with the app</td></tr>
+  <tr><td><b>Scaffolding</b></td><td>Every extension type has a fixed file shape</td><td><code>shopify app generate extension</code></td></tr>
+</table>
+</div>
+
+<h3>The commands that matter</h3>
+
+<pre><code>shopify app dev                  # run locally + create a tunnel
+shopify app generate extension   # scaffold: checkout_ui, POS, customer account,
+                                 #           payments, functions, theme app ext
+shopify app deploy               # push app config + extensions
+</code></pre>
+
+<p>The tunnel is the important one, and it is why
+<a href="0025-step-3-webhooks-in-inventory-back.html">Project Step 3</a> becomes possible at all. Note that the
+tunnel URL <b>changes each time you restart</b> — Shopify's own advice is to use a <b>relative path</b> for a webhook
+URI, such as <code>uri = "/webhooks"</code>, so the subscription does not need updating on every restart.</p>
+
+<h3>Config as code, and what that buys</h3>
+
+<p>Your app's scopes, webhook subscriptions, URLs and extension declarations live in TOML in the repo. So a scope
+change is a <b>reviewable diff</b> rather than something a colleague clicked at 6pm and cannot remember. That is the
+whole argument, and it is a good one.</p>
+
+<div class="diagram">
+  shopify.app.toml         scopes · URLs · webhook subscriptions
+  shopify.extension.toml   one per extension: targets, capabilities,
+                           metafields, settings
+</div>
+
+<h3>Two deploys that succeed and do nothing</h3>
+
+<div class="scar silent">
+  <span class="who">1 · <code>analytics_queryable</code> in a metafield definition</span>
+  Documented plainly: <code>shopify.app.toml</code> accepts
+  <code>capabilities.analytics_queryable</code>, <b>your app deploys without an error, and the capability is not
+  set</b>. You asked for a feature, the deploy went green, and you did not get it.
+  <br><br>
+  So: <b>verify capabilities after deploy</b> rather than trusting the exit code.
+</div>
+
+<div class="scar silent">
+  <span class="who">2 · More than 25 metafield definition changes in one deploy</span>
+  Declarative metafield definitions are capped at <b>25 changes — creation, update or deletion — per deploy</b>. A
+  larger schema change has to be split across deploys, which matters when you planned one release.
+</div>
+
+<p>And a related trap from <a href="../../platform/lessons/0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a>:
+definitions declared in TOML are <b>read-only through the Admin API</b>. You can query them; mutations error. So
+runtime code that creates definitions breaks the day someone moves them into config.</p>
+
+<h3>Dev stores, and the plan choice</h3>
+
+<p>Create dev stores in the Dev Dashboard, on <b>any plan including Plus, at no cost</b>. And the counter-intuitive
+recommendation from <a href="0022-step-0-the-dev-store-and-the-generator.html">Project Step 0</a>: for sync work,
+choose a <b>non-Plus</b> store. Plus multiplies your rate limits by ten, which hides the throttling problems you are
+trying to learn to handle.</p>
+
+<p>Two dev-store limits worth remembering because they shape what you can demo: no real transactions — use the
+<b>Bogus gateway</b> — and <b>Store Credit and Gift Cards are not supported</b> at all.</p>
+
+<h3>What the CLI does not solve</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Still yours</th><th>Note</th></tr>
+  <tr><td>Approvals</td><td>Protected customer data and network access are Partner Dashboard requests. They pass in dev and block at launch</td></tr>
+  <tr><td>Query validity across versions</td><td>The CLI does not tell you a field is deprecated. Validate against the schema in CI — that is how this Course found three</td></tr>
+  <tr><td>Secrets</td><td>Never in the repo. <code>.env</code>, gitignored, and excluded from anything that publishes</td></tr>
+</table>
+</div>
+
+<p class="verified"><b>Verified 2026-08-23:</b> <code>shopify app generate extension</code> as the scaffold command
+across checkout, POS and customer-account extensions; <code>shopify app dev</code> creating a tunnel whose URL
+changes on restart, and the advice to use a relative webhook <code>uri</code>; TOML config for app and extensions
+including targets, capabilities, metafields and settings; the <b>25 declarative metafield changes per deploy</b> cap;
+declarative definitions being <b>read-only through the Admin API</b>; and that
+<code>capabilities.analytics_queryable</code> <b>deploys without error and is not set</b> —
+<a href="https://shopify.dev/docs/apps/build/metafields/definitions">Manage metafield definitions</a>,
+<a href="https://shopify.dev/docs/apps/build/webhooks/verify-deliveries">Verify webhook deliveries</a> and the
+extension references for
+<a href="https://shopify.dev/docs/api/checkout-ui-extensions/2025-07">checkout</a>,
+<a href="https://shopify.dev/docs/api/pos-ui-extensions/2026-01">POS</a> and
+<a href="https://shopify.dev/docs/api/customer-account-ui-extensions/2025-07">customer accounts</a>. Dev stores on
+any plan at no cost, no real transactions, Bogus gateway, and no Store Credit or Gift Cards —
+<a href="https://shopify.dev/docs/apps/build/dev-dashboard/stores/development-stores">Dev stores</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your deploy is green. You added a metafield capability and thirty definition changes in the same release. <b>What
+  actually happened?</b>
+</div>
+
+<p>Probably neither of the things you wanted, and the deploy told you nothing.
+<br><br>
+The <b>thirty definition changes</b> exceed the documented cap of 25 per deploy, so that release could not apply all
+of them — a larger schema change has to be split. And if one of your capabilities was
+<code>analytics_queryable</code>, that one is documented as deploying <b>without an error while not being set</b>.
+<br><br>
+The lesson is the same one as bulk operations in <a href="../../platform/lessons/0018-three-ways-to-push-it-and-bulk-operations.html">P6.2</a>
+and reconciliation in <a href="0014-reconciliation-and-numbers-that-do-not-lie.html">A3.6</a>: <b>a green result is
+a statement about the operation, not about the outcome.</b> Read back what you asked for and confirm it is
+there.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — <code>analytics_queryable</code></span>
+  Documented: deploys clean, capability not set. Verify capabilities after deploy.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — over 25 definition changes in a deploy</span>
+  A hard cap. Split the release, or discover mid-launch that half your schema is missing.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — an absolute webhook URI and a restarted tunnel</span>
+  The tunnel URL changes; the subscription still points at the old one. Shopify fails deliveries you never see. Use a
+  relative <code>uri</code>.
+</div>
+
+<div class="scar">
+  <span class="who">Runtime code creating declarative definitions</span>
+  TOML-declared definitions are read-only through the Admin API. Code that created them at runtime starts failing
+  the day they move into config.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — developing on a Plus dev store</span>
+  Ten times the rate limit hides every throttling problem. You ship to a Basic store and it falls over on day
+  one.
+</div>
+
+<div class="scar">
+  <span class="who">Demoing store credit or gift cards on a dev store</span>
+  Not supported. Plan the demo around it rather than debugging it for an afternoon.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the CLI will not catch a deprecated field</span>
+  It scaffolds and deploys; it does not lint your GraphQL against the version you pinned. Validating queries against
+  the schema in CI is what caught <b>three</b> already-deprecated fields while building this Course. That job is
+  yours to add.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Explaining why config lives in the repo</span>
+  <q>All the app's permissions and webhook settings live in a file in our code rather than being clicked in a
+  dashboard. It means any change to what we can access shows up in a review, with a date and a name against it.
+  Worth it for anything touching your customer data — you can always see what we asked for and when.</q>
+  <span class="why-said">Explains a developer convenience as an audit benefit, which is what the client actually
+  values.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a schema change needs splitting</span>
+  <q>This one goes out over two releases rather than one. Shopify caps how many custom-field definitions can change
+  in a single deploy at twenty-five, and we have thirty. Nothing's wrong — it's just two deploys instead of one, and
+  I'd rather tell you now than have half of it land silently.</q>
+  <span class="why-said">A platform limit, stated as a scheduling fact rather than a problem, with the silent-failure
+  risk named.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Three needs: a public URL, config in the repo, scaffolding.</b> That is what the CLI is for.</li>
+  <li><b><code>shopify app dev</code> makes a tunnel</b>, and its URL changes on restart. Use a relative webhook <code>uri</code>.</li>
+  <li><b>Config as code makes a scope change a reviewable diff.</b> That is the real argument.</li>
+  <li><b>25 declarative metafield changes per deploy.</b> Bigger schemas split across releases.</li>
+  <li><b><code>analytics_queryable</code> deploys clean and is not set.</b> Verify capabilities after deploy.</li>
+  <li><b>TOML definitions are read-only via the Admin API.</b> Runtime creation breaks when they move to config.</li>
+  <li><b>Dev on a non-Plus store</b> for sync work. Plus hides the throttling.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a green deploy is a statement about the operation, not the outcome —
+read back what you asked for.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter A2 is now five Lessons.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0008-run-it-docker-compose-ci-and-what-to-log.html">← A2.4</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

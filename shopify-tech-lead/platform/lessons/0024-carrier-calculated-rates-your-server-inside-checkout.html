@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7.2 — Carrier-Calculated Rates: Your Server Inside Checkout</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P7 · Lesson 2</p>
+<h1>Carrier-calculated rates: your server inside checkout</h1>
+<p class="subtitle">The timeout shrinks as your traffic grows. There is no retry. And Shopify documents its own fail-open.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can build a rate endpoint that degrades correctly under load — and you
+  know why the busiest store you serve gets the shortest timeout.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>What this is</h3>
+
+<p>A <b>carrier service</b> is a callback URL you register. When a customer reaches checkout, <b>Shopify calls
+you</b> and asks for shipping rates. Whatever you return is what they see.</p>
+
+<div class="diagram">
+  customer at checkout
+        │
+        ▼
+  Shopify ──POST──▶ your callback URL
+                     { rate: { origin, destination, items[], currency } }
+        │
+        ◀──JSON──── { rates: [ { service_name, service_code,
+                                 currency, total_price, description } ] }
+        │
+        ▼
+  the rates the customer sees
+</div>
+
+<p>This is <b>shape 3</b> from <a href="../../apps/lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">A4.1</a>
+in its purest form: synchronous, inside a customer's checkout, no retries. Everything this Course says about
+queues and reconciliation does not apply. Different rules, and they are harsher.</p>
+
+<h3>The response, and the five required fields</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Field</th><th>Req</th><th>Notes</th></tr>
+  <tr><td><code>service_name</code></td><td><b>Yes</b></td><td>What the customer sees. "Expedited Mail"</td></tr>
+  <tr><td><code>description</code></td><td><b>Yes</b></td><td>Also customer-facing. "Includes tracking and insurance"</td></tr>
+  <tr><td><code>service_code</code></td><td><b>Yes</b></td><td><b>Must be stable across requests.</b> See the trap below</td></tr>
+  <tr><td><code>currency</code></td><td><b>Yes</b></td><td></td></tr>
+  <tr><td><code>total_price</code></td><td><b>Yes</b></td><td><b>In subunits.</b> <code>500</code> = 5.00 CAD. For currencies without subunits, ×100 — <code>100000</code> = 1000 JPY</td></tr>
+  <tr><td><code>phone_required</code></td><td>No</td><td>Forces a phone number at checkout</td></tr>
+  <tr><td><code>min_delivery_date</code> / <code>max_delivery_date</code></td><td>No</td><td>Shown as an estimate</td></tr>
+  <tr><td><code>metafields</code></td><td>No</td><td><b>Where dynamic data belongs</b> — not in the service code</td></tr>
+</table>
+</div>
+
+<div class="scar silent">
+  <span class="who">The <code>service_code</code> trap</span>
+  It must be <b>stable and consistent for the same shipping option</b>, and must not contain dynamic values —
+  no session IDs, timestamps or request-specific identifiers. Put those in <code>metafields</code> instead.
+  Bake a timestamp into the code and every request looks like a brand-new shipping option to Shopify.
+</div>
+
+<h3>The timeout inverts as you grow</h3>
+
+<p>This is the fact that changes your design, and almost nobody knows it. The read timeout is <b>dynamic, based
+on requests per minute, per shop-and-app pair</b>:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Requests per minute</th><th>Your timeout</th></tr>
+  <tr><td>Under 1,500</td><td><b>10 s</b></td></tr>
+  <tr><td>1,500 – 3,000</td><td><b>5 s</b></td></tr>
+  <tr><td>Over 3,000</td><td><b>3 s</b></td></tr>
+</table>
+</div>
+
+<p>Read that again. <b>The busier the store, the less time you get.</b> So an endpoint that comfortably answers
+in 6 seconds works perfectly on a quiet store and fails on the client's biggest sale day — the one day it
+matters. Design for <b>3 seconds</b>, always, and treat the 10 as headroom you never use.</p>
+
+<p>Shopify says these are <em>upper limits</em>, "not a goal to develop towards", and that they <b>may be
+adjusted outside normal versioning timelines</b>. So this is a number that can change without an API version
+bump.</p>
+
+<h3>The four ways to answer — including two deliberate failures</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You want to say</th><th>Return</th></tr>
+  <tr><td>Here are the rates</td><td>20x with the <code>rates</code> array</td></tr>
+  <tr><td><b>I cannot handle this shipment</b></td><td><b>An empty array</b> with any 20x</td></tr>
+  <tr><td><b>Use the store's backup rates instead</b></td><td><b>40x or 50x</b> with any content. 404 is a good choice</td></tr>
+  <tr><td>(accidentally) use backup rates</td><td>Time out, error, or redirect to a different domain</td></tr>
+</table>
+</div>
+
+<p>Those middle two rows are the important ones, and they are genuinely different. <b>An empty array means "no
+rates from me" — the customer may then see nothing at all.</b> A 4xx means "fall back to the store's configured
+rates" — the customer sees something.</p>
+
+<p>Apply the rule from <a href="../../apps/lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">A4.1</a>:
+shipping at checkout is a <b>promise</b>, not information. So when your service is unhealthy, <b>fail to backup
+rates</b> — return a 404 — rather than returning an empty array and leaving the customer unable to check out.
+Shopify built you an explicit fail-open, and using it is the whole point.</p>
+
+<div class="scar">
+  <span class="who">Redirects, precisely</span>
+  A 30x is followed <b>only within the same domain</b> as the original callback URL. Redirect to a different
+  domain and it triggers backup rates instead. So a load balancer that redirects to another hostname silently
+  turns your service off.
+</div>
+
+<h3>There is no retry mechanism</h3>
+
+<p>Stated plainly in the documentation: the response must succeed <b>on the first try</b>. So retries, backoff
+and jitter — the whole toolkit from <a href="../../apps/lessons/0007-one-queue-with-retries-and-a-dead-letter.html">A2.3</a>
+— are unavailable here. If you call a carrier's API from inside this handler, <b>their</b> latency is inside
+your budget, and their bad day is your bad day.</p>
+
+<p>The design that follows: never call a carrier live from this endpoint. <b>Pre-compute or cache rates on your
+side</b>, and serve them from memory. Your handler should be a lookup, not an integration.</p>
+
+<h3>Shopify caches for you — and the cache key is documented</h3>
+
+<p>A request that matches all of these is served from Shopify's cache instead of hitting you:</p>
+
+<div class="diagram">
+  variant IDs
+  default shipping box weight and dimensions
+  variant quantities
+  carrier service ID
+  origin address
+  destination address
+  item weights and signatures
+
+  cache expires:  15 MINUTES after a successful response
+                  30 SECONDS after an error
+</div>
+
+<p>Two consequences. First, <b>your real traffic is much lower than checkout traffic</b> — identical carts
+inside 15 minutes cost you nothing. Second, notice the asymmetry: <b>an error is cached for only 30
+seconds</b>, so a failing endpoint gets hammered roughly 30× harder than a working one. A brief outage becomes
+a load spike exactly when you are least able to serve it.</p>
+
+<p>And the cache key tells you what to vary on: if your rate depends on something <em>not</em> in that list —
+say a customer tag or the time of day — <b>Shopify will serve a stale cached rate and never ask you</b>.</p>
+
+<pre><code>query CarrierServices {
+  carrierServices(first: 20) {
+    nodes { id formattedName active supportsServiceDiscovery callbackUrl }
+  }
+}</code></pre>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the five required response fields and <code>total_price</code> in
+subunits; empty-array versus 4xx/5xx semantics; 404 suggested for forcing backup rates; same-domain-only
+redirects; <b>no retry mechanism</b>; the <code>service_code</code> stability rule and using metafields for
+dynamic data; the RPM-based timeout table (10 s / 5 s / 3 s) and that these may change outside normal versioning;
+and the full cache key with 15-minute success and 30-second error expiry —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/DeliveryCarrierService">DeliveryCarrierService</a>
+and <a href="https://shopify.dev/docs/api/admin-rest/2026-07/resources/carrierservice">CarrierService</a>. The
+query above was validated against the 2026-07 schema; scope <code>read_shipping</code>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your rate endpoint calls a courier's API, which takes 2.5 seconds at p99. You test on the client's quiet
+  staging store and it is fine. <b>What happens on Black Friday?</b>
+</div>
+
+<p>Three things compound, in this order.
+<br><br>
+<b>1 · Your timeout shrinks.</b> Traffic pushes the store over 3,000 requests per minute, so your budget drops
+from 10 seconds to <b>3</b>. Your 2.5-second p99 now has 0.5 seconds of headroom for everything else.
+<br>
+<b>2 · The courier slows down too</b>, because everyone's Black Friday traffic is hitting them as well. You
+cross 3 seconds and start timing out.
+<br>
+<b>3 · Timeouts cache for 30 seconds, not 15 minutes.</b> So instead of your load dropping, it rises roughly
+thirty-fold — Shopify keeps asking because it has no good answer to cache. You are now being hammered at your
+weakest moment.
+<br><br>
+The fix is not a bigger server. It is <b>never calling the courier from inside the handler</b>. Pre-compute
+rates, serve them from memory in single-digit milliseconds, and refresh them out of band. Then step 1 is
+irrelevant and steps 2 and 3 cannot happen.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — calling a carrier live inside the handler</span>
+  Their latency is inside your budget and there is no retry. The failure lands on the highest-intent page in the
+  store, on the busiest day. Pre-compute and serve from memory.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — designing for the 10-second timeout</span>
+  It shrinks to 3 seconds over 3,000 requests per minute. An endpoint tuned to the generous number fails
+  precisely when the store is busiest. <b>Design for 3.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — an empty array when you meant "I'm broken"</span>
+  An empty array is "no rates from me", and the customer may see no shipping option at all and abandon. To fall
+  back to the store's own rates you must return a <b>4xx or 5xx</b>. Two different meanings, one of which loses
+  the sale.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the 30-second error cache</span>
+  Success caches for 15 minutes; an error caches for 30. So a failing endpoint receives roughly 30× the load of
+  a healthy one. Your outage amplifies itself and your dashboards show a traffic spike you did not cause.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a rate that depends on something outside the cache key</span>
+  Customer tags, time of day, live stock — none is in the cache key. Shopify serves the cached rate and never
+  calls you, so your logic silently does not run.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a dynamic <code>service_code</code></span>
+  A timestamp or session id in the code makes every response a new shipping option. Put dynamic data in
+  <code>metafields</code>.
+</div>
+
+<div class="scar">
+  <span class="who">A cross-domain redirect</span>
+  30x is followed only within the same domain. A load balancer redirecting to another hostname silently triggers
+  backup rates — your service appears to be off.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — decide your own inner deadline</span>
+  Shopify's number can change without a version bump, so do not build to it. Pick your own budget — 500 ms is a
+  reasonable target for a lookup — and return a 404 if you are going to exceed it. <b>Failing fast to backup
+  rates beats answering late</b>, because answering late is the same as not answering.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Before agreeing to live carrier rates</span>
+  <q>I can do it, and I want to flag one thing about how Shopify treats us. The busier your store gets, the less
+  time it gives us to answer — down to three seconds on a big day. So I won't call the courier while the customer
+  is waiting; I'll fetch their prices in the background and answer instantly from what we already have. Slightly
+  less current, and it can't fall over on your biggest day.</q>
+  <span class="why-said">Names the counter-intuitive constraint, states the design, and prices the trade-off in
+  one sentence the client can actually weigh.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked what happens if your service goes down</span>
+  <q>Shopify has a built-in fallback and we use it deliberately: if we can't answer confidently we tell it to
+  use your own configured rates instead. So the customer always sees a shipping option and can still check
+  out — the price is just your standard one rather than the live courier quote. That's much better than showing
+  them nothing.</q>
+  <span class="why-said">Explains fail-open in the client's terms — "they can still check out" — rather than as
+  a status code.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants rates to depend on something Shopify does not send</span>
+  <q>That one's a problem, and it's worth knowing why. Shopify caches our answers for fifteen minutes and the
+  cache is keyed on the cart, the addresses and the weights — not on the customer or the time. So a rule based on
+  who the customer is would simply not get asked most of the time; they'd get whoever's rate was cached first.
+  We'd need a different mechanism for that.</q>
+  <span class="why-said">Refuses on a specific mechanism rather than "that's not possible", and the mechanism is
+  checkable — which is what makes the no credible.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Shopify calls you at checkout.</b> Synchronous, customer waiting, <b>no retry mechanism</b>.</li>
+  <li><b>The timeout shrinks as traffic grows:</b> 10 s under 1,500 RPM · 5 s to 3,000 · <b>3 s above</b>. Design for 3.</li>
+  <li><b><code>total_price</code> is in subunits.</b> 500 = 5.00.</li>
+  <li><b><code>service_code</code> must be stable.</b> Dynamic data goes in <code>metafields</code>.</li>
+  <li><b>Empty array = "no rates from me". 4xx/5xx = "use backup rates".</b> Fail to backup, not to empty.</li>
+  <li><b>Success caches 15 minutes; an error caches 30 seconds</b> — so a broken endpoint gets ~30× the load.</li>
+  <li><b>Never call a carrier live from the handler.</b> Pre-compute; serve a lookup.</li>
+</ul>
+<p class="one-thing">If you remember one thing: your timeout gets shorter as the store gets busier — so build a
+lookup that answers in milliseconds, and fail to backup rates rather than late.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for tax — the one area where the job is mostly not to touch it.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0023-shipping-rates-and-delivery-profiles.html">← P7.1</a></span>
+  <span><a href="0025-tax-what-shopify-does-and-where-you-must-not-guess.html">P7.3 · Tax →</a></span>
+</div>
+
+</div>
+</body>
+</html>

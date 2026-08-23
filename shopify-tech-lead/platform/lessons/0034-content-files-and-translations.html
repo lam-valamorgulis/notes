@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P10.3 — Content, Files and Translations</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P10 · Lesson 3 · <span class="pill depth">depth</span></p>
+<h1>Content, files and translations</h1>
+<p class="subtitle">Low pain per item, high pain in aggregate. Always underestimated in a migration.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can size a content migration honestly, and you know why translations
+  multiply everything else you have estimated.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why does content behave differently?</h3>
+
+<p>Products are structured — you can count them, diff them, and reconcile them. Content is <b>prose, files and
+layout</b>, and none of those has a clean equality test. A page that "moved successfully" can still be visibly
+wrong, and no automated check will say so.</p>
+
+<p>So content is the one area where <b>a human has to look</b>, and that is what makes it expensive in aggregate
+while being trivial per item.</p>
+
+<div class="diagram">
+  what "content" actually contains
+
+  pages           about us, shipping policy, size guides
+  blogs           articles, authors, comments
+  navigation      menus, which break when handles change
+  files           images and documents not attached to products
+  metaobjects     structured content — see P2.2
+  translations    ALL of the above, times every language
+  redirects       the highest-value, least glamorous item of all
+</div>
+
+<h3>Files are not product images</h3>
+
+<p>Product media is attached to a product. <b>Files</b> are the loose assets — a PDF size chart, a lookbook image
+used in a page, a logo in an email template. They live in their own place, and a migration that only moves product
+images leaves every page referencing missing files.</p>
+
+<p>Two practical notes. Files can be created by having Shopify <b>fetch them from a URL</b>, which makes a migration
+a list of URLs rather than a huge upload. And a <b>file reference</b> is a legitimate metafield type, so structured
+content can point at files properly rather than storing a URL string that later rots.</p>
+
+<h3>Translations multiply, they do not add</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You estimated</th><th>With 4 languages it is</th></tr>
+  <tr><td>40 pages</td><td>160 page translations</td></tr>
+  <tr><td>10,000 product titles and descriptions</td><td>40,000 strings</td></tr>
+  <tr><td>1 navigation menu</td><td>4 menus to check</td></tr>
+  <tr><td>30 metaobject entries</td><td>120 entries</td></tr>
+</table>
+</div>
+
+<p>A translation is a <b>separate stored value per locale</b>, not a runtime transformation. So every content item
+you have estimated is multiplied, and any content the integration <em>creates</em> arrives untranslated by default.
+That is the part that catches integrations: your sync writes an English title, and three markets now show English
+where they used to show their own language.</p>
+
+<p>This connects to Markets in <a href="0013-shopify-plus-and-markets.html">P5.1</a>: a market configures content
+translations, so "which language does this customer see" is a market question, and <b>a title is per-market content
+rather than one string</b>.</p>
+
+<h3>Redirects: the one to do first</h3>
+
+<p>Repeating this from <a href="0021-what-a-migration-is-and-what-never-moves.html">P6.5</a> because it belongs here
+too. Old URLs are linked from search engines, emails and other people's sites <b>forever</b>. Without redirects that
+traffic becomes 404s, silently — nothing in your logs, everything in the client's revenue.</p>
+
+<p>It is mechanical, unglamorous, and usually the highest-value hour in a content migration. Bulk redirect import
+exists for exactly this.</p>
+
+<h3>How to size it honestly</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Step</th><th>Do</th></tr>
+  <tr><td>1</td><td><b>Count</b> pages, blog articles, files, menus, metaobject entries. Actual numbers, from the source</td></tr>
+  <tr><td>2</td><td><b>Multiply by locales.</b> Then say the multiplied number out loud to the client</td></tr>
+  <tr><td>3</td><td><b>Sample five pages</b> and migrate them by hand. Time it. That is your per-item cost</td></tr>
+  <tr><td>4</td><td><b>Decide who checks.</b> Content needs a human eye, and it is usually not you</td></tr>
+  <tr><td>5</td><td><b>Separate the redirect list</b> as its own task with its own priority</td></tr>
+</table>
+</div>
+
+<p>Step 4 is the one to get agreed in writing. <b>You can move content; only the client can say whether it reads
+correctly.</b> A migration where nobody owns the reading is a migration that ships with broken pages.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> <code>file_reference</code> as a metafield type and the metaobject
+content model — <a href="https://shopify.dev/docs/apps/build/metafields/metafield-limits">Metafield limits</a> and
+<a href="https://shopify.dev/docs/apps/build/metaobjects">About metaobjects</a>. Markets configuring content
+translations — <a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/MetafieldDefinitionSortKeys">Market</a>.
+<b>Not re-verified today:</b> the exact bulk redirect import mutations, file-creation-by-URL specifics, and blog and
+page API shapes. These were verified for earlier material on 2026-08-03; confirm before building against them.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client's migration brief says "and move our 40 content pages across". They sell in four languages. <b>What do
+  you say the number is?</b>
+</div>
+
+<p><b>160</b>, and say it in the meeting. Forty pages times four locales is a hundred and sixty stored values, each
+of which someone has to confirm reads correctly in a language you probably do not speak.
+<br><br>
+Then say the two things that follow. First: <em>who</em> checks the non-English versions — because you cannot, and
+if nobody is named it ships unchecked. Second: the redirects for those forty pages are a separate task, and if they
+are skipped the pages will be migrated perfectly and unreachable from Google.
+<br><br>
+Saying "160, and here are the two questions" in the first meeting is worth more than any code you write on this
+part of the project.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — estimating content without multiplying by locales</span>
+  Four languages makes every content number four times bigger, including the human checking. This is the single
+  most common content underestimate.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — no redirects</span>
+  Old URLs become 404s. Search traffic dies silently and the cause is invisible in your logs.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — files left behind</span>
+  Moving product images but not loose files leaves pages referencing assets that do not exist. The page loads; the
+  size chart does not.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — an integration writing untranslated content</span>
+  Your sync writes an English title and markets that previously showed a translation now show English. Nothing
+  errors, and only a customer in that market notices.
+</div>
+
+<div class="scar">
+  <span class="who">Broken navigation after handles change</span>
+  Menus point at handles. Change a page or collection handle in a migration and the menu silently links to nothing.
+</div>
+
+<div class="scar">
+  <span class="who">Storing a file URL in a text metafield</span>
+  Use <code>file_reference</code>. A URL string does not survive the file being replaced, and nothing tells you it
+  has rotted.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — nobody owns "does it read correctly"</span>
+  This is the failure mode of content work. You can prove a page moved; only a person can say it reads properly,
+  and in a language you may not speak. Get a named owner per locale in writing, or accept that it ships
+  unchecked.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Sizing it in the first meeting</span>
+  <q>You said forty pages — with four languages that's a hundred and sixty versions, and someone has to read each
+  one. I can move them all; I can't tell you whether the German reads properly. So I need a name per language for
+  checking, and I'd treat the redirects as a separate priority task, because without those the pages move
+  perfectly and Google can't find them.</q>
+  <span class="why-said">Gives the real number, names what you cannot do, and separates the highest-value task. All
+  three in four sentences.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the integration starts overwriting translations</span>
+  <q>Found it. Our sync writes titles in English, and Shopify treats a title as separate content per language — so
+  writing the English one doesn't update the German, and in some cases it's now showing English to German customers.
+  I need to know whether the ERP holds translations. If it doesn't, we should exclude titles from the sync for those
+  markets rather than overwriting good translations with English.</q>
+  <span class="why-said">Diagnoses precisely, and proposes excluding a field — which R2.1 flags as an
+  underused and legitimate answer.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Content has no clean equality test.</b> A human must read it, and that is the real cost.</li>
+  <li><b>Translations multiply everything.</b> A separate stored value per locale, not a runtime transformation.</li>
+  <li><b>Integration-created content arrives untranslated</b> and can replace good translations with English.</li>
+  <li><b>Files are not product media.</b> Loose assets have their own home and get left behind.</li>
+  <li><b>Use <code>file_reference</code>, not a URL string.</b> URLs rot silently.</li>
+  <li><b>Menus point at handles.</b> Change a handle in a migration and navigation breaks quietly.</li>
+  <li><b>Redirects first.</b> Highest value, least glamour, invisible when missing.</li>
+</ul>
+<p class="one-thing">If you remember one thing: multiply every content count by the number of locales, and say the
+multiplied number out loud before anyone writes it into a plan.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for fraud, risk and web pixels.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0033-storefront-performance.html">← P10.2</a></span>
+  <span><a href="0035-fraud-risk-and-web-pixels.html">P10.4 · Fraud &amp; pixels →</a></span>
+</div>
+
+</div>
+</body>
+</html>

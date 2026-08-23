@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P8.2 — Payments, and What You Must Never Touch</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P8 · Lesson 2</p>
+<h1>Payments, and what you must never touch</h1>
+<p class="subtitle">Three minutes to resolve, five days to settle, and a contract about your own pricing.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell a client whether their payment request is a configuration job, an
+  app install, or a regulated build they should not attempt — and you know the three timing rules that catch
+  everyone who does attempt it.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why is payments the hardest thing in this Course?</h3>
+
+<p>It is the only area where <b>every one of the five forces</b> from the
+<a href="../../reference/territory-map.html">territory map</a> applies at once:</p>
+
+<div class="diagram">
+  1. not yours       Shopify can remove your extension from the gateway list
+  2. money           it IS the money. not a record of it
+  3. customer present a person is mid-purchase, watching
+  4. second system   a bank, a processor, a fraud engine
+  5. merchant edits  they can switch gateway on Tuesday
+</div>
+
+<p>So the correct default is: <b>do not build this.</b> Almost every client request that sounds like payments is
+actually configuration or an existing app.</p>
+
+<h3>The three questions that sort the request</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>They want</th><th>It is</th><th>Your job</th></tr>
+  <tr><td>To accept cards</td><td><b>Configuration.</b> Shopify Payments or an existing gateway</td><td>Nothing. Point them at settings</td></tr>
+  <tr><td>A gateway that already exists on Shopify</td><td><b>An app install</b></td><td>Nothing. Install it</td></tr>
+  <tr><td>To reorder or hide payment methods at checkout</td><td>A <b>Shopify Function</b> — payment customisation</td><td>Small, and genuinely yours</td></tr>
+  <tr><td>To offer <em>their own</em> payment method to Shopify merchants</td><td><b>A payments app extension.</b> Regulated</td><td>A serious build. Read the rest of this page</td></tr>
+</table>
+</div>
+
+<p>Rows one to three are most of real life. Row four is a company's product, not a feature — and the reason is
+below.</p>
+
+<h3>The lifecycle, and the ordering rule</h3>
+
+<p>Three extension types exist — <b>offsite</b>, <b>credit card</b>, and <b>alternative</b> — and they share one
+shape:</p>
+
+<div class="diagram">
+  1. Shopify POSTs a payment session to you
+  2. you take payment details / redirect the customer
+     (3-D Secure: paymentSessionConfirm, in an iFrame)
+  3. Shopify POSTs the CONFIRMATION RESULT to your confirm-session URL
+     ── you MUST return 2xx. failure is retried; if it keeps failing,
+        the CUSTOMER has to start their payment again
+  4. you finish it: paymentSessionResolve | Reject | Pending
+</div>
+
+<div class="scar silent">
+  <span class="who">The ordering rule people trip on</span>
+  <b>Shopify fails your Resolve and Reject calls if it has not yet sent the confirmation result</b> to your
+  confirm-session URL. So you cannot resolve early, however confident you are. Step 4 strictly follows step 3.
+</div>
+
+<h3>The three clocks</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Clock</th><th>Limit</th><th>What happens if you miss it</th></tr>
+  <tr><td>Resolve or reject after confirmation</td><td><b>3 minutes</b></td><td>Shopify <b>re-runs the confirmation process</b> on resolve. It no longer guarantees the confirmation result — and <b>may issue a refund or void</b> after you resolve</td></tr>
+  <tr><td>Settlement</td><td><b>5 days</b></td><td>A stated requirement of participating at all</td></tr>
+  <tr><td>Merchant termination notice</td><td><b>7 days</b></td><td>You must allow it, with no penalty</td></tr>
+</table>
+</div>
+
+<p>Read the first row twice. <b>A slow resolve does not just delay the payment — it can produce a refund of a
+payment you thought you had taken.</b> That is a money-losing outcome caused purely by latency, which is force 3
+at its most expensive.</p>
+
+<h3>The requirements are commercial, not just technical</h3>
+
+<p>This is the part almost no developer knows, and it is why row four above is a company's product. Participating
+in the payments ecosystem means agreeing to:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Requirement</th><th>Detail</th></tr>
+  <tr><td><b>Security</b></td><td>Securely collect and store payment information, per applicable law, PCI requirements and market regulations</td></tr>
+  <tr><td><b>Settlement</b></td><td>Settle transactions <b>within five days</b></td></tr>
+  <tr><td><b>Risk and fraud</b></td><td><b>You</b> monitor and manage it. An unreasonably high fraud rate — <em>at Shopify's sole discretion</em> — can get you removed</td></tr>
+  <tr><td><b>Transparent pricing</b></td><td>No low promotional rates that later rise</td></tr>
+  <tr><td><b>Naming</b></td><td>You may <b>not</b> describe any fee as a "Shopify fee" on a merchant invoice</td></tr>
+  <tr><td><b>Exit</b></td><td>Merchants may terminate with <b>7 days' notice, no penalty or fine</b></td></tr>
+</table>
+</div>
+
+<p>And the sanction, stated plainly: Shopify can remove your extension from the public gateway list, suspend or
+terminate your access to the payments ecosystem, "or take any other action deemed necessary".</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the session → confirm → resolve/reject flow, that Shopify must
+receive a 2xx on the confirmation callback and that repeated failure means the customer retries their payment,
+that Resolve/Reject fail before a confirmation result has been sent, the <b>3-minute</b> resolve window with
+re-run confirmation and possible refund or void, and the <code>CONFIRMATION_REJECTED</code> reason code —
+<a href="https://shopify.dev/docs/apps/build/payments/processing">About payment processing</a> and
+<a href="https://shopify.dev/docs/apps/build/payments/offsite/use-the-cli">Build an offsite payments extension</a>.
+The security, <b>5-day settlement</b>, fraud, pricing, fee-naming and <b>7-day termination</b> requirements and
+the sanctions —
+<a href="https://shopify.dev/docs/apps/build/payments/requirements">Requirements for payments extensions</a>.</p>
+
+<h3>What you touch instead, most of the time</h3>
+
+<p>For integration work, payments is mostly <b>read-only output</b>, like tax:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Never</th></tr>
+  <tr><td>Read the transactions on an order and pass them on</td><td>Reconstruct what was charged from line items</td></tr>
+  <tr><td>Treat gateway names and references as opaque strings</td><td>Parse or infer meaning from them</td></tr>
+  <tr><td>Use Functions to reorder or hide payment methods</td><td>Try to influence which one succeeds</td></tr>
+  <tr><td>Carry the payment reference to the ERP for reconciliation</td><td>Store card details anywhere, ever</td></tr>
+</table>
+</div>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You build a payments extension. Your processor is healthy but slow today — confirmations take about four minutes
+  to come back from them. Every payment eventually succeeds. <b>What does the merchant see?</b>
+</div>
+
+<p>Payments that succeed and then get refunded. Because you resolve after the <b>3-minute</b> window, Shopify
+re-runs its confirmation process, no longer guarantees the earlier confirmation result, and <b>may issue a refund
+or void after you have resolved</b>. Your processor took the money; Shopify gave it back.
+<br><br>
+Nothing errored anywhere. Your logs show successful resolves. The processor shows successful captures. The
+merchant sees revenue arriving and then leaving, with no failure to point at.
+<br><br>
+The design consequence is the same as the carrier-rate lesson in
+<a href="0024-carrier-calculated-rates-your-server-inside-checkout.html">P7.2</a>: <b>you cannot put a slow third
+party inside a hard deadline you do not control.</b> If your processor cannot confirm inside three minutes, you
+resolve as <code>Pending</code> and finish it out of band — you do not wait.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — resolving after 3 minutes</span>
+  Shopify re-runs confirmation and may refund or void a payment you already took. Money out, no error anywhere.
+  Use <code>paymentSessionPending</code> rather than waiting.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — a non-2xx on the confirmation callback</span>
+  It is retried, and if it keeps failing <b>the customer has to start their payment again</b>. That is an
+  abandoned checkout caused by your endpoint, at the last possible step.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — resolving before confirmation arrives</span>
+  Shopify fails the call. Code that assumes success and moves on marks the order paid internally while Shopify
+  does not.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — building a payments app as a "feature"</span>
+  It carries PCI obligations, a 5-day settlement duty, fraud responsibility, pricing rules, and a 7-day merchant
+  exit right. Scoping it as an integration task is a category error with legal consequences.
+</div>
+
+<div class="scar">
+  <span class="who">Owning the fraud rate without knowing it</span>
+  Partners monitor and manage risk. An unreasonably high fraud rate — judged at Shopify's sole discretion — can
+  remove you from the gateway list. That is a business risk sitting inside a technical decision.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — parsing gateway references</span>
+  Gateway names and transaction references are opaque and vendor-specific. Code that infers meaning from their
+  shape breaks silently when the merchant switches processor.
+</div>
+
+<div class="scar">
+  <span class="who">The 3-D Secure browsing context</span>
+  Documented precisely: navigate the redirect using the <b>parent</b> browsing context, not the top-level context
+  directly. Get it wrong and the authentication breaks inside the iFrame.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — never store a card number, for any reason</span>
+  Someone will eventually ask you to keep card details "so we can charge them later". The answer is no, and it is
+  not a preference. Shopify and the gateway hold that; you hold a token at most. There is no version of this
+  request you should accommodate.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client says "we need a payments integration"</span>
+  <q>Let me find out which of three things you mean. If you want to accept cards, that's a settings job and I'm not
+  needed. If your provider already has a Shopify app, we install it. If you want to <em>offer</em> your own payment
+  method to other Shopify merchants, that's a regulated build with PCI obligations, a five-day settlement duty and
+  fraud responsibility — that's a product, not a feature. Which is it?</q>
+  <span class="why-said">Three options, and two of them are free. Clients regularly discover they wanted the free
+  one.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to hide a payment method for some customers</span>
+  <q>That one's genuinely doable and reasonably small — Shopify has a payment customisation function for reordering
+  and hiding methods, and it doesn't need Plus. What I can't do is influence which payment <em>succeeds</em>; that's
+  between the customer, their bank and the gateway.</q>
+  <span class="why-said">Says yes to the real request, and draws the boundary at the thing that is not yours.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks you to store card details</span>
+  <q>No — and not because of a preference. Card data carries PCI obligations that neither of us wants to take on,
+  and Shopify and your gateway already hold it. If the goal is charging a customer again later, that's a saved
+  payment method held by the gateway, and I can work with the token rather than the card.</q>
+  <span class="why-said">Refuses in one word, gives the reason, and immediately offers the legitimate route to what
+  they actually wanted.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Payments is the only area where all five forces apply at once.</b> Default to not building it.</li>
+  <li><b>Sort the request:</b> configuration · install an app · a payment customisation Function · a regulated build.</li>
+  <li><b>Resolve or reject within 3 minutes</b> of the confirmation callback, or Shopify may refund or void what you took.</li>
+  <li><b>Return 2xx on the confirmation callback.</b> Repeated failure means the customer restarts their payment.</li>
+  <li><b>You cannot resolve before the confirmation result arrives.</b> Shopify fails the call.</li>
+  <li><b>The requirements are commercial:</b> PCI, 5-day settlement, your fraud rate, pricing rules, no "Shopify fee" naming, 7-day merchant exit.</li>
+  <li><b>Never store a card number.</b> Not a preference — a boundary.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a slow resolve does not delay a payment, it can reverse one — so
+never put a third party inside a three-minute deadline you do not control.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for selling outside the storefront.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0026-returns-refunds-and-order-editing.html">← P8.1</a></span>
+  <span><a href="0028-draft-orders-selling-outside-the-storefront.html">P8.3 · Draft orders →</a></span>
+</div>
+
+</div>
+</body>
+</html>

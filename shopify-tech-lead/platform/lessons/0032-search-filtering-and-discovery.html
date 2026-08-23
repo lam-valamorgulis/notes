@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P10.1 — Search, Filtering and Discovery</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P10 · Lesson 1</p>
+<h1>Search, filtering and discovery</h1>
+<p class="subtitle">Filters must be created in the admin before any code can use them. That surprises everyone.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know why a filter you can see in the data does not appear on the storefront,
+  and you can explain AND-versus-OR filter logic to a client who thinks their filters are broken.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does a filter need to know?</h3>
+
+<p>To filter a collection you need a field, its possible values, and which of them a customer picked. Two of those
+three are <b>merchant decisions</b>, not code decisions — which field is worth filtering on, and how to present it.
+So Shopify puts filter definition in the admin:</p>
+
+<div class="trap">
+  <span class="label">The thing that catches people</span>
+  <b>Filters must be created in the Shopify admin before they can be applied.</b> Having the data is not enough.
+  <br><br>
+  So "we have colour on every product but the colour filter doesn't show" is almost never a code problem — nobody
+  created the filter. Check the admin before you debug anything.
+</div>
+
+<h3>Two methods, and one is legacy in practice</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Method</th><th>Verdict</th></tr>
+  <tr><td><b>Storefront filtering</b></td><td><b>Recommended.</b> Merchants create filter groups from existing product data. Works on collections and search results</td></tr>
+  <tr><td>Tag filtering</td><td>Filtering a collection into subsets using product tags. Older approach</td></tr>
+</table>
+</div>
+
+<p>Storefront filters can be built on: <b>availability, category, price, product tags, product type, vendor,
+variant options, and metafields.</b></p>
+
+<p>That last one connects straight to <a href="0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a>:
+<b>a metafield with no definition is not filterable.</b> So "we can't filter on fabric" and "the integration wrote
+metafields without definitions" are the same bug seen from two ends.</p>
+
+<h3>AND between filters, OR within one</h3>
+
+<div class="diagram">
+  colour = red, blue      →  red OR blue
+  size   = M              →  and M
+
+  result: (red OR blue) AND (M)
+
+  ── never "red AND blue". a product is not two colours.
+</div>
+
+<p>This is the single most common client confusion about filters. "Why do I get 40 results when I picked two
+colours?" — because picking two colours <em>widens</em> the result, it does not narrow it. Applied filters appear
+in the URL as parameters, which makes them shareable and testable.</p>
+
+<h3>Storefront search, and the parameters worth knowing</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Parameter</th><th>Does</th></tr>
+  <tr><td><code>q</code></td><td>The query. The only one needing user input</td></tr>
+  <tr><td><code>type</code></td><td>Restrict to certain resource types</td></tr>
+  <tr><td><code>unavailable_products</code></td><td>Where sold-out products appear. Defaults to <b><code>last</code></b>, and the default is changeable in Search Settings in the Search &amp; Discovery app</td></tr>
+  <tr><td><code>prefix</code></td><td><b><code>last</code> by default</b> — partial match on the final term. "winter snow" also matches "snowshoe", "snowboard". <code>none</code> disables it</td></tr>
+  <tr><td><code>sort_by</code></td><td><code>relevance</code> (default), <code>price-ascending</code>, <code>price-descending</code></td></tr>
+</table>
+</div>
+
+<div class="scar undocumented">
+  <span class="who">A documentation inconsistency — test this yourself</span>
+  Shopify's own page describes <code>price-ascending</code> as sorting "from high to low" and
+  <code>price-descending</code> as "from low to high". <b>Those descriptions look inverted.</b> The names almost
+  certainly mean what the names say, but <b>do not take either on trust</b> — run both on a Dev store and see. It
+  is a thirty-second check and a customer-visible mistake if you guess.
+  <br><br>
+  Also worth knowing: for both price sorts, <b>non-product results are pushed to the end</b> of the results array.
+</div>
+
+<p>The search form posts to <code>action="/search"</code>. Populate that action from the <b><code>routes</code>
+object</b> rather than hardcoding it, so multi-language stores get the right URL — the same discipline as market
+awareness in <a href="0013-shopify-plus-and-markets.html">P5.1</a>. Every parameter except <code>q</code> should be
+a hidden input.</p>
+
+<h3>The app that changes the answers</h3>
+
+<p>The <b>Shopify Search &amp; Discovery</b> app lets merchants customise product recommendations and search
+results. Its settings affect <b>storefront search and the Ajax Product Recommendations API</b>.</p>
+
+<p>That means a merchant can change your search results without touching your code, and there will be no trace of
+it in your repository. When results look wrong, <b>check that app's settings before reading any Liquid</b> — the
+same reflex as checking Flow in <a href="0016-flow-when-automation-replaces-your-code.html">P5.4</a>.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> filters needing to be created in the admin first; the filterable
+data types including metafields; <b>AND between filters, OR between values</b>; filters reflected in URL
+parameters; the <code>q</code>, <code>type</code>, <code>unavailable_products</code>, <code>prefix</code> and
+<code>sort_by</code> parameters with their defaults; non-product results pushed to the end on price sorts;
+<code>action="/search"</code> with the <code>routes</code> object for multi-language; and the Search &amp; Discovery
+app affecting storefront search and the Ajax recommendations API —
+<a href="https://shopify.dev/docs/storefronts/themes/navigation-search/filtering/storefront-filtering">Storefront filtering</a>,
+<a href="https://shopify.dev/docs/storefronts/themes/navigation-search/filtering">Filtering</a> and
+<a href="https://shopify.dev/docs/storefronts/themes/navigation-search/search">Storefront search</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says: "our integration writes a fabric field on every product, but customers can't filter by fabric."
+  <b>Name the two things to check, in order.</b>
+</div>
+
+<p><b>1 · Does the metafield have a definition?</b> An undefined metafield is stored but not filterable — the exact
+trap in P2.1. If the integration wrote values without creating definitions, the data is there and unusable, and
+this is the likely answer.
+<br><br>
+<b>2 · Has the filter been created in the admin?</b> Even a properly defined metafield is not a filter until a
+merchant makes it one. Nothing in code creates it.
+<br><br>
+Both are configuration, and neither produces an error anywhere. This is why "we have the data" and "customers can
+filter on it" are two entirely separate statements — and why the answer is usually a ten-minute admin change rather
+than a build.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the filter that was never created</span>
+  The data exists, the filter does not, and nothing errors. Debugging theme code for this wastes a day. Check the
+  admin first.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — undefined metafields cannot be filtered</span>
+  Same root cause as P2.1. An integration that skipped definitions has produced data that can never appear as a
+  filter.
+</div>
+
+<div class="scar">
+  <span class="who">Explaining AND/OR backwards to a client</span>
+  Selecting two colours <em>widens</em> the results. Clients expect narrowing and report it as a bug. Get the
+  explanation right the first time or you will have it three times.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the Search &amp; Discovery app changing results</span>
+  A merchant can reorder or boost results with no trace in your code, and it also affects the Ajax recommendations
+  API. Results "changing on their own" is usually this.
+</div>
+
+<div class="scar">
+  <span class="who">Trusting the documented sort directions</span>
+  The docs' descriptions of <code>price-ascending</code> and <code>price-descending</code> appear inverted. Test
+  both rather than guessing — this one is visible to every customer.
+</div>
+
+<div class="scar">
+  <span class="who">Hardcoding <code>/search</code></span>
+  Multi-language stores need the localised route. Use the <code>routes</code> object, exactly as with any other
+  market-aware URL.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — partial matching cuts both ways</span>
+  <code>prefix=last</code> is on by default, so "snow" matches "snowboard". Helpful for discovery, and it produces
+  surprising results on short queries or product codes. If a client searches by SKU, test that specifically — a
+  three-character code with prefix matching can return most of the catalogue.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a filter is missing</span>
+  <q>Good news — that's a settings change rather than a build. Having the data isn't enough on its own; a filter has
+  to be created in your admin before it appears on the site. I'll check whether the field is set up properly too,
+  because there's a related thing where data written by an integration can be invisible to filters. Give me ten
+  minutes rather than a day.</q>
+  <span class="why-said">Turns an expected build into a settings change, which builds far more trust than doing the
+  build would.</span>
+</div>
+
+<div class="script">
+  <span class="who">Explaining AND/OR</span>
+  <q>That's working as designed, and it surprises everyone. Picking two colours shows products in <em>either</em>
+  colour — it widens the results. Adding a <em>different</em> filter, like size, narrows them. So colour plus size
+  narrows; two colours widens. If you want it to behave differently, that's a design conversation about how the
+  filters are grouped.</q>
+  <span class="why-said">Explains the rule with their own example, and offers a route forward instead of just
+  "that's how it works".</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Filters must be created in the admin first.</b> Having the data is not enough.</li>
+  <li><b>An undefined metafield is not filterable.</b> Same root cause as P2.1.</li>
+  <li><b>AND between filters, OR within one.</b> Two colours widens; colour plus size narrows.</li>
+  <li><b>Filterable on:</b> availability, category, price, tags, product type, vendor, variant options, metafields.</li>
+  <li><b><code>prefix=last</code> is the default</b> — partial matching on the final term. Test it against SKUs.</li>
+  <li><b>Test the price sort directions.</b> The documented descriptions appear inverted.</li>
+  <li><b>The Search &amp; Discovery app changes results with no trace in your code.</b> Check it first.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "we have the data" and "customers can filter on it" are two
+different statements, and the gap between them is an admin setting.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for storefront performance.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0031-customer-accounts-and-identity.html">← P9.3</a></span>
+  <span><a href="0033-storefront-performance.html">P10.2 · Performance →</a></span>
+</div>
+
+</div>
+</body>
+</html>

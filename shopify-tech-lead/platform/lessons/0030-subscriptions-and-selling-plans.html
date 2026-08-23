@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P9.2 — Subscriptions and Selling Plans</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P9 · Lesson 2</p>
+<h1>Subscriptions and selling plans</h1>
+<p class="subtitle">Uninstall the app and every selling plan is deleted 48 hours later.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know the four policies that define a subscription, the one inventory choice
+  that decides whether you oversell, and the deletion rule that makes backups non-optional.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is a subscription, minimally?</h3>
+
+<p>Not "a recurring order". It is <b>an alternative way to buy the same product</b>. The product does not change;
+the terms do. So Shopify models it as a plan attached to variants, not as a different product:</p>
+
+<div class="diagram">
+  SellingPlanGroup      a selling METHOD
+                        "Subscribe and save" · "Prepaid"
+   │  name          ← what the customer sees
+   │  merchantCode  ← what the merchant sees
+   │  options       ← the storefront drop-down
+   │
+   ├── products / variants   what it applies to
+   │
+   └── SellingPlan     one way to buy. "Deliver weekly"
+         ├── billingPolicy    how often you CHARGE
+         ├── deliveryPolicy   how often you SHIP
+         ├── inventoryPolicy  WHEN stock is committed
+         └── pricingPolicy    fixed, or recurring
+</div>
+
+<p>Billing and delivery are separate on purpose. A prepaid plan bills once for twelve weeks and delivers weekly —
+two different frequencies for one plan.</p>
+
+<h3>The inventory policy is the one that costs money</h3>
+
+<div class="scar money">
+  <span class="who">One choice, two very different behaviours</span>
+  Inventory can be committed <b>when the order is created</b>, or <b>when the order is fulfilled</b>.
+  <br><br>
+  Commit at creation and a twelve-month subscription reserves stock it will not ship for a year — your storefront
+  shows sold out while the shelf is full. Commit at fulfilment and you can take subscriptions you cannot supply,
+  which surfaces as a failed delivery to a paying customer months later.
+  <br><br>
+  Neither is right. It is a business decision, and it must be a deliberate one.
+</div>
+
+<h3>Pricing policies come in two shapes</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Type</th><th>Means</th></tr>
+  <tr><td><b>Fixed</b></td><td>One policy for the whole subscription. "A flat 15% off, always"</td></tr>
+  <tr><td><b>Recurring</b></td><td>A follow-up policy after the initial one expires. "20% off the first cycle, 15% thereafter"</td></tr>
+</table>
+</div>
+
+<p>And a detail that matters for anyone who has read <a href="0029-b2b-companies-catalogs-and-price-lists.html">P9.1</a>:
+<b>selling plan pricing policies work in conjunction with price lists.</b> So a B2B customer on a subscription has
+a price shaped by <em>both</em>. That is a third override layer on top of market and price list.</p>
+
+<h3>Buying one takes two IDs</h3>
+
+<p>To purchase with a purchase option you submit a <b>variant ID and a selling plan ID</b> through the Cart API.
+That is the whole storefront mechanic — a subscription line item is an ordinary line with a plan attached.</p>
+
+<p>Checkout then handles pricing, messaging, <b>payment method vaulting</b> and customer consent. You do not build
+recurring billing; the platform stores the payment method and the <b>subscription contract</b> records the
+agreement between merchant and customer.</p>
+
+<h3>The deletion rule</h3>
+
+<div class="trap">
+  <span class="label">This is the fact to remember from this Lesson</span>
+  Subscriptions, pre-orders and try-before-you-buy records — including <b>SellingPlanGroup, SellingPlan, the
+  policies, and their associations to products and variants</b> — are <b>deleted 48 hours after a user uninstalls
+  the app</b>.
+  <br><br>
+  Products and variants survive. <b>The plans do not.</b> Shopify's own recommendation is to back these records up
+  in case you need to restore them.
+  <br><br>
+  So: a merchant uninstalls to try a competitor, changes their mind on day three, and their entire subscription
+  configuration is gone. If your app does not hold its own copy, it cannot be restored.
+</div>
+
+<h3>Two more constraints worth knowing before you scope</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Constraint</th><th>Detail</th></tr>
+  <tr><td><b>One interval unit per plan</b></td><td>WEEK or MONTH, not both in the same plan. "Every 6 weeks or every 2 months" is two plans</td></tr>
+  <tr><td><b>Read-only without an extension</b></td><td>If your app provides no app extension to edit selling plans, they appear <b>read-only</b> on the product page in the admin. The merchant cannot change what you created</td></tr>
+</table>
+</div>
+
+<p>For advanced delivery behaviour — "fulfilment starts on the 1st of each month" — the mechanism is
+<b>anchors</b> in the API call, and <code>category</code> should be <code>SUBSCRIPTION</code>.</p>
+
+<h3>If it is a public app, the bar is explicit</h3>
+
+<p>Built for Shopify requires subscription apps to use the <b>Selling plan API</b>, the <b>Subscription contract
+API</b> and the <b>Customer payment method API</b>; to add subscriptions on the product page with an <b>Online
+Store 2.0 app block</b>; to display plan name, price and savings on the <b>product, cart and order detail</b>
+pages; to match the theme's colours and fonts by default; and to use <b>Customer Account UI extensions</b> plus
+the <b>Customer Account API</b> for customers to manage their own subscriptions.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the group/plan/policy model and all four policy types including
+inventory committed at creation or fulfilment; fixed versus recurring pricing policies; pricing policies working
+with price lists; variant ID plus selling plan ID through the Cart API; checkout handling vaulting and consent;
+the <b>48-hour deletion after uninstall</b> with Shopify's own backup recommendation; one interval unit per plan;
+plans shown read-only without an app extension; anchors and <code>category: SUBSCRIPTION</code> —
+<a href="https://shopify.dev/docs/apps/build/purchase-options/subscriptions/selling-plans">About selling plans</a>,
+<a href="https://shopify.dev/docs/apps/build/purchase-options/subscriptions/selling-plans/build-a-selling-plan">Build a selling plan</a>
+and <a href="https://shopify.dev/docs/apps/build/purchase-options/subscriptions/model-subscriptions-solution">Model a subscriptions solution</a>.
+The Built for Shopify subscription requirements (5.14) —
+<a href="https://shopify.dev/docs/apps/launch/built-for-shopify/requirements">Built for Shopify requirements</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client sells coffee on a monthly subscription. They have 400 subscribers and 200 bags in stock. <b>Which
+  inventory policy do you choose, and what do you tell them either way?</b>
+</div>
+
+<p><b>Commit at fulfilment</b>, almost certainly — and then say the consequence out loud.
+<br><br>
+Committing at <em>creation</em> would reserve stock for every future cycle of every subscription, so 400
+subscribers would immediately consume far more than 200 bags and the storefront would show sold out permanently.
+That is unusable for a repeat-consumable business.
+<br><br>
+But committing at fulfilment means the platform will happily let them take a 401st subscriber they cannot supply
+this month. So the honest sentence is: <em>"I'll commit stock when we ship, not when they sign up — otherwise your
+website shows sold out forever. That means Shopify won't stop you over-subscribing, so you need a view of
+subscribers against incoming stock. That's a report, and it's worth having before you grow."</em>
+<br><br>
+Notice the shape: you made the technical choice, named what it does not protect against, and proposed the thing
+that does. That is the whole pattern from Track 3.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — uninstall deletes the plans in 48 hours</span>
+  All selling plans, policies and associations gone. Products survive. If your app holds no backup, a merchant's
+  change of mind is unrecoverable.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — committing inventory at creation for a consumable</span>
+  Future cycles reserve stock now. The storefront shows sold out while the warehouse is full.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — committing at fulfilment with no subscriber report</span>
+  The platform will let the merchant over-subscribe. The failure lands months later as a missed delivery to a
+  paying customer.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — three stacking price overrides</span>
+  Market override, B2B price list, and a subscription pricing policy can all apply. "What does this cost?" has no
+  single answer, and reconciling only the variant price confirms nothing.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a subscription order treated as one-off</span>
+  Downstream systems seeing only the first order will report a customer's lifetime value as one cycle, and will
+  not expect the next eleven.
+</div>
+
+<div class="scar">
+  <span class="who">Mixing interval units in one plan</span>
+  WEEK or MONTH, not both. "Every 6 weeks or every 2 months" is two selling plans, and discovering that mid-build
+  changes the storefront options.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — a contract outlives your code</span>
+  A twelve-month subscription taken today will still be billing after your next two refactors and several API
+  version bumps. Anything you encode into a plan is a commitment you cannot easily change for existing
+  subscribers. Design the plan set conservatively, and assume you will be supporting today's plans for years.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The one thing to raise unprompted</span>
+  <q>One risk worth knowing about now. If you ever uninstall the subscriptions app, Shopify deletes all your
+  subscription plans forty-eight hours later — the products survive, the plans don't. So I'll keep our own copy of
+  that configuration, and I'd suggest never uninstalling to "try something", because three days later it isn't
+  recoverable from Shopify.</q>
+  <span class="why-said">A dated, specific, irreversible risk that the client would never discover until it had
+  happened. Raising it unprompted is the whole job.</span>
+</div>
+
+<div class="script">
+  <span class="who">On the inventory decision</span>
+  <q>One choice to make together. We can reserve stock when someone subscribes, or when we actually ship. Reserving
+  at signup means your site shows sold out even with a full warehouse, because it's holding stock for future
+  months. Reserving at shipping avoids that, but then Shopify won't stop you taking more subscribers than you can
+  supply. I'd ship-time it and build you a subscribers-versus-stock report.</q>
+  <span class="why-said">Both options, both consequences, a recommendation, and the thing that covers the
+  recommendation's weakness.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A subscription is an alternative way to buy the same variant</b>, not a different product.</li>
+  <li><b>Four policies: billing · delivery · inventory · pricing.</b> Billing and delivery are separate frequencies.</li>
+  <li><b>Inventory committed at creation or at fulfilment.</b> That one choice decides whether you show sold out or oversell.</li>
+  <li><b>Uninstall deletes all plans after 48 hours.</b> Products survive. <b>Keep your own backup.</b></li>
+  <li><b>Buying takes a variant ID <em>and</em> a selling plan ID</b> through the Cart API.</li>
+  <li><b>One interval unit per plan.</b> Weeks or months, never both.</li>
+  <li><b>Pricing policies stack with price lists</b> — a third override layer after markets and B2B.</li>
+</ul>
+<p class="one-thing">If you remember one thing: an uninstall destroys every selling plan 48 hours later, so your
+app holding its own copy is not optional.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for customer accounts and identity.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0029-b2b-companies-catalogs-and-price-lists.html">← P9.1</a></span>
+  <span><a href="0031-customer-accounts-and-identity.html">P9.3 · Customer accounts →</a></span>
+</div>
+
+</div>
+</body>
+</html>

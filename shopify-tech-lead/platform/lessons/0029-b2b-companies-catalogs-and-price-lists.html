@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P9.1 — B2B: Companies, Catalogs and Price Lists</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P9 · Lesson 1</p>
+<h1>B2B: companies, catalogs and price lists</h1>
+<p class="subtitle">The price stops living on the variant. That breaks every price-sync assumption in this Course.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can explain why "just sync our prices" has a completely different answer
+  once B2B exists — and you know the five objects that replace "a customer with a price".</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does a business buyer need that a consumer does not?</h3>
+
+<p>A consumer is one person, one address, one price, paying now. Take each of those away and you get B2B:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Consumer</th><th>Business buyer</th><th>So Shopify needs</th></tr>
+  <tr><td>One person</td><td>Several people, with different authority</td><td><b>Company contacts</b>, with roles</td></tr>
+  <tr><td>One address</td><td>Branches, each with its own tax and shipping</td><td><b>Company locations</b></td></tr>
+  <tr><td>The listed price</td><td>A negotiated price, per customer</td><td><b>Catalogs</b> and <b>price lists</b></td></tr>
+  <tr><td>Pays now, by card</td><td>Pays in 30 days, on invoice</td><td><b>Payment terms</b></td></tr>
+</table>
+</div>
+
+<p>Five objects, and each one exists because a consumer assumption failed.</p>
+
+<div class="diagram">
+  Company                     the business entity
+   ├── CompanyContact         a person acting for it
+   │     · linked to a CUSTOMER account
+   │     · assigned to one or more locations, WITH ROLES
+   │       roles decide access to catalogs, pricing, payment terms
+   │
+   └── CompanyLocation        a branch. the important one.
+         · its own billing and shipping addresses
+         · its own TAX settings
+         · its own checkout configuration
+         · its own Catalog objects → which products, at which prices
+         · BuyerExperienceConfiguration
+             → PaymentTerms
+             → whether orders REQUIRE MERCHANT REVIEW
+
+  Catalog ──▶ PriceList   the prices
+          └─▶ Publication the products that are even visible
+</div>
+
+<h3>The fact that changes your sync</h3>
+
+<div class="trap">
+  <span class="label">Read this if you take one thing from the Lesson</span>
+  <b>A B2B price does not live on the variant.</b> It lives in a <b>price list</b>, attached to a <b>catalog</b>,
+  attached to a <b>company location</b>.
+  <br><br>
+  So everything Track 2 says about syncing prices — ownership per field, absolute writes, reconciling
+  <code>shadow</code> against Shopify — was written about <em>one</em> price per variant. With B2B there are
+  <b>N+1</b> prices: the retail one on the variant, plus one per price list that overrides it.
+  <br><br>
+  Writing the variant price does <b>not</b> change what a B2B customer pays. And reconciling only variant prices
+  will report everything correct while every wholesale customer is being charged last year's rate.
+</div>
+
+<p>This is the same shape as the Markets override trap in
+<a href="0013-shopify-plus-and-markets.html">P5.1</a>, and it compounds with it: a price can be overridden by
+market <em>and</em> by price list. "What does this cost?" is not a question with one answer.</p>
+
+<h3>Two behaviours that surprise people</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Behaviour</th><th>Consequence</th></tr>
+  <tr><td><b>Catalogs control visibility, not just price</b></td><td>A product can be invisible to one company location and visible to another. "Missing product" is often a catalog question, not a publishing one</td></tr>
+  <tr><td><b>Orders can require merchant review</b></td><td><code>BuyerExperienceConfiguration</code> can make a B2B order need approval. So an order can exist in a state where it is placed but not accepted — a state consumer flows never produce</td></tr>
+</table>
+</div>
+
+<p>That second row is the one that breaks integrations. Anything treating "order created" as "order confirmed"
+will push unapproved orders into a warehouse.</p>
+
+<h3>How a B2B sale actually happens</h3>
+
+<div class="diagram">
+  1. create the company and its location
+  2. set the location's tax exemptions and payment terms
+  3. attach a price list and a publication to a B2B catalog
+     → that decides WHICH products and at WHAT price
+  4. the contact orders — or staff raise a DRAFT ORDER and invoice it
+</div>
+
+<p>Step 4 is why <a href="0028-draft-orders-selling-outside-the-storefront.html">P8.3</a> comes first: the
+documented B2B flow is "manage draft orders for B2B clients by calculating and sending invoices". Draft orders are
+the B2B invoicing mechanism, not a separate feature.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> Company organising multiple locations and contacts; CompanyContact
+linked to a Customer account and assigned to locations <b>with roles determining access to catalogs, pricing and
+payment terms</b>; CompanyLocation having distinct billing and shipping addresses, tax settings and checkout
+configuration, with its own Catalog objects determining published products and pricing; custom pricing via Catalog
+and PriceList; and <code>BuyerExperienceConfiguration</code> determining checkout behaviour including
+<code>PaymentTerms</code> and <b>whether orders require merchant review</b> —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/DraftOrderSortKeys">DraftOrderSortKeys</a>.
+The four-step build flow —
+<a href="https://shopify.dev/docs/apps/build/b2b/start-building">Start building for B2B on Shopify</a>.
+<b>Not verified today:</b> which plan B2B requires. Confirm before scoping.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your ERP sync has been running happily for a year. The client turns on B2B and onboards twelve wholesale
+  accounts. <b>What silently breaks, and what does your reconciliation say?</b>
+</div>
+
+<p>Your price sync stops affecting wholesale customers entirely — and <b>your reconciliation reports zero
+differences</b>.
+<br><br>
+Here is why. You write the variant price; you record it in <code>shadow</code>; you compare
+<code>shadow</code> against the variant price in Shopify. All three agree. Meanwhile the twelve wholesale accounts
+pay whatever is in their price lists, which your sync has never touched and never checked. If the ERP raises
+prices, retail customers see the rise and wholesale customers do not.
+<br><br>
+The failure is invisible for exactly the reason A3.6 warns about: <b>you are reconciling the field you write, not
+the field the customer pays.</b> The fix is to make price lists part of the ownership table and part of the
+comparison — and the moment to do that is when B2B is switched on, not when someone notices the margin.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — syncing only the variant price</span>
+  B2B prices live in price lists. Your sync writes a price nobody in B2B pays, and reconciliation confirms it
+  perfectly. Wholesale margin quietly drifts.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — treating "order created" as "order confirmed"</span>
+  B2B orders can require merchant review. Push those to a warehouse and you ship goods on an unapproved order.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a product invisible to one company location</span>
+  Catalogs control visibility as well as price. A B2B customer reporting a missing product is usually a catalog
+  question, and nothing errors — the product simply is not in their catalog.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — payment terms ignored downstream</span>
+  A B2B order may be payable in 30 days. An ERP treating every order as paid-on-placement will report revenue and
+  chase nothing, and the cash-flow picture is wrong.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — price list and market override stacking</span>
+  A price can be overridden by market <em>and</em> by price list. Code assuming one override level reads a price
+  that is right in one context and wrong in another.
+</div>
+
+<div class="scar">
+  <span class="who">Roles ignored</span>
+  A company contact's role determines their access to catalogs, pricing and payment terms. An integration that
+  treats all contacts as equivalent grants the wrong person the wrong prices.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — B2B is a second store inside the store</span>
+  Different prices, different visibility, different tax, different payment, different approval flow. Estimating it
+  as "add wholesale pricing" is the classic underestimate. Treat it as a second commercial model that happens to
+  share a catalogue, and price it accordingly.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When B2B enters the conversation</span>
+  <q>Worth flagging early, because it changes something we already built. Right now our sync writes one price per
+  product. B2B prices don't live there — each business customer gets their own price list, so writing the normal
+  price won't change what they pay. I need to add price lists to what we sync and to what we check nightly.
+  Otherwise your wholesale margin drifts and our report says everything is fine.</q>
+  <span class="why-said">Names the invisible failure precisely, and asks for the work before it becomes a margin
+  problem. This sentence is the whole value of the Lesson.</span>
+</div>
+
+<div class="script">
+  <span class="who">When scoping B2B</span>
+  <q>I'd treat this as a second way of selling rather than a pricing feature. Business customers get their own
+  prices, their own product visibility, their own tax settings, payment on terms rather than by card, and
+  optionally an approval step before an order is accepted. Each of those touches something we've already built.
+  It's a project, not a setting.</q>
+  <span class="why-said">Five specific differences, each checkable, which is what makes "it's a project" land
+  rather than sound like padding.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Five objects:</b> Company · CompanyContact (with roles) · CompanyLocation · Catalog · PriceList.</li>
+  <li><b>The price is not on the variant.</b> It is in a price list, on a catalog, on a company location.</li>
+  <li><b>So a variant has N+1 prices.</b> Add price lists to the ownership table and to reconciliation.</li>
+  <li><b>Catalogs control visibility too.</b> A "missing product" is often a catalog question.</li>
+  <li><b>Orders can require merchant review.</b> "Created" is not "confirmed".</li>
+  <li><b>Payment terms mean an order may be unpaid for 30 days.</b> Downstream systems must know.</li>
+  <li><b>Roles decide who sees which catalog and price.</b> Contacts are not interchangeable.</li>
+</ul>
+<p class="one-thing">If you remember one thing: with B2B you are reconciling the field you write, not the field
+the customer pays — and that gap reports as zero differences.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for subscriptions.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0028-draft-orders-selling-outside-the-storefront.html">← P8.3</a></span>
+  <span><a href="0030-subscriptions-and-selling-plans.html">P9.2 · Subscriptions →</a></span>
+</div>
+
+</div>
+</body>
+</html>

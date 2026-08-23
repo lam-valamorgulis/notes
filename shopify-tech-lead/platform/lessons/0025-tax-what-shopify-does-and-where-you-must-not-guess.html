@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7.3 — Tax: What Shopify Does, and Where You Must Not Guess</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P7 · Lesson 3</p>
+<h1>Tax: what Shopify does, and where you must not guess</h1>
+<p class="subtitle">The one area of the platform where most of your job is knowing not to touch it.</p>
+
+<div class="trap">
+  <span class="label">Read this first</span>
+  <b>Nothing on this page is tax advice, and you must never give any.</b> Tax is a legal and accounting matter
+  and the merchant's accountant owns it. Your job is the platform mechanics and the sentence
+  <em>"that's a question for your accountant"</em> — said without embarrassment, every time.
+</div>
+
+<div class="win">
+  <strong>Your win today.</strong> You know exactly which tax questions are yours, which are the merchant's, and
+  the three platform facts that most often catch developers out.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why is tax not like shipping?</h3>
+
+<p>Shipping is a commercial decision — the merchant can charge whatever they like, and if the number is wrong
+they lose a little margin. Tax is a <b>legal obligation to a government</b>, calculated from rules you did not
+write, and getting it wrong is not a bug report — it is a liability.</p>
+
+<p>So the correct instinct is the opposite of everywhere else in this Course. Elsewhere, a good developer takes
+ownership. Here, <b>a good developer takes the platform's answer and refuses to compute anything.</b></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Yours</th><th>Not yours</th></tr>
+  <tr><td>Making sure Shopify's calculated tax reaches other systems intact</td><td>Whether the rate is correct</td></tr>
+  <tr><td>Not overwriting or recalculating it</td><td>Where the merchant must register</td></tr>
+  <tr><td>Knowing tax is finalised at checkout, not earlier</td><td>Whether a product is taxable in a jurisdiction</td></tr>
+  <tr><td>Flagging when a client's plan will not do what they expect</td><td>What to do about a tax notice</td></tr>
+</table>
+</div>
+
+<h3>Fact 1 · Tax is calculated at checkout, and the Cart API no longer even offers it</h3>
+
+<p>As of API version <b>2025-01</b>, the <b>tax and duty fields are deprecated in the Storefront Cart API</b>.
+Shopify's stated reason is exact and worth quoting: tax and duties <em>"are calculated at Checkout where they
+can be finalized with the complete context of the buyer's information, ensuring greater accuracy."</em></p>
+
+<p>So the platform has removed your ability to show a tax figure in the cart, deliberately. That means:</p>
+
+<div class="diagram">
+  product page   → no tax context. you do not know where they are.
+  cart           → tax fields DEPRECATED. do not try.
+  checkout       → tax calculated, with the full address and customer context
+  order          → the finalised amounts. THIS is what you sync onward.
+</div>
+
+<p>Any client request for "show tax in the cart" is a request to display a number the platform declines to
+guarantee. The honest answer is that you can show an estimate <em>labelled as an estimate</em>, or wait for
+checkout — and the second is what Shopify wants.</p>
+
+<h3>Fact 2 · Exemption is a per-jurisdiction value, not a checkbox</h3>
+
+<p>A customer is not simply "tax exempt". Shopify models exemption as a long enumeration of specific,
+jurisdiction-scoped entitlements — for example a reseller exemption in one US state, a Canadian provincial
+exemption, or the <b>EU reverse-charge rule</b> for cross-border purchases within the EU and from the EU to the
+UK.</p>
+
+<p>The practical consequence: <b>never model exemption as a boolean in your own system.</b> A customer can be
+exempt from one tax in one place and fully liable elsewhere. Carry the specific values, or carry nothing and
+read them from Shopify when you need them.</p>
+
+<h3>Fact 3 · You cannot build a tax calculation app</h3>
+
+<p>Shopify's Tax Platform is <b>available by invitation only, to selected tax software companies</b>. So "we'll
+integrate our own tax engine" is not a scoping question — it is not available to you.</p>
+
+<p>What that leaves is: use Shopify's own tax calculation, or use one of the invited partner apps. Knowing this
+in the first meeting saves a fortnight of investigation.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> tax and duty fields deprecated in the Storefront Cart API as of
+2025-01, with Shopify's stated reason —
+<a href="https://shopify.dev/changelog/tax-and-duties-are-deprecated-in-storefront-cart-api">changelog</a>.
+The Tax Platform being invitation-only to select tax software companies —
+<a href="https://shopify.dev/docs/apps/build/tax">Tax Partner Apps</a>. Exemption modelled as a large
+jurisdiction-scoped enumeration including the EU reverse-charge rule —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/TaxExemption">TaxExemption</a>.</p>
+
+<h3>What actually reaches your integration</h3>
+
+<p>For a sync, tax is <b>read-only output</b>. It appears on the order, already calculated, and your only jobs
+are to carry it faithfully and never to recompute it.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Never</th></tr>
+  <tr><td>Read the tax lines from the order and pass them on</td><td>Recalculate tax from a rate you looked up</td></tr>
+  <tr><td>Keep tax as integer minor units of the order's currency</td><td>Sum floats, or convert currencies</td></tr>
+  <tr><td>Preserve whether prices were tax-inclusive</td><td>Assume one convention. It differs by market</td></tr>
+  <tr><td>On a migrated order, send the historical tax explicitly</td><td>Let a default recalculate it at today's rates</td></tr>
+</table>
+</div>
+
+<p>That last row is the same trap as
+<a href="0022-orders-money-and-the-shopify-to-shopify-replatform.html">P6.6</a>'s omitted line price, and it is
+worse: an imported order silently taxed at today's rules misstates a historical financial record.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client asks you to show the tax-inclusive price on the product page, "so European customers see the real
+  price". <b>What is true, what is not, and what do you say?</b>
+</div>
+
+<p>What is <b>true</b>: prices can be presented tax-inclusively, and per-market pricing is a real platform
+feature — that part is legitimate and is a Markets question, not a tax-calculation one.
+<br><br>
+What is <b>not</b>: you cannot compute the tax yourself to display it. On a product page you do not know the
+customer's address, and the Cart API's tax fields are deprecated precisely because tax needs the full checkout
+context. So a number you calculate is a number you are guessing.
+<br><br>
+What you say: <em>"We can present prices as tax-inclusive per market, which is a Shopify setting rather than
+something I calculate. What I won't do is work out a tax figure myself and display it — I'd be guessing without
+the customer's address, and if it's wrong it's your liability, not a display bug. Your accountant should confirm
+which markets you present inclusively."</em>
+<br><br>
+That answer gives them most of what they wanted, refuses the part that creates liability, and routes the
+remaining question to the person who owns it.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — recalculating tax anywhere</span>
+  You looked up a rate and applied it. It is wrong for some jurisdiction, product type or exemption you did not
+  know about, and now the merchant has under- or over-collected tax across every affected order. Read Shopify's
+  number; never derive one.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — a migrated order taxed at today's rules</span>
+  Omit the historical tax on an imported order and it is recalculated by current rules. Counts match, line items
+  match, and the financial history is wrong in a way every automated check passes.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — exemption as a boolean</span>
+  Exemption is jurisdiction-scoped. A customer exempt in one state modelled as globally exempt stops being
+  charged tax everywhere, silently, and it will not surface until an audit.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — assuming one tax-inclusive convention</span>
+  Whether prices include tax can differ by market. Code that assumes one answer produces figures that are right
+  in one country and wrong in another, with no error anywhere.
+</div>
+
+<div class="scar">
+  <span class="who">Promising tax in the cart</span>
+  The Storefront Cart API's tax and duty fields are deprecated as of 2025-01. Building on them is building on
+  something already withdrawn.
+</div>
+
+<div class="scar">
+  <span class="who">Scoping a custom tax engine integration</span>
+  The Tax Platform is invitation-only. Discovering that in week three, after it is in a proposal, is an avoidable
+  and embarrassing conversation.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — never answer a tax question, even when you know</span>
+  You will sometimes know the answer. Say it anyway: <em>"that's one for your accountant."</em> An answer from
+  you creates reliance, and if it is wrong the liability is real and it is theirs — which makes it a
+  relationship problem as well as a legal one. There is no upside to being right about this informally.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Any tax question at all</span>
+  <q>That's one for your accountant rather than me. What I can tell you is the mechanical part: Shopify
+  calculates the tax at checkout, once it knows the customer's address, and I make sure that number reaches your
+  other systems unchanged. What I never do is work tax out myself — if I did and it were wrong, that's your
+  liability.</q>
+  <span class="why-said">Declines cleanly, states what you <em>do</em> own, and gives the reason in terms of
+  their risk rather than your caution. Nobody pushes back on this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to show tax earlier in the journey</span>
+  <q>Shopify deliberately removed the tax fields from the cart, because tax needs the full address to be right.
+  So anything I showed before checkout would be an estimate, and I'd want it labelled as one. If it's about
+  European customers seeing inclusive prices, that's a different and better-supported thing — a per-market price
+  presentation setting rather than a calculation.</q>
+  <span class="why-said">Explains the platform's reasoning, offers the legitimate alternative, and separates
+  "display convention" from "calculation" — which is the distinction that matters.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they want their own tax engine</span>
+  <q>I checked, and that route isn't open to us — Shopify's tax platform is invitation-only for tax software
+  companies. So the options are Shopify's own tax calculation, or one of the tax apps they've already approved.
+  Worth your accountant picking between those two rather than me.</q>
+  <span class="why-said">A specific, checkable reason for a no, and it hands the remaining choice to the right
+  person.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Never calculate tax. Never advise on tax.</b> "That's one for your accountant" — every time.</li>
+  <li><b>Tax is finalised at checkout</b>, with the full buyer context. Not on the product page, not in the cart.</li>
+  <li><b>Storefront Cart API tax and duty fields are deprecated as of 2025-01.</b> Do not build on them.</li>
+  <li><b>Exemption is jurisdiction-scoped</b>, not a boolean. Carry the specific values or none.</li>
+  <li><b>The Tax Platform is invitation-only.</b> A custom tax engine is not available to you.</li>
+  <li><b>For a sync, tax is read-only output.</b> Carry it faithfully as integer minor units.</li>
+  <li><b>On a migrated order, send historical tax explicitly</b>, or today's rules rewrite the past.</li>
+</ul>
+<p class="one-thing">If you remember one thing: this is the one place where taking ownership is the wrong
+instinct — read the platform's number, pass it on unchanged, and route every judgement to the accountant.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P7 done — and with it the gap that was missing from Platform.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0024-carrier-calculated-rates-your-server-inside-checkout.html">← P7.2</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

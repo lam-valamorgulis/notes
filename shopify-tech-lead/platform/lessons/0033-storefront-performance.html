@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P10.2 — Storefront Performance</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P10 · Lesson 2</p>
+<h1>Storefront performance</h1>
+<p class="subtitle">The cause is almost always apps, and the fix is almost never a rebuild.</p>
+
+<div class="note">
+  <span class="label">What is verified here, and what is not</span>
+  The Shopify-specific facts on this page are verified and linked. The <b>diagnostic order and the priorities are
+  engineering judgement</b>, not documentation — Shopify publishes no ranked list of causes. Treated as advice, not
+  as fact.
+</div>
+
+<div class="win">
+  <strong>Your win today.</strong> When a client says "the site is slow, should we go headless?", you can find the
+  real cause in an afternoon and usually save them the rebuild.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what can actually make a Shopify storefront slow?</h3>
+
+<p>Shopify hosts the page and serves it from a CDN. So the things <em>you</em> and the merchant control are a short
+list — and that is genuinely useful, because it makes diagnosis finite:</p>
+
+<div class="diagram">
+  Shopify's side          hosting, CDN, Liquid rendering    ← not yours
+  ─────────────────────────────────────────────────────────
+  THE MERCHANT'S SIDE
+    third-party scripts   apps, tag managers, chat, tracking   ← usually the answer
+    images                oversized, wrong format, no lazy load
+    theme JavaScript      too much, or blocking
+    fonts                 render-blocking, too many weights
+    section count         how much is on the page at all
+</div>
+
+<p>Note what is missing from that list: <b>Liquid</b>. Rendering happens on Shopify's infrastructure, before the
+browser is involved. So "Liquid is slow" is almost never the finding, which is exactly why "go headless for speed"
+usually does not help — you would carry every item in the lower box with you and add a hosting layer to tune.</p>
+
+<h3>The diagnostic order</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Check</th><th>Why here</th></tr>
+  <tr><td>1</td><td><b>Count the third-party scripts.</b> View source, list every external domain</td><td>Highest hit rate by a wide margin. Each app adds requests, and apps outlive their usefulness</td></tr>
+  <tr><td>2</td><td><b>Check image sizes and formats</b> on the heaviest page</td><td>Usually the largest bytes. Often a 3000px image in a 400px slot</td></tr>
+  <tr><td>3</td><td><b>Count theme sections</b> on the home page</td><td>Merchants add sections over years and never remove them</td></tr>
+  <tr><td>4</td><td><b>Look for render-blocking fonts and CSS</b></td><td>Cheap to fix, visible improvement</td></tr>
+  <tr><td>5</td><td><b>Only then</b> look at theme JavaScript</td><td>Where developers want to start, and rarely the biggest win</td></tr>
+</table>
+</div>
+
+<p>Step 1 is not glamorous and it is where the answer usually is. <b>Ask which installed apps the merchant still
+actually uses.</b> An uninstalled app can leave script tags behind; an unused one certainly does.</p>
+
+<h3>Two Shopify-specific facts that matter here</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Fact</th><th>Consequence</th></tr>
+  <tr><td><b>Theme app extensions cap Liquid at 100 KB</b></td><td>A hard limit on how much an app can inject. Exceptions exist for custom distribution or Built for Shopify status, and Shopify notes raising it can hurt performance</td></tr>
+  <tr><td><b>Script tags on Thank you / Order status are sunset</b></td><td>28 Aug 2025 for Plus, <b>26 Aug 2026 for non-Plus</b>. Old tracking scripts there have already stopped — which is a performance <em>and</em> a functionality finding</td></tr>
+</table>
+</div>
+
+<p>Both come from <a href="0014-checkout-extensibility.html">P5.2</a> and
+<a href="../../apps/lessons/0001-anatomy-of-a-shopify-app.html">A1.1</a>. The second one is worth checking on any
+inherited store: you may find dead scripts still being downloaded.</p>
+
+<h3>The headless question, answered properly</h3>
+
+<p>From <a href="0009-liquid-or-headless-the-client-conversation.html">P4.1</a>, restated because this is where it
+gets asked: <b>a headless rebuild that carries the same third-party scripts will be slower, not faster</b>, because
+you have added a hosting layer you now have to tune and lost the theme editor.</p>
+
+<p>So the honest sequence is: <b>measure, fix the top two causes, measure again.</b> If the site is still slow after
+removing unused apps and fixing images, you have evidence for a bigger conversation. If it is not — and it usually
+is not — you saved the client a rebuild, and that is a better outcome than winning the argument.</p>
+
+<h3>Performance as a correctness requirement, not a nice-to-have</h3>
+
+<p>Two places in this Course where slow <em>is</em> broken, both verified:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Where</th><th>Why slow = broken</th></tr>
+  <tr><td><b>POS extensions</b></td><td>Shopify's own documentation says extensions "run in the context of key merchant workflows, so always prioritize performance". There is a customer at a counter — see <a href="0008-the-till-pos-lite-pro-the-retail-order-and-ui-extensions.html">P3.3</a></td></tr>
+  <tr><td><b>Carrier rate callbacks</b></td><td>The timeout <b>shrinks as traffic grows</b>: 10 s → 5 s → 3 s. Slow does not degrade, it fails to backup rates — see <a href="0024-carrier-calculated-rates-your-server-inside-checkout.html">P7.2</a></td></tr>
+</table>
+</div>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says a competitor's site feels faster and asks for a quote to go headless. <b>What do you do first, and
+  what do you say?</b>
+</div>
+
+<p><b>First: measure, and count the scripts.</b> View source on their busiest page and list every external domain
+being loaded. That is an afternoon, not a project.
+<br><br>
+What you say: <em>"Before I quote a rebuild, give me an afternoon to find out why it's slow. In my experience it's
+usually apps loading their own scripts, and images that are bigger than the space they're shown in — both fixable
+in the theme this month. If I rebuild it headless and we carry the same scripts across, it'll be slower, not
+faster, because we've added a hosting layer to manage. If the measurement says otherwise, you'll have real evidence
+for the bigger decision."</em>
+<br><br>
+Notice the structure: you refuse the expensive thing, offer a cheap diagnostic, and commit to supporting the
+expensive thing <em>if the evidence supports it</em>. That is not caution — it is the only version of this
+conversation where the client can trust your eventual answer.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a headless rebuild for speed</span>
+  The scripts and images follow you, and you add a hosting layer to tune. The score does not move and nobody can
+  explain why. Measure first.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — scripts from apps nobody uses</span>
+  Uninstalled and unused apps can leave script tags loading on every page view. Nothing errors; the site is just
+  heavier. Audit installed apps against what the merchant actually uses.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — dead checkout scripts still downloading</span>
+  Script tags on Thank you and Order status pages are sunset — 26 Aug 2026 for non-Plus. They may still load and do
+  nothing. A functionality bug wearing a performance costume.
+</div>
+
+<div class="scar">
+  <span class="who">Starting with theme JavaScript</span>
+  Where developers want to begin and rarely the biggest win. Scripts and images first, always.
+</div>
+
+<div class="scar">
+  <span class="who">Blaming Liquid</span>
+  Rendering happens on Shopify's infrastructure before the browser sees anything. It is almost never the finding,
+  and saying so early stops a wrong project.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — a score is not the goal</span>
+  A client will bring a Lighthouse number. Improving a score and improving revenue are correlated but not the same,
+  and some score fixes are cosmetic. Ask what they actually want — faster pages, or a higher number — and if it is
+  the number, say plainly that you will optimise for the number.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The first response, always</span>
+  <q>Give me an afternoon before you spend anything. I'll count what's loading on your busiest pages and check your
+  images. Nine times in ten it's apps adding their own scripts, and images bigger than the space they appear in.
+  Both are fixable in the theme this month. If it turns out to be something structural, you'll have the measurement
+  to justify a bigger piece of work.</q>
+  <span class="why-said">Costs almost nothing, usually solves it, and makes any later big recommendation
+  credible.</span>
+</div>
+
+<div class="script">
+  <span class="who">The app audit conversation</span>
+  <q>Can we go through your installed apps together? Every one adds something to every page load, and most stores
+  have a few nobody uses any more. Removing three unused apps often does more for speed than anything I could code
+  — and it's free.</q>
+  <span class="why-said">Offers a free improvement you do not bill for. That is what buys the trust to be believed
+  on the paid recommendations.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Shopify hosts and renders the page.</b> The controllable causes are a short, finite list.</li>
+  <li><b>Diagnostic order:</b> third-party scripts → images → section count → fonts and CSS → theme JavaScript.</li>
+  <li><b>Scripts from apps are the usual answer.</b> Audit installed apps against what is actually used.</li>
+  <li><b>Liquid is almost never the finding.</b> It renders before the browser is involved.</li>
+  <li><b>Headless for speed usually makes it worse</b> — the scripts follow you, plus a hosting layer to tune.</li>
+  <li><b>Theme app extension Liquid caps at 100 KB</b>, and raising it can hurt performance.</li>
+  <li><b>In POS extensions and carrier callbacks, slow <em>is</em> broken</b> — one has a queue, the other a shrinking timeout.</li>
+</ul>
+<p class="one-thing">If you remember one thing: measure and count the scripts before quoting anything — the cheapest
+fix is usually uninstalling an app nobody uses.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for content, files and translations.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0032-search-filtering-and-discovery.html">← P10.1</a></span>
+  <span><a href="0034-content-files-and-translations.html">P10.3 · Content →</a></span>
+</div>
+
+</div>
+</body>
+</html>

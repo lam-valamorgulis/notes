@@ -26,7 +26,7 @@ centre, and the reading exists to serve the build.
 | 5 | Interviews stay, as one Chapter inside The Room. They are no longer the mission |
 | 6 | Every Lesson has four fixed blocks: **How it works → Where it hurts → What you say to a client/PM → Remember this** |
 | 7 | Each Track gets one **Scars** Reference that collects its "Where it hurts" blocks |
-| 8 | Game Locker is removed. Its technical *patterns* survive, with no company, client, tenant or traceable number |
+| 8 |The company-specific sub-course is removed. Its technical *patterns* survive, with no company, client, tenant or traceable number |
 | 9 | `stockinstore` keeps its real name. Its integration half survives; its SaaS-design half compresses hard |
 | 10 | The **Project** is a NestJS + Postgres service syncing a **Fake ERP** with a **Dev store**. It lives in `shopify-tech-lead/project/` in the private `learn` repo, excluded from publishing |
 | 11 | The Client store is read-only, used for shape, scale, and reading a real integration in flight. See ADR 0001 |
@@ -42,20 +42,34 @@ So 67 Lessons, with **47 marked as the core path** and **20 marked optional
 depth**. At 12 hours a week the core path plus the Project is about 3 months; all
 67 is about 4 to 5 months.
 
-Per Track: Platform **12 core / 10 depth** · Apps & Integrations **25 core / 1
-depth** (it is the point of the Course, so almost nothing is optional) · The Room
-**10 core / 9 depth**. Depth is concentrated in Track 1's storefront and theme
-Chapters, because those are already a strength, and in Track 3's long-form design
-walkthroughs.
+### Then the territory map added 16 more
+
+That estimate was the *merge* of the old course. It was not a survey of Shopify.
+Building `reference/territory-map.html` — rating every area a tech lead meets by
+core / important / edge and by pain — named **fourteen areas with no coverage at
+all**, plus shipping and tax, which the merge had missed entirely.
+
+Filling them added **16 Lessons**, so the real total is **83**: three Chapters new
+to Track 1 (P8 After the sale, P9 Other ways to sell, P10 Conversion, content and
+risk), P7 for shipping and tax, one Lesson each added to P4, A1 and A2.
+
+**Final: 83 Lessons — 58 core, 25 depth.** At 10–15 hours a week the core path plus
+the Project is three to four months; all 83 is five to six.
+
+Per Track: Platform **23 core / 13 depth** · Apps & Integrations **20 core / 3
+depth plus the 5 Project steps** (it is the point of the Course, so almost nothing
+is optional) · The Room **10 core / 9 depth**. Depth is concentrated in Track 1's
+storefront and theme Chapters, because those are already a strength, and in Track
+3's long-form design walkthroughs.
 
 ```
 old: 93 Lessons · 41 References · 10 katas · 151 pages · 7 Maps
-new: 67 Lessons · 14 References ·  0 katas (they became Project steps) · 4 Maps
+new: 83 Lessons · 15 References ·  0 katas (they became Project steps) · 4 Maps
 ```
 
 ---
 
-## Track 1 — Platform (22 Lessons)
+## Track 1 — Platform (36 Lessons)
 
 What Shopify itself is. The vocabulary you need before any integration
 conversation makes sense.
@@ -86,7 +100,7 @@ conversation makes sense.
 | Dawn, Horizon and theme blocks | merge `theme-architecture/0001` + `0002` |
 | The Cart AJAX API | `theme-architecture/0003` — survives |
 | Discounts on the storefront | `theme-architecture/0004` — survives. Keeps the verified deprecated-price-fields trap |
-| Liquid or headless — the client conversation | **NEW**, absorbing `game-locker/0005` + `0006` and `stockinstore/0014` (theme app extensions) |
+| Liquid or headless — the client conversation | **NEW**, absorbingtwo Lessons from the removed sub-course and `stockinstore/0014` (theme app extensions) |
 
 ### P5 · Checkout, money and Plus (4)
 | Lesson | Source |
@@ -110,7 +124,7 @@ conversation makes sense.
 
 ---
 
-## Track 2 — Apps & Integrations (26 Lessons) · the heart of the Course
+## Track 2 — Apps & Integrations (28 Lessons) · the heart of the Course
 
 You integrate Shopify by building an app. The app is the vehicle; the sync is the
 job. This Track carries the Project.
@@ -139,7 +153,7 @@ The strongest material in the old Course. It survives nearly whole.
 
 | Lesson | Source |
 |---|---|
-| Shopify alone, and what a second system adds | merge `sync/0001` + `0002`. **Genericise** — `0002` names Game Locker in its title |
+| Shopify alone, and what a second system adds | merge `sync/0001` + `0002`. **Genericise** — `0002` namesa company in its title |
 | Ownership, per field not per record | `sync/0003` — survives. The spine of the Track |
 | Absolute writes, safe replay, and tombstones | merge `sync/0004` + `0005` |
 | Webhooks are a hint — clocks, order and staleness | merge `sync/0007` + `0006` |
@@ -243,7 +257,7 @@ right.
 
 ---
 
-## References (41 → 14)
+## References (41 → 15)
 
 **Survive or merge:** Glossary (four old glossaries merged) · Shopify object model
 card **NEW** · Rate limits and throttles card **NEW** · Ownership matrix ·
@@ -254,7 +268,7 @@ worksheet · Client/PM phrasebook **NEW** (collects R3) · three **Scars** pages
 **Die:** every sprint-pacing page — `study-plan-7day`, `study-plan` ×2,
 `24-hour-plan`, `day1-mastery-diagnostic`, `day5-recall-check`,
 `night-before-onepager`, `onepager` ×2. They assumed a one-week deadline that no
-longer exists. Also `company-brief` and `verified-facts` (Game Locker).
+longer exists. Also `company-brief` and `verified-facts`.
 
 **Move to `project/`, as real code:** `auth-token-exchange-recipe`,
 `nestjs-orders-module-recipe`, `webhook-erp-worker`, `background-workers`. They
@@ -271,19 +285,22 @@ are code, not reading.
 | **2** | Track 2: A1 → A4, 21 Lessons | **done** |
 | **3** | Track 1 Platform, 22 Lessons | **done** |
 | **4** | Track 3 The Room, 19 Lessons | **done** |
-| **4b** | All 14 References, including three Scars pages | **done** |
+| **4b** | All 15 References, including three Scars pages | **done** |
 | **5** | Root landing page recount, delete `../shopify-nsc-interview-prep/` | **done** |
-| **6** | Commit and deploy | commit done · **deploy not run** |
+| **6** | Commit and deploy | **done** |
+| **7** | `reference/territory-map.html` — rate every area, name every gap | **done** |
+| **8** | Fill all 16 gaps: P7, P8, P9, P10, P4.5, A1.5, A2.5 | **done** |
+| **9** | Check-and-fix pass: links, cross-references, counts, Scars coverage, fact sweep | **done** |
 
 ### What is written
 
-**All 67 Lessons**, including Project Steps 3 and 4 — webhooks in with inventory flowing back, and
+**All 83 Lessons**, including Project Steps 3 and 4 — webhooks in with inventory flowing back, and
 the queue plus dead-letter plus the reconciliation report with its ten-row break-it table.
 
 Nothing is left to *write*. What remains is to **do**: build the Project. Step 3 onward needs a Dev
 store and a public tunnel, and the store work was deliberately deferred.
 
-**All 14 References:** three Scars pages, the Glossary, object model card, what-moves matrix,
+**All 15 References:** three Scars pages, the territory map, the Glossary, object model card, what-moves matrix,
 migration runbook, ownership matrix, conflict cases, rate limits card, phrasebook, rapid-fire,
 STAR worksheet, mock run sheets.
 
@@ -312,6 +329,41 @@ STAR worksheet, mock run sheets.
 3. Three malformed tags from earlier drafts (`</summary>`, `</question>`, `</b]`) and one markdown
    `**bold**` inside HTML, all caught by the structural sweep.
 
+### The check-and-fix pass after the gap-filling (2026-08-23)
+
+Phase 8 added 16 Lessons. Phase 9 checked the whole Course again and found six real
+faults. All are fixed.
+
+1. **Two lessons were inserted mid-Chapter, which silently renumbered the Lessons
+   after them.** `0036` went into P4 before Discounts, so Discounts moved from P4.4
+   to P4.5. `0027` went into A1 before Scopes, so Scopes moved from A1.4 to A1.5.
+   Six cross-references elsewhere still pointed at the old positions. Both new
+   Lessons were moved to the **end** of their Chapter, which restores every existing
+   number and reads better anyway. **The lesson: inserting into the middle of an
+   ordered list is a breaking change.**
+2. **Three broken links** — `../reference/` written from inside `platform/lessons/`,
+   which needs `../../reference/`.
+3. **Every count claim was stale.** The Course Map said 71 Lessons and the site
+   landing page said 65; disk said 83. Both recounted from disk, per the counting
+   rule.
+4. **The territory map still listed all fourteen gaps as open** after every one had
+   been filled. Rewritten: the fourteen moved into the covered table, and the gap
+   list was rebuilt from scratch by searching every page for each candidate area.
+   **Nine real gaps remain** — starting with fulfillment orders and bundles.
+5. **Two Lessons made stale claims about the map** — Track 1 called P8 "the top gap"
+   and `0036` said it "closes the last gap". Both rewritten to say what is now true.
+6. **The Scars pages were missing 13 Lessons entirely**, including P6.1, the
+   matching key — the single most important Lesson in the Course. Their subtitles
+   claim "Every 'Where it hurts' from Track 1", which was false. Fixed by generating
+   the missing scars **verbatim from the Lesson sources** rather than rewriting them,
+   so no fact was restated from memory. All 78 Chapter Lessons are now cited.
+
+Checks that came back clean: 0 broken links · 0 unbalanced `<div>` · 0 orphan pages ·
+0 malformed tags · 0 Markdown residue outside code blocks · 83/83 Lessons carry all
+four blocks and a recall card · 266 cross-references checked, 0 mismatched · the
+number sweep found the only repeated old figures (50,000 / 1,000 per day) to be
+deliberate history notes about the doc disagreement, not errors.
+
 ### The old Course is deleted — what it needed first
 
 Deleting `shopify-nsc-interview-prep/` was not a one-line job. Three things had to happen first, and
@@ -333,7 +385,7 @@ they are worth recording because the same trap will recur:
 
 - **Building the Project.** All five steps are written; none is built. That is the point — the
   scaffold is given, the logic is typed.
-- **The Dev store.** `valamorgulis.myshopify.com` is in `.env.example`, but whether it is genuinely a
+- **The Dev store.**The store domain is in `.env.example`, but whether it is genuinely a
   development store is **unverified** — `plan.partnerDevelopment` was never read, because switching
   stores kept revoking the MCP token. **Confirm before loading 10,000 synthetic products into it.**
 - **Deploy.** Nothing has been published. `--check-only` passes.
@@ -349,6 +401,10 @@ they are worth recording because the same trap will recur:
   lines 30–75, read directly. Corrected one of my own recommendations mid-session:
   `nodejs-mastery-in-1-year` has 8 Lessons and **no NestJS Lesson**, so it cannot
   carry the backend depth.
+- **Phase 9 evidence:** the check battery above, re-run to green after each fix.
+  Scars additions were machine-extracted from the Lesson files, not retyped. The
+  nine new territory-map gaps were each confirmed absent by searching every page
+  before being listed.
 - **Accountable:** Lam Dang.
 - **If wrong:** every phase is additive inside `shopify-tech-lead/`. Roll back with
   `rm -rf shopify-tech-lead/`. The old Course is untouched until Phase 5, so

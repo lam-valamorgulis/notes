@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P8.1 — Returns, Refunds and Order Editing</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P8 · Lesson 1</p>
+<h1>Returns, refunds and order editing</h1>
+<p class="subtitle">Changing a paid order changes what someone was charged. Shopify now <em>forces</em> you to be idempotent.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can refund correctly, restock deliberately, and explain why editing a paid
+  order is a different class of operation from everything else in this Course.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what makes post-purchase different?</h3>
+
+<p>Everything before checkout is a <em>proposal</em>. A cart can be wrong and nothing has happened. After payment,
+the order is a <b>record of a completed financial event</b> — the same category as an imported historical order in
+<a href="0022-orders-money-and-the-shopify-to-shopify-replatform.html">P6.6</a>.</p>
+
+<p>So changing it is not an update. It is <b>amending a financial record and moving money</b>, and three separate
+things move at once:</p>
+
+<div class="diagram">
+  one refund touches THREE systems of record
+
+  MONEY      a transaction back to the payment method
+  STOCK      restock — or deliberately not
+  TAX        proportional tax reversal, calculated by Shopify
+
+  get one right and the other two wrong and nothing errors.
+</div>
+
+<h3>A refund has two halves, and people forget the second</h3>
+
+<p>Shopify's own framing: a refund has <b>transaction records of money returned</b> <em>and</em> <b>the line items
+included, with restocking instructions</b>. Two halves. The money half is obvious; the stock half is where
+integrations go wrong.</p>
+
+<h3>Always calculate before you refund</h3>
+
+<p>Do not compute a refund amount yourself. Ask Shopify what it should be, then create the refund from that
+answer:</p>
+
+<pre><code>query SuggestRefund($orderId: ID!, $lineItems: [RefundLineItemInput!]) {
+  order(id: $orderId) {
+    suggestedRefund(refundLineItems: $lineItems) {
+      amountSet             { shopMoney { amount currencyCode } }
+      maximumRefundableSet  { shopMoney { amount } }
+      shipping {
+        amountSet            { shopMoney { amount } }
+        maximumRefundableSet { shopMoney { amount } }
+      }
+      refundLineItems { quantity restockType lineItem { id } }
+      suggestedTransactions { amountSet { shopMoney { amount } } kind }
+    }
+  }
+}</code></pre>
+
+<p>This is the same rule as tax in <a href="0025-tax-what-shopify-does-and-where-you-must-not-guess.html">P7.3</a>:
+<b>read the platform's number, never derive one.</b> The suggestion accounts for discounts already applied,
+proportional tax, and what has already been refunded — three things you would get wrong by hand.</p>
+
+<div class="note">
+  <span class="label">Refunding less than the calculated amount</span>
+  You may refund less than suggested, for line items or shipping. But know what that does: <b>an order adjustment
+  is created automatically</b> to account for the discrepancy in the store's financial reports. So a partial
+  refund is not silent — it leaves an accounting artefact, which is correct and which the merchant's accountant
+  will see.
+</div>
+
+<h3>Two refund mutations, and the difference is restocking</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Mutation</th><th>Money</th><th>Restocking</th></tr>
+  <tr><td><code>refundCreate</code></td><td>Yes</td><td><b>Yes — you specify restock behaviour per line item</b></td></tr>
+  <tr><td><code>returnRefund</code></td><td>Yes</td><td><b>No restocking input at all</b> — purely financial</td></tr>
+</table>
+</div>
+
+<p>Pick deliberately. A customer returning a faulty item should be refunded <em>without</em> restocking; a
+change-of-mind return usually restocks. Choosing the wrong mutation means either phantom stock you cannot sell or
+real stock that never comes back.</p>
+
+<h3>The breaking change you need to know about</h3>
+
+<div class="trap">
+  <span class="label">Dated, and already in force</span>
+  The refund mutation's <b>idempotency key was optional as of API version 2026-01, and is REQUIRED as of
+  2026-04</b>, supplied with the <code>@idempotent</code> directive.
+  <br><br>
+  So on any current version, <b>a refund without an idempotency key is rejected.</b> Shopify made the discipline
+  from <a href="../../apps/lessons/0011-absolute-writes-safe-replay-and-tombstones.html">A3.3</a> mandatory for
+  exactly the reason that Lesson gives: a retried refund must not pay a customer twice. Code written against
+  2026-01 and not touched since will fail on upgrade.
+</div>
+
+<h3>Order editing: begin, mutate, commit</h3>
+
+<p>Editing a paid order is a three-phase transaction, and the middle phase is not live:</p>
+
+<div class="diagram">
+  1. orderEditBegin(id)          → returns a CalculatedOrder
+                                    a DRAFT. the real order is untouched
+  2. mutate the CalculatedOrder  orderEditAddVariant
+                                 orderEditSetQuantity
+                                 orderEditAddCustomItem
+                                 orderEditAddLineItemDiscount
+  3. orderEditCommit(id, ...)    → NOW the order changes
+</div>
+
+<pre><code>mutation Begin($id: ID!) {
+  orderEditBegin(id: $id) {
+    calculatedOrder { id originalOrder { name } }
+    userErrors { field message }
+  }
+}
+
+mutation Commit($id: ID!, $notify: Boolean, $staffNote: String) {
+  orderEditCommit(id: $id, notifyCustomer: $notify, staffNote: $staffNote) {
+    order { id name totalPriceSet { shopMoney { amount currencyCode } } }
+    userErrors { field message }
+  }
+}
+</code></pre>
+
+<p>The draft phase is the useful part: you can add, remove and price things, read the recalculated totals, and
+<b>show a human the result before committing</b>. Anything that changes what a customer paid should have a human
+look at it first — and this API is built to allow that.</p>
+
+<p>Note <code>notifyCustomer</code> on the commit. Editing an order can email the customer. Decide that
+explicitly rather than accepting a default.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> a refund's two components and the calculate-then-create flow, that
+you may refund less and that an <b>order adjustment is created automatically</b> for the discrepancy —
+<a href="https://shopify.dev/docs/api/admin-rest/unstable/resources/refund">Refund</a>. The
+<code>refundCreate</code> versus <code>returnRefund</code> restocking difference, and the idempotency key being
+<b>optional from 2026-01 and required from 2026-04</b> via <code>@idempotent</code> —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/Refund">Refund — GraphQL Admin</a>. The
+order-edit mutation set — <a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/CalculatedLineItem">CalculatedLineItem</a>.
+All three operations above were <b>validated against the 2026-07 schema</b>. Scopes:
+<code>write_order_edits</code>, <code>read_order_edits</code>, <code>read_orders</code>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your integration refunds an order. The call times out — but it actually succeeded. Your retry logic fires.
+  <b>What happens on 2026-01, and what happens on 2026-07?</b>
+</div>
+
+<p>On <b>2026-01</b>, where the idempotency key is optional and you did not send one: the customer is refunded
+<b>twice</b>. Real money, out of the merchant's account, and the only signal is a second transaction that looks
+deliberate.
+<br><br>
+On <b>2026-07</b>, where the key is required: if you sent one, the retry is recognised and does nothing — correct.
+If your code predates the requirement and sends no key, <b>the call is rejected outright</b> and no refund happens
+at all. That is a different bug, and a much better one: it fails loudly instead of paying twice.
+<br><br>
+The lesson underneath is the whole of A3.3, now enforced by the platform: <b>a write that moves money must be safe
+to repeat, and Shopify stopped trusting developers to remember.</b></p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a refund with no idempotency key</span>
+  On older versions, a retried refund pays the customer twice. On current versions the call is rejected. Either
+  way, code written before 2026-04 needs changing.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — calculating the refund amount yourself</span>
+  Discounts already applied, proportional tax, and prior partial refunds all affect it. Use
+  <code>suggestedRefund</code> and refund from its answer.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — the wrong refund mutation</span>
+  <code>returnRefund</code> takes no restocking input. Use it for a change-of-mind return and the stock never
+  comes back — you have quietly written off sellable inventory.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — restocking a faulty item</span>
+  The reverse. A damaged item restocked becomes phantom stock: Shopify will sell it, and nobody can ship it.
+  Overselling caused by a refund.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — committing an order edit nobody looked at</span>
+  The draft phase exists so a human can check. Skip it and an automated edit changes what a customer paid,
+  correctly according to your code and wrongly according to the customer.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — an unexpected customer email</span>
+  <code>notifyCustomer</code> on the commit, and the notify option on a refund, both send mail. A bulk correction
+  run with notification on emails every affected customer about an order they had forgotten.
+</div>
+
+<div class="scar">
+  <span class="who">Refunds arriving in your ERP as new orders</span>
+  A refund is not an order. Anything consuming order webhooks must handle a refund as an <em>amendment</em> —
+  otherwise your ERP sees revenue where money left the account.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — decide who may refund automatically</span>
+  Shopify will let your app refund without a human. Almost no client should allow that unconditionally. Agree a
+  ceiling — an amount, or a rule — in writing, and put anything above it in a queue for a person. This is a
+  business control, not a technical one, and offering it unprompted is what a lead does.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked for automatic refunds</span>
+  <q>I can do that, and I'd want a limit on it before we switch it on. Refunds move real money out of your
+  account, and if our logic is wrong it's wrong repeatedly and quietly. My suggestion: refund automatically up to
+  a value you're comfortable losing to a bug, and anything above that goes to a person. What's that number for
+  you?</q>
+  <span class="why-said">Says yes, names the specific risk, proposes the control, and hands them the one decision
+  only they can make.</span>
+</div>
+
+<div class="script">
+  <span class="who">On restocking</span>
+  <q>One question per return type, and it matters more than it sounds. When someone returns something faulty, do
+  you want it back in sellable stock? I'd say no — otherwise the website will sell it and nobody can ship it. But
+  for a change of mind, yes. I need that rule per reason code, not one setting for everything.</q>
+  <span class="why-said">Turns an invisible technical flag into a question about their warehouse, which they can
+  answer confidently.</span>
+</div>
+
+<div class="script">
+  <span class="who">When an order needs changing after payment</span>
+  <q>I can edit a paid order, and Shopify lets me build the change as a draft first so someone can see the new
+  total before it's applied. I'd keep that step even when it's tempting to automate — this is the one operation
+  where the customer already has a receipt that says something different.</q>
+  <span class="why-said">Explains a deliberate slowdown by naming what the customer is holding. Nobody argues with
+  that.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A refund moves money, stock and tax at once.</b> Get one right and the others wrong and nothing errors.</li>
+  <li><b>Calculate first.</b> <code>suggestedRefund</code> accounts for discounts, proportional tax and prior refunds.</li>
+  <li><b>Refunding less creates an order adjustment automatically</b> in the store's financial reports.</li>
+  <li><b><code>refundCreate</code> takes restocking input; <code>returnRefund</code> does not.</b> Choose deliberately.</li>
+  <li><b>The idempotency key is REQUIRED from 2026-04</b> via <code>@idempotent</code>. Optional from 2026-01.</li>
+  <li><b>Order editing is begin → mutate a draft → commit.</b> Keep a human on the commit.</li>
+  <li><b>Both refunds and edits can email the customer.</b> Set that flag explicitly, especially on a bulk run.</li>
+</ul>
+<p class="one-thing">If you remember one thing: Shopify now <em>requires</em> an idempotency key on refunds — the
+platform stopped trusting developers to make money-moving writes safe to repeat.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for payments — the other half of the money gap.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0025-tax-what-shopify-does-and-where-you-must-not-guess.html">← P7.3</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

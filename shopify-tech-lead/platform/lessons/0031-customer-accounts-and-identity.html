@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P9.3 — Customer Accounts and Identity</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P9 · Lesson 3</p>
+<h1>Customer accounts and identity</h1>
+<p class="subtitle">There are two versions, and the old one supports none of this. Check first.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You check which account version a store uses <em>before</em> scoping, and you
+  know the three approvals a customer-facing extension needs before it can go live.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is a customer account for?</h3>
+
+<p>Order history, order status, profile editing, and taking action on an order. That is genuinely all — which means
+it is the one surface where <b>the customer returns after buying</b>. Everything valuable there is post-purchase:
+returns, loyalty, subscriptions, tracking.</p>
+
+<h3>First, the fork in the road</h3>
+
+<div class="trap">
+  <span class="label">Check this before you scope anything</span>
+  There are <b>two versions</b> of customer accounts. <b>Customer account UI extensions are only supported on the
+  new version. Legacy customer accounts do not support them at all.</b>
+  <br><br>
+  Query the <b><code>CustomerAccountsV2</code></b> object to find out which a merchant is on. Ten seconds, and it
+  is the difference between a feature being buildable and not existing.
+</div>
+
+<p>So the first question on any customer-account request is not "what should it do" — it is "which version are they
+on". Scoping a loyalty panel for a store on legacy accounts is scoping something impossible.</p>
+
+<h3>What you can extend</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Page</th><th>Is</th><th>Good for</th></tr>
+  <tr><td><b>Order index</b></td><td>The landing page after login. Lists all orders — <b>including draft orders they have been invoiced for</b></td><td>Order actions, suggestions from history, loyalty offers</td></tr>
+  <tr><td><b>Order status</b></td><td>One order: view, track, manage. Returns start here</td><td>Tracking, reviews, surveys, points earned</td></tr>
+  <tr><td><b>Profile</b></td><td>Personal details and addresses. <b>For B2B, also company information</b></td><td>Membership level, points balance, customer metafields</td></tr>
+  <tr><td><b>New pages</b></td><td>Full-page extensions you create</td><td>Wishlist, subscriptions, rewards</td></tr>
+</table>
+</div>
+
+<p>Two connections worth noticing. The order index showing <b>invoiced draft orders</b> ties straight to
+<a href="0028-draft-orders-selling-outside-the-storefront.html">P8.3</a> — a B2B buyer sees their invoices here.
+And the profile page carrying <b>company information</b> ties to
+<a href="0029-b2b-companies-catalogs-and-price-lists.html">P9.1</a>.</p>
+
+<h3>The shape is the same as every other extension</h3>
+
+<p>Polaris, and three parts: <b>targets</b> (where you appear), <b>target APIs</b> (what data you can reach),
+<b>web components</b> (what you render). Preact TSX plus a TOML config, scaffolded with
+<code>shopify app generate extension</code>. If you have read
+<a href="0008-the-till-pos-lite-pro-the-retail-order-and-ui-extensions.html">P3.3</a> or
+<a href="0014-checkout-extensibility.html">P5.2</a>, this is the third time — the pattern is deliberate.</p>
+
+<pre><code># shopify.extension.toml
+[[extensions.targeting]]
+target = "customer-account.order-status.block.render"
+module = "./src/OrderStatusBlock.tsx"
+
+[[extensions.targeting]]
+target = "customer-account.profile.block.render"
+module = "./src/ProfileBlock.tsx"
+
+[[extensions.targeting]]
+target = "customer-account.page.render"        # a whole new page
+module = "./src/LoyaltyPage.tsx"
+
+[extensions.capabilities]
+api_access     = true
+network_access = true                          # needs Partner Dashboard approval
+
+[extensions.capabilities.collect_buyer_consent]
+customer_privacy = true</code></pre>
+
+<h3>Three approvals, and they are the schedule risk</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>What</th><th>Approval needed</th></tr>
+  <tr><td>Accessing customer data at all</td><td><b>Protected customer data access must be approved before it can go live</b></td></tr>
+  <tr><td>Calling your own backend</td><td><code>network_access = true</code> <b>and</b> a request in the Partner Dashboard</td></tr>
+  <tr><td>Collecting buyer consent</td><td>Declared as a capability</td></tr>
+</table>
+</div>
+
+<p>All three work fine in development and block you at launch. That is a schedule risk, not a technical one:
+<b>request them at the start of the build, not the end.</b> And remember from
+<a href="../../apps/lessons/0004-scopes-protected-customer-data-and-compliance.html">A1.4</a> that touching a name,
+address, phone or email puts you at privacy <b>level 2</b> — which is exactly what a customer account extension
+does by definition.</p>
+
+<h3>The CORS trap</h3>
+
+<div class="scar silent">
+  <span class="who">Documented, specific, and invisible until it fails</span>
+  UI extensions run in a <b>Web Worker with a null origin</b>. So if your extension fetches from your backend,
+  <b>your server must return <code>Access-Control-Allow-Origin: *</code></b>. A normal allow-list of domains will
+  not match, because there is no origin to match.
+  <br><br>
+  And the alternative worth considering first: if the data is not truly dynamic, <b>use metafields instead of a
+  network call</b>. Shopify says so explicitly, and it removes the approval, the CORS problem and the latency at
+  once.
+</div>
+
+<h3>The migration fact nobody plans for</h3>
+
+<p>From <a href="0021-what-a-migration-is-and-what-never-moves.html">P6.5</a>: <b>passwords never move between
+platforms.</b> Modern customer accounts can sign a customer in with a <b>one-time code sent to their email</b>,
+which removes the password problem entirely — and turns a technical dead end into a communications plan. Raise it
+in the first meeting.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> two account versions with <b>legacy not supporting UI
+extensions</b>, and <code>CustomerAccountsV2</code> as the way to detect which; the four extendable surfaces
+including draft orders on the order index and company information on the B2B profile; Polaris with
+targets/target APIs/web components; the TOML targets and capabilities shown above; <b>protected customer data
+access required before going live</b>; <code>network_access</code> needing a Partner Dashboard request; the
+<b>null origin requiring <code>Access-Control-Allow-Origin: *</code></b>; metafields as the alternative to network
+calls; and that the latest version <b>replaces checkout metafields with order metafields</b> —
+<a href="https://shopify.dev/docs/apps/build/customer-accounts">Building apps for customer accounts</a> and
+<a href="https://shopify.dev/docs/api/customer-account-ui-extensions/2025-07">Customer account UI extensions</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client wants a loyalty points balance shown in their customers' accounts. Points live in an external loyalty
+  system. <b>Name the four things you must establish before giving an estimate.</b>
+</div>
+
+<p><b>1 · Which account version are they on?</b> Query <code>CustomerAccountsV2</code>. On legacy accounts, UI
+extensions do not exist and the answer is "not possible without migrating first" — which is a different project.
+<br><br>
+<b>2 · Has protected customer data access been approved?</b> Showing a balance against a named customer is
+customer data. It works in development and blocks at launch.
+<br><br>
+<b>3 · Network access, or metafields?</b> If points can be synced periodically into a metafield, you avoid the
+Partner Dashboard request, the CORS work and the latency. If they must be live, you need
+<code>network_access</code> plus approval, and your server must send
+<code>Access-Control-Allow-Origin: *</code>.
+<br><br>
+<b>4 · What shows when the loyalty system is down?</b> A points balance is <em>information</em>, so fail open —
+hide the panel. Same rule as <a href="../../apps/lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">A4.1</a>.
+<br><br>
+Three of those four are approvals and version checks rather than code. That is what makes this area's estimates go
+wrong.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — scoping extensions for legacy accounts</span>
+  Legacy customer accounts support none of this. Discovering it after quoting means the real project is an account
+  migration. Query <code>CustomerAccountsV2</code> first.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — approvals requested at the end</span>
+  Protected customer data access and network access both work in development and block go-live. Request them on
+  day one.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a domain allow-list for CORS</span>
+  Extensions run with a <b>null origin</b>. An allow-list matches nothing. You need
+  <code>Access-Control-Allow-Origin: *</code>, and the failure looks like an empty panel.
+</div>
+
+<div class="scar">
+  <span class="who">A network call where a metafield would do</span>
+  Every network call adds an approval, a CORS surface, latency and a failure mode. Shopify's own advice is to prefer
+  metafields when the data is not truly live.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — checkout metafields after upgrading</span>
+  The latest extension version <b>replaces checkout metafields with order metafields</b>. Code reading the old
+  location finds nothing after an upgrade.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — the login surprise on migration day</span>
+  Passwords never transfer. Every returning customer fails to sign in on go-live morning, and nothing is broken.
+  One-time email codes plus a communications plan is the fix.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — this is privacy level 2 by definition</span>
+  A customer account extension shows a named customer their own data, so you are handling name and email whether
+  you meant to or not. Assume level 2 and its data-protection review from the start rather than discovering it
+  during app review.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The first question, always</span>
+  <q>Before I estimate, let me check which version of customer accounts you're on — there are two, and the older
+  one can't run app content in accounts at all. It's a ten-second check. If you're on the old one, this becomes a
+  migration conversation first, which I'd rather know now than in three weeks.</q>
+  <span class="why-said">A ten-second check that can save three weeks, framed as protecting them rather than as
+  doubt.</span>
+</div>
+
+<div class="script">
+  <span class="who">On approvals</span>
+  <q>Two approvals from Shopify sit on the critical path, and both work fine in testing and block us at launch —
+  access to customer data, and permission for the extension to call our server. I'll request both this week. If
+  they're slow, the date moves, and I'd rather that risk be visible now.</q>
+  <span class="why-said">Names an external dependency early, exactly as R2.2 teaches. Absent from the estimate, the
+  delay would look like yours.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Two versions. Legacy supports no UI extensions.</b> Query <code>CustomerAccountsV2</code> before scoping.</li>
+  <li><b>Four surfaces:</b> order index, order status, profile, and full new pages.</li>
+  <li><b>The order index lists invoiced draft orders</b>; the B2B profile carries company information.</li>
+  <li><b>Three approvals</b> — protected customer data, network access, buyer consent. Request on day one.</li>
+  <li><b>Null origin means <code>Access-Control-Allow-Origin: *</code></b>. An allow-list matches nothing.</li>
+  <li><b>Prefer metafields over a network call.</b> It removes an approval, CORS and latency together.</li>
+  <li><b>Passwords never migrate.</b> One-time email codes plus a communications plan.</li>
+</ul>
+<p class="one-thing">If you remember one thing: check the account version first — on legacy accounts, everything in
+this Lesson is unavailable.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for search and discovery.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0030-subscriptions-and-selling-plans.html">← P9.2</a></span>
+  <span><a href="0032-search-filtering-and-discovery.html">P10.1 · Search →</a></span>
+</div>
+
+</div>
+</body>
+</html>

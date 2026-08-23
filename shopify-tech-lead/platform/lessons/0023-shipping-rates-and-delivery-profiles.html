@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7.1 — Shipping Rates and Delivery Profiles</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P7 · Lesson 1</p>
+<h1>Shipping rates and delivery profiles</h1>
+<p class="subtitle">Five nested objects between a product and a price at checkout. Miss one and the rate disappears.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can answer "why is no shipping rate showing?" by walking the chain, and
+  you know why "we ship heavy items differently" is a whole extra profile rather than a setting.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does a shipping price depend on?</h3>
+
+<p>A customer at checkout needs a number. Ask what it can possibly depend on, from first principles:</p>
+
+<div class="diagram">
+  WHAT is being shipped   ── a sofa costs more than a card
+  FROM where              ── which warehouse or shop
+  TO where                ── which country
+  HOW MUCH of it          ── weight, or cart value
+</div>
+
+<p>Four inputs. So Shopify's model is four nested groupings, plus the rate itself — and that is exactly the
+object chain:</p>
+
+<div class="diagram">
+  Delivery profile        shipping settings for a GROUP OF VARIANTS
+   │                       e.g. one for heavy items, one for fragile
+   ├── Profile items       which products and variants are in it
+   │
+   └── Location group      a set of locations that ship to the SAME zones
+        │                   e.g. "Americas" ships to Canada and Germany
+        │
+        └── Delivery zone  a group of COUNTRIES
+             │
+             └── Delivery method   the static or carrier-calculated rate
+                  │                 static rates can be CONDITIONAL
+                  └── Rate         the number the customer sees
+</div>
+
+<p>Feynman version: <b>a profile answers "which things", a location group answers "from where", a zone answers
+"to where", and a method answers "how much".</b> All four must line up or the customer sees nothing.</p>
+
+<h3>The profile is the part people miss</h3>
+
+<p>Every store has a <b>default</b> profile containing everything. You create a second profile when a group of
+variants needs genuinely different shipping — heavy goods, fragile goods, items that only ship from one
+warehouse.</p>
+
+<p>Once a variant is in a custom profile it is <b>no longer covered by the default one</b>. So the classic
+failure is: someone creates a "Bulky items" profile, adds products to it, and forgets to configure a zone for
+one country. Those products now have <em>no rate at all</em> in that country, while every other product is
+fine.</p>
+
+<h3>Rate types</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Type</th><th>Based on</th><th>Notes</th></tr>
+  <tr><td><b>Flat</b></td><td>Nothing. A fixed price</td><td>Simplest, and what most stores should start with</td></tr>
+  <tr><td><b>Weight-based</b></td><td>Cart weight bands</td><td>Needs weights on <em>every</em> variant. A missing weight counts as zero</td></tr>
+  <tr><td><b>Price-based</b></td><td>Cart total bands</td><td>This is how "free shipping over $100" is built</td></tr>
+  <tr><td><b>Carrier-calculated</b></td><td>A live call to a carrier or your app</td><td><a href="0024-carrier-calculated-rates-your-server-inside-checkout.html">P7.2</a> — a different job entirely</td></tr>
+</table>
+</div>
+
+<p>Static rates support <b>conditions</b>: a rate that applies only when the cart total is at or above a
+threshold, or the weight is within a band. That is the mechanism behind free shipping — it is a conditional
+rate of zero, not a discount.</p>
+
+<h3>Local pickup and local delivery</h3>
+
+<p>These are separate delivery methods, not shipping rates. A location can offer <b>local pickup</b> (the
+customer collects) or <b>local delivery</b> (you drive it). Both connect back to
+<a href="0007-locations-and-multi-location-inventory.html">P3.2</a>: a location is only usable for online
+orders when it is configured with shipping rates, local pickup, or local delivery.</p>
+
+<div class="scar">
+  <span class="who">One documented limitation worth knowing</span>
+  For <b>subscription</b> checkouts, if the customer chooses local pickup or local delivery, that method applies
+  to the <b>entire order</b>. <b>Mixed delivery methods are not supported</b> — so a cart with a one-time item and
+  a subscription cannot have one collected and the other shipped.
+</div>
+
+<h3>Reading it all in one query</h3>
+
+<pre><code>query DeliveryProfiles {
+  deliveryProfiles(first: 10) {
+    nodes {
+      id name default
+      activeMethodDefinitionsCount
+      productVariantsCount { count }
+      profileLocationGroups {
+        locationGroup { id locations(first: 10) { nodes { name } } }
+        locationGroupZones(first: 20) {
+          nodes {
+            zone { id name countries { code { countryCode } } }
+            methodDefinitions(first: 20) {
+              nodes {
+                id name active
+                rateProvider {
+                  __typename
+                  ... on DeliveryRateDefinition {
+                    price { amount currencyCode }
+                  }
+                  ... on DeliveryParticipant {
+                    carrierService { id formattedName }
+                    percentageOfRateFee
+                    fixedFee { amount currencyCode }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<p>Read the nesting — it <em>is</em> the model. And note <code>rateProvider</code> is a union: a
+<code>DeliveryRateDefinition</code> is a static price; a <code>DeliveryParticipant</code> is a carrier service,
+optionally with a markup (<code>percentageOfRateFee</code>, <code>fixedFee</code>) applied on top of whatever
+the carrier returns.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the profile → profile items → location group → zone → method →
+rate hierarchy, that a profile groups <em>variants</em>, that static rates support conditional rates such as
+free shipping over a threshold, and the <code>profiles/create</code>, <code>profiles/update</code>,
+<code>profiles/delete</code> webhook topics —
+<a href="https://shopify.dev/docs/apps/build/purchase-options/deferred/delivery-and-deferment">About delivery for Pre-orders and TBYB</a>.
+The subscription mixed-method limitation —
+<a href="https://shopify.dev/docs/apps/build/purchase-options/subscriptions/selling-plans">About selling plans</a>.
+Rate type names (<code>weight_based_shipping_rates</code>, <code>price_based_shipping_rates</code>,
+<code>carrier_shipping_rate_providers</code> with <code>flat_modifier</code> and
+<code>percent_modifier</code>) — <a href="https://shopify.dev/docs/api/admin-rest/2026-01/resources/shippingzone">ShippingZone</a>.
+The query above was <b>validated against the 2026-07 Admin schema</b>. Scope for carrier services:
+<code>read_shipping</code>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "customers in Germany can't check out — it says no shipping available. But it works for
+  everyone else." <b>Walk the chain and name the four things to check, in order.</b>
+</div>
+
+<p>In order, cheapest first:
+<br><br>
+<b>1 · Which profile are those products in?</b> If they are in a custom profile, the default profile's Germany
+zone does not help them. This is the answer most of the time.
+<br>
+<b>2 · Does that profile have a location group containing a location that can ship?</b> A location needs shipping
+rates, local pickup or local delivery configured to fulfil online orders at all.
+<br>
+<b>3 · Is Germany in a zone on that location group?</b> A zone is a list of countries; Germany may simply be
+absent.
+<br>
+<b>4 · Does that zone have an active method whose conditions the cart meets?</b> A weight-based rate with bands
+0–5 kg gives nothing to a 6 kg cart. A price-based rate starting at $50 gives nothing to a $30 cart.
+<br><br>
+Notice that step 4 is the only one that depends on the <em>cart</em>. Steps 1 to 3 are configuration, which is
+why "it works for everyone else" is a strong hint the answer is step 1 or 3.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a custom profile with an incomplete zone list</span>
+  Moving variants into a new profile removes them from the default one. Forget a country and those products have
+  <b>no rate at all</b> there — the customer cannot check out, and every other product looks fine, so nobody
+  suspects configuration.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a missing variant weight</span>
+  Weight-based rates need a weight on every variant. A blank weight is treated as zero, so a heavy item can
+  silently fall into the cheapest band and you ship it at a loss.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — free shipping built as a discount</span>
+  A conditional rate of zero and a shipping discount code behave differently, combine differently, and report
+  differently. If the client means "free over $100 for everyone", that is a <b>conditional rate</b>, not a
+  discount.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a location that cannot fulfil online orders</span>
+  A location must be configured with shipping rates, local pickup or local delivery to be usable online. In the
+  profile it looks present; at checkout it contributes nothing.
+</div>
+
+<div class="scar">
+  <span class="who">Assuming one rate per order</span>
+  When more than one rate is available the <b>customer chooses</b>. So your fulfilment logic must read what they
+  picked, not assume the cheapest or the only one.
+</div>
+
+<div class="scar">
+  <span class="who">Mixed delivery methods on a subscription checkout</span>
+  Documented as unsupported: pickup or local delivery applies to the whole order. A cart mixing a subscription
+  and a one-time item cannot split methods.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — profiles multiply your test matrix</span>
+  Every profile × location group × zone × condition is a case that can be wrong on its own. Two profiles is not
+  twice the testing, it is closer to four times. Push back on a third profile unless the shipping economics
+  genuinely differ, and keep a written list of the country-and-cart combinations you actually tested.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks for different shipping on heavy items</span>
+  <q>That's a separate shipping profile, which is a bigger change than it sounds. Once those products are in
+  their own profile they stop using your normal rates entirely — so we have to set up every country and every
+  rate again for them. Worth doing if the economics are really different. If it's just "a bit more", a
+  weight-based band on your existing rates is far less to maintain.</q>
+  <span class="why-said">Names the real cost — duplicated configuration and a doubled test matrix — and offers
+  the cheaper option. Most clients take the band.</span>
+</div>
+
+<div class="script">
+  <span class="who">When customers in one country cannot check out</span>
+  <q>That's almost always configuration rather than a bug, and it's usually one of two things: those products
+  are in a separate shipping profile that doesn't list that country, or the country isn't in any zone. I can
+  check both in about ten minutes. Nothing is broken — there's just no rate for that combination, and checkout
+  won't let someone through without one.</q>
+  <span class="why-said">Reassures, names the two likely causes specifically, and gives a time. "No rate
+  exists" is a much calmer explanation than "checkout is broken".</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Profile → location group → zone → method → rate.</b> All four must line up or the customer sees nothing.</li>
+  <li><b>A profile groups variants.</b> Moving a variant into a custom profile removes it from the default one.</li>
+  <li><b>Four rate types:</b> flat, weight-based, price-based, carrier-calculated.</li>
+  <li><b>Free shipping is a conditional rate of zero</b>, not a discount. They behave differently.</li>
+  <li><b>A blank variant weight counts as zero</b> and silently falls into the cheapest band.</li>
+  <li><b>A location needs rates, pickup or local delivery configured</b> to fulfil online orders at all.</li>
+  <li><b>The customer picks the rate</b> when several are offered. Read what they chose.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "no shipping available" is almost never a bug — it means one
+link in the profile → group → zone → method chain does not cover that cart.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the version where your own server has to answer inside checkout.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0022-orders-money-and-the-shopify-to-shopify-replatform.html">← P6.6</a></span>
+  <span><a href="0024-carrier-calculated-rates-your-server-inside-checkout.html">P7.2 · Carrier rates →</a></span>
+</div>
+
+</div>
+</body>
+</html>
