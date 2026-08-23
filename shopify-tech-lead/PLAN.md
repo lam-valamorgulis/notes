@@ -305,6 +305,7 @@ are code, not reading.
 | **10** | Goal change to *domain expert*: remove the client/PM block, add **Say it out loud** and **Build it** to all 83 Lessons | **done** |
 | **11** | Write the last 9 gap Lessons (92 total) | **done** |
 | **12** | Re-check everything, rebuild the territory map a third time, recount | **done** |
+| **13** | `reference/the-spine.html` — the 28-step reading order, with a `spine NN` pill on every step's Track Map | **done** |
 
 ### What is written
 
@@ -314,7 +315,7 @@ the queue plus dead-letter plus the reconciliation report with its ten-row break
 Nothing is left to *write*. What remains is to **do**: build the Project. Step 3 onward needs a Dev
 store and a public tunnel, and the store work was deliberately deferred.
 
-**All 16 References:** three Scars pages, the territory map, the topic phrasebook, the Glossary, object model card, what-moves matrix,
+**All 17 References:** three Scars pages, the territory map, the spine, the topic phrasebook, the Glossary, object model card, what-moves matrix,
 migration runbook, ownership matrix, conflict cases, rate limits card, phrasebook, rapid-fire,
 STAR worksheet, mock run sheets.
 
@@ -416,6 +417,33 @@ both upgrade paths.
 **This is the most valuable thing the gap research produced** — not a new Lesson, but a
 correction to one that already existed. Worth remembering as a habit: researching adjacent
 topics is how you find out what you already teach has changed.
+
+### The spine — resolving the 20/80 request properly (2026-08-23)
+
+The learner asked to be taught "the 20% that drives 80%", then chose to have all 92 Lessons
+treated equally. Those two answers left the 20% as an idea with nothing implementing it.
+
+`reference/the-spine.html` is the resolution: **28 numbered steps — 23 Lessons plus the 5
+Project steps — ordered by what depends on what, not by Track.** Every step also carries a
+`spine NN` pill on its Track Map, so the path is visible while browsing rather than only on one
+page.
+
+**The selection test, applied to all 92:** *if you did not know this, would it stop you shipping
+an integration?* Not "is it useful" — everything in the Course is useful. Stop-you-shipping.
+
+**The bet that test encodes, stated on the page itself:** that most Shopify integration work is
+catalogue and inventory moving between two systems with orders coming back. If the actual job is
+B2B pricing, a migration, or payments, the relevant Lesson is *off* the spine and should be read
+anyway. The spine is a starting order, not a ranking of importance.
+
+**Track 3 has zero spine steps**, and its Map says so explicitly rather than leaving the absence
+to be noticed. You can ship working code without being able to explain it — but being unable to
+explain a design, give a range, or say "I don't know yet" is what stops the work from being given
+to you at all. So Track 3 is read *alongside* the spine, not after it.
+
+**Three separate ideas now coexist and the root Map keeps them apart:** `core`/`depth` is
+position within a Chapter; `spine NN` is position in the reading order; the territory map rates
+areas by *pain*. A Lesson can be core and not on the spine.
 
 ### The old Course is deleted — what it needed first
 

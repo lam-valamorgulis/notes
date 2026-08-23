@@ -42,6 +42,15 @@ The one Reference per Track that collects every "Where it hurts" block from that
 Track's Lessons into a single page.
 _Avoid_: gotchas, pitfalls, traps, war stories
 
+**Spine**:
+The 28 numbered steps — 23 Lessons plus the 5 Project steps — that are the
+shortest honest route to building an integration alone. The number is a **reading
+order** and crosses Tracks, so it is not the same as a Chapter position. Lives in
+`reference/the-spine.html`, and every step carries a `spine NN` pill on its Track
+Map. A Lesson can be **core** and not on the spine: core means "on the main path
+of its own Chapter", spine means "not knowing this stops you shipping".
+_Avoid_: critical path, must-reads, fast track, essentials, the 20%
+
 ## Lesson anatomy
 
 Every Lesson has these five blocks, in this order. The names are fixed.
