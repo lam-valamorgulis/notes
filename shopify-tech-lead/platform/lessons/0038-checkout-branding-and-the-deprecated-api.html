@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P5.6 — Checkout Branding</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P5 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Checkout branding, and the API that is already deprecated</h1>
+<p class="subtitle">The answer to "can we restyle checkout?" — plus a worked example of reading a deprecation notice properly.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can answer the restyling question with the plan gate and the mechanism, and you have seen why "it is in the docs" and "it is current" are different claims.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what can you change about a page you do not own?</h3>
+
+<p>P5.2 established why checkout was closed: it is where the money happens, and it was the one page anyone
+could put arbitrary code on. So the answer to "can we restyle checkout?" cannot be "yes, write CSS".</p>
+
+<p>What you get instead is a <b>controlled vocabulary</b>. Shopify defines the things that can vary — colours,
+type, spacing, corners, imagery, which components are visible — and you supply values. You are filling in a
+form, not writing a stylesheet. That is deliberate: Shopify can keep improving checkout because it knows every
+possible variation in advance.</p>
+
+<p>The <code>CheckoutBranding</code> object has two halves:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Field</th><th>What it holds</th></tr>
+  <tr><td><code>designSystem</code></td><td>The foundations — colour roles, typography scales, spacing units. Set these once and they apply throughout.</td></tr>
+  <tr><td><code>customizations</code></td><td>Specific components and areas — sections, dividers, interactive elements, visibility.</td></tr>
+</table>
+</div>
+
+<p>The split matters more than it looks. The design system is where you make <b>broad</b> changes consistently;
+customizations are where you override <b>one</b> thing. Doing everything through customizations produces a
+checkout that looks fine and cannot be adjusted later without touching twenty places.</p>
+
+<p>Different colour schemes can be defined for different contexts, which is how contrast and accessibility stay
+correct across checkout states rather than being something you hand-check.</p>
+
+<h3>The plan gate, which is more generous than people assume</h3>
+
+<p><code>CheckoutBranding</code> requires access to checkout branding settings <b>and the shop must be on a
+Plus plan <em>or</em> a Development store plan</b>.</p>
+
+<p>That second half is the useful part. You can build and rehearse the whole thing on a dev store without Plus —
+which, per P5.1, is exactly why "do we need Plus?" has to be answered per feature. Here the answer is "yes for
+a live shop, no to learn it".</p>
+
+<h3>Now read the deprecation notice, because this is the real lesson</h3>
+
+<p>Look at how you would actually use it. The query is <code>checkoutBranding</code>, taking a required
+<code>checkoutProfileId</code>. The mutation is <code>checkoutBrandingUpsert</code>, taking a
+<code>CheckoutBrandingInput</code> and a required <code>checkoutProfileId</code>, where passing
+<code>null</code> resets to default.</p>
+
+<p><b>Both are marked Deprecated in 2026-07.</b></p>
+
+<p>Read that carefully, because it is a pattern worth internalising. The <em>object</em> is documented, current
+and fully described. The <em>ways in</em> are deprecated. So a search that lands you on the object page shows
+you something that looks completely healthy, and the deprecation is on the query and mutation pages you did not
+open.</p>
+
+<p>This is the same shape as P1.3&#39;s falling forward: nothing errors, nothing warns you in the place you
+looked, and the signal is somewhere adjacent. Before building on any surface, check the deprecation state of the
+<b>operations</b>, not just the type.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> that <code>CheckoutBranding</code> requires access to checkout
+branding settings and the shop must be on a <b>Plus plan or a Development store plan</b>; that it exposes
+<code>designSystem</code> (colour roles, typography scales, spacing units) and <code>customizations</code>
+(sections, dividers, interactive elements, visibility); that different colour schemes can be defined per
+context; and that the <code>checkoutBranding</code> query and the <code>checkoutBrandingUpsert</code> mutation
+are both <b>marked Deprecated</b>, both take a required <code>checkoutProfileId</code>, and that passing
+<code>null</code> to the input resets settings to default —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/CheckoutBranding">CheckoutBranding</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client on the Basic plan asks you to match checkout to their brand. <b>Give the three-part answer.</b>
+</div>
+
+<p>One: what is possible — colours, type, spacing, imagery and component visibility, through a defined set of
+values rather than free CSS. Two: what it costs — checkout branding needs <b>Plus</b> on a live shop, so this is
+a plan upgrade conversation before it is a development one. Three: what could go wrong — the API surface for it
+is already deprecated, so before committing I would confirm the current supported route and put the date on the
+answer. That third part is what separates a real answer from a confident one.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — building on the deprecated operations</span>
+  The <code>checkoutBranding</code> query and <code>checkoutBrandingUpsert</code> mutation are both marked
+  <b>Deprecated</b> in 2026-07. Building on them without checking the current route is signing up for a rewrite
+  you were told about in advance.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — reading the object page and stopping</span>
+  The <code>CheckoutBranding</code> <em>object</em> page looks entirely current. The deprecation is on the
+  <em>query and mutation</em>. Check the operations, not the type — this is the same silence as falling forward
+  in P1.3.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — promising checkout styling on a non-Plus live shop</span>
+  It needs <b>Plus</b> for a live store. Dev stores can do it, which makes the demo work and the go-live
+  fail — the worst possible ordering.
+</div>
+
+<div class="scar">
+  <span class="who">Doing everything through customizations</span>
+  The design system exists so broad changes stay consistent. Override component by component and the next
+  adjustment touches twenty places, which is how a "quick branding tweak" becomes a day.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — passing <code>null</code> without meaning to</span>
+  Passing <code>null</code> to the input <b>resets settings to default</b>. A partial payload that nulls a
+  section is not "leave it alone" — it is "put it back", which is the same whole-state trap as
+  <code>productSet</code> in P6.2.
+</div>
+
+<div class="scar">
+  <span class="who">Hand-checking contrast</span>
+  Colour schemes can be defined per context precisely so accessibility holds across checkout states. Setting one
+  scheme and eyeballing the rest produces unreadable text in a state nobody tested.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — this is usually not your decision</span>
+  Checkout appearance is a designer&#39;s call and a brand call. Your job is to say what is possible, what it
+  needs, and what the risks are. A developer choosing the colour roles is a developer who will be asked to
+  change them repeatedly.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">Explain the difference between "this is in the documentation" and "this is the current way to
+  do it" — using this API as the example.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Documentation describes what <em>exists</em>. It does not promise that what exists is what you should
+build on.</p>
+
+<p>Here is the exact situation. There is a page describing the thing that holds all the checkout appearance
+settings. It is detailed, it is current, and reading it you would have no idea anything was wrong.</p>
+
+<p>But the two <em>doors</em> into that thing — the one for reading the settings and the one for changing them —
+are both marked as being on their way out. And those marks are on <em>different pages</em>. So you can read the
+main page carefully, understand it correctly, and start building on something you were warned about on a page
+you never opened.</p>
+
+<p>The general habit: the thing and the way in are documented separately, and they can be in different states.
+So before building, check the state of the <b>operations you will actually call</b>, not just the object you
+read about.</p>
+
+<p>And this is the same shape as the version problem. Nothing errors. Nothing warns you where you were looking.
+The signal exists, one page sideways.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>deprecated · sunset · API surface · type versus operation · breaking change.</em> "The thing and the door
+  into it are documented separately and can be in different states" is the explanation.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 30 minutes <span class="needs">no store needed</span></span>
+  <p>Build the habit this Lesson is really about.</p>
+  <ol>
+    <li>List every Shopify operation your integration calls — queries and mutations, not types.</li>
+    <li>Open each one&#39;s own reference page and record whether it is marked <b>deprecated</b>.</li>
+    <li>Write today&#39;s date next to the list.</li>
+    <li>Add this check to your CI alongside the schema validation from A2.4, so it cannot go stale.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you found at least one deprecation you did not know about. This
+  Course found <b>three already-deprecated fields</b> that way, every one inside a query that looked obviously
+  correct.</p>
+</div>
+
+<div class="task">
+  <span class="label">Then actually brand a checkout · 60 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>On a dev store — which qualifies without Plus — set the <b>design system</b> first: colour roles,
+        typography, spacing.</li>
+    <li>Only then add one <b>customization</b> for a single component.</li>
+    <li>Now change the brand colour once, in the design system, and confirm it moves everywhere.</li>
+    <li>Send a partial input that nulls one section. Watch it <b>reset to default</b> rather than stay put.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> one edit changed the whole checkout, and you have personally reset a
+  section by passing <code>null</code>. That is the whole-state trap again, and it is cheaper to meet here than
+  on a live shop.</p>
+</div>
+
+<div class="task">
+  <span class="label">The client answer · 15 minutes, recorded <span class="needs">a voice recorder</span></span>
+  <p>Record the three-part answer to "can we restyle checkout?" — what is possible, what plan it needs, and the
+  fact that you would confirm the current route before committing.</p>
+  <p class="proof"><b>Proof it worked:</b> the third part is in there. Saying "let me confirm the supported route
+  and come back with the date I checked" is the R5.3 habit, and it is the part that makes the first two
+  trustworthy.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>You get a controlled vocabulary, not CSS.</b> Shopify defines what can vary; you supply values.</li>
+  <li><b>Two halves:</b> <code>designSystem</code> for broad consistent foundations, <code>customizations</code> for specific overrides. Lead with the design system.</li>
+  <li><b>Needs Plus <em>or</em> a Development store plan.</b> So you can learn it free and cannot ship it free.</li>
+  <li><b>The <code>checkoutBranding</code> query and <code>checkoutBrandingUpsert</code> mutation are both deprecated</b> in 2026-07 — while the object page looks current.</li>
+  <li><b>Check the deprecation state of operations, not types.</b> They are documented separately and can differ.</li>
+  <li><b>Passing <code>null</code> resets to default.</b> A partial payload is not "leave it alone".</li>
+  <li><b>Define colour schemes per context</b> so accessibility holds across checkout states.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "it is documented" and "it is the current way in" are different claims — so check the deprecation state of the operations you will actually call.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P5 done. Then <b>"next"</b> for Chapter P6 and moving data at scale.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0037-bundles-and-cart-transform-functions.html">← P5.5</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

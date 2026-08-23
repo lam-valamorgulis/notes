@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P8.6 — Payouts and Finance Reconciliation</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P8 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Payouts and finance reconciliation</h1>
+<p class="subtitle">P8.2 covered taking the money. This is where it lands — and the question comes from an accountant, not a developer.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can explain why an order total never equals a bank deposit, and you know which objects answer a finance team&#39;s questions.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why does the bank figure never match the orders figure?</h3>
+
+<p>Take a day with exactly a thousand pounds of orders. The bank receives something else. Every time. Not
+because of a bug — because a deposit and a day of sales are not the same kind of thing.</p>
+
+<p>Four reasons, and they compound:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Reason</th><th>Effect</th></tr>
+  <tr><td><b>Fees</b></td><td>The processor keeps a percentage. Gross is not net.</td></tr>
+  <tr><td><b>Timing</b></td><td>Money is paid out on a <em>schedule</em>, so a deposit spans part of one day and part of another.</td></tr>
+  <tr><td><b>Refunds and adjustments</b></td><td>They reduce a payout, and they relate to orders from any earlier period.</td></tr>
+  <tr><td><b>Non-gateway money</b></td><td>Gift cards and store credit (P8.5) recognise revenue with no deposit at all.</td></tr>
+</table>
+</div>
+
+<p>So "orders today" and "money today" are two different questions and always will be. The useful skill is not
+making them match — it is <b>explaining the difference precisely</b>, which is exactly what an accountant is
+asking for when they say the numbers are wrong.</p>
+
+<h3>The objects that answer it</h3>
+
+<div class="diagram">
+  ShopifyPaymentsAccount
+    |- balances, per supported currency
+    |- ShopifyPaymentsPayoutSchedule       when money moves
+    |- ShopifyPaymentsBalanceTransaction   every charge, refund, adjustment
+    |- ShopifyPaymentsBankAccount
+         |- ShopifyPaymentsPayout          one transfer
+              |- net amount, issue date, status
+              |- ShopifyPaymentsPayoutSummary
+                   |- fees and gross, BY TRANSACTION TYPE
+</div>
+
+<p>Two of those deserve attention.</p>
+
+<p><b><code>ShopifyPaymentsBalanceTransaction</code></b> is the individual level — each charge, refund and
+adjustment that moved the balance. This is the layer that lets you <em>explain</em> a payout rather than
+merely report it.</p>
+
+<p><b><code>ShopifyPaymentsPayoutSummary</code></b> breaks a payout down into <b>fees and gross amounts by
+transaction type</b> — charges, refunds, adjustments. That summary is the bridge between "orders" and "bank",
+and it is the thing finance actually wants.</p>
+
+<p>Note the direction too: <code>ShopifyPaymentsPayoutTransactionType</code> distinguishes a <b>deposit</b>
+(into the bank) from a <b>withdrawal</b> (back to Shopify Payments). Payouts can go backwards. Code that
+assumes money only flows one way will produce a negative it cannot explain.</p>
+
+<h3>The permission, which is not a normal scope conversation</h3>
+
+<p>Reading a payout <b>requires the user to have access to payouts</b>. This is a more sensitive surface than
+product data, and the client&#39;s finance people may reasonably refuse. That is a conversation to have before
+you promise a finance dashboard, not after.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> that <code>ShopifyPaymentsPayout</code> requires the user to
+have access to payouts and is a transfer between the Shopify Payments balance and a
+<code>ShopifyPaymentsBankAccount</code>, carrying net amount, issue date and
+<code>ShopifyPaymentsPayoutStatus</code>; that <code>ShopifyPaymentsPayoutSummary</code> breaks down fees and
+gross amounts by transaction type such as charges, refunds and adjustments; that
+<code>ShopifyPaymentsPayoutTransactionType</code> distinguishes deposit from withdrawal; and that
+<code>ShopifyPaymentsAccount</code> tracks balances across supported currencies, payout schedules and
+<code>ShopifyPaymentsBalanceTransaction</code> records —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/ShopifyPaymentsPayout">ShopifyPaymentsPayout</a>
+and <a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/PayoutSortKeys">PayoutSortKeys</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  An accountant says "we invoiced fifty-two thousand last month and only forty-nine arrived. Where is the
+  rest?" <b>Name four places it went, using the right object names.</b>
+</div>
+
+<p>One: processor fees, visible in the <code>ShopifyPaymentsPayoutSummary</code> as the gap between gross and
+net. Two: timing — the last day or two of the month is in a payout issued next month, so the money exists and
+has not arrived yet. Three: refunds and adjustments, which appear in the summary by transaction type and may
+relate to orders from earlier months. Four: gift card and store credit redemptions, which recognised revenue
+with no deposit at all. Only the fourth is invisible in the payout data, which is why P8.5 comes first.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — reconciling order totals against bank deposits</span>
+  They cannot match. Fees, payout timing, refunds and non-gateway money all separate them. Building a check on
+  the assumption produces permanent false alarms, and a permanently red report gets ignored.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — assuming payouts only add money</span>
+  <code>ShopifyPaymentsPayoutTransactionType</code> includes a <b>withdrawal</b> back to Shopify Payments. Code
+  that sums payouts as income produces a total that is quietly too high.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — promising a finance dashboard before checking access</span>
+  Payout data <b>requires the user to have access to payouts</b>, and finance may refuse. Scope that
+  conversation before the build, not after the demo.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — reporting the payout without the summary</span>
+  The net figure alone cannot explain itself. The <code>ShopifyPaymentsPayoutSummary</code> breakdown by
+  transaction type is the part that answers "where did the difference go", and omitting it turns your report
+  into another number nobody trusts.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — ignoring currency</span>
+  The account tracks balances <b>per supported currency</b>. Summing across them, as warned in P5.1, produces a
+  meaningless figure that looks authoritative.
+</div>
+
+<div class="scar">
+  <span class="who">Attributing a refund to the wrong period</span>
+  A refund reduces the payout it appears in, not the month the original order was placed. Anything that files
+  it by order date makes two months wrong instead of one.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — this is not your number to interpret</span>
+  Same boundary as tax in P7.3 and fraud in P10.4. You can build the report that <em>shows</em> where the
+  difference went. You do not decide what it means for their accounts, and you do not tell them how to book
+  it.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">A shop sold exactly a thousand pounds today. Explain why the bank will not receive a
+  thousand pounds — and why that is normal rather than a bug.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Four things happen between a sale and a bank deposit, and every one of them changes the number.</p>
+
+<p><b>The processor takes a cut.</b> Handling the card costs something, and that is taken out before the money
+is sent on. So the amount leaving is already smaller than the amount sold.</p>
+
+<p><b>The money is sent on a timetable</b>, not per sale. So a deposit does not correspond to a day. It covers
+part of one day and part of another, and today&#39;s last few sales will be in tomorrow&#39;s transfer.</p>
+
+<p><b>Refunds come out of it.</b> And a refund can be for something bought weeks ago, so it reduces today&#39;s
+transfer for a reason that has nothing to do with today.</p>
+
+<p><b>Some sales bring no money at all.</b> Gift cards and store credit were paid for earlier, so spending them
+adds revenue without adding a penny to the bank.</p>
+
+<p>So the two numbers are answers to different questions: "how much did we sell" and "how much money moved".
+The job is not to make them equal. The job is to be able to say <b>exactly which of those four things accounts
+for the gap</b> — because that is what the person asking actually needs.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>gross versus net · settlement · payout cadence · clearing · chargeback · accrual.</em> "The processor
+  takes a cut, the money moves on a timetable, refunds come out of it, and some sales bring no money at all" is
+  the explanation, and it needs none of those words.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 90 minutes <span class="needs">real store, read-only, payout access</span></span>
+  <p>Build the bridge report — the one thing finance asks for and almost nobody produces.</p>
+  <ol>
+    <li>Query one <code>ShopifyPaymentsPayout</code> with its <b>summary</b>. Note net, issue date and
+        status.</li>
+    <li>Pull the <code>ShopifyPaymentsBalanceTransaction</code> records behind it.</li>
+    <li>Produce a single table that starts at <b>orders in the period</b> and ends at <b>the deposit</b>, with
+        one row per reason: fees, timing, refunds, adjustments, non-gateway redemptions.</li>
+    <li>Check the <b>transaction type</b> on every payout and handle withdrawals as negative.</li>
+    <li>Group by currency. Never add across currencies.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> your table reconciles exactly, and every line names the reason for
+  its part of the gap. If any line is called "other", keep going — "other" is where the real problem hides.</p>
+</div>
+
+<div class="task">
+  <span class="label">Ask before you build · 15 minutes <span class="needs">a real client</span></span>
+  <p>Payout data needs payout access. Ask for it <b>before</b> designing anything, and record the answer.</p>
+  <p class="proof"><b>Proof it worked:</b> you have a yes or a no in writing. A no is a useful finding: it
+  changes the deliverable from a dashboard to an export finance runs themselves.</p>
+</div>
+
+<div class="task">
+  <span class="label">The sentence · 5 minutes <span class="needs">nothing</span></span>
+  <p>Say out loud: <q>Those two numbers answer different questions. Let me show you the four things between them
+  — then you can tell me which one you want me to track.</q></p>
+  <p class="proof"><b>Proof it worked:</b> it comes out without defensiveness. "The numbers do not match" is
+  almost never an accusation about your code, and treating it as one is how the conversation goes wrong.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>Order totals and bank deposits cannot match.</b> Fees, payout timing, refunds and non-gateway money separate them.</li>
+  <li><b>Your job is to explain the gap</b>, not to close it. The bridge report is the deliverable.</li>
+  <li><b><code>ShopifyPaymentsPayoutSummary</code></b> breaks a payout into fees and gross <b>by transaction type</b> — that is the bridge.</li>
+  <li><b><code>ShopifyPaymentsBalanceTransaction</code></b> is the individual level: every charge, refund and adjustment.</li>
+  <li><b>Payouts can be withdrawals</b>, not just deposits. Summing them as income overstates it.</li>
+  <li><b>Payout access is a separate permission</b> and finance may refuse. Ask before you promise.</li>
+  <li><b>Balances are per currency.</b> Never add across them.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "how much did we sell" and "how much money moved" are different questions — build the report that names every step between them.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P8 done. Then <b>"next"</b> for the additions to P10.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0041-gift-cards-and-store-credit.html">← P8.5</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

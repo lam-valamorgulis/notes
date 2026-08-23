@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P10.6 — Marketing Surfaces</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P10 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Marketing surfaces, and what not to build</h1>
+<p class="subtitle">Mostly the merchant&#39;s tooling. Worth knowing exists so you do not build it by hand.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know where marketing attribution data comes from, and you know that the app extension surface for it is deprecated — so you can stop a project before it starts.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does Shopify need to know about marketing?</h3>
+
+<p>A merchant sends an email, runs an ad, posts a link. Later, someone buys something. Shopify&#39;s question is
+narrow: <b>which effort produced this order?</b></p>
+
+<p>To answer it, Shopify needs the campaign to be identifiable in the link the customer followed. That is what
+UTM parameters are for, and the API models them exactly and minimally:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Field</th><th>What it is</th></tr>
+  <tr><td><code>source</code></td><td>The website or application where the referral link exists</td></tr>
+  <tr><td><code>medium</code></td><td>The campaign medium</td></tr>
+  <tr><td><code>campaign</code></td><td>The campaign name</td></tr>
+</table>
+</div>
+
+<p>All three are <b>non-null</b>. That is a small detail with a real consequence: there is no such thing as a
+partially-tagged marketing activity in this API. If your integration cannot supply all three, it cannot report
+the activity at all — so decide the naming convention <em>before</em> you build, because you cannot fill it in
+later.</p>
+
+<h3>The two shapes, and the one that is going away</h3>
+
+<p>There are two families of input here, and the difference matters more than the names suggest.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Shape</th><th>Meaning</th><th>State</th></tr>
+  <tr><td><code>MarketingActivityCreateInput</code> / <code>MarketingActivityUpdateInput</code></td><td>An activity managed <em>through a Shopify app extension</em></td><td><b>Deprecated</b> — "will be removed in the near future"</td></tr>
+  <tr><td><code>MarketingActivityCreateExternalInput</code> / <code>MarketingActivityUpsertExternalInput</code></td><td>An <b>externally-managed</b> activity — it lives in your system, you report it to Shopify</td><td>Current</td></tr>
+</table>
+</div>
+
+<p>The documentation is explicit: <b>marketing activity app extensions are deprecated and will be removed in the
+near future.</b></p>
+
+<p>So the shape that survives is the honest one: <b>the marketing tool is not Shopify.</b> The campaign lives
+wherever it lives — an email platform, an ad account, your own system — and you <em>report</em> it to Shopify so
+orders can be attributed. You are not building marketing tooling inside Shopify; you are telling Shopify what
+happened elsewhere.</p>
+
+<p>Which is why this Lesson is called "what not to build". The instinct is to build the merchant a campaign
+manager. The deprecation is Shopify saying that is not the shape.</p>
+
+<h3>Where this connects</h3>
+
+<p>Attribution needs the customer&#39;s journey to be observable, which is P10.4: web pixels are the sanctioned
+tracking path, and script tags on Thank you and Order status are sunset — <b>28 Aug 2025</b> for Plus,
+<b>26 Aug 2026</b> for non-Plus. So a client can be confident they have attribution data they stopped receiving
+months ago.</p>
+
+<p>And audiences come from P10.5: a segment is a saved question, so a campaign aimed at one is aimed at a moving
+target.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the <code>UTMInput</code> fields <code>campaign</code>,
+<code>medium</code> and <code>source</code>, all <b><code>String!</code> non-null</b>; and that
+<code>MarketingActivityCreateInput</code> and <code>MarketingActivityUpdateInput</code> both carry the note
+"<b>Marketing activity app extensions are deprecated and will be removed in the near future</b>", while the
+external variants (<code>MarketingActivityCreateExternalInput</code>,
+<code>MarketingActivityUpsertExternalInput</code>, <code>marketingActivityUpdateExternal</code>) describe
+externally-managed activities —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/input-objects/UTMInput">UTMInput</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client asks you to build them a campaign manager inside their Shopify admin, so their team can plan and
+  launch email campaigns without leaving Shopify. <b>What do you say?</b>
+</div>
+
+<p>That the surface for doing that is deprecated and going away, so building it means building something with a
+known end date. The supported shape is the reverse: campaigns live in a real marketing tool, and Shopify is told
+about them so it can attribute orders. Then the useful question — which is not the one they asked — is what they
+actually want. If it is "see campaign performance next to orders", that is reporting and it is achievable. If it
+is "replace our email tool", that is a product, not an integration.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — building on marketing activity app extensions</span>
+  Documented as <b>deprecated and to be removed in the near future</b>. Building a merchant-facing campaign
+  manager on it is committing to a rewrite with a date attached.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — no naming convention before you start</span>
+  <code>source</code>, <code>medium</code> and <code>campaign</code> are all <b>non-null</b>. There is no partial
+  activity. Decide the convention up front, because you cannot backfill an attribution you never sent.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — attribution that stopped at a sunset date</span>
+  From P10.4: script tags on Thank you and Order status are sunset — <b>28 Aug 2025</b> Plus, <b>26 Aug
+  2026</b> non-Plus. They may still download and do nothing, so the client is confident about data they no
+  longer have.
+</div>
+
+<div class="scar">
+  <span class="who">Building marketing tooling inside Shopify</span>
+  The supported direction is <em>reporting in</em>, not <em>managing inside</em>. Fighting that direction means
+  fighting the platform for the life of the project.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a campaign aimed at a segment</span>
+  From P10.5: segment membership is recomputed. The audience for a scheduled send is not the audience you saw
+  when you scheduled it.
+</div>
+
+<div class="scar">
+  <span class="who">Inconsistent UTM values across systems</span>
+  Two systems reporting the same campaign under slightly different names produce two campaigns in the reporting,
+  each with half the numbers. Nothing errors; the analysis is just wrong.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — ask what they want to see, not what they want to build</span>
+  "Build us a campaign manager" is almost always a reporting request wearing a tooling request&#39;s clothes.
+  The question that saves the project is "what do you want to be able to see?" — and it is usually
+  achievable.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">Shopify is deprecating the way apps add marketing campaign management to the admin. Explain
+  what that tells you about the <b>direction</b> Shopify wants this to work.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>It tells you Shopify does not want to be where campaigns are <em>run</em>. It wants to be where their
+<em>results</em> land.</p>
+
+<p>Think about what a shop needs. It needs to know which effort produced which sale. That is it. It does not
+need the planning, the scheduling, the writing or the sending to happen inside Shopify — there are whole
+companies whose entire product is doing that well.</p>
+
+<p>So the useful arrangement is: run the campaign wherever it is best run, then <b>tell Shopify what you
+did</b>, with enough labelling that Shopify can match orders back to it. Shopify becomes the place you find out
+whether it worked.</p>
+
+<p>Removing the way to build campaign management <em>into</em> the admin is Shopify saying that clearly. The
+remaining supported shape is the one for activities managed somewhere else and reported in.</p>
+
+<p>Which is worth reading as general advice, not just about marketing. When a platform removes a way to do
+something, that is usually information about the shape it wants, not just a maintenance decision. Pushing
+against it means fighting the platform for as long as the project exists.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>attribution · UTM · app extension surface · externally-managed · sunset.</em> "Shopify wants to be where
+  the results land, not where campaigns are run" is the explanation.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 30 minutes, written <span class="needs">no store needed</span></span>
+  <p>The deliverable is a refusal with an alternative — the R3.2 shape.</p>
+  <ol>
+    <li>Take a real "build us marketing tooling in Shopify" request.</li>
+    <li>Write the constraint plainly: that surface is deprecated and going away.</li>
+    <li>Write the supported alternative: activities managed externally and <b>reported in</b> for
+        attribution.</li>
+    <li>Then ask the question that reframes it: <b>what do you want to be able to see?</b></li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> your note ends in a question about reporting rather than a no. Most of
+  these requests resolve into a report somebody can actually have.</p>
+</div>
+
+<div class="task">
+  <span class="label">Fix the convention first · 30 minutes <span class="needs">no store needed</span></span>
+  <ol>
+    <li>Write the naming convention for <code>source</code>, <code>medium</code> and <code>campaign</code>.
+        All three are required, always.</li>
+    <li>Find every system that will report activities and make them share that convention exactly.</li>
+    <li>Write down what happens to an activity you cannot fully label. (It cannot be reported. That is the
+        answer.)</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> two systems reporting the same campaign produce <b>one</b> campaign in
+  the reporting, not two half-sized ones. That is the failure this document prevents.</p>
+</div>
+
+<div class="task">
+  <span class="label">Check what they actually have · 30 minutes <span class="needs">a real store</span></span>
+  <p>Before promising any reporting, verify the tracking still works: list script tags on Thank you and Order
+  status, check them against the sunset dates, and compare the client&#39;s numbers before and after.</p>
+  <p class="proof"><b>Proof it worked:</b> you either confirmed the data is real or found a gap the client did
+  not know about. Building a report on tracking that stopped is worse than building nothing.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>Shopify wants to be where results land, not where campaigns run.</b> Report in; do not manage inside.</li>
+  <li><b>Marketing activity app extensions are deprecated</b> and will be removed in the near future. Do not build on them.</li>
+  <li><b>The external variants are the supported shape</b> — activities managed elsewhere, reported to Shopify.</li>
+  <li><b><code>source</code>, <code>medium</code> and <code>campaign</code> are all non-null.</b> No partial activity, so decide the convention first.</li>
+  <li><b>One convention across every reporting system</b>, or one campaign becomes two half-sized ones.</li>
+  <li><b>Verify tracking before promising reporting</b> — the checkout script sunsets in P10.4 may already have stopped it.</li>
+  <li><b>A campaign aimed at a segment is aimed at a moving target</b> — see P10.5.</li>
+</ul>
+<p class="one-thing">If you remember one thing: when a platform removes a way to build something, that is information about the shape it wants — and here the shape is "report it in", not "manage it inside".</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P10 done, and Track 1 with it. Then <b>"next"</b> for Track 2.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0043-customer-segments-and-shopifyql.html">← P10.5</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

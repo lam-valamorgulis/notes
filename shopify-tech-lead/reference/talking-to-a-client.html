@@ -1,0 +1,2428 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<title>Talking to a client about Shopify</title>
+<link rel="stylesheet" href="../assets/base.css">
+<body class="t1">
+<div class="wrap">
+
+<nav class="mapnav"><a href="../index.html">The Map</a> · <a href="phrasebook.html">Client / PM phrasebook</a></nav>
+
+<h1>Talking to a client about Shopify</h1>
+<p class="subtitle">Every sentence that used to sit inside a Lesson, on one page, in Lesson order.</p>
+
+<div class="note">
+  <span class="label">Why this page exists</span>
+  Every Lesson used to carry a block called <b>What you say to a client/PM</b>. That block was
+  removed on 2026-08-23, because this Course is now about <b>building</b> Shopify integrations, not
+  about talking about them. The sentences themselves are still good, so they all live here instead —
+  unchanged, grouped by Lesson, each linking back to the Lesson that explains why the sentence is
+  true.
+  <br><br>
+  Use it the way you would use a phrasebook: find the situation, read the sentence, say it out loud.
+  For the <em>situational</em> ones — buying ten seconds, saying no, disagreeing upward — use the
+  <a href="phrasebook.html">Client / PM phrasebook</a> instead. This page is organised by
+  <b>topic</b>; that one is organised by <b>moment</b>.
+</div>
+
+<h2>P1 · The shape of Shopify</h2>
+
+<h3><a href="../platform/lessons/0001-the-shopify-object-model-end-to-end.html">P1.1</a> — The Shopify object model, end to end</h3>
+
+<div class="script">
+  <span class="who">When a client says "just sync our stock number"</span>
+  <q>I need to be precise about which number. Shopify keeps stock per location, and it separates
+  "physically here" from "available to sell" — the difference being items already sold but not yet
+  shipped. If your system's number includes those, sending it straight across would re-sell them.
+  Which number is it?</q>
+  <span class="why-said">One question that prevents the most expensive failure in the project.
+  Ask it before agreeing to anything.</span>
+</div>
+
+<div class="script">
+  <span class="who">Explaining why "one product" is not one thing</span>
+  <q>In Shopify a product is really a folder. The things customers buy are the variants inside it —
+  each size and colour has its own price, its own code and its own stock. So when we say "10,000
+  products", the number that actually matters for how long anything takes is the variant count,
+  which is usually four or five times bigger.</q>
+  <span class="why-said">Corrects the unit before it appears in an estimate. Clients count
+  products; the work scales with variants.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0002-the-two-apis-and-the-rate-limit-model.html">P1.2</a> — The two APIs and the rate limit model</h3>
+
+<div class="script">
+  <span class="who">When asked "how many API calls per second can we do?"</span>
+  <q>It doesn't work as a number of calls. Shopify gives us a budget and charges each request by
+  how much data it asks for, so one big request can cost as much as a hundred small ones. What that
+  means practically: the way to go faster is to ask for less, not to ask more often. And your plan
+  sets the budget size.</q>
+  <span class="why-said">Corrects the mental model and immediately gives the lever that actually
+  works. Ends the "can't we just parallelise it?" conversation early.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone proposes a quick fix on REST</span>
+  <q>I'd rather not add new REST code. Shopify marked it legacy in October 2024, and new apps have
+  had to be GraphQL-only since April 2025 — so anything we write there is work we'll redo. It's the
+  same effort in GraphQL today.</q>
+  <span class="why-said">Two dates make this unarguable. Vague "it's deprecated" invites a
+  debate.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0003-api-versioning-and-the-quarterly-upgrade.html">P1.3</a> — API versioning and the quarterly upgrade</h3>
+
+<div class="script">
+  <span class="who">When quoting the build, before anyone asks</span>
+  <q>One thing to build into your budget: Shopify releases a new version of their API every three
+  months, and each one is supported for about a year. So the integration needs a small maintenance
+  slot roughly quarterly. It's a few hours if we keep up. It's a fortnight if we leave it two
+  years, which is what usually happens.</q>
+  <span class="why-said">Raising it unprompted makes it a platform fact rather than a later
+  surprise. Clients accept costs they were warned about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client says their existing integration "works fine, don't touch it"</span>
+  <q>I'd check one thing first. Shopify retires API versions after about a year, and when yours
+  retires they don't fail your requests — they quietly serve a newer version instead. So an
+  integration that hasn't been touched in two years is running on a version nobody picked, and it
+  changed without telling anyone. It might genuinely be fine. I'd rather know than assume.</q>
+  <span class="why-said">Describes a real mechanism instead of implying the previous developer was
+  careless. That keeps the client on your side.</span>
+</div>
+
+
+<h2>P2 · Custom data</h2>
+
+<h3><a href="../platform/lessons/0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a> — Metafields, definitions, and the cost of skipping them</h3>
+
+<div class="script">
+  <span class="who">When a client asks "can Shopify store our custom product data?"</span>
+  <q>Yes, and there are two ways. Simple extra fields on a product — a care instruction, a fabric,
+  a supplier code — are straightforward. If the data has several parts that belong together, like a
+  size chart with rows and columns, that's a slightly different mechanism but still built in. What
+  I need from you is the list of fields and their types, because defining them properly up front is
+  what makes them editable and searchable later.</q>
+  <span class="why-said">Answers yes, distinguishes the two mechanisms without naming either, and
+  asks for the one input that prevents the expensive mistake.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you inherit an integration that skipped definitions</span>
+  <q>The data is all there, but it was saved without telling Shopify what it means — so your team
+  can't see or edit it in the admin, and it can't be used for filtering. Fixing it is
+  straightforward but not instant: we declare the fields properly, then check every existing value
+  matches the type we declared. I'd do it before adding anything new on top.</q>
+  <span class="why-said">Describes the symptom in the client's terms — "you can't see or edit it" —
+  rather than as a technical omission.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0005-metaobjects-and-when-data-does-not-belong-on-the-product.html">P2.2</a> — Metaobjects, and when data does not belong on the product</h3>
+
+<div class="script">
+  <span class="who">When a client describes data with parts</span>
+  <q>That sounds like a thing in its own right rather than a label on a product. So I'd set it up
+  once, as its own record, and have the products point at it. Then when a measurement changes you
+  edit it in one place and every product that uses it updates. If we put it on each product
+  instead, you'd be editing it forty times.</q>
+  <span class="why-said">Explains normalisation with no jargon and in terms of the client's future
+  editing effort, which is what they actually care about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked whether the team will be able to edit it themselves</span>
+  <q>Yes, as long as we set it up as yours rather than as our app's. That's a decision at build
+  time — the two look identical afterwards, but only one lets your team manage it in the admin. I'll
+  set it up as yours by default unless it's purely internal plumbing.</q>
+  <span class="why-said">Surfaces a build-time decision that is invisible later and expensive to
+  reverse. Clients rarely know to ask.</span>
+</div>
+
+
+<h2>P3 · Inventory, locations and the till</h2>
+
+<h3><a href="../platform/lessons/0006-three-ways-in-store-stock-reaches-the-storefront.html">P3.1</a> — Three ways in-store stock reaches the storefront</h3>
+
+<div class="script">
+  <span class="who">First conversation</span>
+  <q>There are three ways to do this and they cost very differently. If your shop stock is already
+  in Shopify, it's nearly free — the website already knows. If it lives in a separate till system,
+  we either ask that system every time someone loads a page, which makes your pages depend on its
+  speed, or we copy the numbers over every few minutes and say how fresh they are. Where does your
+  shop stock live today?</q>
+  <span class="why-said">Three options with their real costs, then one question that decides it.
+  The client leaves knowing why the answer differs.</span>
+</div>
+
+<div class="script">
+  <span class="who">When pushing back on exact numbers</span>
+  <q>I'd show "in stock" or "low stock" rather than a count. Shop floors are never accurate to the
+  single item — things get held, damaged, or sit in a fitting room. If we say "2 left" and someone
+  drives over for it, being wrong costs you that customer. Bands answer the question they actually
+  have, which is whether it's worth the trip.</q>
+  <span class="why-said">Grounds a technical recommendation in a physical reality the client knows
+  better than you do. Very hard to argue with.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0007-locations-and-multi-location-inventory.html">P3.2</a> — Locations and multi-location inventory</h3>
+
+<div class="script">
+  <span class="who">During discovery</span>
+  <q>Can I get a list of your physical locations, and separately what Shopify shows? They're often
+  different — warehouses appear, apps create their own, and locations that were closed are usually
+  still there. I need to know which ones actually hold stock you'd sell online, because that's the
+  set I'll sync.</q>
+  <span class="why-said">Pre-empts a discrepancy the client does not know exists, and frames it as
+  normal rather than as their mistake.</span>
+</div>
+
+<div class="script">
+  <span class="who">When totals do not match</span>
+  <q>Shopify's total is higher than ours by a consistent amount, which points at a location we're
+  not including rather than updates we're missing. There's a location in your account that's marked
+  inactive but still holds stock. Do you want it in scope or excluded? Either is fine — I just need
+  it to be a decision rather than an accident.</q>
+  <span class="why-said">Distinguishes a missing place from missing updates, which is the diagnosis
+  that saves a day, and asks for a decision instead of guessing.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0008-the-till-pos-lite-pro-the-retail-order-and-ui-extensions.html">P3.3</a> — The till: POS, the retail order, and UI extensions</h3>
+
+<div class="script">
+  <span class="who">When a client is about to open their first shop</span>
+  <q>Before that goes live I need to check what our integration does with shop sales. They arrive as
+  orders like any other, but they're already complete — the customer has walked out with the item.
+  Right now our warehouse feed would treat them as things to pick. That's a small change, but it has
+  to happen before the shop opens rather than after.</q>
+  <span class="why-said">Raises a failure before it happens, with the timing that matters. This is
+  the single most valuable habit in integration work.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked for a feature on the till</span>
+  <q>We can put it on the till in three ways: a tile on the home screen, a button that opens a
+  full-screen step-by-step, or a small block inside an existing screen. The thing I'd hold us to is
+  speed — there's a customer waiting at a counter, so if it takes two seconds staff will stop using
+  it. Which of the three fits the moment they'd need it?</q>
+  <span class="why-said">Gives real options in plain terms, and sets a performance constraint using
+  the customer at the counter rather than a millisecond target.</span>
+</div>
+
+
+<h2>P4 · The storefront</h2>
+
+<h3><a href="../platform/lessons/0009-liquid-or-headless-the-client-conversation.html">P4.1</a> — Liquid or headless: the client conversation</h3>
+
+<div class="script">
+  <span class="who">When asked "should we go headless?"</span>
+  <q>Three questions decide it for me. Is your storefront doing something genuinely unusual, beyond
+  showing a catalogue? Will you have front-end developers on staff permanently, not just for the
+  build? And does your team need to change pages without asking a developer? If it's no, no, yes —
+  which is most businesses — a theme is the right answer, and we can still build one fully custom
+  section for the page that needs it.</q>
+  <span class="why-said">Three questions, an honest default, and a middle option so "no" does not
+  sound like a refusal.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client has already decided and you disagree</span>
+  <q>I'll build it, and I want one thing on the record first: this needs a front-end developer
+  available every quarter, permanently — for Shopify's API versions, for security updates, and for
+  the apps we'll be replacing by hand. If that resource exists, headless is a good fit. If it
+  doesn't, the site will freeze about a year from now. Which is it?</q>
+  <span class="why-said">Does not fight the decision. Names the one condition that makes it work and
+  hands the risk back, in writing.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0010-dawn-horizon-and-theme-blocks.html">P4.2</a> — Dawn, Horizon and theme blocks</h3>
+
+<div class="script">
+  <span class="who">Explaining the value of a modern theme</span>
+  <q>The practical difference is how much your team can change without me. Layout changes — moving a
+  band, adding a promo to another page, reordering things — become something you do yourself in the
+  editor. What you'd still come to me for is a genuinely new kind of content band. So over a year,
+  fewer small tickets and more of your budget going to real work.</q>
+  <span class="why-said">Describes the change in terms of the client's own future workload, not in
+  terms of theme architecture.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked for four slightly different versions of the same band</span>
+  <q>Let me build one with a few options instead. It'll take a little longer than the first one and
+  much less than the fourth, and after that you can add it anywhere yourself and choose the layout
+  each time. If I build four separate ones, the fifth request is another job.</q>
+  <span class="why-said">Names the cost of the alternative rather than arguing for reuse in the
+  abstract.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0011-the-cart-ajax-api.html">P4.3</a> — The Cart AJAX API</h3>
+
+<div class="script">
+  <span class="who">When a customer reports "the cart let me buy 50 and then wouldn't"</span>
+  <q>That's a known behaviour of one of Shopify's cart endpoints — it doesn't check stock when you
+  change the quantity of something already in the cart, so the limit only applies at checkout. I'm
+  switching us to the endpoint that does check, so customers see the real limit in the cart instead of
+  after they've entered their card.</q>
+  <span class="why-said">Names it as a platform behaviour, not a mystery, and describes the fix by
+  where the customer experiences it.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to add a "remove this discount" button</span>
+  <q>Slightly awkward, and worth knowing why. Shopify's cart takes the full list of discount codes,
+  not add-one or remove-one. So to remove one, we send all the others. It works fine — it just means
+  the cart has to know every code currently applied, which is a thing I need to keep track of
+  properly.</q>
+  <span class="why-said">Explains an odd bit of extra work with the reason, so it does not look like
+  padding an estimate.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0012-discounts-on-the-storefront.html">P4.4</a> — Discounts on the storefront</h3>
+
+<div class="script">
+  <span class="who">When the numbers do not add up on the cart page</span>
+  <q>Nothing's charging twice — the discount is applied once and correctly. The line prices are being
+  read from an older field that doesn't include discount codes, while the total does. So the gap
+  you're seeing <em>is</em> the discount. It's a display fix, and I'd like to do it soon, because
+  customers seeing inconsistent numbers at the cart is the worst place for it.</q>
+  <span class="why-said">Kills the scary theory first, explains the real cause in one sentence, then
+  argues for urgency on the customer's behalf rather than the code's.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to show a "you saved X%" calculation</span>
+  <q>Happy to show it, and I'll take the numbers from Shopify rather than working them out in the
+  page. If the theme does its own maths, it'll eventually disagree with what's actually charged —
+  usually on a promotion, which is exactly when you'd least want it.</q>
+  <span class="why-said">Says yes, and defends "no arithmetic in the theme" with the moment it would
+  fail.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0036-hydrogen-oxygen-and-building-headless.html">P4.5</a> — Hydrogen, Oxygen and building headless</h3>
+
+<div class="script">
+  <span class="who">Before a headless build</span>
+  <q>Before we commit, can I list your installed apps? Anything that shows something on your storefront — reviews,
+  upsells, a store locator — mostly stops working when we leave the theme, so each becomes a custom build and then
+  something I maintain forever. That list is usually the biggest number in the quote, and it's the one nobody
+  expects.</q>
+  <span class="why-said">Names the largest hidden cost and asks for the one artefact that quantifies it.</span>
+</div>
+
+<div class="script">
+  <span class="who">On an existing headless site you have been asked to take over</span>
+  <q>Give me a day before I quote. I need to know when this was last upgraded — Shopify retires API versions after
+  about a year, and a custom storefront that's been untouched for two is running on a contract nobody chose. It might
+  be fine. I'd rather know than assume, because it changes whether this is maintenance or a rebuild.</q>
+  <span class="why-said">Uses the verified fall-forward mechanism from P1.3 to justify a paid discovery day, rather
+  than guessing at the state.</span>
+</div>
+
+
+<h2>P5 · Checkout, money and Plus</h2>
+
+<h3><a href="../platform/lessons/0013-shopify-plus-and-markets.html">P5.1</a> — Shopify Plus, and Markets</h3>
+
+<div class="script">
+  <span class="who">When asked "do we need Plus?"</span>
+  <q>It depends which piece. Changing the checkout page itself — the payment and shipping steps —
+  that's Plus only. Everything after the order is placed works on your current plan. And the
+  server-side logic, like custom discount rules, doesn't need Plus at all. Tell me which of the three
+  matters most and I'll tell you whether it's an upgrade conversation.</q>
+  <span class="why-said">Splits one question into three answers, which is honest and usually saves
+  the client money.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client mentions selling internationally</span>
+  <q>One thing to check early: how many markets are set up in your Shopify account? These can
+  multiply fast — I've seen a store with over two hundred, one per country, created automatically by
+  a cross-border app. It matters because prices and availability can be set per market, so if we're
+  syncing prices I need to know which one we're writing to.</q>
+  <span class="why-said">Turns an invisible configuration detail into a specific question before it
+  causes a whole country to sell at the wrong price.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0014-checkout-extensibility.html">P5.2</a> — Checkout extensibility</h3>
+
+<div class="script">
+  <span class="who">On inheriting a store with old checkout customisations</span>
+  <q>Before we plan anything new, I need to check something with a deadline attached. Shopify has
+  retired the old way of customising the order confirmation page — for stores on your plan that
+  happened in August 2026. So any tracking or upsell script there has either stopped or is about to.
+  There's a report in your admin that lists exactly what you have. Can I run it today?</q>
+  <span class="why-said">Leads with the dated risk, not with the new work, and asks for one concrete
+  thing. Deadlines get attention that "technical debt" never will.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client wants to change the payment step and is not on Plus</span>
+  <q>That specific page is Plus-only — Shopify doesn't allow app content on the payment and shipping
+  steps below that plan. What I can do on your plan is everything after the order is placed, plus the
+  server-side rules like custom discounts. If the payment-step change is genuinely important, that's
+  a plan conversation, and I'd want to be sure it's worth it before you upgrade for one message.</q>
+  <span class="why-said">Says no with the reason, immediately says what is possible, and declines to
+  upsell a plan for a small feature. That last part buys a lot of trust.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0015-shopify-functions.html">P5.3</a> — Shopify Functions</h3>
+
+<div class="script">
+  <span class="who">Explaining what a Function is, without jargon</span>
+  <q>Normally when something happens in your store, Shopify tells our server and our server responds.
+  This is the opposite: we put a small piece of our logic inside Shopify, and Shopify runs it itself.
+  That means it's instant and it can't be affected by our server being slow or down — which matters,
+  because this runs while a customer is checking out.</q>
+  <span class="why-said">Explains it by contrast with the thing the client already understands, and
+  lands on the benefit they care about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the rule needs data from another system</span>
+  <q>One constraint worth knowing: that logic runs inside Shopify and can't reach out to your loyalty
+  system while the customer is there. So we copy each customer's tier into Shopify ahead of time and
+  the rule reads it from there. Practically that means a tier change takes a few minutes to affect
+  discounts rather than being instant. Is that acceptable?</q>
+  <span class="why-said">States the constraint, gives the workaround, names the exact cost in the
+  client's terms, and asks. Four sentences and no jargon.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0016-flow-when-automation-replaces-your-code.html">P5.4</a> — Flow: when automation replaces your code</h3>
+
+<div class="script">
+  <span class="who">When the request is a Flow workflow</span>
+  <q>I don't think you should pay me for this one. Shopify has a built-in automation tool that does
+  exactly this — when an order is over an amount, tag the customer and send an email. I'll set it up
+  with you now, and you'll be able to change the amount yourself later without asking me. Let's spend
+  the budget on something it can't do.</q>
+  <span class="why-said">Turning down work you could bill for is the single most trust-building thing
+  you can do with a client, and it costs you almost nothing.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client asks for "an app" and means a sync</span>
+  <q>Worth checking what you picture here. If you're expecting screens in your Shopify admin, that's
+  real design and build work. If what you actually want is the two systems staying in step, it can run
+  entirely in the background with nothing to look at — which is faster and cheaper. Is there anything
+  you'd want to click?</q>
+  <span class="why-said">Finds out whether an expensive part of the scope is wanted at all, before
+  it is in a quote.</span>
+</div>
+
+<div class="script">
+  <span class="who">When automatic changes appear that nobody can explain</span>
+  <q>Before I dig into our code, can I look at your Flow workflows? Automations built there are
+  invisible to us, and something changing tags or inventory on its own is very often a workflow
+  somebody set up months ago and forgot.</q>
+  <span class="why-said">Checks the cheap explanation first. Saves a day roughly one time in
+  three.</span>
+</div>
+
+
+<h2>P6 · Getting data in and out</h2>
+
+<h3><a href="../platform/lessons/0017-the-matching-key-and-custom-ids.html">P6.1</a> — The matching key, and custom IDs</h3>
+
+<div class="script">
+  <span class="who">Explaining why you need a stable code from them</span>
+  <q>I need one code per product that never changes for the life of that product. Not the name — your
+  team edits those, and if I match on a name, editing it creates a duplicate. Whatever your ERP uses
+  internally is usually perfect. I'll store it against each Shopify product so anyone can see which is
+  which.</q>
+  <span class="why-said">Explains the requirement through the failure it prevents, and offers the
+  answer they already have.</span>
+</div>
+
+<div class="script">
+  <span class="who">When duplicates have already appeared</span>
+  <q>These are duplicates from name changes — the previous integration matched products by name, so
+  editing a title made it look like a new product. I'm switching to your product codes, which don't
+  change. Then I'll merge the existing duplicates, and I'll need your team to tell me which of each
+  pair to keep, because both may have sales against them.</q>
+  <span class="why-said">Names the cause, states the fix, and is honest that cleanup needs the
+  client's decisions rather than pretending it is automatic.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0018-three-ways-to-push-it-and-bulk-operations.html">P6.2</a> — Three ways to push it, and bulk operations</h3>
+
+<div class="script">
+  <span class="who">When asked how long an import takes</span>
+  <q>The upload is quick; the queue on Shopify's side is what takes time, and I won't have a real
+  number until I've run it once at your volume. What I can tell you is that it's restartable and that
+  I'll give you a count of what succeeded and what didn't — because a job finishing isn't the same as
+  every row working.</q>
+  <span class="why-said">Refuses a made-up number, offers restartability, and sets the expectation
+  that there will be a failure list.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone suggests just using a CSV</span>
+  <q>That's the right tool if you're doing it by hand occasionally. For something we run repeatedly I'd
+  rather use the API route, because it tells me exactly which rows failed and why. With a spreadsheet
+  import, a bad row tends to disappear quietly, and we find out from a missing product.</q>
+  <span class="why-said">Respects the suggestion, then distinguishes it by error visibility rather
+  than by sounding more technical.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0019-the-huge-catalogue-load-and-the-throttle.html">P6.3</a> — The huge catalogue load, and the throttle that starts at 500,000</h3>
+
+<div class="script">
+  <span class="who">When asked for a timeline on a large catalogue</span>
+  <q>I'll give you a range today and a number after one test load. The reason I'm careful is that
+  Shopify limits how fast new variants can be created once a store gets large, and that limit is
+  different on your plan than on others — I've also seen the published figure change. So I'd rather
+  measure it on a test store like yours than quote something I'd have to walk back.</q>
+  <span class="why-said">Explains the caution with a specific, verifiable mechanism. "It depends" with
+  a reason is a strong answer; "it depends" alone is not.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client says "we have 80,000 products"</span>
+  <q>The number I actually need is variants — every size and colour counts separately, and that's what
+  Shopify limits. If those 80,000 average four variants each, we're really talking about 320,000. Worth
+  getting exactly right before I put a date on anything, because the arithmetic changes a lot.</q>
+  <span class="why-said">Corrects the unit before it enters an estimate, and shows the arithmetic so
+  it does not look like hedging.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0020-the-cutover-and-the-proof.html">P6.4</a> — The cutover and the proof</h3>
+
+<div class="script">
+  <span class="who">Agreeing the plan, a week before</span>
+  <q>Two things I need from you before the date. First, a freeze on editing products for the window —
+  a few hours, announced to your team. Second, I want us to agree now what would make us stop and
+  revert. My suggestion: any price difference in your top fifty sellers, or more than one percent
+  overall. Deciding that today is much better than deciding it at two in the morning.</q>
+  <span class="why-said">Asks for the freeze and pre-agrees the abort criteria in the same
+  conversation, when everyone is calm and reasonable.</span>
+</div>
+
+<div class="script">
+  <span class="who">During the cutover, when asked to just push through</span>
+  <q>We agreed a stop line last week and this is inside it, so we're going ahead — but I'm putting
+  these twelve products on a list with a name and a date against them, and they'll be in the handover
+  note. What I'm not going to do tonight is change any code to fix them. Tired changes on a live store
+  is how a small problem becomes a big one.</q>
+  <span class="why-said">Uses the pre-agreed line as the authority, and refuses the one genuinely
+  dangerous action while still saying yes.</span>
+</div>
+
+<div class="script">
+  <span class="who">The morning after</span>
+  <q>Here's the record: 40,120 variants expected, 40,120 loaded, 0 failed. Prices compared on all of
+  them, 12 differences, all long-tail and on the list. Stock compared, no differences. I also checked
+  ten products by hand against your old system, including your three bestsellers. Reconciliation runs
+  again tonight and I'll send the result.</q>
+  <span class="why-said">Numbers with denominators, the hand-check named, and the next checkpoint
+  stated. This is what "it worked" sounds like when it is evidence rather than a feeling.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0021-what-a-migration-is-and-what-never-moves.html">P6.5</a> — What a migration is, and what never moves</h3>
+
+<div class="script">
+  <span class="who">First meeting, unprompted</span>
+  <q>Three things I want to flag now rather than later. Customer passwords can't move between platforms
+  — everyone will need to set a new one, or sign in with a code we email them, so that needs a
+  communication plan. Second, anything living in your current apps — reviews, loyalty points — is a
+  separate export each, and I need the app list this week. And third, we need redirects from every old
+  URL, or you lose your search traffic on day one.</q>
+  <span class="why-said">Three items, all of which are cheap now and expensive later. Delivering them
+  unprompted is the difference between a supplier and a lead.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to migrate ten years of orders</span>
+  <q>Let me ask what they're for. If it's so customers can see what they bought, we can bring across the
+  items, dates and totals and that works well. If it's for accounting or tax, I'd keep the old system
+  readable instead — a recreated order isn't the original transaction, and making it accurate enough for
+  an audit is a project on its own. Which one matters?</q>
+  <span class="why-said">One question that can remove the largest and least valuable chunk of a
+  migration from the scope entirely.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0022-orders-money-and-the-shopify-to-shopify-replatform.html">P6.6</a> — Orders, money, and the Shopify → Shopify replatform</h3>
+
+<div class="script">
+  <span class="who">Before importing any orders</span>
+  <q>One thing I want to be careful about. When we recreate old orders, if we don't send the exact price
+  paid, the system can fill in today's price instead — so an order from 2019 would show what the item
+  costs now. Nothing would look broken; the numbers would just be wrong. So I'll send every price
+  explicitly and then check ten old orders by hand against your current system before we sign it off.</q>
+  <span class="why-said">Explains a silent failure in the client's own terms and commits to the specific
+  check that catches it. This is the sentence that makes a client trust the whole migration.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to quote a Shopify-to-Shopify move as "simple"</span>
+  <q>It's simpler in one way — the data shapes match, so there's no translation. But every product,
+  customer and order gets a brand new ID in the new store, so everything that references anything has to
+  be re-mapped. And every app has to be reinstalled and its data exported separately. That's the actual
+  work, and it's the part that looks invisible from outside.</q>
+  <span class="why-said">Concedes the genuine advantage first, which makes the rest credible rather
+  than defensive.</span>
+</div>
+
+
+<h2>P7 · Shipping, delivery and tax</h2>
+
+<h3><a href="../platform/lessons/0023-shipping-rates-and-delivery-profiles.html">P7.1</a> — Shipping rates and delivery profiles</h3>
+
+<div class="script">
+  <span class="who">When a client asks for different shipping on heavy items</span>
+  <q>That's a separate shipping profile, which is a bigger change than it sounds. Once those products are in
+  their own profile they stop using your normal rates entirely — so we have to set up every country and every
+  rate again for them. Worth doing if the economics are really different. If it's just "a bit more", a
+  weight-based band on your existing rates is far less to maintain.</q>
+  <span class="why-said">Names the real cost — duplicated configuration and a doubled test matrix — and offers
+  the cheaper option. Most clients take the band.</span>
+</div>
+
+<div class="script">
+  <span class="who">When customers in one country cannot check out</span>
+  <q>That's almost always configuration rather than a bug, and it's usually one of two things: those products
+  are in a separate shipping profile that doesn't list that country, or the country isn't in any zone. I can
+  check both in about ten minutes. Nothing is broken — there's just no rate for that combination, and checkout
+  won't let someone through without one.</q>
+  <span class="why-said">Reassures, names the two likely causes specifically, and gives a time. "No rate
+  exists" is a much calmer explanation than "checkout is broken".</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0024-carrier-calculated-rates-your-server-inside-checkout.html">P7.2</a> — Carrier-calculated rates: your server inside checkout</h3>
+
+<div class="script">
+  <span class="who">Before agreeing to live carrier rates</span>
+  <q>I can do it, and I want to flag one thing about how Shopify treats us. The busier your store gets, the less
+  time it gives us to answer — down to three seconds on a big day. So I won't call the courier while the customer
+  is waiting; I'll fetch their prices in the background and answer instantly from what we already have. Slightly
+  less current, and it can't fall over on your biggest day.</q>
+  <span class="why-said">Names the counter-intuitive constraint, states the design, and prices the trade-off in
+  one sentence the client can actually weigh.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked what happens if your service goes down</span>
+  <q>Shopify has a built-in fallback and we use it deliberately: if we can't answer confidently we tell it to
+  use your own configured rates instead. So the customer always sees a shipping option and can still check
+  out — the price is just your standard one rather than the live courier quote. That's much better than showing
+  them nothing.</q>
+  <span class="why-said">Explains fail-open in the client's terms — "they can still check out" — rather than as
+  a status code.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants rates to depend on something Shopify does not send</span>
+  <q>That one's a problem, and it's worth knowing why. Shopify caches our answers for fifteen minutes and the
+  cache is keyed on the cart, the addresses and the weights — not on the customer or the time. So a rule based on
+  who the customer is would simply not get asked most of the time; they'd get whoever's rate was cached first.
+  We'd need a different mechanism for that.</q>
+  <span class="why-said">Refuses on a specific mechanism rather than "that's not possible", and the mechanism is
+  checkable — which is what makes the no credible.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0025-tax-what-shopify-does-and-where-you-must-not-guess.html">P7.3</a> — Tax: what Shopify does, and where you must not guess</h3>
+
+<div class="script">
+  <span class="who">Any tax question at all</span>
+  <q>That's one for your accountant rather than me. What I can tell you is the mechanical part: Shopify
+  calculates the tax at checkout, once it knows the customer's address, and I make sure that number reaches your
+  other systems unchanged. What I never do is work tax out myself — if I did and it were wrong, that's your
+  liability.</q>
+  <span class="why-said">Declines cleanly, states what you <em>do</em> own, and gives the reason in terms of
+  their risk rather than your caution. Nobody pushes back on this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to show tax earlier in the journey</span>
+  <q>Shopify deliberately removed the tax fields from the cart, because tax needs the full address to be right.
+  So anything I showed before checkout would be an estimate, and I'd want it labelled as one. If it's about
+  European customers seeing inclusive prices, that's a different and better-supported thing — a per-market price
+  presentation setting rather than a calculation.</q>
+  <span class="why-said">Explains the platform's reasoning, offers the legitimate alternative, and separates
+  "display convention" from "calculation" — which is the distinction that matters.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they want their own tax engine</span>
+  <q>I checked, and that route isn't open to us — Shopify's tax platform is invitation-only for tax software
+  companies. So the options are Shopify's own tax calculation, or one of the tax apps they've already approved.
+  Worth your accountant picking between those two rather than me.</q>
+  <span class="why-said">A specific, checkable reason for a no, and it hands the remaining choice to the right
+  person.</span>
+</div>
+
+
+<h2>P8 · After the sale</h2>
+
+<h3><a href="../platform/lessons/0026-returns-refunds-and-order-editing.html">P8.1</a> — Returns, refunds and order editing</h3>
+
+<div class="script">
+  <span class="who">When asked for automatic refunds</span>
+  <q>I can do that, and I'd want a limit on it before we switch it on. Refunds move real money out of your
+  account, and if our logic is wrong it's wrong repeatedly and quietly. My suggestion: refund automatically up to
+  a value you're comfortable losing to a bug, and anything above that goes to a person. What's that number for
+  you?</q>
+  <span class="why-said">Says yes, names the specific risk, proposes the control, and hands them the one decision
+  only they can make.</span>
+</div>
+
+<div class="script">
+  <span class="who">On restocking</span>
+  <q>One question per return type, and it matters more than it sounds. When someone returns something faulty, do
+  you want it back in sellable stock? I'd say no — otherwise the website will sell it and nobody can ship it. But
+  for a change of mind, yes. I need that rule per reason code, not one setting for everything.</q>
+  <span class="why-said">Turns an invisible technical flag into a question about their warehouse, which they can
+  answer confidently.</span>
+</div>
+
+<div class="script">
+  <span class="who">When an order needs changing after payment</span>
+  <q>I can edit a paid order, and Shopify lets me build the change as a draft first so someone can see the new
+  total before it's applied. I'd keep that step even when it's tempting to automate — this is the one operation
+  where the customer already has a receipt that says something different.</q>
+  <span class="why-said">Explains a deliberate slowdown by naming what the customer is holding. Nobody argues with
+  that.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0027-payments-and-what-you-must-never-touch.html">P8.2</a> — Payments, and what you must never touch</h3>
+
+<div class="script">
+  <span class="who">When a client says "we need a payments integration"</span>
+  <q>Let me find out which of three things you mean. If you want to accept cards, that's a settings job and I'm not
+  needed. If your provider already has a Shopify app, we install it. If you want to <em>offer</em> your own payment
+  method to other Shopify merchants, that's a regulated build with PCI obligations, a five-day settlement duty and
+  fraud responsibility — that's a product, not a feature. Which is it?</q>
+  <span class="why-said">Three options, and two of them are free. Clients regularly discover they wanted the free
+  one.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to hide a payment method for some customers</span>
+  <q>That one's genuinely doable and reasonably small — Shopify has a payment customisation function for reordering
+  and hiding methods, and it doesn't need Plus. What I can't do is influence which payment <em>succeeds</em>; that's
+  between the customer, their bank and the gateway.</q>
+  <span class="why-said">Says yes to the real request, and draws the boundary at the thing that is not yours.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks you to store card details</span>
+  <q>No — and not because of a preference. Card data carries PCI obligations that neither of us wants to take on,
+  and Shopify and your gateway already hold it. If the goal is charging a customer again later, that's a saved
+  payment method held by the gateway, and I can work with the token rather than the card.</q>
+  <span class="why-said">Refuses in one word, gives the reason, and immediately offers the legitimate route to what
+  they actually wanted.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0028-draft-orders-selling-outside-the-storefront.html">P8.3</a> — Draft orders: selling outside the storefront</h3>
+
+<div class="script">
+  <span class="who">When asked for phone or wholesale ordering</span>
+  <q>That's a draft order — your team builds the order, then either emails the customer a link to pay, or marks it
+  paid if they've already transferred the money. Same mechanism handles quotes and wholesale invoices. Two things I
+  need from you: who's allowed to change a price, and by how much.</q>
+  <span class="why-said">Names the mechanism once for all four use cases, then asks the control question before it
+  becomes a problem.</span>
+</div>
+
+<div class="script">
+  <span class="who">On quote expiry</span>
+  <q>Shopify won't expire a quote — a draft order sits there until someone acts on it. So if you want 30-day
+  validity, I build that, and I'd also want a rule for what happens when an expired quote is accepted anyway. Do we
+  block it, or re-price it?</q>
+  <span class="why-said">Names a platform gap, offers to fill it, and asks for the business rule rather than
+  choosing one.</span>
+</div>
+
+
+<h2>P9 · Other ways to sell</h2>
+
+<h3><a href="../platform/lessons/0029-b2b-companies-catalogs-and-price-lists.html">P9.1</a> — B2B: companies, catalogs and price lists</h3>
+
+<div class="script">
+  <span class="who">When B2B enters the conversation</span>
+  <q>Worth flagging early, because it changes something we already built. Right now our sync writes one price per
+  product. B2B prices don't live there — each business customer gets their own price list, so writing the normal
+  price won't change what they pay. I need to add price lists to what we sync and to what we check nightly.
+  Otherwise your wholesale margin drifts and our report says everything is fine.</q>
+  <span class="why-said">Names the invisible failure precisely, and asks for the work before it becomes a margin
+  problem. This sentence is the whole value of the Lesson.</span>
+</div>
+
+<div class="script">
+  <span class="who">When scoping B2B</span>
+  <q>I'd treat this as a second way of selling rather than a pricing feature. Business customers get their own
+  prices, their own product visibility, their own tax settings, payment on terms rather than by card, and
+  optionally an approval step before an order is accepted. Each of those touches something we've already built.
+  It's a project, not a setting.</q>
+  <span class="why-said">Five specific differences, each checkable, which is what makes "it's a project" land
+  rather than sound like padding.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0030-subscriptions-and-selling-plans.html">P9.2</a> — Subscriptions and selling plans</h3>
+
+<div class="script">
+  <span class="who">The one thing to raise unprompted</span>
+  <q>One risk worth knowing about now. If you ever uninstall the subscriptions app, Shopify deletes all your
+  subscription plans forty-eight hours later — the products survive, the plans don't. So I'll keep our own copy of
+  that configuration, and I'd suggest never uninstalling to "try something", because three days later it isn't
+  recoverable from Shopify.</q>
+  <span class="why-said">A dated, specific, irreversible risk that the client would never discover until it had
+  happened. Raising it unprompted is the whole job.</span>
+</div>
+
+<div class="script">
+  <span class="who">On the inventory decision</span>
+  <q>One choice to make together. We can reserve stock when someone subscribes, or when we actually ship. Reserving
+  at signup means your site shows sold out even with a full warehouse, because it's holding stock for future
+  months. Reserving at shipping avoids that, but then Shopify won't stop you taking more subscribers than you can
+  supply. I'd ship-time it and build you a subscribers-versus-stock report.</q>
+  <span class="why-said">Both options, both consequences, a recommendation, and the thing that covers the
+  recommendation's weakness.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0031-customer-accounts-and-identity.html">P9.3</a> — Customer accounts and identity</h3>
+
+<div class="script">
+  <span class="who">The first question, always</span>
+  <q>Before I estimate, let me check which version of customer accounts you're on — there are two, and the older
+  one can't run app content in accounts at all. It's a ten-second check. If you're on the old one, this becomes a
+  migration conversation first, which I'd rather know now than in three weeks.</q>
+  <span class="why-said">A ten-second check that can save three weeks, framed as protecting them rather than as
+  doubt.</span>
+</div>
+
+<div class="script">
+  <span class="who">On approvals</span>
+  <q>Two approvals from Shopify sit on the critical path, and both work fine in testing and block us at launch —
+  access to customer data, and permission for the extension to call our server. I'll request both this week. If
+  they're slow, the date moves, and I'd rather that risk be visible now.</q>
+  <span class="why-said">Names an external dependency early, exactly as R2.2 teaches. Absent from the estimate, the
+  delay would look like yours.</span>
+</div>
+
+
+<h2>P10 · Conversion, content and risk</h2>
+
+<h3><a href="../platform/lessons/0032-search-filtering-and-discovery.html">P10.1</a> — Search, filtering and discovery</h3>
+
+<div class="script">
+  <span class="who">When a filter is missing</span>
+  <q>Good news — that's a settings change rather than a build. Having the data isn't enough on its own; a filter has
+  to be created in your admin before it appears on the site. I'll check whether the field is set up properly too,
+  because there's a related thing where data written by an integration can be invisible to filters. Give me ten
+  minutes rather than a day.</q>
+  <span class="why-said">Turns an expected build into a settings change, which builds far more trust than doing the
+  build would.</span>
+</div>
+
+<div class="script">
+  <span class="who">Explaining AND/OR</span>
+  <q>That's working as designed, and it surprises everyone. Picking two colours shows products in <em>either</em>
+  colour — it widens the results. Adding a <em>different</em> filter, like size, narrows them. So colour plus size
+  narrows; two colours widens. If you want it to behave differently, that's a design conversation about how the
+  filters are grouped.</q>
+  <span class="why-said">Explains the rule with their own example, and offers a route forward instead of just
+  "that's how it works".</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0033-storefront-performance.html">P10.2</a> — Storefront performance</h3>
+
+<div class="script">
+  <span class="who">The first response, always</span>
+  <q>Give me an afternoon before you spend anything. I'll count what's loading on your busiest pages and check your
+  images. Nine times in ten it's apps adding their own scripts, and images bigger than the space they appear in.
+  Both are fixable in the theme this month. If it turns out to be something structural, you'll have the measurement
+  to justify a bigger piece of work.</q>
+  <span class="why-said">Costs almost nothing, usually solves it, and makes any later big recommendation
+  credible.</span>
+</div>
+
+<div class="script">
+  <span class="who">The app audit conversation</span>
+  <q>Can we go through your installed apps together? Every one adds something to every page load, and most stores
+  have a few nobody uses any more. Removing three unused apps often does more for speed than anything I could code
+  — and it's free.</q>
+  <span class="why-said">Offers a free improvement you do not bill for. That is what buys the trust to be believed
+  on the paid recommendations.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0034-content-files-and-translations.html">P10.3</a> — Content, files and translations</h3>
+
+<div class="script">
+  <span class="who">Sizing it in the first meeting</span>
+  <q>You said forty pages — with four languages that's a hundred and sixty versions, and someone has to read each
+  one. I can move them all; I can't tell you whether the German reads properly. So I need a name per language for
+  checking, and I'd treat the redirects as a separate priority task, because without those the pages move
+  perfectly and Google can't find them.</q>
+  <span class="why-said">Gives the real number, names what you cannot do, and separates the highest-value task. All
+  three in four sentences.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the integration starts overwriting translations</span>
+  <q>Found it. Our sync writes titles in English, and Shopify treats a title as separate content per language — so
+  writing the English one doesn't update the German, and in some cases it's now showing English to German customers.
+  I need to know whether the ERP holds translations. If it doesn't, we should exclude titles from the sync for those
+  markets rather than overwriting good translations with English.</q>
+  <span class="why-said">Diagnoses precisely, and proposes excluding a field — which R2.1 flags as an
+  underused and legitimate answer.</span>
+</div>
+
+
+<h3><a href="../platform/lessons/0035-fraud-risk-and-web-pixels.html">P10.4</a> — Fraud, risk and web pixels</h3>
+
+<div class="script">
+  <span class="who">Where the fraud line sits</span>
+  <q>Fraud decisions are yours rather than mine, and I'd keep it that way — Shopify gives you a risk assessment, and
+  I'll make sure that flag reaches your operations tool so nobody has to go looking. What I won't do is invent my own
+  score or cancel orders automatically. If you want automation, give me a rule in writing and I'll build exactly
+  that.</q>
+  <span class="why-said">Draws the boundary, says what you <em>will</em> do, and offers automation on their explicit
+  terms rather than refusing it.</span>
+</div>
+
+<div class="script">
+  <span class="who">On an inherited store's tracking</span>
+  <q>Worth checking before you trust your numbers. Shopify retired the old way of adding tracking to the order
+  confirmation page — for stores on your plan that was August 2026. So any tracking there has probably stopped, and
+  your reports may be missing conversions without anything looking broken. There's a report in your admin that lists
+  what you have; can I run it?</q>
+  <span class="why-said">Frames it as protecting the numbers they already rely on, which gets attention that
+  "deprecated API" never would.</span>
+</div>
+
+
+<h2>A1 · What an app is</h2>
+
+<h3><a href="../apps/lessons/0001-anatomy-of-a-shopify-app.html">A1.1</a> — Anatomy of a Shopify app</h3>
+
+<div class="script">
+  <span class="who">When a client asks "will this be in the App Store?"</span>
+  <q>It doesn't need to be. Since it's only for your store, we build it as a custom app —
+  that skips Shopify's review queue, so we ship sooner. The trade-off is that nobody else can
+  install it, and it can't bill through Shopify. If you ever want to sell it to other
+  retailers, tell me now, because that's a different build.</q>
+  <span class="why-said">Gives the recommendation, the benefit, the cost, and the one
+  question that would change the answer. That shape works for almost every technical choice.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why the storefront part is riskier than the admin part</span>
+  <q>The admin part runs on our server, so I can read logs and deploy a fix in minutes. The
+  storefront part runs inside Shopify, where I can't. So I'm keeping the logic on our side and
+  the storefront piece as thin as possible. It'll look like less work than it is.</q>
+  <span class="why-said">Explains a design choice by naming what you lose, not by naming a
+  pattern. "Thin extension, fat service" means nothing to a PM; "I can't read the logs" does.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0002-app-auth-session-tokens-and-token-exchange.html">A1.2</a> — App auth: session tokens and token exchange</h3>
+
+<div class="script">
+  <span class="who">When a client offers to "just send you an API key"</span>
+  <q>That works for a custom app on your store, and I'll take it — but two things. It can read
+  and write your whole store, so it goes in our secrets manager, never in email or Slack. And
+  if it's ever rotated, the sync stops until we update it, so tell me before you rotate rather
+  than after.</q>
+  <span class="why-said">Accepts the offer, states the handling rule, and pre-agrees the one
+  operational thing that will otherwise cause a 2am incident.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks why the sync must not run "as" a staff member</span>
+  <q>If we tie it to a person's login, it breaks when they leave or when their permissions
+  change — and it breaks quietly, months later. The sync gets its own identity that doesn't
+  belong to anyone. It's also better for you: nobody's departure takes the integration down.</q>
+  <span class="why-said">Frames a technical rule as a staffing risk, which is a thing the
+  other person actually owns.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0003-webhooks-done-right.html">A1.3</a> — Webhooks done right</h3>
+
+<div class="script">
+  <span class="who">When a client says "so it updates instantly"</span>
+  <q>Usually within seconds, yes. But a webhook is a notification, not a guarantee — it can
+  be delayed, and occasionally it doesn't arrive. So alongside it we run a check that
+  re-reads from Shopify on a schedule and fixes anything that drifted. Without that, one
+  missed message means one wrong stock number forever.</q>
+  <span class="why-said">Sets the expectation before the first miss, and sells the
+  reconciliation job as insurance rather than extra scope.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the integration silently stopped and the client asks what happened</span>
+  <q>Our endpoint failed eight times in a row, so Shopify removed the subscription — that's
+  designed behaviour, not a bug. I've fixed the endpoint, recreated the subscription, and
+  backfilled the gap. I'm also adding an alert on the failure rate so we hear about it from
+  monitoring rather than from you.</q>
+  <span class="why-said">Names the mechanism, does not hide behind it, and closes with the
+  thing that stops the same conversation happening twice.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you need a queue "just to receive a message"</span>
+  <q>We get five seconds total to answer, and that's the whole budget. If we do the work
+  inside those five seconds, a slow day means timeouts, and enough timeouts means Shopify
+  stops sending. So we accept the message, say yes immediately, and do the work behind it.</q>
+  <span class="why-said">A hard number and a named consequence. "Best practice" would have
+  lost this argument.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0004-scopes-protected-customer-data-and-compliance.html">A1.4</a> — Scopes, protected customer data &amp; compliance</h3>
+
+<div class="script">
+  <span class="who">When a client offers full admin access "to make it easier"</span>
+  <q>I'd rather take less. The sync only needs products, inventory and locations — no
+  customers, no orders. That means if our credentials ever leaked, nobody's personal data is
+  exposed, and it keeps us out of a whole category of privacy obligations. It's not extra work
+  for you; it's a shorter list.</q>
+  <span class="why-said">Turns "least privilege" into two things a client cares about: their
+  customers' exposure, and less paperwork.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client asks for a customer name on the sync dashboard</span>
+  <q>I can, but I want you to know what it costs before you decide. Adding a name moves us
+  into a higher tier of Shopify's customer-data rules — extra approval and a data protection
+  review. If support just needs to find an order, an order number does the job with none of
+  that. Which do you want?</q>
+  <span class="why-said">Never refuse outright and never comply silently. Price it, offer the
+  cheaper option, hand back the decision.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone promises a client "deletions happen within 24 hours"</span>
+  <q>I need to correct that before it's in writing. If the customer has ordered in the last
+  six months, Shopify holds the deletion request for six months before it reaches us — the
+  merchant still needs those records for returns and tax. We have 30 days to act once it
+  arrives. Let's say that instead.</q>
+  <span class="why-said">Catching a wrong promise before it is written down is worth more than
+  anything you will build that week.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0027-distribution-billing-and-app-store-review.html">A1.5</a> — Distribution, billing and App Store review</h3>
+
+<div class="script">
+  <span class="who">On day one</span>
+  <q>One question that shapes the build: will anyone other than you ever install this? If it's only ever yours, we
+  build it as a custom app — faster, no Shopify review. If there's a real chance you'd sell it to suppliers or peers,
+  I'd build differently from the start, because retrofitting that is significant work rather than a feature.</q>
+  <span class="why-said">Gets the decision on the record when it is free, which is the entire point.</span>
+</div>
+
+<div class="script">
+  <span class="who">When resale comes up later</span>
+  <q>Genuinely possible, and I want to be straight that it's a new project rather than an add-on. The sync itself
+  barely changes. What's new is Shopify's app review, billing — a custom app can't charge through Shopify at all — and
+  making it work for many stores at once with separate credentials and separate rate limits. Weeks, and mostly on the
+  parts you can't see.</q>
+  <span class="why-said">Names three concrete pieces of work and says the surprising part out loud: the valuable
+  code is not the expensive part.</span>
+</div>
+
+
+<h2>A2 · The backend the app needs</h2>
+
+<h3><a href="../apps/lessons/0005-the-nestjs-module-shape-for-a-sync-service.html">A2.1</a> — The NestJS module shape for a sync service</h3>
+
+<div class="script">
+  <span class="who">When asked why you are "spending time on structure" in week one</span>
+  <q>Shopify releases a new API version every three months, and we'll need to keep up. I'm
+  putting all the Shopify-specific code in one place so those upgrades stay small. If it's
+  spread through the codebase, every upgrade becomes a re-test of everything.</q>
+  <span class="why-said">Justifies structure with a recurring, externally-imposed cost. Not
+  with "clean architecture", which sounds like a preference.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client asks what happens if they change ERP vendors</span>
+  <q>That's the one change I've planned for. The part that talks to your ERP is separate from
+  the part that decides what the correct data is. A new vendor means rewriting the connector,
+  not the sync. I'd guess weeks, not months — but I'd want to see their API before I put a
+  number on it.</q>
+  <span class="why-said">Answers the question, gives a rough scale, and refuses to commit to a
+  number without evidence. All three are the job.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0006-a-postgres-schema-for-a-sync-store.html">A2.2</a> — A Postgres schema for a sync store</h3>
+
+<div class="script">
+  <span class="who">When a client asks whether you are "copying their data"</span>
+  <q>Not really. We don't keep a second copy of your catalogue — Shopify stays the place to
+  look. What we store is the plumbing: which record matches which, how far we've read, and
+  what we last sent. That last one is what lets me tell you exactly what changed and when, if
+  anything ever looks wrong.</q>
+  <span class="why-said">Answers the data-residency worry honestly, and turns the shadow table
+  into a benefit the client can feel.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked why a few products are wrong and the rest are fine</span>
+  <q>Almost always it's records that changed while we were mid-scan, and our bookmark moved
+  past them. It's a known failure and it doesn't show up as an error — that's why we run a
+  reconciliation that compares what we sent against what's there, rather than trusting counts.
+  Give me the report and I'll tell you exactly which ones.</q>
+  <span class="why-said">Names the mechanism instead of promising to "look into it", which is
+  what separates a lead from a developer in that conversation.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0007-one-queue-with-retries-and-a-dead-letter.html">A2.3</a> — One queue, with retries and a dead-letter</h3>
+
+<div class="script">
+  <span class="who">When asked why the sync is "slow" </span>
+  <q>It's not slow, it's paced. Shopify gives us a budget of API calls and we deliberately
+  stay under it — if we push through, they start rejecting us and everything takes longer.
+  Your plan sets the budget, so a higher plan genuinely makes this faster if that ever
+  matters.</q>
+  <span class="why-said">Reframes pacing as deliberate, and names the one lever the client
+  actually controls.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 900 products did not sync</span>
+  <q>They were rejected, not delayed — each has a specific reason and I've got the list. I
+  don't retry those, because they'd fail identically and eat the capacity the working records
+  need. Send me the list back with fixes and they'll go through on the next run.</q>
+  <span class="why-said">Separates "failed" from "not tried yet", which is the distinction
+  that makes a client trust the report.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM suggests "just run more workers to speed it up"</span>
+  <q>It won't help — the limit is per store, not per worker. Ten workers share the same
+  budget, so I'd get the same throughput and more throttling. If we need it faster, the levers
+  are fewer calls per product or a higher Shopify plan.</q>
+  <span class="why-said">Kills a plausible-sounding suggestion with a mechanism, then offers
+  the two real options. Never just say no.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0008-run-it-docker-compose-ci-and-what-to-log.html">A2.4</a> — Run it: docker-compose, CI, and what to log</h3>
+
+<div class="script">
+  <span class="who">When a client asks "how do we know it's working?"</span>
+  <q>Not from the absence of errors — a sync that's doing nothing has no errors either. We run
+  a nightly check that compares what we sent against what's actually in Shopify and reports
+  the differences. If that number is zero, it's working. That's the one I'd put on a
+  report.</q>
+  <span class="why-said">Gives them a single number that means something, and pre-empts the
+  false comfort of a quiet log.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to add "just a bit of extra logging" to debug a live issue</span>
+  <q>I'll add it around the decision, not the payload. Order and customer payloads have names
+  and emails in them, and once those are in our logs they're subject to the same privacy rules
+  as a database. I can get you the same answer without that.</q>
+  <span class="why-said">Says yes to the need and no to the method, with a reason that is
+  about their liability rather than your preference.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why tests do not run against the real store</span>
+  <q>Because then a build fails when someone's token expires or we hit a rate limit — nothing
+  to do with the code being tested. We test the logic against a fake Shopify, and separately
+  we validate our queries against Shopify's real schema every night. That second one already
+  caught two fields Shopify had deprecated.</q>
+  <span class="why-said">Has a concrete win to point at. An argument with evidence ends the
+  conversation.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0028-the-shopify-cli-and-the-dev-workflow.html">A2.5</a> — The Shopify CLI and the dev workflow</h3>
+
+<div class="script">
+  <span class="who">Explaining why config lives in the repo</span>
+  <q>All the app's permissions and webhook settings live in a file in our code rather than being clicked in a
+  dashboard. It means any change to what we can access shows up in a review, with a date and a name against it.
+  Worth it for anything touching your customer data — you can always see what we asked for and when.</q>
+  <span class="why-said">Explains a developer convenience as an audit benefit, which is what the client actually
+  values.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a schema change needs splitting</span>
+  <q>This one goes out over two releases rather than one. Shopify caps how many custom-field definitions can change
+  in a single deploy at twenty-five, and we have thirty. Nothing's wrong — it's just two deploys instead of one, and
+  I'd rather tell you now than have half of it land silently.</q>
+  <span class="why-said">A platform limit, stated as a scheduling fact rather than a problem, with the silent-failure
+  risk named.</span>
+</div>
+
+
+<h2>A3 · The sync discipline</h2>
+
+<h3><a href="../apps/lessons/0009-shopify-alone-and-what-a-second-system-adds.html">A3.1</a> — Shopify alone, and what a second system adds</h3>
+
+<div class="script">
+  <span class="who">The first meeting, when they say "we want them to match"</span>
+  <q>I want to turn that into something we can build. For each piece of information — the
+  title, the price, how many you have — one system needs to be the one that decides, and the
+  other follows. Where do your staff actually edit prices? And where does a sale reduce stock?
+  Those two answers give us most of it.</q>
+  <span class="why-said">Converts a wish into a specification using two questions the client
+  can definitely answer, without a single technical term.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked why this is harder than it sounds</span>
+  <q>On its own, Shopify can't be wrong — there's only one copy of each number. The moment
+  there are two copies, they can disagree, and most of my work is deciding what should happen
+  when they do. That's not complexity I'm adding; it comes with having two systems.</q>
+  <span class="why-said">Explains the difficulty as a property of their situation rather than
+  of your work. It is also simply true, which is why it lands.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0010-ownership-per-field-not-per-record.html">A3.2</a> — Ownership, per field not per record</h3>
+
+<div class="script">
+  <span class="who">Filling in the table, in the room</span>
+  <q>I'll go field by field and I only need one answer each: if these two systems disagree
+  tomorrow morning, which one would you believe? For the title? For the price? For how many you
+  have left?</q>
+  <span class="why-said">"Which would you believe" is answerable by anyone. "Which is the
+  source of truth" gets a confident nod and no information.</span>
+</div>
+
+<div class="script">
+  <span class="who">When both sides insist they own tags</span>
+  <q>Then let's not share it. Your ERP tags start with a marker — I only ever touch those, and
+  I never delete anything else. Marketing's tags are invisible to me. You both keep what you
+  need and neither of you can overwrite the other.</q>
+  <span class="why-said">Removes the conflict instead of adjudicating it. This is the most
+  reusable move in integration work.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client asks you to sync warehouse stock into Shopify</span>
+  <q>I want to check one thing first, because this is where oversells come from. Is the number
+  in your ERP everything in the warehouse, or only what's available to sell online? If it
+  includes reserved stock or wholesale allocation, sending it straight through will sell items
+  you can't ship.</q>
+  <span class="why-said">One question, and it prevents the most expensive failure in the
+  project. Ask it before you agree to anything.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0011-absolute-writes-safe-replay-and-tombstones.html">A3.3</a> — Absolute writes, safe replay and tombstones</h3>
+
+<div class="script">
+  <span class="who">When a client asks what happens if the sync crashes mid-run</span>
+  <q>We just run it again. Every update we send is a complete statement — "this price is
+  14.99" — rather than an instruction like "add two". So sending it twice changes nothing.
+  That's deliberate, and it's why a failed run isn't an incident.</q>
+  <span class="why-said">Turns a scary question into a designed-for answer, with a concrete
+  example the client can picture.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you discover the vendor hard-deletes records</span>
+  <q>There's a gap I need to flag. When you remove a product from your ERP, nothing tells us —
+  it just stops appearing, which looks identical to "unchanged". So deleted items would stay on
+  sale. Two options: ask them for a deleted-items flag, or we compare full lists nightly, which
+  is slower and costs more. I'd push for the flag.</q>
+  <span class="why-said">Names the invisible failure, gives two costed options, and states a
+  preference. That is the shape of every good escalation.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks you to delete products that leave the catalogue</span>
+  <q>I'd rather archive them. Deleting destroys the product's web address and its history, so
+  if it comes back next season it comes back as a new page with no search ranking. Archived is
+  invisible to customers and reversible in one click.</q>
+  <span class="why-said">Frames a reversibility argument in terms of SEO and next season, which
+  are things the client already worries about.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0012-webhooks-are-a-hint-clocks-order-and-staleness.html">A3.4</a> — Webhooks are a hint: clocks, order and staleness</h3>
+
+<div class="script">
+  <span class="who">When a client asks for "real-time" sync</span>
+  <q>Usually a few seconds, and I'll build for that. But I won't promise instant, because
+  Shopify's own guidance is that a notification can arrive up to a day late. So the design is:
+  react immediately when we're told, and also check on a schedule so nothing can be missed.
+  "Fast, and definitely correct" rather than "instant".</q>
+  <span class="why-said">Refuses the wrong promise, gives the right one, and cites the platform
+  rather than your own caution.</span>
+</div>
+
+<div class="script">
+  <span class="who">When one product had a stale price for a day</span>
+  <q>Found it — a notification arrived late and we'd been trusting the values inside it rather
+  than checking the current ones. I've changed it so a notification just tells us to go and
+  look. A late message is now harmless instead of harmful. The nightly check will correct
+  anything else from the same cause.</q>
+  <span class="why-said">Explains the class of bug, not just the instance, and says what will
+  catch the rest. Clients forgive a fixed cause far more easily than a fixed symptom.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0013-the-backlog.html">A3.5</a> — The backlog</h3>
+
+<div class="script">
+  <span class="who">During recovery, when asked "how long until it's caught up?"</span>
+  <q>Stock and prices will be right within about twenty minutes — I'm doing those first because
+  they're the ones that cost you money. Descriptions and images will trail behind for an hour or
+  two. I'm deliberately not pushing at full speed, because Shopify would start rejecting us and
+  the whole thing would take longer.</q>
+  <span class="why-said">Two timelines instead of one, ordered by the client's risk, plus the
+  reason for the pace. Nobody argues with this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the queue is empty after a long outage</span>
+  <q>I need to be straight with you: the queue is empty because Shopify stopped sending, not
+  because we're caught up. After enough failures it removes the subscription — that's designed
+  behaviour. I've recreated it and I'm now re-reading everything that changed during the
+  window, so nothing is lost. It'll take longer than a normal catch-up.</q>
+  <span class="why-said">Says the uncomfortable thing first. A client who later discovers you
+  reported "caught up" will not trust the next report.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0014-reconciliation-and-numbers-that-do-not-lie.html">A3.6</a> — Reconciliation, and numbers that do not lie</h3>
+
+<div class="script">
+  <span class="who">When asked for one number that proves it works</span>
+  <q>Every night we compare what we sent against what's actually in Shopify, field by field, for
+  prices and stock. The report is "we checked 46,000 values and found 3 differences, here they
+  are". If I only told you the product count matched, that would look reassuring and prove almost
+  nothing.</q>
+  <span class="why-said">Gives the number, gives the denominator, and pre-emptively dismisses the
+  weaker metric someone will otherwise ask for.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a price is wrong and it is not your fault</span>
+  <q>We sent 14.99 on Tuesday and I can show you that. It's 12.99 now, and we didn't change it —
+  so someone edited it in the admin, or another app did. That's worth a decision: if staff need to
+  override prices there, I'll stop overwriting that field. If not, I should be putting it back.</q>
+  <span class="why-said">Turns "who broke it" into "what should the rule be". Only possible
+  because the shadow table exists.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to make the sync fix everything automatically</span>
+  <q>For prices and stock, yes — your ERP owns those, so I'll correct them. For anything your
+  team edits in Shopify, I'd rather show you the difference than silently overwrite their work.
+  Otherwise we get a tug-of-war where a person changes something and it reverts overnight.</q>
+  <span class="why-said">Says yes to most of it, and gives a vivid reason for the exception.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0015-store-17-of-four-hundred.html">A3.7</a> — Store 17 of four hundred</h3>
+
+<div class="script">
+  <span class="who">When asked to move from one store to many</span>
+  <q>The sync logic doesn't change much — what changes is the plumbing around it. Each store needs
+  its own credentials, its own place-marker, and its own share of Shopify's rate limit, and one
+  store failing mustn't stop the others. That's the real work, and it's mostly invisible from the
+  outside, which is why it looks smaller than it is.</q>
+  <span class="why-said">Sets the expectation that a re-platform to multi-tenant is not a small
+  change, and says why it looks like one.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks "is the fleet healthy?"</span>
+  <q>I won't give you an average, because 399 fine and one broken averages to fine. What I'll
+  report is the number of stores outside tolerance and which ones. Today that's two, both waiting
+  on the merchant to reinstall.</q>
+  <span class="why-said">Refuses the misleading metric and replaces it with an actionable one,
+  in the same breath.</span>
+</div>
+
+
+<h2>A4 · Real connectors</h2>
+
+<h3><a href="../apps/lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">A4.1</a> — Integration patterns: ERP, CRM, payments, fulfillment</h3>
+
+<div class="script">
+  <span class="who">First meeting, placing the work</span>
+  <q>Let me sort this into the pieces that behave differently. Products and prices coming in is
+  one job. Orders going out is another. Stock going both ways is the risky one. And anything that
+  has to answer <em>during</em> checkout is a different kind of job entirely, because there we
+  get milliseconds, not minutes.</q>
+  <span class="why-said">Breaks one vague request into four with different risks, in language
+  with no jargon. This is usually the moment a client realises the scope.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a third party will sit inside checkout</span>
+  <q>I need a number from them before I agree to this: how fast do they respond at their worst,
+  and what's their uptime? Because if they're slow, your customers see a spinner and some of them
+  leave. And I need your decision on what we do when they're down — hide the feature, or stop the
+  checkout. I'd hide it.</q>
+  <span class="why-said">Makes the client's own decision explicit rather than absorbing it
+  silently into code, and gives a recommendation.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0017-set-piece-design-a-shopify-erp-sync-at-scale.html">A4.2</a> — Set piece: design a Shopify ↔ ERP sync at scale</h3>
+
+<div class="script">
+  <span class="who">The 30-second version, for a non-technical stakeholder</span>
+  <q>Your ERP decides what the products are and what they cost. Shopify decides how many you have
+  left, because that's where sales happen. We move each piece one direction only, so the two can
+  never fight. Every update we send is a complete statement rather than an instruction, so
+  re-sending is always safe. And every night we compare the two and report any differences.</q>
+  <span class="why-said">Five sentences, no jargon, and it covers ownership, direction,
+  idempotency and verification. This is the Feynman test: if you cannot say it this way, you do
+  not have it yet.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked for a timeline in the same meeting</span>
+  <q>I can give you a shape now and a number after two things: seeing their API docs, and running
+  one test load at your real volume. The shape is a few weeks for catalogue-in, then inventory
+  both ways, then the checking layer. The reason I won't give a number yet is that "can your ERP
+  tell me what changed since Tuesday?" has two possible answers, and they're weeks apart.</q>
+  <span class="why-said">A range with the reason for the range, and one concrete unknown named.
+  Chapter R3 drills this pattern on its own.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0018-the-vendor-stock-feed-connector-csv-and-sftp.html">A4.3</a> — The vendor stock-feed connector: CSV and SFTP</h3>
+
+<div class="script">
+  <span class="who">When a client apologises that their supplier "only does CSV"</span>
+  <q>That's genuinely fine, and in one way it's better — a full file every day tells me clearly
+  when something has been discontinued, which APIs often don't. What I need from them is
+  consistency: same columns, same order, and ideally uploaded to a temporary name then renamed, so
+  I never read a half-finished file.</q>
+  <span class="why-said">Removes the apology, names the real advantage, and asks for the three
+  things that prevent most incidents. All in one reply.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a feed arrives short and you have held it</span>
+  <q>Today's file has 38,500 products; yesterday's had 40,000. That might be genuine, or it might
+  be a failed upload — I can't tell from the file. I've held it rather than applying it, because
+  if it's a bad upload, applying it would take 1,500 products off sale. Can someone confirm with
+  the supplier?</q>
+  <span class="why-said">Explains the hold as protection rather than as a blocker, with the
+  specific damage named. Nobody argues with this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When no file has arrived for two days</span>
+  <q>We've had no feed since Monday. Nothing has failed on our side — there's simply nothing to
+  process, which is why it wouldn't show up as an error. Your stock figures are two days stale
+  right now. Worth chasing them today.</q>
+  <span class="why-said">Reports silence as a finding. Most connectors never notice, and the
+  client discovers it from a customer instead.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0019-identifier-mapping-and-the-mapping-registry.html">A4.4</a> — Identifier mapping and the mapping registry</h3>
+
+<div class="script">
+  <span class="who">Before building, asking about identity</span>
+  <q>I need one thing that never changes for a product. Not the name — those get edited. Something
+  like a product code that stays the same for the life of the product. And one important question:
+  do you ever reuse a code after discontinuing something? Because if so I need to handle that, or
+  a new product will overwrite an old one.</q>
+  <span class="why-said">Asks for the stable key and pre-empts the reuse trap in the same breath.
+  Most clients have never been asked the second question.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 1,500 products are unmapped</span>
+  <q>We're matching 97% of your catalogue, but I'd rather show you it differently: those 1,500
+  unmatched products include four of your top sellers, so it's more serious than 3% sounds. Here's
+  the list — they mostly have blank product codes, so I need those filled in or a rule for what to
+  do without one.</q>
+  <span class="why-said">Refuses to let a comfortable percentage stand, and hands over a concrete
+  action rather than a problem.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0020-when-the-vendor-will-not-give-you-an-api.html">A4.5</a> — When the vendor will not give you an API</h3>
+
+<div class="script">
+  <span class="who">When the vendor has said no</span>
+  <q>They won't issue API access — I don't think that's them being difficult, I think they never
+  built it for third parties. So here are our options, cheapest first: they already have an export
+  button in their admin, and a scheduled version of that file would work well. Or you use your own
+  login and push the data to us. Or we escalate for proper access, which is slower and might still
+  be no. I'd start with the export.</q>
+  <span class="why-said">Removes the blame, names three costed options, recommends one. The client
+  leaves the meeting with a decision to make rather than a problem to worry about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client asks you to "just scrape it"</span>
+  <q>I'd need that in writing from them, not from us. Without permission it risks breaching their
+  terms, and it breaks the first time they change their page — usually silently, so we'd be showing
+  stale data without knowing. If you can get written agreement I'll build it. Otherwise the export
+  route is slower to set up and far cheaper to own.</q>
+  <span class="why-said">Does not lecture. Names the legal risk and the maintenance risk, then
+  offers to proceed with authorisation. That is a lead's answer, not a refusal.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you find the second ledger</span>
+  <q>I've found something that needs a decision before we go further. Their system already tracks a
+  credit balance per customer. If we also issue store credit in Shopify, you'd have two records of
+  the same money and a customer could spend it twice. We need to pick one place for that balance to
+  live — I'd say theirs, since it's already there.</q>
+  <span class="why-said">A finding, its consequence in plain money terms, the decision required,
+  and a recommendation. Four sentences.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0021-worked-example-integrating-a-stock-availability-saas.html">A4.6</a> — Worked example: integrating a stock-availability SaaS</h3>
+
+<div class="script">
+  <span class="who">Build versus buy, when asked</span>
+  <q>You could build it, and the inventory part isn't the hard bit — Shopify already tracks stock
+  per location. What you'd be building is the store locator, the pickup flow, the reservation
+  logic, and the shop-facing screens, then maintaining them forever. Buying gets you that on day
+  one. I'd buy it, and keep the ability to leave: our data stays ours, and the integration is one
+  module we could point elsewhere.</q>
+  <span class="why-said">Recommends buying without pretending it is free, and names the exit — the
+  question a client should ask and usually does not.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked what happens if the vendor has an outage</span>
+  <q>Three different things, depending on what we're promising at that moment. Browsing: the
+  in-stock panel just disappears, and nobody notices. Checkout: pickup stops being offered, because
+  I won't promise an item I can't confirm. And orders already placed queue up and send when they're
+  back. The rule is that we hide information but we never make a promise we can't keep.</q>
+  <span class="why-said">One memorable rule with three concrete consequences. This answer gets
+  repeated back to you in later meetings, which is how you know it worked.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants to launch to all 40 shops at once</span>
+  <q>I'd rather do one shop with the display switched off first, so we can check the numbers
+  against what's actually on the shelf without any customer seeing it. Then one shop live, then a
+  handful — and I'd pick your most awkward ones deliberately, because those are where we'll find
+  the problems. All 40 at once means finding them everywhere simultaneously.</q>
+  <span class="why-said">Argues for a staged rollout by naming what each stage proves, rather than
+  by appealing to caution.</span>
+</div>
+
+
+<h2>R1 · Talking about systems</h2>
+
+<h3><a href="../room/lessons/0001-system-design-explained-out-loud.html">R1.1</a> — System design, explained out loud</h3>
+
+<div class="script">
+  <span class="who">Opening — the one-sentence problem</span>
+  <q>The situation today is that your team edits prices in the ERP and customers buy on Shopify, and
+  nothing keeps those two in step. So the price on your website is whatever it was last time somebody
+  updated it by hand. That's what I want to fix, and I'll show you how in about three minutes.</q>
+  <span class="why-said">States the problem as a consequence they recognise, and sets a time budget so
+  they know to listen rather than wait for a gap.</span>
+</div>
+
+<div class="script">
+  <span class="who">The checkpoint</span>
+  <q>That's the shape of it — three parts. Before I go into how a price actually travels, does that much
+  make sense, or shall I go back over any of it?</q>
+  <span class="why-said">Explicitly offers going back, which makes it safe to admit confusion.
+  "Any questions?" gets "no" from a room that is completely lost.</span>
+</div>
+
+<div class="script">
+  <span class="who">Closing — measurement</span>
+  <q>And the way you'll know it's working isn't the absence of errors — a sync doing nothing has no
+  errors either. Every night we compare what we sent against what's actually in Shopify and report the
+  differences. If that number is zero, it's working. That's the number I'd put in front of you.</q>
+  <span class="why-said">Ends on something they can hold and ask for. It also quietly demonstrates you
+  have thought past go-live, which most people have not.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0002-the-design-conversation-whiteboard-for-a-client.html">R1.2</a> — The design conversation: whiteboard for a client, not a grader</h3>
+
+<div class="script">
+  <span class="who">Serving both audiences at once</span>
+  <q>At a high level: your ERP owns prices, Shopify owns stock, and we move each one direction only so
+  they can't fight. That's the whole design. Happy to go deeper on how we handle their system being
+  temporarily down, if that's useful.</q>
+  <span class="why-said">Complete for the decision-maker, with an explicit door for the technical
+  person. Nobody is bored and nobody is short-changed.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you genuinely do not know</span>
+  <q>I don't know yet, and I don't want to guess at it. What I'd do is load a sample at your real volume
+  and measure — that's about half a day and it turns a guess into a number. Can I do that before we
+  commit to a date?</q>
+  <span class="why-said">"I don't know" plus a concrete plan and a cost reads as rigour. "I don't know"
+  alone reads as unpreparedness. The difference is the next sentence.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone proposes a worse design</span>
+  <q>That could work. The thing I'd want to check is what happens when two people edit the same product
+  in both systems on the same day — with that approach I think we'd get a flicker. Want me to try it
+  and see, or shall we design around it now?</q>
+  <span class="why-said">Does not reject, names one specific consequence, and offers two ways forward.
+  You get the better outcome without anyone being corrected.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0003-design-a-stock-availability-platform-domain-and-engine.html">R1.3</a> — Design a stock-availability platform: domain and engine</h3>
+
+<div class="script">
+  <span class="who">Explaining the design in one pass</span>
+  <q>We keep a count per item per location, and crucially we keep <em>when</em> we last heard it. Then
+  before we show anything, we take off whatever's promised to customers coming to collect, hold back a
+  small buffer because shop floors are never exact, and check the number isn't too old. What comes out
+  is "available", "low", "not available", or "we can't confirm right now" — rather than a count we can't
+  stand behind.</q>
+  <span class="why-said">Describes the whole engine in four sentences with no jargon, and the fourth
+  outcome makes the honesty visible.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client asks why the site says no and the shelf says yes</span>
+  <q>Two reasons, both deliberate. One of those three is promised to someone who's on their way to
+  collect it. And we hold back two per shop, because a shop floor is never accurate to the item — things
+  get held, damaged, or left in a fitting room. So we're not reporting your stock, we're answering
+  whether a customer can actually get it. The buffer is yours to set if two feels too cautious.</q>
+  <span class="why-said">Explains a confusing behaviour as two intentional decisions, and hands them the
+  dial. The last sentence turns a complaint into a setting.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0004-allocation-data-model-consistency-and-failure-at-scale.html">R1.4</a> — Allocation, data model, consistency and failure at scale</h3>
+
+<div class="script">
+  <span class="who">When asked why orders do not always go to the nearest shop</span>
+  <q>Nearest sounds right but it buries your busiest shops — they'd get almost every order, their staff
+  would stop serving walk-in customers, and their stock would empty while your quieter shops sat full. So
+  we score each shop on distance, how much stock it has, and how much it's already handled today. Those
+  weights are yours to set, and I'd rather you owned them than me.</q>
+  <span class="why-said">Names three specific consequences of the obvious rule, then hands over the
+  controls. The last sentence is what makes them trust the first three.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a shop complains they are getting too many orders</span>
+  <q>That's a real problem and it's a setting, not a rebuild. Each shop has a daily cap and a weighting.
+  I can lower theirs today. Worth deciding together where that work should go instead, because it has to
+  land somewhere — that's the trade-off rather than a fix.</q>
+  <span class="why-said">Responds to a complaint with an immediate action and an honest statement that
+  the work moves rather than disappears.</span>
+</div>
+
+
+<h2>R2 · Owning the work</h2>
+
+<h3><a href="../room/lessons/0005-owning-ambiguous-scope.html">R2.1</a> — Owning ambiguous scope</h3>
+
+<div class="script">
+  <span class="who">Asking the one blocking question</span>
+  <q>One thing I need before I start, because it's expensive to get wrong. Does anyone on your team edit
+  product titles or descriptions directly in Shopify? If they do, and I set this up with the ERP as the
+  source, their edits would get overwritten every night. Everything else I can make a sensible call on
+  and tell you what I chose.</q>
+  <span class="why-said">One question, the consequence spelled out, and an explicit promise to decide the
+  rest yourself. That last clause is what makes the question welcome rather than annoying.</span>
+</div>
+
+<div class="script">
+  <span class="who">Stating decisions, at the start</span>
+  <q>Three calls I've made so I could get moving. Product details sync once a day, stock every few
+  minutes. I'm matching products on your ERP product code. And if your ERP is unreachable we hold the
+  last known values rather than blanking anything. All three are easy to change — flag any that don't
+  match how you work.</q>
+  <span class="why-said">Shows initiative and stays correctable. Three specific decisions with an open
+  door reads as ownership; asking about all three reads as needing supervision.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the ambiguity is really a disagreement between two people</span>
+  <q>I've hit something I shouldn't decide. Your buying team wants prices controlled in the ERP; the
+  marketing team is currently setting promotional prices in Shopify. Both are reasonable, and whichever
+  we pick means the other loses something. I'll keep working on the parts that don't depend on it — can
+  the two of them agree by Thursday?</q>
+  <span class="why-said">Refuses to arbitrate a business decision in code, keeps working, and asks for a
+  dated resolution. This is the highest-value sentence in the Lesson.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0006-estimating-pacing-and-holding-two-projects.html">R2.2</a> — Estimating, pacing, and holding two projects</h3>
+
+<div class="script">
+  <span class="who">The estimate itself</span>
+  <q>Three days if their system can tell me what's changed since a given time. Eight if it can't, because
+  then I have to compare full lists every night, which is a different piece of work. I'll know which
+  within an hour of seeing their API docs — can you get me those?</q>
+  <span class="why-said">Range, reason, and the exact thing that collapses the uncertainty, framed as a
+  request. The client can now do something to shorten their own project.</span>
+</div>
+
+<div class="script">
+  <span class="who">Naming the client's part in the timeline</span>
+  <q>Two things on your side are on the critical path: the API credentials from your ERP vendor, and a
+  decision on who owns product descriptions. If both land this week we're on for the 14th. If the
+  credentials take three weeks — which happens — the date moves by that much, and I'd rather we both see
+  that now.</q>
+  <span class="why-said">Makes their dependencies visible before they cause a delay, without blaming
+  anyone for something that has not happened yet.</span>
+</div>
+
+<div class="script">
+  <span class="who">Re-estimating early</span>
+  <q>Something's changed and I want to tell you today rather than in three weeks. Their API can't tell me
+  what's changed since a timestamp, so we're on the eight-day path, not the three-day one. Nothing's gone
+  wrong — this was the unknown I flagged, and it resolved the expensive way.</q>
+  <span class="why-said">Ties the revision back to a risk you already named, which turns bad news into a
+  demonstration that your process works.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0007-communicating-with-a-busy-client.html">R2.3</a> — Communicating with a busy client</h3>
+
+<div class="script">
+  <span class="who">The four-line decision message</span>
+  <q>Need a call from you before Thursday. Do we send historical orders across, or keep the old system
+  readable as an archive? Sending them is about two weeks and the money won't be exactly right; the
+  archive is a day and keeps the numbers accurate. I'd do the archive. If I don't hear by Thursday I'll
+  plan for the archive and we can revisit.</q>
+  <span class="why-said">Ask, two costed options, a recommendation, a dated default. Answerable in five
+  seconds with "agreed".</span>
+</div>
+
+<div class="script">
+  <span class="who">Following the default through</span>
+  <q>Didn't hear back, so as flagged I've gone with the archive. Nothing is lost — if you want the full
+  order history later, it's still possible, it's just the two-week version. Wanted to make sure you knew
+  the choice was made.</q>
+  <span class="why-said">No reproach, and it restates that the decision is reversible. This is the message
+  that makes a client comfortable with you using defaults again.</span>
+</div>
+
+<div class="script">
+  <span class="who">Escalating an irreversible one</span>
+  <q>I've asked twice about who owns product pricing and I don't want to guess, because whichever way I
+  build it, the other team's work gets overwritten and there's no undo. I've paused that piece and I'm
+  working on inventory instead, so nothing is idle — but the go-live date moves by however long this
+  takes. Who should I be asking?</q>
+  <span class="why-said">Names the irreversibility, shows you kept working, states the cost, and asks for a
+  person rather than an answer. That last part is often what actually unblocks it.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0008-the-integration-project-discovery-to-rollout.html">R2.4</a> — The integration project: discovery to rollout</h3>
+
+<div class="script">
+  <span class="who">Setting up discovery on day one</span>
+  <q>Before I design anything I want two days to look at the actual data in both systems — how many
+  variants, how well they match up, which fields are actually filled in, and how much changes daily. I'm
+  not doubting what you've told me; it's that these numbers decide the whole approach, and I'd rather find
+  a surprise now than in week six. I also need one name: who decides when something's ambiguous?</q>
+  <span class="why-said">Asks for the audit and the decision-maker together, and frames the audit as
+  protecting the project rather than checking their claims.</span>
+</div>
+
+<div class="script">
+  <span class="who">Presenting an uncomfortable audit result</span>
+  <q>Here's what I found. 94% of your products match between the two systems — but the 6% that don't
+  include eleven of your top hundred sellers, so it matters more than the number suggests. Most have blank
+  supplier codes. I need either those filled in, or a rule for what we do without one. It's a day or two of
+  someone's time and it saves us a lot later.</q>
+  <span class="why-said">Leads with the weighted framing, names the cause, and asks for a specific, bounded
+  action rather than presenting a problem.</span>
+</div>
+
+<div class="script">
+  <span class="who">Arguing for the awkward store early</span>
+  <q>For the second group of stores I'd like to include the one with the older till system, rather than
+  saving it for last. If it's going to cause problems I want to find them while we still have time and
+  attention for it. Leaving it to the end means discovering it when everyone thinks we're finished.</q>
+  <span class="why-said">Gives the reason in terms of when attention is available, which is a scheduling
+  argument rather than a technical one — and therefore lands with a PM.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0009-build-vs-buy-lock-in-and-the-exit.html">R2.5</a> — Build vs buy, lock-in, and the exit</h3>
+
+<div class="script">
+  <span class="who">The recommendation</span>
+  <q>I'd buy it. You could build it — the inventory part isn't the hard bit — but you'd be building the
+  collection flow, the store locator and the staff screens, then maintaining them forever, and customers
+  don't choose you because those are bespoke. Two conditions though: I want it behind one piece of our code
+  so we could swap it, and I want written confirmation you can export your own data whenever you like.</q>
+  <span class="why-said">A clear recommendation with two conditions that cost nothing and preserve every
+  option. This is what a lead sounds like on a commercial question.</span>
+</div>
+
+<div class="script">
+  <span class="who">The question they did not ask</span>
+  <q>One thing worth asking them before you sign: if you left in three years, could you take your data with
+  you, and in what format? It's a much easier conversation now than later. Vendors answer it happily
+  pre-sale and much less happily afterwards.</q>
+  <span class="why-said">Offers a piece of commercial advice a developer is not expected to give, which is
+  exactly why it lands.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants to build for the wrong reason</span>
+  <q>I'll build it if you want it. The question I'd want answered first is who maintains it in two years —
+  because this touches stock and customer promises, so it can't be left unowned. If there's a name, building
+  is fine. If there isn't, buying is genuinely the safer call even though it feels like less control.</q>
+  <span class="why-said">Does not refuse. Names the one condition and is honest that buying feels worse and
+  usually is not.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0010-agile-delivery-as-a-senior.html">R2.6</a> — Agile delivery as a senior</h3>
+
+<div class="script">
+  <span class="who">Standup, with a blocker</span>
+  <q>Delta load is working end to end. Today I'm on inventory write-back. Still blocked on the ERP
+  credentials — I chased on Tuesday, nothing yet. If they land tomorrow the date holds; after that it
+  starts moving.</q>
+  <span class="why-said">Progress, plan, blocker, and the consequence of the blocker. Four clauses and the
+  last one is what gets it acted on.</span>
+</div>
+
+<div class="script">
+  <span class="who">Refusing an unready ticket</span>
+  <q>I don't want to put a number on this one yet — it'd be a guess and it'd end up in the plan. What I can
+  do this sprint is the read-only half: pull their data, log exactly what we'd change, write nothing. That's
+  three days I'm confident about, it's demonstrable, and it answers the two questions that decide the rest.</q>
+  <span class="why-said">Refuses and immediately offers something valuable of the same size. Almost
+  impossible to argue with, and it keeps the sprint full.</span>
+</div>
+
+<div class="script">
+  <span class="who">At the demo</span>
+  <q>Before I show you it working, I want to show you it failing. I'm going to turn the ERP off mid-sync.
+  You'll see it retry, then give up on the ones that can't work, and then the report tells us exactly which
+  records need attention. That's the part I'd want to see if I were you.</q>
+  <span class="why-said">Demonstrating failure handling is the single most confidence-building thing you can
+  do in a review, and almost nobody does it.</span>
+</div>
+
+
+<h2>R3 · The sentences</h2>
+
+<h3><a href="../room/lessons/0011-buying-thinking-time-and-saying-i-dont-know-yet.html">R3.1</a> — Buying thinking time, and saying "I don't know yet"</h3>
+
+<div class="script">
+  <span class="who">A hard technical question you can answer, but need a moment for</span>
+  <q>Let me take that in two parts. First, whether it's possible — yes. Second, what it costs — that
+  depends on one thing, which is whether their system can tell us what changed since a timestamp.</q>
+  <span class="why-said">"In two parts" buys the pause and structures the answer. You now have a
+  scaffold instead of an open field.</span>
+</div>
+
+<div class="script">
+  <span class="who">A number you genuinely do not have</span>
+  <q>I don't know yet, and I don't want to guess — a number I invent today becomes the plan. Give me half
+  a day to load a real sample and I'll have a proper answer. What I can commit to now is that timing.</q>
+  <span class="why-said">Refuses, gives a method, gives a cost, and commits to something concrete. This
+  is the strongest available answer and it should be automatic.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you have over-explained and lost the room</span>
+  <q>I'm overcomplicating this. The short version: their system decides prices, Shopify decides stock, and
+  each one only travels one direction. That's it.</q>
+  <span class="why-said">Resets cleanly and usually lands better than the original attempt. Self-correcting
+  in public reads as confidence, not as weakness.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0012-saying-no-without-sounding-negative.html">R3.2</a> — Saying no without sounding negative</h3>
+
+<div class="script">
+  <span class="who">Not possible</span>
+  <q>That specific page is Plus-only — Shopify doesn't allow app content on the payment and shipping steps
+  below that plan. What I can do on your plan is everything after the order is placed, plus the server-side
+  rules. If that page genuinely matters, it's a plan conversation, and I'd want to be sure it's worth it for
+  one message.</q>
+  <span class="why-said">Names the platform rule, offers the alternative, and declines to upsell them. That
+  last part is what makes the no trustworthy.</span>
+</div>
+
+<div class="script">
+  <span class="who">Possible but unwise</span>
+  <q>I can build it. Before you decide — that number includes stock that's already been sold but not shipped,
+  so sending it across would let customers buy things you can't ship. I'd use the sellable figure instead.
+  Same work, and it won't oversell. Shall I do that?</q>
+  <span class="why-said">Yes, then the consequence, then the better version, then a question. They get to
+  choose and the right thing is the easy choice.</span>
+</div>
+
+<div class="script">
+  <span class="who">Possible but not now</span>
+  <q>Yes — about three days. Where would you like those three days to come from? Right now they'd have to
+  come out of the reconciliation report, and I'd keep the report if it were me, because it's how we'd catch
+  anything going wrong quietly.</q>
+  <span class="why-said">Never refuses, makes the cost unavoidable, and gives a recommendation. This is the
+  most reusable sentence in the Chapter.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0013-a-range-not-a-number.html">R3.3</a> — A range, not a number</h3>
+
+<div class="script">
+  <span class="who">The estimate</span>
+  <q>Three working days if their API can tell me what's changed since a given time. Eight if it can't,
+  because then I'd have to compare the full catalogue every night, which is a different piece of work. I'll
+  know within an hour of seeing their documentation — can you get me that?</q>
+  <span class="why-said">All four slots, the unit stated, and it ends by giving the client something they can
+  do to shorten it.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they want one number</span>
+  <q>I'll give you a firm number on Thursday. To get there I need their API docs and half a day to run a test
+  load. If you need a single figure today, I'd have to quote the bad case — eight days — because I can't
+  promise the good one yet. I'd rather give you the real number on Thursday.</q>
+  <span class="why-said">Offers the commitment, then shows what insisting actually costs them. Most people
+  choose Thursday.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the range collapses badly</span>
+  <q>Update on the estimate, today rather than in three weeks. Their API can't do changed-since, so we're on
+  the eight-day path. Nothing's gone wrong — this was the unknown I flagged, and it resolved the expensive
+  way.</q>
+  <span class="why-said">Ties it back to a named risk. The same news delivered without that reference sounds
+  like a slip; with it, it sounds like the process working.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0014-disagreeing-upward-and-the-senior-narrative.html">R3.4</a> — Disagreeing upward, and the senior narrative</h3>
+
+<div class="script">
+  <span class="who">Disagreeing with a PM under time pressure</span>
+  <q>I want to hit that date too. The one thing I'd worry about is that without the checking report we can't
+  tell a working sync from a stopped one — they look identical. Your call, but I'd keep a half-day version that
+  just compares prices and stock, and drop the rest.</q>
+  <span class="why-said">Agrees, one concern, and a cheaper version of your own position so they can say
+  yes without losing their constraint.</span>
+</div>
+
+<div class="script">
+  <span class="who">Overruled, and moving on</span>
+  <q>Understood, we'll go without it. I've written the concern down so if stock numbers look odd later we know
+  where to check first. On to the inventory piece.</q>
+  <span class="why-said">Accepts cleanly, records once, and changes subject in the same breath. The last
+  three words are what stop it sounding grudging.</span>
+</div>
+
+<div class="script">
+  <span class="who">The thirty-second narrative</span>
+  <q>Six years on Shopify. The first three were deep in themes and storefronts, so I know where that platform
+  hurts and what breaks in a real shop. Then more front end, and increasingly the integration side — how
+  Shopify talks to the systems behind it. That's what I'm focused on now, and it's where I want to keep
+  going.</q>
+  <span class="why-said">Direction, specificity, and it ends on where they are heading. Thirty seconds and
+  no technology list.</span>
+</div>
+
+
+<h2>R4 · Mentoring and pressure</h2>
+
+<h3><a href="../room/lessons/0015-mentoring-and-code-review-both-directions.html">R4.1</a> — Mentoring and code review, both directions</h3>
+
+<div class="script">
+  <span class="who">When asked how you would mentor a junior</span>
+  <q>Mostly by giving them the question rather than the answer. If they've written something that breaks on a
+  retry, I don't say "use absolute values" — I ask "what happens if this runs twice?" They get there
+  themselves, and next time they ask themselves. And if I find myself asking the same question three times, I
+  write it down as a rule, because at that point it's our process failing, not them.</q>
+  <span class="why-said">Concrete, has an example, and the last sentence shows you think about systems rather
+  than about people's shortcomings. That is what a lead sounds like.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked how you handle criticism of your own work</span>
+  <q>If they're right, "good catch, I'll fix it" and no explanation — the explanation is just me protecting
+  myself. If I disagree I say why and ask whether it changes their view, because it often turns out they know
+  a constraint I don't. The reviews I've learned most from were the uncomfortable ones.</q>
+  <span class="why-said">Specific behaviours rather than a claim about being open-minded. Anyone can claim
+  the attitude; describing the actual sentences is evidence.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0016-confident-problem-solving-under-pressure.html">R4.2</a> — Confident problem-solving under pressure</h3>
+
+<div class="script">
+  <span class="who">First response to a live problem</span>
+  <q>Let's stop it getting worse first — I'll pause the sync so nothing else gets overwritten. Then give me two
+  product codes that are wrong and I'll trace exactly what we sent and when. I'd rather see it than guess at
+  it.</q>
+  <span class="why-said">Mitigation, then method, in two sentences. It also converts the client into someone
+  supplying evidence rather than watching.</span>
+</div>
+
+<div class="script">
+  <span class="who">Mid-investigation, asked "what's causing it?"</span>
+  <q>Two possibilities and I don't want to guess between them yet. Either we sent the wrong value, or we sent
+  the right one and something else changed it afterwards — and our record of what we sent will tell us which.
+  Ten minutes.</q>
+  <span class="why-said">Refuses to name a cause, shows the method, and gives a time. All three reduce the
+  client's anxiety more than a confident guess would.</span>
+</div>
+
+<div class="script">
+  <span class="who">Asking for the room</span>
+  <q>Give me twenty minutes on my own with this and I'll come back with either a cause or a much better
+  question. It's paused, so nothing's getting worse while I do.</q>
+  <span class="why-said">Names what you will return with — including the honest possibility that it is a better
+  question. And it reminds them the bleeding has stopped.</span>
+</div>
+
+
+<h2>R5 · Interviews</h2>
+
+<h3><a href="../room/lessons/0017-the-experience-gap-talking-about-what-you-have-not-built.html">R5.1</a> — The experience gap: talking about what you have not built</h3>
+
+<div class="script">
+  <span class="who">The direct question</span>
+  <q>Not in production, no. What I have done is build one end to end — a service syncing a fake ERP with a
+  Shopify dev store, with switches to make the other side fail on purpose so I could handle it rather than hope.
+  What I haven't had is a real merchant's data wrong on a Monday morning with someone on the phone. That's the
+  part I can't practise.</q>
+  <span class="why-said">Three parts, no hedging, and it ends on the honest remainder. The last sentence is what
+  makes the first two credible.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they push on the difference</span>
+  <q>Fair — a dev store isn't production. The rate limits and webhooks are real, so I've hit real throttling and
+  real duplicate deliveries. What's missing is scale, real money, and the pressure. I'd want to be paired with
+  someone who's done a live cutover before I ran one alone.</q>
+  <span class="why-said">Concedes the point precisely, states exactly what does transfer, and asks for the
+  support you would actually need. That request is a strength, not a weakness.</span>
+</div>
+
+<div class="script">
+  <span class="who">Turning the gap into a question for them</span>
+  <q>Can I ask how you'd want that handled? If something's quietly wrong at nine in the morning, do you want me
+  to pause the sync and investigate, or fix forward? I'd default to pausing — but I'd rather know your preference
+  now than guess on the day.</q>
+  <span class="why-said">Converts the topic from your history into how you would work together. It also shows
+  you have thought about the failure they were worried about, which is the underlying question.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0018-what-a-shopify-tech-lead-interview-actually-probes.html">R5.2</a> — What a Shopify tech-lead interview actually probes</h3>
+
+<div class="script">
+  <span class="who">Opening a design answer</span>
+  <q>Two questions before I design anything, because they change the answer. Can the ERP tell me what's changed
+  since a given time? And how does it tell me something was deleted? If the answer to the first is no, this is a
+  nightly full comparison rather than an incremental sync — different piece of work.</q>
+  <span class="why-said">Demonstrates the habit rather than describing it, and shows you know which unknowns
+  are load-bearing.</span>
+</div>
+
+<div class="script">
+  <span class="who">Volunteering a failure</span>
+  <q>The bit I'd want to get right is what happens when the same webhook arrives twice — which it will. Without
+  handling that, a duplicate delivery becomes a duplicate order. So I'd make the message id a primary key and let
+  the second insert fail, rather than checking first, because two workers can both pass a check.</q>
+  <span class="why-said">Unprompted, specific, and it includes why the naive version is wrong. This single
+  answer moves you from assessed to consulted.</span>
+</div>
+
+<div class="script">
+  <span class="who">A limit, dated</span>
+  <q>The extra variant throttle kicks in at half a million variants on the store, then caps new ones at ten
+  thousand a day, and Plus is exempt. I checked that this month — and worth saying, that number had changed since
+  I last looked, so I'd re-check before quoting it in a proposal.</q>
+  <span class="why-said">The fact, the date, and the habit. The last clause is worth more than the number.</span>
+</div>
+
+
+<h3><a href="../room/lessons/0019-the-full-mock.html">R5.3</a> — The full mock</h3>
+
+<div class="script">
+  <span class="who">When you scored well but the gap is real</span>
+  <q>I can talk through all of that, and I want to be straight about the difference between talking and having
+  done it. I've built a sync end to end against a dev store — real rate limits, real webhooks, deliberate
+  failures. What I haven't done is a live cutover with real money moving. That's the piece I'd want support on
+  first time.</q>
+  <span class="why-said">Uses the honesty from R5.1 rather than letting fluency imply experience. Fluency
+  without that sentence is exactly what reads as overselling.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you are asked something you scored 0 on</span>
+  <q>I don't have that one at my fingertips. What I'd do is check Shopify's documentation and note the date,
+  because these limits move — I've seen one change by a factor of ten in three weeks. I'd rather look it up than
+  give you a number I half-remember.</q>
+  <span class="why-said">Turns a genuine gap into a demonstration of the right habit. Far stronger than a
+  half-remembered fact delivered confidently.</span>
+</div>
+
+
+<h2>A5 · The Project</h2>
+
+<h3><a href="../apps/lessons/0022-step-0-the-dev-store-and-the-generator.html">A5.1</a> — The Dev store, the Shape sample, and the generator</h3>
+
+<div class="script">
+  <span class="who">When a client offers you a copy of their live data</span>
+  <q>I'd rather not take a copy of the real catalogue. What I need is its shape — how many
+  products, how many variants each, which custom fields you use. I'll build test data that
+  matches that shape. You get the same confidence, and your customer data never leaves your
+  systems.</q>
+  <span class="why-said">This is the rare answer that is both safer for them and easier for
+  you. It also signals that you think about data handling before someone makes you.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you need a test store at all</span>
+  <q>Because the failure I need to find is throttling, and it only appears at volume. On a
+  small test set the sync looks perfect. I'd rather find it this week on a store nobody uses
+  than in week one of go-live.</q>
+  <span class="why-said">Ties the cost of the environment to a specific risk. "Best practice"
+  persuades nobody; a named failure does.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks for a date and you have not measured yet</span>
+  <q>I can give you a range now and a number after I've loaded the real volume. The reason
+  I'm careful is the throttle: Shopify caps new variants once a store passes half a million,
+  and I need to know if you're near that line. Same work, very different timeline either
+  side of it.</q>
+  <span class="why-said">A range plus the reason for the range. Chapter R3 drills this
+  sentence pattern on its own, because it is the one you will need most.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0023-step-1-the-fake-erp.html">A5.2</a> — The Fake ERP</h3>
+
+<div class="script">
+  <span class="who">When a client asks who owns a field</span>
+  <q>For each field we need one system that decides, and the other one follows. Your ERP
+  should own titles and prices — that's where your staff edit them. Shopify should own stock,
+  because that's where the sale happens and it changes by the second. Two systems both
+  deciding the same field is the one arrangement I'd push back on.</q>
+  <span class="why-said">"Who decides" is the question a non-engineer can answer. "Source of
+  truth" makes people nod without understanding. Ask the version they can answer.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you are building a fake version of their system</span>
+  <q>I need their system to fail on demand — go down, send stale data, repeat a record. I
+  can't ask the real one to do that on a schedule. Half a day of fake ERP buys me every
+  failure test, and it means the first time we see those bugs isn't in production.</q>
+  <span class="why-said">Names the cost, names what the cost buys. Never justify work with
+  "good practice" when you can justify it with a bug you will otherwise ship.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a vendor says "just poll our API every hour"</span>
+  <q>That works, and I want to check one thing first: does your API tell me what changed
+  since a timestamp, and does it page with a cursor? If it's page numbers, I'll miss records
+  whenever your data changes during my scan. It's a quiet failure — nothing errors, the
+  numbers just drift.</q>
+  <span class="why-said">Two specific questions instead of a general worry. Vendors answer
+  specific questions; they deflect general concerns.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0024-step-2-catalogue-out.html">A5.3</a> — Catalogue out</h3>
+
+<div class="script">
+  <span class="who">When a client asks how long the initial load takes</span>
+  <q>The upload itself is quick. What takes the time is the queue on Shopify's side, and I
+  can't promise a number until I've run it once against real volume. What I can promise is
+  that it's restartable — if it fails at 80% we don't start again from zero.</q>
+  <span class="why-said">Restartability is the thing a client actually cares about and rarely
+  knows to ask for. Offering it unprompted is what a lead sounds like.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone says "the import finished, so we're done"</span>
+  <q>The job finished, but each row can fail on its own and those errors are in a separate
+  results file. Give me twenty minutes to reconcile the counts before we tell anyone it
+  worked.</q>
+  <span class="why-said">This is the sentence that prevents the worst kind of go-live: the
+  one everybody has already celebrated.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you are testing on a smaller plan than the client has</span>
+  <q>Their store is Plus, which gets ten times our rate limit and skips one throttle
+  completely. If I build against those limits I'll never see the throttling bugs. Testing
+  somewhere stricter means the client's store is the easy case, not the surprise.</q>
+  <span class="why-said">Reframes "worse environment" as deliberate margin. That is a lead's
+  argument, not a developer's excuse.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0025-step-3-webhooks-in-inventory-back.html">A5.4</a> — Webhooks in, inventory back</h3>
+
+<div class="script">
+  <span class="who">When asked why inventory goes the opposite way to everything else</span>
+  <q>Because that's where it actually changes. Your ERP decides what a product is and what it costs, but a sale
+  happens in Shopify — so Shopify knows the quantity first, and we carry that back to you. It means one product
+  has information flowing both ways at once, which sounds odd but is the arrangement that stops the two systems
+  fighting.</q>
+  <span class="why-said">Explains a design that looks inconsistent by grounding it in where the event happens.
+  Clients accept it immediately once "a sale happens there" is said aloud.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked how fast the update is</span>
+  <q>Usually a few seconds. I won't say instant, because Shopify's own guidance is that a notification can
+  arrive up to a day late — so alongside reacting to notifications we also re-check on a schedule. What I can
+  promise is that a late or repeated message can't do any damage, which matters more than the speed.</q>
+  <span class="why-said">Refuses the wrong promise and replaces it with a better guarantee.</span>
+</div>
+
+
+<h3><a href="../apps/lessons/0026-step-4-the-queue-the-dead-letter-and-the-proof.html">A5.5</a> — The queue, the dead-letter and the proof</h3>
+
+<div class="script">
+  <span class="who">The one number that means "it works"</span>
+  <q>Every night we compare what we sent against what's actually in Shopify, field by field, for prices and
+  stock. The report says "we checked 46,367 values and found 3 differences, here they are". If I only told you
+  no errors had happened, that would sound reassuring and prove almost nothing — a sync that's stopped has no
+  errors either.</q>
+  <span class="why-said">Gives the number, the denominator, and pre-empts the weaker metric someone will
+  otherwise ask for.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 900 records did not sync</span>
+  <q>They were rejected, not delayed — each has a specific reason and I've grouped them into three problems
+  rather than 900 lines. I don't retry those, because they'd fail identically and use up the capacity the
+  working records need. Fix the three and they'll go through on the next run.</q>
+  <span class="why-said">Separates "failed" from "not tried yet", and turns a scary number into three
+  tasks.</span>
+</div>
+
+<div class="script">
+  <span class="who">Now that the Project runs — the sentence this Step buys you</span>
+  <q>I've built one end to end. It syncs a catalogue out and inventory back, and I deliberately broke it ten
+  different ways — stale data, duplicate messages, the other system down, a killed process mid-batch — to
+  check the report catches each one. What I haven't had is a real merchant's data wrong on a Monday morning
+  with someone on the phone. That's the part I can't manufacture.</q>
+  <span class="why-said">Specific enough that only someone who did it could say it, and it still names the
+  remainder honestly. That combination is the whole point of the Project.</span>
+</div>
+
+
+<div class="ask">
+  <b>Reading these does nothing.</b> Saying them does. Pick three and say them out loud now.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="phrasebook.html">Client / PM phrasebook →</a></span>
+</div>
+
+</div>
+</body>
+</html>

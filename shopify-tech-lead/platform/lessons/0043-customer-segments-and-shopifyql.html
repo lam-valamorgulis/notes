@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P10.5 — Customer Segments</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P10 · Lesson 5 · <span class="pill depth">depth</span></p>
+<h1>Customer segments, and the query that defines them</h1>
+<p class="subtitle">A segment is a saved question, not a saved list — and that one distinction explains every surprise.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know why segment membership changes without anyone touching it, and why a wrong segment is silent by construction.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: a saved list, or a saved question?</h3>
+
+<p>You want to email everyone who spent over a hundred pounds last year. There are two ways to hold that.</p>
+
+<p>You could save the <b>list of people</b>. Simple, and immediately wrong — somebody buys something tomorrow
+and the list is stale, with nothing to tell you.</p>
+
+<p>Or you could save the <b>question</b>, and answer it fresh every time somebody asks. That is what a segment
+is: <em>a group of customers that meet specific criteria</em>, where the criteria are stored and the membership
+is derived.</p>
+
+<p>So the mental model is a saved search, not a saved list. Which explains every surprising behaviour:
+membership changes on its own, two runs a day apart give different answers, and nothing in your code changed in
+between. None of that is a bug.</p>
+
+<div class="diagram">
+  SAVED LIST      [alice, bob, carol]     fixed, and stale by tomorrow
+  SAVED QUESTION  "spent > 100 last year"  answered fresh, every time
+
+  Shopify stores the QUESTION.
+  So membership is a result, never a fact.
+</div>
+
+<h3>What the object actually holds</h3>
+
+<p>A <code>Segment</code> is deliberately thin. Four fields carry everything:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Field</th><th>What it is</th></tr>
+  <tr><td><code>name</code></td><td>What a human calls it</td></tr>
+  <tr><td><code>query</code></td><td><b>The definition</b> — conditions on facts about customers, written in ShopifyQL</td></tr>
+  <tr><td><code>creationDate</code></td><td>When it was added to the store</td></tr>
+  <tr><td><code>lastEditDate</code></td><td>When the definition last changed</td></tr>
+</table>
+</div>
+
+<p>Notice there is no member list on the object, and no count. That absence <em>is</em> the design: the
+definition is the thing, and the members are computed.</p>
+
+<p>The <code>query</code> field holds <b>ShopifyQL</b> conditions — purchase history, location, engagement
+patterns and similar facts about customers. So a segment is a small program somebody wrote, stored as text, and
+it can be wrong in exactly the way a small program can be wrong.</p>
+
+<p>Reading segments requires the <code>read_customers</code> scope, <b>and the user must not have restricted
+access</b>. That second condition is worth noting: it is a per-user restriction, not just an app scope, so your
+app can hold the right scope and still see nothing for a particular staff member.</p>
+
+<h3>Why this belongs in a conversion chapter</h3>
+
+<p>Segments drive things that touch money — marketing sends, and automated discount eligibility. So a wrong
+segment does not throw an error. It sends the wrong offer to the wrong people, or makes a discount available to
+customers who should not have it.</p>
+
+<p>Which puts it firmly in this Chapter&#39;s pattern, alongside search filters in P10.1: <b>the failure is
+invisible in logs and visible in revenue.</b> Nothing is broken. The wrong people simply received something.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> that a <code>Segment</code> is a group of customers meeting
+criteria defined through <b>ShopifyQL</b> query conditions; that its fields are <code>name</code>,
+<code>query</code>, <code>creationDate</code> and <code>lastEditDate</code>, where <code>query</code> is "a
+precise definition… composed of a combination of conditions on facts about customers"; that common use cases are
+customer analytics, targeted marketing campaigns and <b>automated discount eligibility</b>; and that it requires
+<code>read_customers</code> and that <b>the user must not have restricted access</b> —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/objects/Segment">Segment</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "the VIP discount went to 400 people last month and 900 this month, and nobody changed
+  anything". <b>Give two explanations, and say which field would tell them apart.</b>
+</div>
+
+<p>One: nobody changed the segment and the <em>customers</em> changed — more people now meet the condition,
+because a segment is a question answered fresh. Two: somebody did edit the definition, and
+<code>lastEditDate</code> would show it. So that single field separates "the world moved" from "someone changed
+the rule", and it is the first thing to read before investigating anything else.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — treating a segment as a fixed list</span>
+  Membership is recomputed. A discount aimed at 400 people can reach 900 next month with nothing changed in your
+  code, and the first sign is the cost.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a wrong condition</span>
+  The <code>query</code> is a small program stored as text. Get a condition subtly wrong and the segment
+  returns confidently wrong people. Nothing validates intent, and the offer still goes out.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — caching membership</span>
+  Cache the members and you have converted the saved question back into a stale list, reintroducing exactly the
+  problem the design avoids. And the staleness has no event to react to.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — automated discount eligibility on an unreviewed segment</span>
+  A segment can gate a discount automatically. A definition nobody checked is then a spending decision nobody
+  reviewed.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the restricted-access condition</span>
+  Reading segments needs <code>read_customers</code> <b>and</b> the user must not have restricted access. Your
+  app can hold the scope and still see nothing for a given staff member, which looks like an empty store rather
+  than a permission.
+</div>
+
+<div class="scar">
+  <span class="who">Not reading <code>lastEditDate</code> first</span>
+  It separates "the customers changed" from "somebody changed the rule". Investigating without it means guessing
+  between two completely different explanations.
+</div>
+
+<div class="scar">
+  <span class="who">Assuming segments are level 0 data</span>
+  Segments are conditions on facts about <b>customers</b>. Touching them puts you in the privacy territory of
+  A1.4, not in catalogue territory.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — a segment definition needs an owner and a review</span>
+  It is business logic written in a text field, usually by a marketer, often once, and then it silently governs
+  spending for years. Treat a segment that gates money the way you would treat code: someone owns it, and
+  somebody other than its author has read it.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">A "VIP customers" group had 400 people last month and has 900 today. Nobody edited anything.
+  Explain why that is correct behaviour.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Because the group is not a list of names. It is a <em>question</em>, and the answer is worked out fresh every
+time somebody asks.</p>
+
+<p>Somebody wrote down a rule once — something like "people who have spent more than a hundred pounds". That
+rule is what got saved. Nobody saved the people.</p>
+
+<p>So between last month and today, more customers crossed that line by simply buying things. The rule did not
+change. The answer did.</p>
+
+<p>Compare it to a folder versus a search. If you drag files into a folder, the folder holds those files until
+you move them. If you save a search for "files with 'invoice' in the name", the results change as you create
+files, and you did not touch the search.</p>
+
+<p>This is the saved search. Which is good — it can never go stale. And it means anything you attach to it,
+like a discount, is attached to a moving target. If a hundred more people qualify tomorrow, a hundred more
+people get the discount, and nobody decided that today.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>dynamic segment · ShopifyQL · predicate · materialised view · membership evaluation.</em> "A folder versus
+  a saved search" is the explanation. If you said "it is a dynamically evaluated predicate", you named it and
+  taught nothing.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 45 minutes <span class="needs">Dev store</span></span>
+  <p>Watch a segment change underneath you.</p>
+  <ol>
+    <li>Create a segment with a spend condition. Record the member count and today&#39;s date.</li>
+    <li>Place enough test orders to push one more customer over the line.</li>
+    <li>Read the count again. It moved, and <code>lastEditDate</code> did <b>not</b>.</li>
+    <li>Now edit the definition and read <code>lastEditDate</code> again.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you have two events — membership changing with no edit, and an edit —
+  and you can tell them apart from one field. That is the diagnostic you will actually use.</p>
+</div>
+
+<div class="task">
+  <span class="label">Then gate money with it, carefully · 45 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>Attach a discount to the segment.</li>
+    <li>Add a customer who newly qualifies. Confirm the discount reaches them with no action from you.</li>
+    <li>Write down the worst case: how many people <em>could</em> qualify, and what that costs.</li>
+    <li>Then check the <code>read_customers</code> plus restricted-access condition by reading segments as a
+        restricted user.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you have a costed worst case for an automatic discount, and you have
+  seen the empty result a restricted user gets — which looks like no data rather than no permission.</p>
+</div>
+
+<div class="task">
+  <span class="label">Review one like code · 20 minutes <span class="needs">a real store</span></span>
+  <p>Take a real segment that gates money. Read its <code>query</code> out loud as a sentence, and get somebody
+  other than its author to confirm that sentence is what they meant.</p>
+  <p class="proof"><b>Proof it worked:</b> either it was right, or you found a condition nobody had re-read since
+  it was written. This is business logic in a text field, and it deserves the same review as code.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>A segment is a saved question, not a saved list.</b> Membership is computed fresh every time.</li>
+  <li><b>So membership changes with no edit</b> — and <code>lastEditDate</code> is how you tell that from someone changing the rule.</li>
+  <li><b>The <code>query</code> field is the segment.</b> ShopifyQL conditions on facts about customers.</li>
+  <li><b>Never cache the members.</b> That turns the saved question back into a stale list.</li>
+  <li><b>Segments can gate discounts automatically</b>, so an unreviewed definition is unreviewed spending.</li>
+  <li><b>Needs <code>read_customers</code> <em>and</em> an unrestricted user.</b> The wrong user sees nothing, not an error.</li>
+  <li><b>It is customer data</b> — the privacy rules in A1.4 apply, not the catalogue ones.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a segment is a question answered fresh, so anything you attach to it is attached to a moving target — read <code>lastEditDate</code> before you investigate anything.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for marketing surfaces — and one more deprecation worth knowing before you build.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0035-fraud-risk-and-web-pixels.html">← P10.4</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

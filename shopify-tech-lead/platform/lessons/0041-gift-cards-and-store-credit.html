@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P8.5 — Gift Cards and Store Credit</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P8 · Lesson 5 · <span class="pill core">core</span></p>
+<h1>Gift cards and store credit</h1>
+<p class="subtitle">Money that exists outside the payment gateway — so it reconciles differently from every other total.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know why a gift card is a promise rather than a payment, and you can read a store credit balance as a ledger rather than a number.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: where does this money live?</h3>
+
+<p>Normally money arrives from outside: a customer&#39;s card, through a gateway, into the merchant&#39;s
+account. Every total you reconcile assumes that shape.</p>
+
+<p>A gift card breaks it. Somebody paid real money <em>earlier</em>, possibly months ago, possibly a different
+person. What exists now is a <b>promise the shop owes</b>. When it is spent, no money moves at all — the shop
+is settling a debt it already took payment for.</p>
+
+<p>So a gift card sale and a gift card redemption are two different financial events at two different times,
+and neither looks like a normal payment. That is the whole reason this needs its own Lesson: <b>revenue and
+bank figures diverge, correctly, and reconciliation that assumes they match will report a fault that is not
+there.</b></p>
+
+<div class="diagram">
+  NORMAL          card  ->  gateway  ->  merchant bank
+                  revenue and money move together
+
+  GIFT CARD       Day 1:  card -> gateway -> bank, and a PROMISE is created
+                  Day 90: promise spent, NO money moves
+                          revenue is recognised with no bank movement
+</div>
+
+<h3>Store credit is a ledger, not a balance</h3>
+
+<p>Store credit is the same idea in a different shape, and Shopify exposes it as a <b>list of
+transactions</b> rather than a single figure. You read a <code>storeCreditAccount</code> and page through its
+<code>transactions</code>:</p>
+
+<pre><code>query storeCreditAccount($accountId: ID!, $first: Int!) {
+  storeCreditAccount(id: $accountId) {
+    id
+    transactions(first: $first, sortKey: CREATED_AT, reverse: true) {
+      edges { node {
+        amount { amount currencyCode }
+        balanceAfterTransaction { amount currencyCode }
+        createdAt
+        ... on StoreCreditAccountCreditTransaction {
+          id expiresAt remainingAmount { amount currencyCode }
+        }
+        ... on StoreCreditAccountDebitTransaction { id }
+        ... on StoreCreditAccountDebitRevertTransaction { id debitTransaction { id } }
+        ... on StoreCreditAccountExpirationTransaction { creditTransaction { id } }
+      } }
+    }
+  }
+}</code></pre>
+
+<p>Read the four transaction types, because they tell you what can happen:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Type</th><th>Meaning</th><th>The bit that matters</th></tr>
+  <tr><td><code>CreditTransaction</code></td><td>Credit added</td><td>Carries <code>expiresAt</code> and <code>remainingAmount</code></td></tr>
+  <tr><td><code>DebitTransaction</code></td><td>Credit spent</td><td>—</td></tr>
+  <tr><td><code>DebitRevertTransaction</code></td><td>A spend was reversed</td><td>Points at the original <code>debitTransaction</code></td></tr>
+  <tr><td><code>ExpirationTransaction</code></td><td>Credit expired unused</td><td>Points at the <code>creditTransaction</code> that expired</td></tr>
+</table>
+</div>
+
+<p>Two consequences fall straight out. <b>Credit expires</b> — so a balance is only true as of a moment, and a
+cached one can go wrong without anything happening. And <b>each credit has its own remaining amount</b>, so an
+account balance is a <em>sum over separately expiring pieces</em>, not one pot.</p>
+
+<p>Which is why you read the ledger. Asking "what is the balance?" throws away the information you need to
+answer "and how much of it disappears next month?"</p>
+
+<h3>The dev-store problem</h3>
+
+<p>From A2.5: <b>development stores do not support store credit or gift cards.</b> So this is one of the few
+areas you cannot fully rehearse on a Dev store. Plan the demo around it rather than spending an afternoon
+debugging a documented limitation.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the <code>storeCreditAccount</code> query, its
+<code>transactions</code> connection with <code>sortKey: CREATED_AT</code>, and the four transaction types
+including <code>expiresAt</code> and <code>remainingAmount</code> on a credit,
+<code>DebitRevertTransaction.debitTransaction</code> and
+<code>ExpirationTransaction.creditTransaction</code> —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/queries/storeCreditAccount">storeCreditAccount</a>.
+That gift cards never transfer in a migration is covered in P6.5, and that Dev stores do not support store
+credit or gift cards in A2.5.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A finance team says January revenue is higher than the money that reached the bank, and nothing is broken.
+  <b>Give the gift-card explanation.</b>
+</div>
+
+<p>Gift cards sold in December brought money into the bank in December. Spending them in January recognises
+revenue with no bank movement at all, because the shop is settling a promise it was already paid for. So
+January shows revenue above receipts by exactly the value of vouchers redeemed. It is not a discrepancy — it
+is two events in two months, and any reconciliation that expects revenue to equal receipts will report it as a
+fault forever.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — treating a redemption as a payment</span>
+  No money moves when a gift card is spent. Code that records it as an incoming payment inflates receipts, and
+  the error compounds every month until somebody audits it.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — caching a store credit balance</span>
+  Credit <b>expires</b>. A cached balance goes wrong on its own, with no event, no webhook and nothing to
+  react to. Read the ledger when you need the number.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — treating the balance as one pot</span>
+  Each credit carries its own <code>expiresAt</code> and <code>remainingAmount</code>. A balance made of two
+  credits expiring in different months is not the same as one lump, and a single figure cannot express that.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — reconciling revenue against receipts</span>
+  With gift cards in play they are <em>supposed</em> to differ. A reconciliation that treats the gap as a fault
+  will cry wolf until it is switched off — and then it is not watching the real faults either.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — promising a gift-card migration</span>
+  From P6.5: gift cards <b>never move</b>. They are outstanding promises on the old platform. Committing to
+  carry them across is committing to something impossible, and it is normally discovered late.
+</div>
+
+<div class="scar">
+  <span class="who">Missing the revert transaction</span>
+  A spend can be reversed, and it appears as its own transaction pointing back at the original. Code that only
+  understands credits and debits will double-count a reversal.
+</div>
+
+<div class="scar">
+  <span class="who">Testing it on a Dev store</span>
+  Development stores <b>do not support</b> store credit or gift cards. Discovering that halfway through a demo
+  build is an afternoon lost to a documented limitation.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — expiry is a legal question, not a setting</span>
+  Whether and when store credit may expire is regulated differently in different places, and the rules are not
+  yours to interpret. Same rule as tax in P7.3: carry the platform&#39;s value, and send the question to the
+  client&#39;s accountant.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">A customer pays with a gift card. Explain why the shop&#39;s <b>revenue</b> goes up and the
+  money in its <b>bank account</b> does not change at all — and why that is correct.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Because the shop was already paid, months ago, by somebody else.</p>
+
+<p>Think about what happens when a gift card is bought. Somebody hands over real money. That money goes into
+the bank straight away. But the shop has not <em>sold</em> anything yet — it has taken money and made a
+promise. It now owes somebody some goods.</p>
+
+<p>Months later a customer walks in and uses the card. <em>Now</em> the shop has sold something, so revenue
+goes up. But no money arrives, because the money arrived in December. The shop is just settling the promise it
+made.</p>
+
+<p>So the money and the sale happened in <b>different months</b>. And that is not a mistake to be corrected —
+it is genuinely what happened, and any accounting that insists revenue must equal money received will report
+it as broken forever.</p>
+
+<p>Which is why this needs handling explicitly rather than being treated as a payment method. A card payment
+is money arriving. A gift card is a promise being paid off.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>deferred revenue · liability account · accrual · settlement · payment instrument · breakage.</em> "The
+  shop was already paid, months ago, by somebody else" is the explanation. If you needed the word "liability"
+  to say it, try again without it — the idea is a promise the shop owes.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 45 minutes <span class="needs">a real store, read-only</span></span>
+  <p>Dev stores do not support this, so read a real store rather than trying to create it.</p>
+  <ol>
+    <li>Query one <code>storeCreditAccount</code> and page its <code>transactions</code>.</li>
+    <li>Find a credit with an <code>expiresAt</code> in the future. Note its
+        <code>remainingAmount</code>.</li>
+    <li>Add up the remaining amounts <b>grouped by expiry month</b>. That is the number a finance team actually
+        wants and almost nobody produces.</li>
+    <li>Find a <code>DebitRevertTransaction</code> if there is one, and follow it to the debit it
+        reverses.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you can state the balance <em>and</em> how much of it expires next
+  month. If you only produced a single total, you threw away the expiry information the ledger exists to
+  carry.</p>
+</div>
+
+<div class="task">
+  <span class="label">Fix the reconciliation · 45 minutes <span class="needs">your Project</span></span>
+  <ol>
+    <li>Take your reconciliation report and add gift-card redemptions as an explicit <b>expected</b> difference
+        between revenue and receipts.</li>
+    <li>Make the report show that difference as a named line, not as drift.</li>
+    <li>Then seed a real fault as well, and confirm the report still catches it.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> the report separates <b>expected</b> divergence from <b>drift</b>,
+  and it still goes red for the real fault. A report that cries wolf gets switched off, and then it is not
+  watching anything.</p>
+</div>
+
+<div class="task">
+  <span class="label">The migration note · 10 minutes, written <span class="needs">no store needed</span></span>
+  <p>Write the paragraph you would send a client who assumed gift cards migrate: they do not, what the
+  outstanding balance is, and the three options — honour manually, issue new cards, or keep the old platform
+  readable for a period.</p>
+  <p class="proof"><b>Proof it worked:</b> the note names the outstanding balance as a real number and offers
+  choices rather than a problem. Discovering this in week nine is what makes it expensive.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>A gift card is a promise the shop owes</b>, not a payment. Money arrived when it was <em>sold</em>.</li>
+  <li><b>Revenue and receipts are supposed to diverge</b> when cards are redeemed. That gap is not a fault.</li>
+  <li><b>Store credit is a ledger, not a balance.</b> Read <code>transactions</code>, not one number.</li>
+  <li><b>Credit expires</b>, so a cached balance goes stale with no event to react to.</li>
+  <li><b>Each credit has its own <code>expiresAt</code> and <code>remainingAmount</code>.</b> A balance is a sum over separately expiring pieces.</li>
+  <li><b>Four transaction types</b> — credit, debit, debit-revert, expiration. Missing the revert double-counts.</li>
+  <li><b>Dev stores do not support gift cards or store credit</b>, and gift cards never migrate.</li>
+</ul>
+<p class="one-thing">If you remember one thing: this is money that moved at a different time from the sale — so never record a redemption as a payment, and never treat the revenue-versus-bank gap as drift.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for payouts — where the money actually lands, and the question an accountant will ask you.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0040-fulfillment-orders-and-being-a-fulfillment-service.html">← P8.4</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7.4 — Market-Driven Shipping</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P7 · Lesson 4 · <span class="pill core">core</span></p>
+<h1>Market-driven shipping: the model replacing delivery profiles</h1>
+<p class="subtitle">Shipping configuration is moving out of delivery profiles and into markets. Every merchant, by July 2027.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know which of the two shipping models a store is on, you can detect it in one field, and you know which of your own code has to change.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<div class="note">
+  <span class="label">Why this Lesson exists, honestly</span>
+  This slot was originally going to be about Managed Markets. While researching it on <b>2026-08-23</b> I found
+  something more urgent that I could verify: <b>the delivery profile model taught in P7.1 is being
+  deprecated</b>. That is a live change to something the Course already teaches, so it wins the slot. Managed
+  Markets stays on the gap list until I can verify it properly.
+</div>
+
+<h3>Derive it: why would Shopify move shipping into markets?</h3>
+
+<p>P5.1 established what a market is: <b>a group of buyers you treat differently</b>. Currency, prices, which
+products they can see, which website they land on, language — all already overridable per market.</p>
+
+<p>Now ask the obvious question. If everything else about how you sell to a group of buyers lives in one place,
+why is <em>shipping</em> configured somewhere else entirely?</p>
+
+<p>It should not be. Which is why it is moving. Shipping options are being moved <b>into each market</b>, so a
+merchant configures rates per market — across regions, POS locations and B2B company locations — and gets more
+predictable rates at checkout.</p>
+
+<div class="diagram">
+  OLD   delivery profile -> location group -> zone -> method -> rate
+        a parallel structure, with its own idea of geography
+
+  NEW   market -> shipping configuration
+        one place per group of buyers, alongside currency,
+        prices, catalogue visibility and language
+</div>
+
+<p>So this is not a new feature bolted on. It is a correction: shipping was the last thing configured outside
+the market model, and now it is not.</p>
+
+<h3>What is being deprecated, and what is not</h3>
+
+<p>This distinction is the whole Lesson, and getting it wrong means either panicking about nothing or missing a
+real break.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Your app…</th><th>Action</th></tr>
+  <tr><td>Only creates and manages <b>its own app-owned</b> delivery profiles, and never reads merchant ones</td><td><b>No change.</b> Keep using <code>deliveryProfile</code> / <code>deliveryProfiles</code>. Your integration keeps working.</td></tr>
+  <tr><td><b>Reads</b> merchant delivery profiles — to surface rates, or sync with an external system</td><td>Update your <b>read</b> path.</td></tr>
+  <tr><td><b>Creates or modifies</b> the merchant&#39;s delivery profiles</td><td>Update your <b>write</b> path.</td></tr>
+</table>
+</div>
+
+<p>So the deprecation is specifically of <code>deliveryProfile</code> and <code>deliveryProfiles</code>
+<b>for merchant-owned shipping configuration</b>. App-owned profiles are untouched.</p>
+
+<p>To find out which case you are in, audit your own GraphQL for <code>deliveryProfile</code>,
+<code>deliveryProfiles</code>, <code>deliveryProfileCreate</code>, <code>deliveryProfileUpdate</code> and
+<code>deliveryProfileRemove</code>. <b>Anything that targets a profile your app did not create is a
+merchant-profile interaction</b>, and that is the test — not the mutation name.</p>
+
+<h3>Detecting which model a merchant is on</h3>
+
+<p>You cannot assume, because merchants opt in over time and both models exist at once. There is one field for
+it: <b><code>marketDrivenShipping</code> on <code>ShopFeatures</code></b>.</p>
+
+<p>So your code branches:</p>
+
+<div class="diagram">
+  read ShopFeatures.marketDrivenShipping
+      |
+      |-- true  -> write via marketCreate / marketUpdate
+      |            (needs read_markets AND write_markets)
+      |
+      |-- false -> write via deliveryProfiles  (legacy)
+
+  Once every merchant is on the new model (July 2027),
+  the legacy branch can be deleted.
+</div>
+
+<h3>The two read paths, and why one is recommended</h3>
+
+<p>For reading merchant shipping configuration there are two options, and Shopify has a preference.</p>
+
+<p><b>Option A — Contextual Product Feeds.</b> Recommended, if your app is a sales channel or can become one.
+Shopify states it has several advantages over reading the Markets API directly. See A1.6 for what becoming a
+channel involves.</p>
+
+<p><b>Option B — the Markets API.</b> If Option A is not a fit, read from Markets directly. The
+<code>markets</code> query needs <code>read_markets</code>; mutations need <code>read_markets</code> <em>and</em>
+<code>write_markets</code>.</p>
+
+<h3>Test it before merchants arrive</h3>
+
+<p>There is a <b>Market-driven shipping feature preview</b> for development stores. Select it when creating a
+dev store, or enable it on an existing one from the developer dashboard. That means you can run your
+integration against both models today, before any merchant opts in — which is the entire point of a feature
+preview and almost nobody uses one.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> that market-driven shipping moves shipping options into each
+market across regions, POS locations and B2B company locations; that <code>deliveryProfile</code> and
+<code>deliveryProfiles</code> are being deprecated <b>for merchant-owned shipping configuration</b> while
+app-owned profiles are unchanged; the three action cases; the audit list of five operation names; the
+<code>marketDrivenShipping</code> field on <code>ShopFeatures</code>; that writers move to
+<code>marketCreate</code> / <code>marketUpdate</code> needing <code>read_markets</code> and
+<code>write_markets</code>; that readers should prefer Contextual Product Feeds if they are or can be a sales
+channel; that all merchants are expected on the new model by <b>July 2027</b>; and that a feature preview is
+available on development stores —
+<a href="https://shopify.dev/docs/apps/build/orders-fulfillment/market-driven-shipping/upgrade-your-app">Upgrade your app for market-driven shipping</a>
+and <a href="https://shopify.dev/docs/api/admin-graphql/2026-07/queries/markets">markets</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your app creates its own delivery profile for a special "bulky items" rate, and separately reads the
+  merchant&#39;s profiles to sync rates into an ERP. <b>Which half breaks, and what do you do about each?</b>
+</div>
+
+<p>The app-owned profile is fine — keep using <code>deliveryProfiles</code> for it, unchanged. The reading half
+breaks, because it targets profiles your app did not create. So you branch on
+<code>ShopFeatures.marketDrivenShipping</code> and, on the new model, read from the Markets API — or become a
+sales channel and use Contextual Product Feeds, which is the recommended path. One app, two answers, and
+mixing them up means either rewriting something that was fine or missing the part that breaks.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — assuming all delivery profile use is deprecated</span>
+  App-owned profiles are <b>unchanged</b>. Rewriting them is work you did not need to do, and it is the most
+  likely over-reaction to this announcement.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — assuming which model a merchant is on</span>
+  Both exist at once while merchants opt in. Guessing means writing to the wrong place, and shipping
+  configuration failing to appear is not an exception you will see — it is a checkout with no shipping option,
+  which is P7.1&#39;s symptom.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — auditing by mutation name instead of by ownership</span>
+  The test is <b>whose profile</b> you are touching, not which operation you called. Anything targeting a
+  profile your app did not create is a merchant-profile interaction, however you got there.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — discovering the market scopes late</span>
+  Writing through markets needs <code>read_markets</code> <b>and</b> <code>write_markets</code>. Adding a scope
+  means re-consent from every merchant, as in A1.4 — so add it in the same release, not after.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — not using the feature preview</span>
+  You can enable market-driven shipping on a development store <em>today</em>. Skip it and your first contact
+  with the new model is a live merchant who opted in, which is the most expensive possible place to find a
+  gap.
+</div>
+
+<div class="scar">
+  <span class="who">Treating July 2027 as far away</span>
+  It is the date the legacy branch can be <em>deleted</em>, not the date to start. Merchants opt in before then,
+  individually and without telling you.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — this changes the shape of a shipping estimate</span>
+  Under the old model, shipping was one configuration to get right. Under the new one it is a configuration
+  <em>per market</em>, and a store with many markets — P5.1 records one real store with <b>205</b> — is a very
+  different amount of work. Ask how many markets before quoting shipping work.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">Shopify is moving shipping settings out of one place and into another. Explain <b>why</b> —
+  and why some code that uses the old place is completely fine.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>A shop already keeps a lot of settings per group of customers: what currency they see, what prices they pay,
+which products they are even shown, which language, which website. All in one place per group.</p>
+
+<p>But shipping was configured somewhere else entirely, in its own structure with its own idea of geography. So
+a shop owner setting up a new country had to do part of the job in one place and part in another, and the two
+could disagree.</p>
+
+<p>Moving shipping in with everything else means one place per group of customers. That is the whole reason.</p>
+
+<p><b>On the code that is fine:</b> there are two different things using the old structure. Some apps create
+<em>their own</em> shipping setup — a special rate for oversized items, say — and that is theirs to manage.
+Other apps read or change <em>the shop owner&#39;s</em> setup. Only the second kind is affected, because only
+the second kind is touching the thing that moved.</p>
+
+<p>So the question is not "do I use the old thing?" It is "whose settings am I touching?"</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>delivery profile · market-driven · deprecation · app-owned versus merchant-owned · feature flag.</em>
+  "The shop owner had to do half the job in one place and half in another" explains the move. "Whose settings am
+  I touching?" explains who is affected.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 45 minutes <span class="needs">your own codebase</span></span>
+  <p>Audit yourself. This is twenty minutes that decides whether you have any work at all.</p>
+  <ol>
+    <li>Grep for all five: <code>deliveryProfile</code>, <code>deliveryProfiles</code>,
+        <code>deliveryProfileCreate</code>, <code>deliveryProfileUpdate</code>,
+        <code>deliveryProfileRemove</code>.</li>
+    <li>For every hit, answer one question: <b>did my app create that profile?</b></li>
+    <li>Sort the hits into two lists: app-owned (no change) and merchant-owned (must change).</li>
+    <li>Split the merchant-owned list into <b>reads</b> and <b>writes</b>.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you have four lists and you can say the size of the actual job. If
+  your merchant-owned list is empty, you are done — write that down with the date so you do not re-audit in six
+  months.</p>
+</div>
+
+<div class="task">
+  <span class="label">Then branch on the field · 60 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>Read <code>ShopFeatures.marketDrivenShipping</code> and log it at start-up next to the API
+        version.</li>
+    <li>Create a dev store with the <b>Market-driven shipping feature preview</b> on — or enable it on an
+        existing one from the developer dashboard.</li>
+    <li>Run your integration against <b>both</b> a preview store and a normal one.</li>
+    <li>For writes, implement the <code>marketCreate</code> / <code>marketUpdate</code> branch, and add
+        <code>read_markets</code> and <code>write_markets</code> in the <em>same</em> release.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> the same code handles both stores, and your logs say which model
+  each one is on. That log line is what stops the eventual "it broke for one client" from being a mystery.</p>
+</div>
+
+<div class="task">
+  <span class="label">The estimate question · 10 minutes <span class="needs">no store needed</span></span>
+  <p>Add one line to your shipping-work estimate template: <b>how many markets does this store have?</b></p>
+  <p class="proof"><b>Proof it worked:</b> the question is in the template. Shipping used to be one
+  configuration; it is becoming one per market, and P5.1 records a real store with 205 of them.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>Shipping is moving into markets</b> — per region, POS location and B2B company location. All merchants by <b>July 2027</b>.</li>
+  <li><b><code>deliveryProfile</code> / <code>deliveryProfiles</code> are deprecated for <em>merchant-owned</em> configuration only.</b> App-owned profiles are unchanged.</li>
+  <li><b>The test is ownership, not the operation name.</b> Anything touching a profile your app did not create is affected.</li>
+  <li><b>Detect the model with <code>ShopFeatures.marketDrivenShipping</code>.</b> Never assume — both exist at once.</li>
+  <li><b>Writers move to <code>marketCreate</code> / <code>marketUpdate</code></b>, needing <code>read_markets</code> and <code>write_markets</code>.</li>
+  <li><b>Readers should prefer Contextual Product Feeds</b> if they are or can become a sales channel; otherwise read the Markets API.</li>
+  <li><b>A feature preview exists on dev stores.</b> Test both models before a merchant opts in.</li>
+</ul>
+<p class="one-thing">If you remember one thing: the question is not "do I use delivery profiles?" but "<em>whose</em> delivery profiles am I touching?" — and the answer decides whether you have any work at all.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P7 done. Then <b>"next"</b> for Chapter P8 and everything after the sale.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0025-tax-what-shopify-does-and-where-you-must-not-guess.html">← P7.3</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,9 +1,15 @@
-# Mission: Shopify tech lead
+# Mission: Shopify domain expert
 
 ## Why
 Lam builds Shopify integrations, but has never run a live sync end to end. The
-goal is to close that gap for real, and to be the person in the room who can
-explain a Shopify design to a client and a PM without hedging.
+goal is to close that gap for real, and to become a **domain expert** in Shopify:
+the person who can be handed any Shopify integration job and ship it **alone**.
+
+**The proof is working code, not a conversation.** Decided 2026-08-23. The earlier
+version of this Course aimed at "the person in the room who can explain a design
+to a client". That goal produced a block in every Lesson called *What you say to a
+client/PM*. It is gone. Understanding you cannot build is the failure mode this
+Course now exists to prevent.
 
 
 ## Success looks like
@@ -16,6 +22,11 @@ explain a Shopify design to a client and a PM without hedging.
 - Can look at a live Shopify store and read its integration: which app wrote which
   field, where the tags came from, whether inventory is written by the store or by
   an app.
+- Can **explain any core Shopify idea to a beginner, out loud, without jargon.**
+  That is the test, not recognising the term. Every Lesson has a *Say it out loud*
+  block for exactly this, and its model answer is hidden so you have to try first.
+- Can **finish the Build it task in every Lesson** against the Dev store. Each one
+  ends in a proof — something to look at that says it worked.
 - Can give a client a **range** instead of a number, say "I don't know yet"
   without losing the room, and disagree with a PM in English under pressure.
 - Can size a large catalogue load and say honestly whether it is a 30-day job or a

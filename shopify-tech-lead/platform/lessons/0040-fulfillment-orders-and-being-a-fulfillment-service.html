@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P8.4 — Fulfillment Orders and Being a Fulfillment Service</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P8 · Lesson 4 · <span class="pill core">core</span></p>
+<h1>Fulfillment orders, and being a fulfillment service</h1>
+<p class="subtitle">The object that represents the <em>work</em> of an order — and the one you cannot create.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can model an order as work to be done rather than a thing to be shipped, and you know which of the three fulfilment scope pairs your integration needs.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is an order once it has been paid for?</h3>
+
+<p>An order is a customer's request. It is <em>not</em> a shipment, and it is not a job. Somebody still has to
+pick the items, from somewhere, and put them in a box.</p>
+
+<p>Push on "from somewhere". A cart can contain a shirt in the warehouse and a mug in a shop. Those are two
+different buildings, two different sets of staff, two different parcels. So the work cannot be one thing
+attached to the order — the work has to be described <b>per place</b>.</p>
+
+<p>That is exactly what a <code>FulfillmentOrder</code> is: <b>the items from one order that are expected to
+be fulfilled from the same location.</b> One order, several fulfillment orders. And there can be more than
+one per order <em>per location</em>.</p>
+
+<div class="diagram">
+  Order                       the customer's request
+    └── FulfillmentOrder      the WORK, at ONE location
+          ├── FulfillmentOrderLineItem
+          └── Fulfillment     the actual parcel, with tracking
+
+  Order      : "they want these things"
+  FulfillmentOrder : "somebody at this place must pick these"
+  Fulfillment      : "this parcel left, here is the tracking"
+</div>
+
+<p>So there are three layers and they answer three different questions. People collapse them into one and
+then cannot express a partial shipment.</p>
+
+<h3>The thing you cannot do</h3>
+
+<p><b>Shopify creates fulfillment orders automatically when an order is created. It is not possible to
+manually create them.</b> There is no create mutation, and looking for one is how developers lose an
+afternoon.</p>
+
+<p>You can move them, hold them, split them, and fulfil them. You cannot bring one into existence. That is a
+deliberate constraint: the work is derived from the order, so inventing work that no order asked for would
+make the two disagree.</p>
+
+<h3>The statuses, and the two that surprise people</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Status</th><th>What it means</th></tr>
+  <tr><td><code>OPEN</code></td><td>Ready to be fulfilled</td></tr>
+  <tr><td><code>IN_PROGRESS</code></td><td>Being worked on</td></tr>
+  <tr><td><code>ON_HOLD</code></td><td>Fulfilment <b>cannot start</b> until the hold is released</td></tr>
+  <tr><td><code>SCHEDULED</code></td><td>Deferred — becomes ready after the date in <code>fulfill_at</code></td></tr>
+  <tr><td><code>INCOMPLETE</code></td><td>Cannot be completed as requested</td></tr>
+  <tr><td><code>CLOSED</code></td><td>Completed and closed</td></tr>
+  <tr><td><code>CANCELLED</code></td><td>Cancelled by the merchant</td></tr>
+</table>
+</div>
+
+<p><code>ON_HOLD</code> and <code>SCHEDULED</code> are the two that break naive code. Both are orders that
+look unfulfilled and are <em>not</em> waiting for you. A warehouse integration that treats every
+non-fulfilled order as "pick this now" will ship a pre-order six weeks early and release goods a fraud team
+deliberately held.</p>
+
+<p>Note also that the <code>Fulfillment</code> object has its own, different status set —
+<code>SUCCESS</code>, <code>CANCELLED</code>, <code>ERROR</code>, <code>FAILURE</code> — and its
+<code>OPEN</code> and <code>PENDING</code> values are <b>deprecated</b>. Two objects, two status vocabularies,
+similar words.</p>
+
+<h3>Being the warehouse: the request/accept dance</h3>
+
+<p>If a location is managed by a fulfillment service — a third-party warehouse, possibly you — then work is
+not simply assigned. It is <b>requested</b>, and the service can accept or reject.</p>
+
+<div class="diagram">
+  merchant / order-management app
+        │  sends a fulfilment REQUEST
+        ▼
+  fulfillment service  ──► ACCEPT  or  REJECT
+        │
+        │  after ACCEPT the merchant can no longer cancel it —
+        │  they must submit a CANCELLATION REQUEST instead
+        ▼
+  service packs, then calls fulfillmentCreate
+        │  (tracking now, or later via fulfillmentTrackingInfoUpdate)
+        ▼
+  Fulfillment exists
+</div>
+
+<p>The line worth memorising: <b>once the service accepts, the merchant cannot cancel — only ask.</b> That is
+a genuine handover of control, and it is the moment your system stops being able to change its mind.</p>
+
+<h3>Three scope pairs, and picking the wrong one</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Scope pair</th><th>Grants access to fulfillment orders at…</th></tr>
+  <tr><td><code>read/write_merchant_managed_fulfillment_orders</code></td><td>merchant-managed locations</td></tr>
+  <tr><td><code>read/write_assigned_fulfillment_orders</code></td><td>locations <b>your</b> service manages — this is the fulfilment-service one</td></tr>
+  <tr><td><code>read/write_third_party_fulfillment_orders</code></td><td>locations managed by <em>other</em> fulfilment services</td></tr>
+</table>
+</div>
+
+<p>These are not degrees of the same permission. They are three different <em>roles</em>. An order-management
+app needs the first; a warehouse app needs the second; an app that has to see the whole picture needs the
+third as well. Asking for the wrong one produces an empty list rather than an error, which reads exactly like
+"there is no work".</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the <code>FulfillmentOrderStatus</code> values and their
+meanings, that <b>Shopify creates fulfillment orders automatically and they cannot be created manually</b>,
+that there can be more than one fulfillment order per order per location, the accept/reject flow and that a
+merchant must submit a cancellation request after acceptance, <code>fulfillmentCreate</code> and
+<code>fulfillmentTrackingInfoUpdate</code>, the three access-scope pairs, and that
+<code>FulfillmentStatus.OPEN</code> and <code>PENDING</code> are deprecated —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/FulfillmentOrderStatus">FulfillmentOrderStatus</a>
+and <a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/FulfillmentStatus">FulfillmentStatus</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "we have 40 unfulfilled orders and the warehouse says it has nothing to pick".
+  <b>Name three explanations using the right object names.</b>
+</div>
+
+<p>One: they are <code>ON_HOLD</code>, so the work exists and is deliberately blocked. Two: they are
+<code>SCHEDULED</code> with a future <code>fulfill_at</code>, so they are pre-orders and not late at all.
+Three: the fulfillment orders are assigned to a location the warehouse app cannot see, because the app holds
+the wrong scope pair and receives an empty list rather than an error. All three look identical on an
+"unfulfilled orders" report.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — looking for a create mutation</span>
+  There is not one. <b>Fulfillment orders are created by Shopify automatically and cannot be created
+  manually.</b> Code written on the assumption that you create work is code that has to be redesigned, not
+  fixed.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — treating <code>SCHEDULED</code> as "late"</span>
+  A pre-order deferred to a future <code>fulfill_at</code> looks unfulfilled. Ship it now and you have
+  dispatched something the customer expected in six weeks, possibly before you have it.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — fulfilling something <code>ON_HOLD</code></span>
+  A hold is somebody's deliberate decision — fraud review, a payment problem, a customer request. Fulfilment
+  cannot start until it is released, and code that works around the hold ships goods a human stopped.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the wrong scope pair</span>
+  The three pairs are three <em>roles</em>, not three levels. Hold the merchant-managed one when you needed
+  the assigned one and you get an <b>empty list</b>, which is indistinguishable from having no work.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — assuming you can still cancel after acceptance</span>
+  Once a fulfillment service accepts a request, <b>the merchant cannot cancel it</b> — only submit a
+  cancellation request the service may or may not honour. Any workflow with a "cancel" button that assumes
+  immediacy is lying to whoever presses it.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — one order equals one shipment</span>
+  A cart spanning two locations produces two fulfillment orders and can produce two parcels. Downstream
+  systems modelling one shipment per order will silently drop the second, and only for multi-location carts.
+</div>
+
+<div class="scar">
+  <span class="who">Confusing the two status vocabularies</span>
+  <code>FulfillmentOrder</code> and <code>Fulfillment</code> have different status sets with overlapping
+  words, and <code>FulfillmentStatus.OPEN</code> and <code>PENDING</code> are already deprecated. Check which
+  object you are reading before you branch on a status name.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — decide who may release a hold</span>
+  Shopify will let your app release holds. Almost no client should allow that automatically, because a hold is
+  usually a human protecting the business from something your code cannot see. Agree in writing who is
+  allowed to release one.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">A customer buys two things and they are in two different buildings. Explain why Shopify
+  needs a separate object for "the work", and why you are <b>not allowed to create one</b>.</p>
+  <p>Say it out loud, with no object names. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>The order says what the customer wants. It does not say who has to do anything. Somebody in the warehouse
+has to pick the shirt, and somebody in the shop has to pick the mug. Those are two separate jobs, for two
+separate sets of people, ending in two separate parcels.</p>
+
+<p>If you attached the job to the order, you could only ever describe <em>one</em> job — so you could never
+express "half of this is being handled over there". So the job is a thing of its own, and there is one per
+place.</p>
+
+<p><b>On not creating them:</b> the work is <em>derived</em> from what was bought. Shopify works it out and
+makes the job records the moment the order appears. If you could invent extra work, you would be able to
+create a job to pick something nobody ordered — and then the order and the work would disagree, with no way
+to say which was right.</p>
+
+<p>So you can move a job, pause it, split it and finish it. You cannot make one up. Looking for a way to
+create one is the mistake — the work already exists, you just have to find it.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>fulfillment order · line item · derived entity · immutable · assignment · scope.</em> "The order says
+  what they want; the job says who has to go and get it" is the explanation. A beginner does not need the
+  word "derived" to understand that inventing work nobody ordered would be nonsense.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 60 minutes <span class="needs">Dev store, 2+ locations</span></span>
+  <p>Make one order become two jobs, with your own hands.</p>
+  <ol>
+    <li>Stock item A only at location 1 and item B only at location 2.</li>
+    <li>Buy both in one order.</li>
+    <li>Query the order's <code>fulfillmentOrders</code>. There are two, each with its own location and
+        status.</li>
+    <li>Fulfil <b>one</b> of them. Look at the order: it is now partially fulfilled, with one parcel and one
+        outstanding job.</li>
+    <li>Feed that order through your own order handler.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> your handler either dropped the second job or reported the order as
+  fully shipped. Either way you have found the bug, and it only ever appears on multi-location carts — which
+  is why it survives testing.</p>
+</div>
+
+<div class="task">
+  <span class="label">The two statuses that look like "late" · 45 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>Put a hold on one fulfillment order. Note it is <code>ON_HOLD</code> and cannot be started.</li>
+    <li>Create a deferred one so it is <code>SCHEDULED</code> with a future <code>fulfill_at</code>.</li>
+    <li>Now run your "unfulfilled orders" report. Both appear.</li>
+    <li>Fix the report so it separates <b>waiting for us</b> from <b>deliberately not ready</b>.</li>
+    <li>Try to release the hold from code, then delete that code and write down who is allowed to.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> your report has three buckets, not one. A warehouse dashboard that
+  shows held and scheduled work as "to pick" will get those items shipped, and both are somebody's deliberate
+  decision.</p>
+</div>
+
+<div class="task">
+  <span class="label">Pick your role · 20 minutes <span class="needs">no store needed</span></span>
+  <p>Write down which of the three scope pairs your integration needs, and why — merchant-managed, assigned
+  (you are the warehouse), or third-party (you need to see other services' work).</p>
+  <p class="proof"><b>Proof it worked:</b> your note names the role, not just the scope. Then prove it: hold
+  only the wrong pair and confirm you get an <b>empty list rather than an error</b>. That silence is the
+  failure mode.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>A fulfillment order is the <em>work</em></b> — the items from one order expected to ship from one location. One order, several jobs.</li>
+  <li><b>You cannot create one.</b> Shopify creates them automatically with the order. There is no create mutation.</li>
+  <li><b>Three layers:</b> Order (what they want) → FulfillmentOrder (who must pick it) → Fulfillment (the parcel that left).</li>
+  <li><b><code>ON_HOLD</code> and <code>SCHEDULED</code> are not "late".</b> Both are deliberate. Never treat non-fulfilled as ready-to-pick.</li>
+  <li><b>Three scope pairs are three roles</b> — merchant-managed, assigned, third-party. The wrong one returns an empty list, not an error.</li>
+  <li><b>After a service accepts, the merchant cannot cancel</b> — only request cancellation. Control has genuinely moved.</li>
+  <li><b>FulfillmentOrder and Fulfillment have different status sets</b>, and <code>FulfillmentStatus.OPEN</code>/<code>PENDING</code> are deprecated.</li>
+</ul>
+<p class="one-thing">If you remember one thing: an order tells you what a customer wants; the fulfillment order tells you what somebody has to <em>do</em> — and Shopify decides that, not you.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for gift cards and store credit — money that lives outside the payment gateway.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0028-draft-orders-selling-outside-the-storefront.html">← P8.3</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -53,8 +53,19 @@ Filling them added **16 Lessons**, so the real total is **83**: three Chapters n
 to Track 1 (P8 After the sale, P9 Other ways to sell, P10 Conversion, content and
 risk), P7 for shipping and tax, one Lesson each added to P4, A1 and A2.
 
-**Final: 83 Lessons — 58 core, 25 depth.** At 10–15 hours a week the core path plus
-the Project is three to four months; all 83 is five to six.
+**Then the goal changed, and so did every Lesson.** On 2026-08-23 the mission moved from
+"tech lead who can discuss well with a client" to **domain expert who can build any Shopify
+integration alone**. Three consequences:
+
+1. The **What you say to a client/PM** block was removed from all 83 Lessons. Its 201
+   sentences moved verbatim to `reference/talking-to-a-client.html`.
+2. Two new blocks replaced it: **Say it out loud** (a Feynman prompt with the model answer
+   hidden behind a `<details>`, plus a list of words that mean you recited the docs) and
+   **Build it** (one task ending in a checkable proof). Lessons went from four blocks to five.
+3. The remaining nine territory-map gaps were written, taking the total to **92**.
+
+**Final: 92 Lessons — 62 core, 30 depth, 16 References.** At 10–15 hours a week the core path
+plus the Project is about four months; all 92 is six to seven.
 
 Per Track: Platform **23 core / 13 depth** · Apps & Integrations **20 core / 3
 depth plus the 5 Project steps** (it is the point of the Course, so almost nothing
@@ -69,7 +80,7 @@ new: 83 Lessons · 15 References ·  0 katas (they became Project steps) · 4 Ma
 
 ---
 
-## Track 1 — Platform (36 Lessons)
+## Track 1 — Platform (44 Lessons)
 
 What Shopify itself is. The vocabulary you need before any integration
 conversation makes sense.
@@ -124,7 +135,7 @@ conversation makes sense.
 
 ---
 
-## Track 2 — Apps & Integrations (28 Lessons) · the heart of the Course
+## Track 2 — Apps & Integrations (29 Lessons) · the heart of the Course
 
 You integrate Shopify by building an app. The app is the vehicle; the sync is the
 job. This Track carries the Project.
@@ -291,16 +302,19 @@ are code, not reading.
 | **7** | `reference/territory-map.html` — rate every area, name every gap | **done** |
 | **8** | Fill all 16 gaps: P7, P8, P9, P10, P4.5, A1.5, A2.5 | **done** |
 | **9** | Check-and-fix pass: links, cross-references, counts, Scars coverage, fact sweep | **done** |
+| **10** | Goal change to *domain expert*: remove the client/PM block, add **Say it out loud** and **Build it** to all 83 Lessons | **done** |
+| **11** | Write the last 9 gap Lessons (92 total) | **done** |
+| **12** | Re-check everything, rebuild the territory map a third time, recount | **done** |
 
 ### What is written
 
-**All 83 Lessons**, including Project Steps 3 and 4 — webhooks in with inventory flowing back, and
+**All 92 Lessons**, in the five-block format, including Project Steps 3 and 4 — webhooks in with inventory flowing back, and
 the queue plus dead-letter plus the reconciliation report with its ten-row break-it table.
 
 Nothing is left to *write*. What remains is to **do**: build the Project. Step 3 onward needs a Dev
 store and a public tunnel, and the store work was deliberately deferred.
 
-**All 15 References:** three Scars pages, the territory map, the Glossary, object model card, what-moves matrix,
+**All 16 References:** three Scars pages, the territory map, the topic phrasebook, the Glossary, object model card, what-moves matrix,
 migration runbook, ownership matrix, conflict cases, rate limits card, phrasebook, rapid-fire,
 STAR worksheet, mock run sheets.
 
@@ -363,6 +377,45 @@ Checks that came back clean: 0 broken links · 0 unbalanced `<div>` · 0 orphan 
 four blocks and a recall card · 266 cross-references checked, 0 mismatched · the
 number sweep found the only repeated old figures (50,000 / 1,000 per day) to be
 deliberate history notes about the doc disagreement, not errors.
+
+### The goal change, and the two blocks that replaced one (2026-08-23)
+
+The Course was re-interviewed and the mission changed. Recorded here because every Lesson shows it.
+
+| Decision | Choice |
+|---|---|
+| The proof of expertise | **Build any Shopify integration solo.** Working code, not a conversation. |
+| Lesson shape | **Five blocks:** How it works → Where it hurts → Say it out loud → Build it → Remember this |
+| The removed block | *What you say to a client/PM* — deleted from every Lesson, 201 sentences preserved in `reference/talking-to-a-client.html` |
+| Track 3 | **Kept in full**, all 19 converted. "Build it" is a written or recorded deliverable, not a fake code task |
+| Scope | All nine remaining gaps written; every one of the 92 Lessons rewritten |
+
+**Two options were offered and declined, and the reasons are worth keeping.** A two-tier
+structure (deep spine plus short reference cards) was recommended for the 20/80 request and
+rejected in favour of treating all 92 equally — so "the 20%" is now a reading order rather than
+a cut. And the five-block shape makes each Lesson roughly 30% longer, which was flagged before
+it was chosen. Both are the learner's call, made with the cost stated.
+
+**One planned Lesson was deliberately not written.** Managed Markets was scheduled and the
+research did not confirm enough to teach it honestly, so it stayed on the gap list rather than
+becoming a Lesson built on assumptions. Its slot went to **market-driven shipping** instead,
+which turned out to matter more — see below.
+
+### The research found a live change to existing content
+
+While researching the gaps, the docs revealed that **`deliveryProfile` and `deliveryProfiles`
+are being deprecated for merchant-owned shipping configuration**, with all merchants expected
+on market-driven shipping by **July 2027**. Lesson P7.1 teaches the delivery profile model, so
+it was already partly out of date.
+
+Fixed in two places: a dated warning block at the top of P7.1 explaining what still works
+(app-owned profiles) and what does not (reading or writing the merchant's), and a new Lesson
+**P7.4** covering the new model, the `ShopFeatures.marketDrivenShipping` detection field, and
+both upgrade paths.
+
+**This is the most valuable thing the gap research produced** — not a new Lesson, but a
+correction to one that already existed. Worth remembering as a habit: researching adjacent
+topics is how you find out what you already teach has changed.
 
 ### The old Course is deleted — what it needed first
 

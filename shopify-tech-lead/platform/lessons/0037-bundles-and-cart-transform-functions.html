@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P5.5 — Bundles and Cart Transform Functions</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P5 · Lesson 5 · <span class="pill core">core</span></p>
+<h1>Bundles and cart transform Functions</h1>
+<p class="subtitle">One line becomes several — so price <em>and</em> inventory stop matching what your sync wrote.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know the three ways a bundle can be composed, and why a bundle silently invalidates a price reconciliation that was passing yesterday.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is a bundle, really?</h3>
+
+<p>A customer buys "the shampoo and soap set". But the warehouse does not stock a set — it stocks shampoo and
+it stocks soap. So a bundle is a thing that exists at the moment of <b>buying</b> and does not exist at the
+moment of <b>picking</b>.</p>
+
+<p>Which means something has to translate between them. Somewhere between the customer clicking and the
+warehouse packing, one line has to become two.</p>
+
+<p>That translation is the whole subject, and it is where your integration breaks — because your sync wrote
+one price against one product, and by the time checkout has finished there are two lines with different
+numbers.</p>
+
+<h3>Three ways a bundle gets composed</h3>
+
+<p>Shopify composes bundles during calculation in two shapes — <b>expand</b> and <b>merge</b> — and the expand
+shape comes from two different sources. So there are three cases, and they are named in the API:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Name</th><th>What happens</th><th>Where it comes from</th></tr>
+  <tr><td><code>BUNDLES_STATIC_EXPAND</code></td><td>A parent variant expands into its component lines</td><td>A fixed bundle definition</td></tr>
+  <tr><td><code>BUNDLES_DYNAMIC_EXPAND</code></td><td>A parent variant expands into component lines</td><td>A cart transform Function&#39;s <b>expand</b> operation</td></tr>
+  <tr><td><code>BUNDLES_DYNAMIC_MERGE</code></td><td>Separate lines are <b>merged</b> into one bundle line</td><td>A cart transform Function&#39;s <b>merge</b> operation</td></tr>
+</table>
+</div>
+
+<div class="diagram">
+  EXPAND   cart:  [ Hair &amp; Skin Bundle x1 ]
+           after: [ Shampoo x1 ] [ Soap x1 ]     one line became two
+
+  MERGE    cart:  [ Shampoo x1 ] [ Soap x1 ]
+           after: [ Hair &amp; Skin Bundle x1 ]     two lines became one
+
+  Either way: what the customer chose is not what the warehouse picks,
+             and the prices are recomputed in between.
+</div>
+
+<p>Notice that expand and merge run in opposite directions but cause the <em>same</em> problem for you: the
+lines that come out are not the lines that went in.</p>
+
+<h3>The fixed kind: an async operation, not a mutation</h3>
+
+<p>A fixed bundle is created with <code>productBundleCreate</code>. The part people miss is that it does not
+return a product — it returns a <b><code>productBundleOperation</code></b> with an <code>id</code> and a
+<code>status</code>, which you then poll.</p>
+
+<pre><code>mutation ProductBundleCreate($input: ProductBundleCreateInput!) {
+  productBundleCreate(input: $input) {
+    productBundleOperation { id status }
+    userErrors { message field }
+  }
+}</code></pre>
+
+<p>The first response comes back with <code>status: "CREATED"</code>, which means <em>the operation was
+created</em> — not the bundle. Same shape as a bulk operation, and the same trap: a clean response is a
+statement about the request, not about the outcome.</p>
+
+<p>Each component carries a <code>quantity</code>, a <code>productId</code>, and
+<code>optionSelections</code> naming which options of that component the bundle exposes. If two components
+both have an option you want to present as one choice — every component has a "scent" — you use
+<code>consolidatedOptions</code> to map them into a single bundle option.</p>
+
+<h3>The Function kind: your code, at checkout, with no network</h3>
+
+<p>A cart transform Function is a Function like any other, so <b>everything in P5.3 applies</b>: it runs
+inside Shopify while a customer waits, it cannot reach anything, it has no logs of its own, and its input
+query drops metafield values over 10,000 bytes.</p>
+
+<p>Which produces a specific and common design failure: "the Function will check our ERP to decide what goes
+in the bundle". It cannot. Anything it needs must already be in Shopify before the customer arrives.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the three composition names
+(<code>BUNDLES_STATIC_EXPAND</code>, <code>BUNDLES_DYNAMIC_EXPAND</code>,
+<code>BUNDLES_DYNAMIC_MERGE</code>), that expand takes a parent variant into component lines and merge takes
+separate lines into one bundle, the <code>productBundleCreate</code> mutation returning a
+<code>productBundleOperation</code> to poll, component <code>optionSelections</code> and
+<code>consolidatedOptions</code>, and that subscription contract calculation needs
+<code>withMerchandiseCustomizations: true</code> to expand a bundle —
+<a href="https://shopify.dev/docs/apps/build/product-merchandising/bundles/add-product-fixed-bundle">Add a product fixed bundle</a>
+and <a href="https://shopify.dev/docs/apps/build/purchase-options/subscriptions/contracts/edit-contracts-with-bundles">Edit subscription contracts with bundles</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your nightly reconciliation compares every variant&#39;s price against the ERP and passes. A finance report
+  says margin is down on bundles. <b>Explain how both can be true.</b>
+</div>
+
+<p>Because your reconciliation compares the price on the <em>parent</em> variant, and nobody pays that. The
+bundle&#39;s pricing is applied during composition, when the parent expands into components. So you are
+checking a number that is correct and irrelevant — the same failure shape as B2B price lists in P9.1, where
+the price lives somewhere other than the variant. Bundles are the next override layer that reconciliation
+forgets, after markets, price lists and subscription pricing policies.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — reconciling the parent variant&#39;s price</span>
+  Nobody pays it. The bundle&#39;s price is applied when the parent expands. Your check passes forever while
+  margin drifts, exactly like the B2B price-list trap in P9.1.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — inventory against a bundle that does not exist as stock</span>
+  The warehouse holds shampoo and soap, not sets. Writing stock against the parent variant writes a number for
+  something nobody picks, and the real components go unmanaged.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — designing a Function that checks an external system</span>
+  A cart transform Function is a Function: <b>no network access</b>. "It will look up our ERP to build the
+  bundle" has to become sync-then-read, and finding that out after promising the feature means a redesign.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — treating <code>productBundleCreate</code> as synchronous</span>
+  It returns a <code>productBundleOperation</code> with <code>status: CREATED</code>, meaning the
+  <em>operation</em> exists. Code that reads the bundle immediately finds nothing and concludes the mutation
+  failed.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the 10,000-byte input-query cliff</span>
+  From P5.3: a metafield value above that arrives as <code>null</code> in a Function input query. A bundle
+  rule stored in a large JSON metafield works in the Admin API and is invisible to the Function.
+</div>
+
+<div class="scar">
+  <span class="who">One set of lines in, a different set out</span>
+  Expand and merge run in opposite directions and both mean the lines leaving checkout are not the lines that
+  entered. Anything downstream matching on line count or line identity will disagree with the order.
+</div>
+
+<div class="scar">
+  <span class="who">Forgetting the flag on subscription contracts</span>
+  Editing a subscription contract that contains a bundle needs
+  <code>withMerchandiseCustomizations: true</code>, or the parent is not expanded and the calculation runs
+  against the wrong lines.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — decide who owns the component list</span>
+  A bundle&#39;s components are merchandising; its stock is operations. Those are usually different people and
+  often different systems. Decide which side owns the component list before either starts writing it, or you
+  have created a field owned by nobody — see A3.2.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">A customer buys one thing: "the shampoo and soap set". Explain why that single purchase
+  makes both the <b>price check</b> and the <b>stock count</b> in your nightly sync wrong.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Because the set is not a real thing in the warehouse. Nobody has a shelf of sets. They have shampoo and
+they have soap, and somebody puts one of each in a box when an order comes in.</p>
+
+<p>So there are two different views of the same purchase. The customer bought one item. The warehouse picks
+two. And somewhere in between, Shopify turns the one into the two.</p>
+
+<p><b>The price goes wrong</b> because your sync wrote a price against the "set" — but the customer&#39;s
+actual charge is worked out during that turning-one-into-two step. So you can check the set&#39;s price every
+night, find it perfectly correct, and never once look at what anyone paid.</p>
+
+<p><b>The stock goes wrong</b> for the mirror-image reason. Your sync wrote a stock number against the set,
+which is a number for something that does not physically exist. Meanwhile the shampoo and soap — the things
+that actually run out — had their numbers written by nobody.</p>
+
+<p>So both checks pass and both are looking at a thing that is not what happened. That is why this is
+dangerous rather than merely annoying: <b>it is a failure that makes your monitoring more confident, not
+less.</b></p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>bundle parent · component variant · cart transform · expand operation · merge operation · SKU
+  decomposition.</em> "Nobody has a shelf of sets" is the explanation. If you reached for "the parent variant
+  is expanded into its components", you have named the mechanism and explained nothing.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 90 minutes <span class="needs">Dev store</span></span>
+  <p>Make your own reconciliation pass while the money is wrong.</p>
+  <ol>
+    <li>Create a fixed bundle with <code>productBundleCreate</code>. <b>Poll the operation</b> — do not read
+        the product straight away.</li>
+    <li>Give the bundle a price that is not the sum of its components.</li>
+    <li>Buy it. Look at the order lines: the bundle expanded.</li>
+    <li>Run your price reconciliation. Watch it pass.</li>
+    <li>Now extend it to compare the price a customer <em>actually paid</em>, and watch it find the gap.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> the first run said everything was correct and the second did not.
+  Add bundles to your ownership table as another price-override layer, after markets, B2B price lists and
+  subscription pricing policies.</p>
+</div>
+
+<div class="task">
+  <span class="label">The stock half · 45 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>Set stock on the bundle parent to 100 and on one component to 1.</li>
+    <li>Try to buy two bundles.</li>
+    <li>Write down which number actually constrained the sale.</li>
+    <li>Now fix your sync: write stock to the <b>components</b>, and stop writing anything to the parent.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you can say which number Shopify honoured, from testing rather than
+  reasoning. And your sync no longer writes a stock figure for something that does not exist on a shelf.</p>
+</div>
+
+<div class="task">
+  <span class="label">Hit the Function walls · 90 minutes <span class="needs">Dev store</span></span>
+  <ol>
+    <li>Build a cart transform Function with an <b>expand</b> operation.</li>
+    <li>Try to call your own server from inside it. There is no network.</li>
+    <li>Put the bundle rule in a metafield just over <b>10,000 bytes</b>. The Function receives
+        <code>null</code>.</li>
+    <li>Then build a <b>merge</b> operation and watch two lines become one.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you hit both walls and you have seen composition run in both
+  directions. Now check every downstream consumer that matches on line count — both directions break it.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>A bundle exists when buying and not when picking.</b> Something has to translate, and that is where your numbers break.</li>
+  <li><b>Three composition names:</b> <code>BUNDLES_STATIC_EXPAND</code> (fixed definition), <code>BUNDLES_DYNAMIC_EXPAND</code> and <code>BUNDLES_DYNAMIC_MERGE</code> (cart transform Function).</li>
+  <li><b>Expand and merge run in opposite directions</b> and cause the same problem: lines out are not lines in.</li>
+  <li><b><code>productBundleCreate</code> is asynchronous.</b> It returns a <code>productBundleOperation</code> to poll; <code>CREATED</code> describes the operation.</li>
+  <li><b>Reconcile what was paid, not the parent&#39;s price.</b> Bundles are a price-override layer, like markets and B2B price lists.</li>
+  <li><b>Write stock to components, never the parent.</b> The parent is not a thing on a shelf.</li>
+  <li><b>A cart transform Function has no network access</b> and the 10,000-byte metafield cliff. Everything it needs must already be in Shopify.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a bundle makes your price and stock checks pass while both are measuring something nobody bought — so reconcile against what was <em>paid</em> and what was <em>picked</em>.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the checkout branding API — and why the one you would reach for is already deprecated.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0016-flow-when-automation-replaces-your-code.html">← P5.4</a></span>
+  <span><a href="../index.html">Track 1</a></span>
+</div>
+
+</div>
+</body>
+</html>

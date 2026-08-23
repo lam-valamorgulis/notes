@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A1.6 — Sales Channel Apps</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A1 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Sales channel apps</h1>
+<p class="subtitle">Publishing <em>to</em> a channel is ordinary. <em>Being</em> the channel is a different app type.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell the two jobs apart, you know the six-step connection flow, and you know the one reason a non-marketplace app might still want to become a channel.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is a channel, from Shopify&#39;s side?</h3>
+
+<p>A shop sells in more than one place: its website, a till, a marketplace, a social app. Shopify has to answer
+two questions about each of those places. <b>Which products appear there?</b> And <b>which orders came from
+there?</b></p>
+
+<p>That pair is what a channel <em>is</em>. Not a feature — a named place, with a set of products published to
+it and orders attributed to it.</p>
+
+<p>So there are two completely different jobs available to you, and they are confused constantly:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Job</th><th>What you do</th><th>Difficulty</th></tr>
+  <tr><td><b>Publishing to a channel</b></td><td>Read or set which products appear in an existing channel, using publications</td><td>Ordinary API work</td></tr>
+  <tr><td><b>Being a channel</b></td><td>Register as a place things are sold, receive product feeds, attribute orders back</td><td>A different app type with its own object model</td></tr>
+</table>
+</div>
+
+<p>P4.5 already met the first one from the other direction: the Storefront API is channel-scoped, so a product
+missing from a headless site is usually a publication question. That is publishing.</p>
+
+<h3>Publications, which you will meet either way</h3>
+
+<p>A <code>Publication</code> is <b>a group of products and collections published to an app</b>. Each publication
+manages what displays on its associated channel. Three details worth carrying:</p>
+
+<ul>
+  <li><b><code>autoPublish</code></b> — merchants can have products published automatically when created. So "the
+      product appeared in a place I did not expect" can be a setting rather than your code.</li>
+  <li><b>Scheduled publishing</b> — future publish dates are supported for online store channels, so merchants
+      can coordinate launches. A product can exist and be deliberately not visible yet.</li>
+  <li><b>The <code>catalog</code> field</b> links to pricing and availability rules for that publication&#39;s
+      context. Which is the same idea as B2B catalogs in P9.1: <em>visibility and price travel together</em>.</li>
+</ul>
+
+<h3>Becoming a channel: the six-step flow</h3>
+
+<p>The connection is not a single call. A sales channel app integrates channel connections as part of its
+post-authentication flow:</p>
+
+<div class="diagram">
+  1. merchant installs the app, completes OAuth
+  2. app presents the EXTERNAL platform's login
+     (for example, a marketplace seller account)
+  3. merchant authenticates with their external account
+  4. app calls channelCreate  with the specification handle
+     and the account details
+        -> Shopify creates PRODUCT FEEDS
+        -> Shopify creates a channel-based
+           ORDER ATTRIBUTION definition
+  5. app subscribes to product feed webhooks
+  6. app triggers a FULL SYNC
+
+  For multiple connections, repeat 2-6 per connection.
+</div>
+
+<p>Read step 4 carefully. <code>channelCreate</code> does not just record a name — Shopify creates the product
+feeds <em>and</em> the order attribution definition for you. So the plumbing you would expect to build is
+provisioned by the platform, and your job becomes consuming it correctly.</p>
+
+<p>And steps 5 and 6 together are the pattern from A3.4 and A3.5, arriving again: <b>subscribe to the stream,
+then do a full sweep.</b> The webhook tells you about changes from now on; the full sync establishes the
+baseline. Doing only one of them is the bug.</p>
+
+<p>Beyond the connection there is a <b>channel config extension</b> for describing your channel&#39;s
+capabilities, <b>order attribution</b> configuration for attributing orders to connections or custom sources, and
+<b>contextual product feeds</b> for subscribing to feed events.</p>
+
+<h3>The reason a non-marketplace app might still want this</h3>
+
+<p>Here is the connection people miss. P7.4 covered market-driven shipping, and for <em>reading</em> merchant
+shipping configuration Shopify&#39;s recommended path is <b>Contextual Product Feeds</b> — which is available if
+your app is a sales channel or can become one, and which Shopify says has several advantages over reading the
+Markets API directly.</p>
+
+<p>So "should we become a channel?" is not only a marketplace question any more. If your app reads merchant
+shipping configuration, becoming a channel is the recommended route rather than a stretch goal.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the typical sales channel integration flow — install and OAuth,
+external platform authentication, merchant authenticates, <code>channelCreate</code> with a specification handle
+and account details, Shopify creating product feeds and a channel-based order attribution definition, subscribing
+to product feed webhooks, then a full sync, repeated per connection for multi-channel apps; that a
+<code>Publication</code> is a group of products and collections published to an app, supports
+<code>autoPublish</code> and scheduled future publish dates for online store channels, and has a
+<code>catalog</code> field linking to pricing and availability rules; and that Contextual Product Feeds is the
+recommended read path for market-driven shipping if an app is or can become a sales channel —
+<a href="https://shopify.dev/docs/apps/build/sales-channels/channel-connections">Managing channel connections</a>,
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/connections/ChannelConnection">ChannelConnection</a>
+and <a href="https://shopify.dev/docs/apps/build/orders-fulfillment/market-driven-shipping/upgrade-your-app">Upgrade your app for market-driven shipping</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "our products are not showing up on the marketplace app we installed". <b>Name three
+  explanations, and say which one is your code.</b>
+</div>
+
+<p>One: the products are not published to that channel&#39;s publication — a merchant setting, not your code.
+Two: they are published with a <em>future</em> publish date, so they exist and are deliberately not visible yet.
+Three: the channel&#39;s product feed sync has not run, or the app subscribed to feed webhooks without ever doing
+the initial full sync — that one <em>is</em> your code, and it is the classic version of A3.5&#39;s missing
+baseline. Checking the publication first costs a minute and rules out two of the three.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — quoting "add a marketplace" as ordinary API work</span>
+  Publishing to a channel is ordinary. <b>Being</b> a channel is a different app type with its own object model,
+  a connection flow, feeds, attribution and a config extension. Confusing the two understates the job
+  substantially.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — subscribing to feed webhooks without a full sync</span>
+  Step 6 exists for a reason. Webhooks tell you about changes <em>from now on</em>; without the initial sweep you
+  have no baseline, and every product that never changes again is permanently missing.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — blaming your sync for <code>autoPublish</code></span>
+  Merchants can have products published automatically on creation. "Products appeared in the channel and we did
+  not put them there" is often a setting, and hunting for it in your code wastes a day.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a future publish date</span>
+  Scheduled publishing is supported for online store channels. A product that exists and is invisible may be
+  correctly waiting, not broken.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — ignoring the publication&#39;s catalog</span>
+  The <code>catalog</code> field carries pricing and availability rules for that context. Same trap as B2B in
+  P9.1: the price you reconciled is not necessarily the price in that channel.
+</div>
+
+<div class="scar">
+  <span class="who">Building one connection when the client wants several</span>
+  Multi-connection apps repeat the authentication and sync steps <b>per connection</b>. A single hard-coded
+  connection is the "store 17 of four hundred" problem from A3.7, one level up.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — becoming a channel is a commitment, not a shortcut</span>
+  It is now the recommended path for reading merchant shipping configuration, which makes it tempting for apps
+  that are not marketplaces at all. It is still a different app type with its own review surface and its own
+  ongoing obligations. Decide it deliberately, and price it.
+</div>
+</div>
+
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<div class="explain">
+  <span class="label">Explain this to a beginner</span>
+  <p class="prompt">Explain the difference between an app that <b>puts products into</b> a marketplace and an app
+  that <b>is</b> the marketplace, from Shopify&#39;s point of view.</p>
+  <p>Say it out loud. Then read on.</p>
+</div>
+
+<details class="model">
+<summary>Now compare with a plain-words answer</summary>
+
+<p>Shopify only cares about two things per selling place: which products are available there, and which orders
+came from there.</p>
+
+<p>An app that <em>puts products into</em> a place is just ticking boxes on a list Shopify already keeps. Shopify
+knows the place exists. You are saying "these ones, please". That is ordinary work.</p>
+
+<p>An app that <em>is</em> the place has to be introduced first. Shopify has never heard of it, so there is no
+list to tick and nowhere for orders to be attributed. So the app registers itself, and in return Shopify sets up
+two things: a feed telling the app which products it should show, and a way to label orders as having come from
+there.</p>
+
+<p>After that the app has an ongoing job. It listens for changes to the feed, and — the part people forget — it
+also has to ask for <b>everything, once, at the start</b>. Otherwise it only ever hears about products that
+change, and anything that never changes again is invisible to it forever.</p>
+
+<p>So: one job is ticking boxes on an existing list. The other is being introduced, being given a feed, and
+keeping up with it.</p>
+
+</details>
+
+<div class="jargon-check">
+  <span class="label">If you used any of these words, try again</span>
+  <em>publication · channel · product feed · order attribution · specification handle.</em> "One ticks boxes on a
+  list Shopify already keeps; the other has to be introduced first" is the explanation.
+</div>
+</div>
+
+<div class="block build">
+<h2>Build it</h2>
+
+<div class="task">
+  <span class="label">Task · 45 minutes <span class="needs">Dev store</span></span>
+  <p>Do the ordinary job first, and meet the two settings that get blamed on code.</p>
+  <ol>
+    <li>List the store&#39;s publications and which products are in each.</li>
+    <li>Unpublish one product from a channel. Confirm it disappears there and nowhere else.</li>
+    <li>Turn <b>autoPublish</b> on. Create a product. Watch it appear with no action from you.</li>
+    <li>Publish a product with a <b>future</b> date. Confirm it exists and is not visible.</li>
+    <li>Read the publication&#39;s <code>catalog</code> and note the pricing rules attached to it.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> you have produced "the product is missing" and "the product appeared on
+  its own" deliberately, and neither was your code. Those are two of the three explanations in the recall
+  question.</p>
+</div>
+
+<div class="task">
+  <span class="label">Then the baseline bug · 60 minutes <span class="needs">Dev store</span></span>
+  <p>This is the one that is genuinely yours.</p>
+  <ol>
+    <li>Subscribe to product feed webhooks. <b>Do not</b> run a full sync.</li>
+    <li>Change one product. Confirm your app hears about it.</li>
+    <li>Now list what your app knows. Every unchanged product is missing.</li>
+    <li>Add the full sync. Run it. Compare again.</li>
+  </ol>
+  <p class="proof"><b>Proof it worked:</b> before the sweep your app knew about one product; after it, all of
+  them. Same lesson as A3.5 — the stream tells you about changes, and only a sweep establishes what is true
+  now.</p>
+</div>
+
+<div class="task">
+  <span class="label">The decision, written · 30 minutes <span class="needs">no store needed</span></span>
+  <p>Answer in writing: <b>should this app become a sales channel?</b> Cover the marketplace reason, and the P7.4
+  reason — Contextual Product Feeds being the recommended read path for market-driven shipping.</p>
+  <p class="proof"><b>Proof it worked:</b> your note treats it as a deliberate commitment with its own review
+  surface and ongoing obligations, not as a shortcut to a shipping read. Both answers are fine; an accidental
+  answer is not.</p>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+<li><b>Two different jobs:</b> publishing <em>to</em> a channel is ordinary work; <em>being</em> a channel is a different app type.</li>
+  <li><b>A channel is "which products appear here" plus "which orders came from here".</b> That pair is the whole idea.</li>
+  <li><b><code>channelCreate</code> provisions the plumbing</b> — Shopify creates the product feeds and the order attribution definition.</li>
+  <li><b>Subscribe <em>and</em> full-sync.</b> Feed webhooks alone leave every unchanged product permanently missing.</li>
+  <li><b><code>autoPublish</code> and future publish dates</b> explain most "missing" and "unexpected" products, and neither is your code.</li>
+  <li><b>A publication&#39;s <code>catalog</code> carries pricing and availability</b> — visibility and price travel together, as in P9.1.</li>
+  <li><b>Multi-connection apps repeat the flow per connection.</b> One hard-coded connection is A3.7 one level up.</li>
+</ul>
+<p class="one-thing">If you remember one thing: publishing to a channel ticks boxes on a list Shopify already keeps; being a channel means being introduced, given a feed, and keeping up with it — and the full sync is the step everyone forgets.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter A1 done. Then <b>"next"</b> for the backend the app needs.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0027-distribution-billing-and-app-store-review.html">← A1.5</a></span>
+  <span><a href="../index.html">Track 2</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -44,21 +44,36 @@ _Avoid_: gotchas, pitfalls, traps, war stories
 
 ## Lesson anatomy
 
-Every Lesson has these four blocks, in this order. The names are fixed.
+Every Lesson has these five blocks, in this order. The names are fixed.
 
 **How it works**:
-The mechanism. What the platform actually does, with a visual.
+The mechanism, in plain words. What the platform actually does, with a visual.
+Written for someone who has never seen Shopify. A real term is introduced once in
+basic words, then used properly from then on — never simplified away.
 
 **Where it hurts**:
 The failure modes. What breaks in production, what the docs do not say, and what
 two Shopify pages disagree about.
 
-**What you say to a client/PM**:
-The spoken answer. How to explain the trade-off, the risk, or the "no" to a
-non-engineer.
+**Say it out loud**:
+The Feynman check. A prompt to explain the idea to a beginner, then a plain-words
+model answer hidden behind a `<details>` so you have to try before you read. Plus
+a short list of words that mean you recited the docs instead of understanding
+them.
+_Avoid_: quiz, self-test, comprehension check
+
+**Build it**:
+One small task with a **checkable result**. Every task ends in a proof — something
+you can look at to know it worked. A task with no proof is reading with extra
+steps. For Track 3, the deliverable is written or spoken, not code.
 
 **Remember this**:
 The recall card. Five to seven bullets plus one bold one-line takeaway.
+
+**What you say to a client/PM**:
+The removed fifth block. It was deleted from every Lesson on 2026-08-23 when the
+goal changed to building. Its 201 sentences live in
+`reference/talking-to-a-client.html`. Do not reintroduce it.
 
 ## Stores
 
