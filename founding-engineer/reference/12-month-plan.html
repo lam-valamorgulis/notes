@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The 12-Month Plan — Founding Engineer</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Reference · the whole year on one page</p>
+<h1>The 12-Month Plan</h1>
+<p class="subtitle">Twelve months, twelve core ideas, forty-eight Lessons. One
+month is the unit of work, and every month has to end in something a stranger
+can look at.</p>
+
+<div class="win">
+  <strong>Why the course is a year.</strong> It is not a round number. A seed
+  startup with $600k in the bank and $50k a month of burn has twelve months of
+  runway. That is arithmetic, and it is the same arithmetic taught in
+  <a href="../lessons/0001-the-founding-engineer-job.html">F1</a>. So the course
+  runs on the clock it teaches: <b>month 1 of the course is month 1 of the
+  runway.</b> By month 12 you either have a product strangers pay for, or you
+  killed it on purpose and can say exactly why.
+</div>
+
+<div class="note">
+  <span class="label">Whose idea this shape is</span>
+  The twelve-month shape, the month titles, and the gates on this page are
+  <b>ours</b>. No source says "do discovery for four months". The runway
+  arithmetic is Blank's search-versus-execute framing plus simple division; the
+  individual ideas inside each month are sourced on their own Lesson pages and in
+  <a href="../RESOURCES.md">RESOURCES.md</a>.
+</div>
+
+<h2>How a month works</h2>
+
+<p>Every month has the same four parts. Nothing else.</p>
+
+<div class="table-scroll">
+<table>
+<tr><th>Part</th><th>What it is</th></tr>
+<tr><td><b>One core Lesson</b></td><td>The idea the month is built on. Twelve core ideas, one per month. These are the 20% — see <a href="../MISSION.md">MISSION.md</a>.</td></tr>
+<tr><td><b>Three support Lessons</b></td><td>The parts that make the core idea real work instead of a nice sentence.</td></tr>
+<tr><td><b>One artefact</b></td><td>A thing that exists at the end of the month. A memo, a page, a deploy, a payment. Not a feeling of progress.</td></tr>
+<tr><td><b>One gate</b></td><td>A sentence that must be true before month N+1 starts. If it is not true, you repeat the month or you use the kill rule.</td></tr>
+</table>
+</div>
+
+<p>At 20 hours a week, a month is about <b>80 hours</b>. Most of that is the
+artefact, not the reading. Four Lessons cost maybe eight hours to read. The other
+seventy-two are talking to people, cutting scope, and shipping.</p>
+
+<h2>The year at a glance</h2>
+
+<div class="table-scroll">
+<table>
+<tr><th>Month</th><th>Core Lesson</th><th>The month ends with</th></tr>
+<tr><td><b>1</b></td><td>F1 · The job is not writing code</td><td>The company's timer on one page, and your offer read correctly</td></tr>
+<tr><td><b>2</b></td><td>F2 · The Mom Test</td><td>Twenty recorded conversations where you never pitched</td></tr>
+<tr><td><b>3</b></td><td>F3 · Choosing which problem to build</td><td>One problem, scored on four filters, written so nobody argues</td></tr>
+<tr><td><b>4</b></td><td>F4 · The kill rule</td><td>A signed go / no-go memo with the number, the date and the exit</td></tr>
+<tr><td><b>5</b></td><td>B1 · Appetite, not estimate</td><td>A six-week appetite and a shaped pitch, not an estimate</td></tr>
+<tr><td><b>6</b></td><td>B2 · Cutting to the MVP</td><td>The feature list, plus the longer list of what is missing on purpose</td></tr>
+<tr><td><b>7</b></td><td>B3 · Boring stack and innovation tokens</td><td>The stack chosen in writing, with the three tokens spent named</td></tr>
+<tr><td><b>8</b></td><td>B4 · Walking skeleton and the quality boundary</td><td>A real URL a stranger can open, doing one thing end to end</td></tr>
+<tr><td><b>9</b></td><td>L1 · The first ten users, by hand</td><td>Ten strangers using it, and a log of everyone who said no</td></tr>
+<tr><td><b>10</b></td><td>L2 · The first price</td><td>Money in the account, or the first honest refusal written down</td></tr>
+<tr><td><b>11</b></td><td>L3 · The one metric that matters</td><td>One number, measured weekly, moved once on purpose</td></tr>
+<tr><td><b>12</b></td><td>L4 · Keeping it alive alone</td><td>A restored backup, an error on your phone, a Friday deploy</td></tr>
+</table>
+</div>
+
+<p class="small">Reading order is the month order. The Lessons are chained: month
+3 uses the interview notes from month 2, month 6 uses the problem from month 3,
+month 12 needs the product from month 8.</p>
+
+<!-- ================= PHASE 1 ================= -->
+<p class="phase-head p1">Phase 1 · Months 1–4 · Track 1 — Find</p>
+<p class="phase-sub">Four months and not one line of product code. You are buying
+one answer: is there a real problem here, and is it worth the other eight months?
+You still ship every month — a memo, a landing page, a fake door — but never the
+product.</p>
+
+<div class="month m1">
+  <p class="meta">Month 1 <span class="tag live">1 of 4 live</span></p>
+  <h3>The seat and the timer</h3>
+  <p class="desc">Before anything else: what the job is, how long you have, and
+  what you are actually being paid in.</p>
+  <p><b>The question:</b> how many months are there, and what does a month have to
+  buy?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0001-the-founding-engineer-job.html">F1 · The job is not writing code</a> — the runway is a timer, so the output of a month is an answer. <span class="tag live">live</span></li>
+    <li class="planned"><b>Runway, burn, and the cost of a month</b> — reading a real set of numbers, and what "we have some time" hides.</li>
+    <li class="planned"><b>Why startups die, and which causes you control</b> — the honest list, split into the ones an engineer can move and the ones they cannot.</li>
+    <li class="planned"><b>The offer: equity, vesting, cliff, dilution</b> — read this before you sign. The usual ranges are convention, not law.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> one page — cash, burn, months left, and the
+  three questions the company most needs answered.<br>
+  <b>Gate:</b> you can say the company's runway in months, out loud, without
+  looking it up.</p>
+</div>
+
+<div class="month m1">
+  <p class="meta">Month 2 <span class="tag live">1 of 4 live</span></p>
+  <h3>Talking to people without poisoning it</h3>
+  <p class="desc">The hardest skill in the course, and the one everyone thinks
+  they already have.</p>
+  <p><b>The question:</b> what actually hurts, in words the person used first?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0002-the-mom-test.html">F2 · The Mom Test</a> — talk about their life, not your idea. Ask about the last time, never about the future. <span class="tag live">live</span></li>
+    <li class="planned"><b>Finding twenty strangers to talk to</b> — where they are, the first message, and why a warm intro is worse than it looks.</li>
+    <li class="planned"><b>Notes that survive the week</b> — recording, tagging and storing a conversation so month 3 can use it.</li>
+    <li class="planned"><b>Reading the transcript</b> — separating a fact from a compliment, and what to do with the enthusiastic person who never buys.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> twenty conversations, written up, with the exact
+  words people used for the pain.<br>
+  <b>Gate:</b> you can point at three conversations where you learned something
+  that surprised you. Nothing surprising means you were pitching.</p>
+</div>
+
+<div class="month m1">
+  <p class="meta">Month 3 <span class="tag live">1 of 4 live</span></p>
+  <h3>Choosing the problem</h3>
+  <p class="desc">Twenty conversations produce more than one problem. This month
+  picks one and kills the rest.</p>
+  <p><b>The question:</b> which of these problems is worth a year?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0003-choosing-which-problem.html">F3 · Choosing which problem to build</a> — frequency, pain, who signs, can you reach them. Score 0 to 5 and multiply. <span class="tag live">live</span></li>
+    <li class="planned"><b>The one-page problem statement</b> — writing it so the person with the problem reads it and says "yes, that is it".</li>
+    <li class="planned"><b>How small is too small</b> — counting the buyers from the bottom up. No market-sizing slides.</li>
+    <li class="planned"><b>Competitors, and why "nobody does this" is bad news</b> — an empty space usually means people tried and it did not work.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> one problem statement, one page, plus the
+  scoring table showing the problems you rejected and why.<br>
+  <b>Gate:</b> a person with the problem read your page and did not correct
+  you.</p>
+</div>
+
+<div class="month m1">
+  <p class="meta">Month 4 <span class="tag live">1 of 4 live</span></p>
+  <h3>Deciding to commit, or not</h3>
+  <p class="desc">The month that makes the difference between a decision and a
+  drift.</p>
+  <p><b>The question:</b> what evidence would make us stop, and have we tested the
+  riskiest guess yet?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0004-the-kill-rule.html">F4 · The kill rule</a> — the number, the date and the action, written while you are still calm. <span class="tag live">live</span></li>
+    <li class="planned"><b>The riskiest assumption, and the cheapest test</b> — finding the one belief that, if false, makes everything else pointless.</li>
+    <li class="planned"><b>Fake doors, landing pages and concierge tests</b> — shipping a test that is not the product, and the honesty line you do not cross.</li>
+    <li class="planned"><b>The go / no-go memo, and saying no out loud</b> — the sentences to use when the answer is no and the founder is in the room.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a signed memo — the guess, the test, the result,
+  the decision, the kill rule, and the date it gets checked.<br>
+  <b>Gate:</b> the kill rule has a number and a date on it. "It feels wrong" is
+  not a kill rule.</p>
+</div>
+
+<!-- ================= PHASE 2 ================= -->
+<p class="phase-head p2">Phase 2 · Months 5–8 · Track 2 — Build</p>
+<p class="phase-sub">Now you build, with the objective function changed. You stop
+asking "how long will this take?" and start asking "how much time is this worth?"
+The month-8 deploy is the point of the whole phase.</p>
+
+<div class="month m2">
+  <p class="meta">Month 5 <span class="tag live">1 of 4 live</span></p>
+  <h3>Time as the fixed thing</h3>
+  <p class="desc">The one habit that stops a six-week feature becoming a six-month
+  feature.</p>
+  <p><b>The question:</b> how much time is this problem worth, before we know how
+  long it takes?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0005-appetite-not-estimate.html">B1 · Appetite, not estimate</a> — fix the time, vary the scope. A fixed-scope overrun has no limit. <span class="tag live">live</span></li>
+    <li class="planned"><b>Shaping, before anyone bets on it</b> — rough sketches at the right altitude: concrete enough to build, loose enough to cut.</li>
+    <li class="planned"><b>The scope hammer and the circuit breaker</b> — cutting inside the cycle, and the rule that an unfinished bet does not get an extension.</li>
+    <li class="planned"><b>The cycle when the team is one person</b> — what six weeks looks like with no designer, no QA and no one to hand off to.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> one shaped pitch — the problem, the appetite, a
+  rough solution, the rabbit holes, and the things explicitly not doing.<br>
+  <b>Gate:</b> the pitch has an appetite in weeks and a written list of what is
+  out. A pitch with no "no" in it has not been shaped.</p>
+</div>
+
+<div class="month m2">
+  <p class="meta">Month 6 <span class="tag live">1 of 4 live</span></p>
+  <h3>Cutting</h3>
+  <p class="desc">Deciding the smallest thing that still answers the question, and
+  saying out loud what is missing.</p>
+  <p><b>The question:</b> what is the least we can build and still learn the
+  thing?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0006-cutting-to-the-mvp.html">B2 · Cutting to the MVP</a> — the removal test and the answer test. A human doing it by hand is a valid implementation. <span class="tag live">live</span></li>
+    <li class="planned"><b>Buy, glue, or build</b> — the make-or-buy call, and the three questions that settle it in ten minutes.</li>
+    <li class="planned"><b>Design and brand with no designer</b> — enough taste to not look untrustworthy, using other people's decisions.</li>
+    <li class="planned"><b>The three-minute demo</b> — the script, and why the demo gets written before the software.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> two lists on one page — in, and deliberately
+  out. The "out" list should be the longer one.<br>
+  <b>Gate:</b> you can give the three-minute demo of a product that does not
+  exist yet, and someone follows it.</p>
+</div>
+
+<div class="month m2">
+  <p class="meta">Month 7 <span class="tag live">1 of 4 live</span></p>
+  <h3>The stack</h3>
+  <p class="desc">Choosing the tools, and spending your small budget of new
+  things where it actually wins.</p>
+  <p><b>The question:</b> which parts of this are we allowed to find interesting?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0007-boring-stack-innovation-tokens.html">B3 · Boring stack and innovation tokens</a> — about three novel choices, and a database is a terrible place to spend one. <span class="tag live">live</span></li>
+    <li class="planned"><b>One box, and what it can carry</b> — the honest capacity of a single server and a single database, with numbers.</li>
+    <li class="planned"><b>The tables you will regret</b> — the few data-model decisions that are expensive to reverse, and the many that are not.</li>
+    <li class="planned"><b>AI features: the product, or a button</b> — when a model is the thing being sold, and when it is a feature that must fail quietly.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a one-page stack decision — every choice, and
+  for each one the sentence "I have run this in production" or "this is a token I
+  am spending".<br>
+  <b>Gate:</b> you spent three tokens or fewer, and you can name what each one
+  buys.</p>
+</div>
+
+<div class="month m2">
+  <p class="meta">Month 8 <span class="tag live">1 of 4 live</span></p>
+  <h3>Shipping something real</h3>
+  <p class="desc">The biggest month in the course. At the end of it there is a URL
+  a stranger can open.</p>
+  <p><b>The question:</b> does the whole path work end to end, for one real
+  case?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0008-walking-skeleton-quality-boundary.html">B4 · The walking skeleton and the quality boundary</a> — deploy on day one, then go fast everywhere except where a failure loses data or trust. <span class="tag live">live</span></li>
+    <li class="planned"><b>Auth, payments and email</b> — the three you do not write yourself, and what you still have to understand about each.</li>
+    <li class="planned"><b>One database, many customers</b> — tenant isolation done simply, and the query that leaks everyone's data.</li>
+    <li class="planned"><b>Shipping alone, continuously</b> — environments, migrations with no downtime, and a flag you can turn off from your phone.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a live URL. One real user journey, start to
+  finish, on the internet, with a real domain.<br>
+  <b>Gate:</b> someone who is not you completed the whole journey without being told
+  what to click.</p>
+</div>
+
+<!-- ================= PHASE 3 ================= -->
+<p class="phase-head p3">Phase 3 · Months 9–12 · Track 3 — Live</p>
+<p class="phase-sub">A product nobody uses has taught you nothing. Four months of
+users, money, one number, and the operations work that stops you losing what you
+built.</p>
+
+<div class="month m3">
+  <p class="meta">Month 9 <span class="tag live">1 of 4 live</span></p>
+  <h3>The first users</h3>
+  <p class="desc">One at a time, by hand, watching them fail in front of you.</p>
+  <p><b>The question:</b> will a stranger get through it without you in the
+  room?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0009-first-ten-users-by-hand.html">L1 · The first ten users, by hand</a> — every channel multiplies a stock you do not have, so at zero they all return zero. <span class="tag live">live</span></li>
+    <li class="planned"><b>Onboarding one person at a time</b> — sitting with them, saying nothing, and writing down every place they stopped.</li>
+    <li class="planned"><b>Support that does not eat your week</b> — the inbox, the canned answers, and turning a repeated question into a fix.</li>
+    <li class="planned"><b>The weekly learning review</b> — one hour, one page: what did this week's users teach us, and what changes because of it.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> ten real users, plus a refusal log — everyone
+  who said no, and the exact reason.<br>
+  <b>Gate:</b> at least one user came back a second week without being asked.</p>
+</div>
+
+<div class="month m3">
+  <p class="meta">Month 10 <span class="tag live">1 of 4 live</span></p>
+  <h3>Money</h3>
+  <p class="desc">Charging is a test, not a reward. This is the month the test
+  runs.</p>
+  <p><b>The question:</b> will anyone move money for this?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0010-the-first-price.html">L2 · The first price</a> — never ask "would you pay?". Say "it is $X, shall I send the link?" and then be quiet. <span class="tag live">live</span></li>
+    <li class="planned"><b>Taking the money</b> — payments, invoices, tax, refunds, and failed cards. The boring half of revenue.</li>
+    <li class="planned"><b>Pricing v2: tiers, packaging, expansion</b> — what to change once the first price has been tested, and what not to touch.</li>
+    <li class="planned"><b>The first churn, and the exit interview</b> — the most useful conversation in the course, and the one everyone avoids.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a payment in the account from someone who is
+  not a friend — or, if nobody paid, the written record of every refusal.<br>
+  <b>Gate:</b> you said a price out loud to a stranger's face and did not
+  apologise for it.</p>
+</div>
+
+<div class="month m3">
+  <p class="meta">Month 11 <span class="tag live">1 of 4 live</span></p>
+  <h3>The number</h3>
+  <p class="desc">One number for this stage. The other thirty are noise until this
+  one moves.</p>
+  <p><b>The question:</b> which single number tells us whether this is
+  working?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0011-one-metric-that-matters.html">L3 · The one metric that matters</a> — one number per stage: empathy, stickiness, virality, revenue, scale. <span class="tag live">live</span></li>
+    <li class="planned"><b>Instrumentation you will not regret</b> — the few events worth naming carefully, funnels, and cohorts that do not lie.</li>
+    <li class="planned"><b>Growth channels after hand-recruiting</b> — picking one channel, testing it properly, and killing it on a date.</li>
+    <li class="planned"><b>A/B testing once you finally have traffic</b> — the traffic you need before a test means anything, and what to do below it.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> one number on a dashboard, measured every week
+  for four weeks, with the change you made to move it.<br>
+  <b>Gate:</b> you can say why this number and not the obvious one, and what
+  would make you switch.</p>
+</div>
+
+<div class="month m3">
+  <p class="meta">Month 12 <span class="tag live">1 of 4 live</span></p>
+  <h3>Staying alive</h3>
+  <p class="desc">The smallest set of operations work that stops you losing data
+  or losing trust — plus the honest list of what you skip.</p>
+  <p><b>The question:</b> can this survive a bad week without you awake for
+  it?</p>
+  <ul class="lesson-links">
+    <li><a href="../lessons/0012-keeping-it-alive-alone.html">L4 · Keeping it alive alone</a> — a backup you have restored, errors that reach your phone, a deploy you are not scared of. <span class="tag live">live</span></li>
+    <li class="planned"><b>The first security review</b> — SOC 2, GDPR and the questionnaire, from the point of view of one engineer with no compliance team.</li>
+    <li class="planned"><b>Scaling past one box</b> — queues, caching and read replicas, and why this is a problem you have to earn.</li>
+    <li class="planned"><b>Handing it over: engineers 2 to 5</b> — the month your habits become the company's habits, whether you wrote them down or not.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a restore you actually performed, dated. An
+  error that woke your phone. A deploy done on a Friday afternoon on purpose.<br>
+  <b>Gate:</b> you restored a backup into a clean environment and the product
+  worked. Not "we have backups". You restored one.</p>
+</div>
+
+<h2>What is not in the year</h2>
+
+<p>Two items from the depth queue are deliberately outside the twelve months,
+because raising money is not the goal of this course:</p>
+
+<ul>
+  <li><b>Fundraising: what a seed deck has to prove.</b> Useful as a skill, wrong
+  as a purpose.</li>
+  <li><b>Investor and board reporting.</b> The same reason.</li>
+</ul>
+
+<p>If you want either one early, say so. The Lesson will name which month it is
+jumping over.</p>
+
+<h2>If a month fails</h2>
+
+<p>A gate that does not close is information, not shame. Three legal moves, and
+you must pick one out loud:</p>
+
+<div class="table-scroll">
+<table>
+<tr><th>Move</th><th>When it is the right one</th></tr>
+<tr><td><b>Repeat the month</b></td><td>The work was thin. You read four Lessons and shipped nothing. Do the artefact this time.</td></tr>
+<tr><td><b>Go back a month</b></td><td>The gate failed because the month before it was wrong. Ten users refuse to come back because the problem in month 3 was not real.</td></tr>
+<tr><td><b>Use the kill rule</b></td><td>The evidence you wrote down in month 4 has arrived. Stop, and write what you learned.</td></tr>
+</table>
+</div>
+
+<p>The one move that is not legal is carrying on with the gate unclosed and
+hoping month N+1 fixes it. That is how twelve months become one long unanswered
+question.</p>
+
+<div class="ask">
+  Reading order is the month order. If you are not sure where you are, you are in
+  the earliest month whose <b>gate has not closed</b>.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="glossary.html">Glossary</a></span>
+  <span><a href="../lessons/0001-the-founding-engineer-job.html">Month 1: F1 — The job is not writing code →</a></span>
+</div>
+
+</div>
+</body>
+</html>

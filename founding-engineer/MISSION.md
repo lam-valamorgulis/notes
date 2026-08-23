@@ -36,10 +36,39 @@ The standard for expert stays the five abilities:
 - Debug a problem in it that has no ready answer online
 - Judge someone else's work in it, and say what is wrong and why
 
-## The 20% core
-Twelve items. Four per Track. Nothing else is taught until these are solid.
+## The shape of the year
+The course runs for **twelve months**, and the number is not decorative. A seed
+startup with $600k in the bank and $50k a month of burn has twelve months of
+runway. That is the same arithmetic taught in F1. So **month 1 of the course is
+month 1 of the runway**, and by month 12 there is either a product strangers pay
+for, or an honest kill with the reason written down.
 
-**Track 1 — Find** (is there a real problem?)
+One month is the unit of work. Every month has:
+
+- **one core Lesson** — the idea the month is built on
+- **three support Lessons** — the parts that turn the idea into work
+- **one artefact** — a thing that exists at the end: a memo, a page, a deploy, a payment
+- **one gate** — a sentence that must be true before month N+1 starts
+
+Twelve months × four Lessons = **48 Lessons**. Twelve are written: the core ones.
+
+The month titles, the phases and the gates are **ours**. No source says "spend
+four months on discovery". The runway arithmetic is Blank's search-versus-execute
+framing plus division. The ideas inside the months are sourced individually,
+below and in RESOURCES.md. The full year is in
+[reference/12-month-plan.html](reference/12-month-plan.html).
+
+| Phase | Months | Track | The question it answers |
+|---|---|---|---|
+| 1 | 1–4 | Find | Is there a real problem, and is it worth the other eight months? |
+| 2 | 5–8 | Build | What is the smallest real thing, and is it deployed? |
+| 3 | 9–12 | Live | Do strangers use it, pay for it, and can it survive a bad week? |
+
+## The 20% core
+Twelve items, one per month. Four per Track. Nothing else is taught until these
+are solid.
+
+**Track 1 — Find** — months 1–4 (is there a real problem?)
 
 1. **The founding engineer's job** — the role is "first person accountable for
    the company being able to act", not "first person to write code". That
@@ -58,7 +87,7 @@ Twelve items. Four per Track. Nothing else is taught until these are solid.
    ([Annie Duke, _Quit_](https://x.com/AnnieDuke/status/1579891488221061120), and
    [Steve Blank: search vs execute](https://steveblank.com/2012/03/05/search-versus-execute/))
 
-**Track 2 — Build** (make the smallest real thing)
+**Track 2 — Build** — months 5–8 (make the smallest real thing)
 
 5. **Appetite, not estimate** — fix the time, vary the scope. This is the single
    habit that stops six-week features becoming six-month features.
@@ -73,7 +102,7 @@ Twelve items. Four per Track. Nothing else is taught until these are solid.
    trust. The boundary rule is this course's own; the skeleton is Cockburn's.
    ([Alistair Cockburn](https://www.oreilly.com/library/view/97-things-every/9780596800611/ch60.html))
 
-**Track 3 — Live** (users, money, and staying alive)
+**Track 3 — Live** — months 9–12 (users, money, and staying alive)
 
 9. **The first ten users, by hand** — recruit them one at a time. The point is
    not the users, it is what you learn standing next to them.
@@ -89,8 +118,11 @@ Twelve items. Four per Track. Nothing else is taught until these are solid.
     a deploy you are not afraid of.
     ([Choose Boring Technology](https://mcfunley.com/choose-boring-technology) — failure modes you already understand)
 
-Everything else is **depth** and waits. The full depth queue is on
-[The Map](index.html).
+Each core item is the spine of one month. The three Lessons that finish a month
+are named on [The Map](index.html) and in
+[the 12-month plan](reference/12-month-plan.html) — they are scheduled, not
+hidden. Only two items stay outside the year on purpose: fundraising, and
+investor reporting.
 
 ## Constraints
 - **No product idea yet.** Track 1 has to produce one. The course cannot assume

@@ -14,8 +14,14 @@ missing block is visible at a glance.
 | 04 | `.block.do` | One task inside `.task`, ending in `.proof`. |
 | — | `.remember` | 5 to 7 bullets plus one bold takeaway. Always last, before `.footer-nav`. |
 
-Also required near the top of every Lesson: `.expertise` — which of the five
-expert abilities this Lesson moves forward, and the `core` or `depth` tag.
+Also required near the top of every Lesson:
+
+- `.expertise` — which of the five expert abilities this Lesson moves forward, the
+  `core` or `depth` tag, and the month it belongs to.
+- `.monthnote` — sits after `.win` and before block 01. It names the month, the
+  question that month answers, the other three Lessons of the month (as
+  `li.planned` when they are not written yet), and the month's gate. This is the
+  only place a Lesson says where it sits in the year, so it is not optional.
 
 ## Components in `./assets/`
 
@@ -63,11 +69,26 @@ in nine of the twelve Lessons, so it is now a rule:
 
 ## Staleness traps in this course
 
-- `item N of 12` appears in the `.expertise` line of all 12 Lessons. Changing the
-  core list means editing 12 files plus `index.html` plus `MISSION.md`. That is the
-  cost of adding a thirteenth core item — pay it deliberately or move one out.
-- `index.html` hard-codes the progress bar (12 spans), the caption, three
-  "4 core · 4 written" lines and the reading order. All must move together.
+The 2026-08-23 recut into a twelve-month course added a second copy of the plan
+inside every Lesson. That buys clarity and costs duplication. Know where the
+copies are.
+
+- **The month plan lives in three places.** `reference/12-month-plan.html` is the
+  long version, `index.html` is the short version, and the `.monthnote` in each
+  Lesson is the one-month version. Changing a month title, a gate, or one of the
+  three unwritten Lesson names means editing all three. The plan page is the one
+  that wins if they disagree.
+- `item N of 12` **and** `Month: N of 12` both appear in the `.expertise` line of
+  all 12 Lessons. Changing the core list means editing 12 files plus `index.html`,
+  `MISSION.md` and the plan page. That is the cost of a thirteenth core item — pay
+  it deliberately or move one out.
+- `index.html` hard-codes the progress bar (**48 spans, one per Lesson, 12 with
+  `class="done"`**), the caption, three "16 Lessons · 4 written" lines, twelve
+  month cards and the reading order. All must move together. When a support Lesson
+  gets written, one `<span>` becomes `done` and one `li.planned` becomes a link.
+- **The counts are hard-coded in the repo root too.** `../index.html` says
+  "12 lessons live of 48". It is a different file in a different folder and it is
+  easy to forget.
 - "Links checked 2026-08-23" appears in every Lesson footnote plus the glossary and
   `RESOURCES.md`. The date is per-page on purpose, so each page carries the honesty
   of its own claims.
