@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0007 · Long tasks, starvation &amp; input delay — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Event loop · Lesson 0007</p>
+<h1>Long tasks, starvation &amp; input delay</h1>
+<p class="subtitle">The two previous lessons were mechanism. This one turns them into a number you can put in front of a client — and into the metric Google now ranks you on.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #4 (debug with no ready answer) and ability #5 (judge someone else's work) — "the site feels slow" is not a bug report until you can split it into these three parts.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can take "the button feels laggy", split it into input delay, processing and presentation, measure each in DevTools, and say which of the three your fix would change — before writing the fix.
+</div>
+
+<h2>1. Deriving input delay from run-to-completion</h2>
+<p>
+  Lesson 0005 proved a task cannot be interrupted. Now put a user in the picture. A customer taps <b>Add to cart</b> at
+  a moment nobody controls — the middle of some other task. Three things must happen, in this order, and none of them
+  can overlap:
+</p>
+<ol>
+  <li><b>Input delay.</b> The tap waits in the queue until the running task ends and the microtask checkpoint is done.
+  Your code has not run yet. Nothing is on screen yet.</li>
+  <li><b>Processing.</b> Your handler runs — all of it, plus every microtask it queues.</li>
+  <li><b>Presentation delay.</b> The browser still has to do style, layout, paint and composite before the customer
+  can see the result.</li>
+</ol>
+<p>
+  Add them up and you have what the user actually felt. That sum has an official name: <b>INP</b> — Interaction to Next
+  Paint (<a href="https://web.dev/articles/inp">web.dev — INP</a>). It is measured to the <em>next paint</em> precisely
+  because a handler that finishes fast but paints late still feels slow, and the customer cannot tell the difference.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 230" role="img" aria-label="A click arrives in the middle of a long task, waits for it to finish, then the handler runs, then the browser paints; the sum of the three is what the user felt">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">TIME &rarr;</text>
+
+  <rect class="box bad" x="20" y="34" width="200" height="40" rx="5"/>
+  <text class="mono sm" x="32" y="52">long task 240ms</text>
+  <text class="sub" x="32" y="68">third-party script</text>
+
+  <rect class="box hot" x="220" y="34" width="150" height="40" rx="5"/>
+  <text class="mono sm" x="232" y="52">your handler</text>
+  <text class="sub" x="232" y="68">60ms</text>
+
+  <rect class="box good" x="370" y="34" width="120" height="40" rx="5"/>
+  <text class="mono sm" x="382" y="52">render</text>
+  <text class="sub" x="382" y="68">30ms</text>
+
+  <rect class="box dim" x="490" y="34" width="200" height="40" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="sub" x="502" y="58">idle — too late to help</text>
+
+  <line class="rule thin" x1="16" y1="86" x2="704" y2="86"/>
+
+  <path class="flow amber" d="M120,112 L120,80"/>
+  <text class="cap amber" x="126" y="106">USER TAPS HERE</text>
+
+  <path class="flow" d="M120,130 L216,130"/>
+  <text class="sub" x="124" y="148">1 input delay 120ms</text>
+  <path class="flow" d="M222,130 L366,130"/>
+  <text class="sub" x="226" y="148">2 processing 60ms</text>
+  <path class="flow" d="M372,130 L486,130"/>
+  <text class="sub" x="376" y="148">3 presentation 30ms</text>
+
+  <line class="rule" x1="120" y1="176" x2="490" y2="176"/>
+  <line class="rule" x1="120" y1="170" x2="120" y2="182"/>
+  <line class="rule" x1="490" y1="170" x2="490" y2="182"/>
+  <text class="cap" x="200" y="200">INP = 210ms — WHAT THE CUSTOMER FELT</text>
+  <text class="sub" x="200" y="218">your own code was only 60ms of it</text>
+</svg>
+<figcaption>The most common shape in real audits: your handler is fine, and the interaction is still slow because the tap spent half its life waiting behind someone else's task.</figcaption>
+</figure>
+
+<h2>2. Where the 50 ms rule comes from</h2>
+<p>
+  A <b>long task</b> is a task that occupies the main thread for <b>50 ms or more</b>. That number is not arbitrary, and
+  being able to derive it is a small senior-signal in an interview.
+</p>
+<p>
+  Research-based guidance says a response should land within about <b>100 ms</b> to feel instant. A tap arrives at a
+  random point inside whatever task is running, so on average it waits half that task, and in the worst case almost all
+  of it. If every task stays under 50 ms, the worst-case wait is under 50 ms — leaving the other 50 ms of the budget for
+  your handler and the paint. Over 50 ms and the arithmetic stops working, so that is where the browser draws the line
+  and flags it.
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Metric</th><th>Good</th><th>Needs work</th><th>Poor</th></tr>
+<tr><td><b>INP</b> (75th percentile of real users)</td><td>≤ 200 ms</td><td>200–500 ms</td><td>&gt; 500 ms</td></tr>
+<tr><td><b>Long task</b> (one task, lab)</td><td>&lt; 50 ms</td><td>50–200 ms</td><td>&gt; 200 ms</td></tr>
+</table>
+</div>
+<p class="small">
+  Thresholds per <a href="https://web.dev/articles/inp">web.dev — INP</a>; treat them as bare facts, published numbers
+  rather than derivations. What <em>is</em> derivable is why a threshold has to exist at all.
+</p>
+
+<h2>3. Starvation: the failure with nothing to blame</h2>
+<p>
+  Now the case that defeats most audits. Nothing here is a long task, and the page is still unusable:
+</p>
+<pre><code>for (const section of sections) {
+  setTimeout(() =&gt; renderSection(section), 0);   <span class="cmt">// 40ms each, 30 sections</span>
+}</code></pre>
+<p>
+  Thirty tasks of 40 ms. Every one is under the 50 ms line, so DevTools flags nothing. But the queue never empties for
+  1.2 seconds, and a tap that arrives at the start of it waits behind all thirty. This is <b>starvation</b>: the thread
+  is not held by one greedy task, it is held by a crowd of polite ones. Chunking work into "small" pieces and queueing
+  them all at once does not fix responsiveness — it only hides the evidence.
+</p>
+<div class="trap">
+  <span class="label">Trap</span>
+  Splitting a long task into smaller tasks helps only if the browser is <b>actually allowed to breathe between them</b>.
+  Queue them all up front and you have starvation with a clean long-task report. Queue the next chunk only after
+  yielding — and ideally check whether input is waiting first — and you have responsiveness. The pattern that works is
+  a loop that yields, not a loop that schedules.
+</div>
+<pre><code>async function renderAll(sections) {
+  for (const s of sections) {
+    renderSection(s);
+    <span class="cmt">// end the task so a queued tap can be served before the next chunk</span>
+    await new Promise(r =&gt; setTimeout(r, 0));
+  }
+}</code></pre>
+<p>
+  Remember lesson 0006: it must be a <b>task</b> yield. <code>await Promise.resolve()</code> here would change nothing
+  at all — same turn, same starvation, no paint.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    When someone taps a button, three separate waits happen one after another. First, the browser is busy with
+    something it cannot put down, so the tap sits in line. Second, your code for that button runs. Third, the browser
+    redraws the screen so the person can see what changed. The person feels all three as one delay. Most of the time
+    the first wait is the biggest, and it has nothing to do with the button.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A doctor's waiting room. Your appointment feels slow if the doctor was already mid-appointment
+    when you arrived (waiting), if your own appointment is long (processing), or if you then queue at reception to get
+    the paperwork (presentation). Complaining that the doctor is slow when you actually waited 20 minutes in the
+    corridor misses the real problem.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A waiting room lets you see the queue and lets urgent cases jump ahead. The browser has no
+    triage: your tap cannot be prioritised over the analytics script that got there first, and the person cannot see
+    that a queue exists — which is exactly why they tap again, adding another appointment to the same queue.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    The sticking point is assuming slow interaction means slow handler. Very often the handler is 20 ms and the
+    interaction is 400 ms, because 350 ms of it was input delay caused by code you did not write. If you optimise the
+    handler you will move the number by 5%, tell the client you fixed it, and be wrong. Second sticking point:
+    believing "I split it into small chunks" is the same as "the browser can respond between chunks". It is not — see
+    starvation. A queue of thirty polite tasks blocks a tap exactly as well as one rude one.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a client who says: <i>"your developers made the button faster but it still feels slow"</i>.
+    Explain the three waits in everyday words, say which one you measured, and say what you would change next. No
+    jargon: not "main thread", not "task", not "INP", until you have said it plainly first. Then <b>send it to me</b>.
+    Being able to say this to a non-technical stakeholder is most of what "senior" means in a client agency.
+  </p>
+</div>
+
+<h2>5. Point at it: measure all three parts <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Long tasks, visually.</b> DevTools &rarr; <b>Performance</b> &rarr; record while you interact. Grey
+  <i>Task</i> bars with a red corner are long tasks. Enable the <b>Interactions</b> track: each interaction is drawn as
+  a bar split into exactly the three parts from the diagram.</li>
+  <li><b>The number, in the Console.</b> Paste this and then click around — it prints every interaction over 40 ms with
+  its duration, using <a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceObserver">PerformanceObserver</a>:
+  <pre><code>new PerformanceObserver(list =&gt; {
+  for (const e of list.getEntries()) {
+    console.log(e.name, Math.round(e.duration) + 'ms',
+      'delay:', Math.round(e.processingStart - e.startTime) + 'ms');
+  }
+}).observe({ type: 'event', durationThreshold: 40, buffered: true });</code></pre>
+  The <code>delay</code> figure is input delay — the part your handler cannot influence.</li>
+  <li><b>Blame it correctly.</b> Click a long task in the flame chart and read the <b>Bottom-Up</b> tab: it names the
+  script file. If the top entry is a chat widget or a reviews app, your handler was never the problem, and the fix is a
+  loading decision, not a code change.</li>
+  <li>Throttle the CPU to <b>4× slower</b> before you conclude anything. A mid-range Android phone is roughly there, and
+  it is the device most storefront customers are using.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A client complains that the <b>Add to cart</b> button on a product page takes "about half a second" to respond on mobile. You record a profile with 4× CPU throttling. Your handler shows 45&nbsp;ms of processing. Directly before it sits a 300&nbsp;ms task whose Bottom-Up view names a reviews app script, and after your handler there is a 90&nbsp;ms render.</p>
+  Before flipping the recall cards: give the INP figure, name which part dominates, and say what you would propose — including what you would <em>refuse</em> to spend the client's hours on. Then the interviewer's follow-up: the client says the reviews app cannot be removed. What are your remaining options, in order of cost?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Make a scratch HTML file with one button, and type this by hand:</p>
+  <pre><code>&lt;button id="b"&gt;Tap me&lt;/button&gt;
+&lt;script&gt;
+  b.addEventListener('click', () =&gt; {
+    console.log('handler ran at', Math.round(performance.now()));
+  });
+  function block(ms) {
+    const end = performance.now() + ms;
+    while (performance.now() &lt; end) {}
+  }
+  setInterval(() =&gt; block(300), 350);      <span class="cmt">// a rude neighbour</span>
+&lt;/script&gt;</code></pre>
+  <p><b>Predict first:</b> if you tap at a random moment, what is the range of possible waits before
+  <code>handler ran</code> appears? Then tap ten times and watch the timestamps. You are measuring input delay by hand.</p>
+  <p><b>Now the starvation version.</b> Replace the <code>setInterval</code> line with thirty small tasks queued at once:</p>
+  <pre><code>  for (let i = 0; i &lt; 30; i++) setTimeout(() =&gt; block(40), 0);</code></pre>
+  <p>Predict: does DevTools flag a long task? Does your tap still wait about a second? Record a profile and check both
+  answers. Seeing "no long tasks" next to a one-second delay is the lesson.</p>
+  <p><b>Then fix it properly</b> — a loop that yields instead of a loop that schedules:</p>
+  <pre><code>  (async () =&gt; {
+    for (let i = 0; i &lt; 30; i++) {
+      block(40);
+      await new Promise(r =&gt; setTimeout(r, 0));
+    }
+  })();</code></pre>
+  <p>Tap during it and compare the timestamps with the previous run. Same total work, very different feel — and now
+  change that one yield to <code>await Promise.resolve()</code> and watch the improvement disappear completely. That
+  contrast is lesson 0006 and this lesson in one experiment.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>long tasks, starvation, input delay</b> done only if all three held, from memory: (1) you explained the three waits to a non-technical person — the teach-back in section 4; (2) you predicted the input-delay range before tapping, and predicted that the thirty-task version would show no long task; (3) you read a real interaction's delay figure, either from the Interactions track or from the PerformanceObserver snippet. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://web.dev/articles/optimize-inp">web.dev — Optimize INP</a> (30 min). It is
+  organised as exactly the three parts in this lesson, with the yielding patterns written out. Then keep
+  <a href="https://web.dev/articles/inp">web.dev — INP</a> open as the definition you quote to clients.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Nested microtask starvation</b> <span class="pill depth">depth</span> — the version of this failure with no task
+  boundary at all. <b><code>requestIdleCallback</code>, <code>isInputPending</code> and <code>scheduler.postTask</code>
+  priorities</b> <span class="pill depth">depth</span> — better yielding tools, once the plain pattern is second
+  nature. <b>Web Workers</b> <span class="pill depth">depth</span>. <b>Long Animation Frames (LoAF)</b>
+  <span class="pill depth">depth</span> — the newer, more honest replacement for long-task attribution. The rendering
+  half of presentation delay is Chapter 2, and INP as a metric to defend is
+  <a href="0016-lcp-cls-inp.html">lesson 0016</a>. Next core lesson:
+  <a href="0008-promise-state-machine.html">0008 · the promise state machine</a>.
+</div>
+
+<p class="ask">Anything unclear — why the 50 ms line is where it is, how to argue a third-party script out of a client's theme, which yielding pattern to use where? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Every interaction is three waits: <b>input delay</b> (queued behind other work) + <b>processing</b> (your handler) + <b>presentation delay</b> (style, layout, paint).</li>
+    <li><b>INP</b> measures all three, to the <em>next paint</em>. Good is ≤&nbsp;200&nbsp;ms at the 75th percentile of real users.</li>
+    <li>A <b>long task</b> is ≥&nbsp;50&nbsp;ms. The number comes from the ~100 ms response budget minus the worst-case wait.</li>
+    <li>Most slow interactions are <b>input delay</b>, often caused by scripts you did not write. Optimising your handler then moves almost nothing.</li>
+    <li><b>Starvation</b>: thirty 40&nbsp;ms tasks block a tap as well as one 1.2&nbsp;s task, and DevTools flags nothing.</li>
+    <li>Chunking works only with a <b>loop that yields</b>, not a loop that schedules — and the yield must reach the <b>task</b> queue.</li>
+    <li>Never conclude anything without <b>4× CPU throttling</b>; that is the customer's phone.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>measure which of the three waits is biggest before you fix anything — most teams optimise the smallest one.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/event-loop.html">Cheat sheet: event loop</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0008-promise-state-machine.html">Next: 0008 · promises &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What are the three parts of the delay a user feels after a tap?',
+    options: [
+      'input delay, processing, presentation delay',
+      'network delay, script delay, paint delay',
+      'queue delay, compile delay, render delay'
+    ],
+    answer: 0,
+    why: 'The tap waits for the running task to finish, then your handler runs, then the browser must style, layout and paint before anything is visible. INP is the sum of all three.'
+  },
+  {
+    q: 'Why is the long-task threshold set at 50 ms rather than some other value?',
+    options: [
+      'a 100 ms response budget minus the worst-case wait',
+      'the average frame budget of a 60 hertz display',
+      'the shortest task the profiler can measure reliably'
+    ],
+    answer: 0,
+    why: 'A response should land within about 100 ms. A tap can arrive at the worst moment of a task, so tasks under 50 ms leave roughly 50 ms for the handler and the paint.'
+  },
+  {
+    q: 'Thirty tasks of 40 ms each are queued at once. What does the Performance panel report?',
+    options: [
+      'no long task, although a tap waits over a second',
+      'one long task of one thousand two hundred ms',
+      'thirty long tasks, one for each queued chunk'
+    ],
+    answer: 0,
+    why: 'Each task is under the 50 ms line so nothing is flagged, yet the queue never empties. This is starvation: many polite tasks block input exactly as well as one rude one.'
+  },
+  {
+    q: 'Which change actually lets a queued tap be served mid-way through a batch of work?',
+    options: [
+      'yield to a task between chunks, then continue',
+      'queue every chunk with setTimeout up front',
+      'await an already-resolved promise per chunk'
+    ],
+    answer: 0,
+    why: 'Only ending the current task and letting the loop pick the next queued item — which may be the tap — restores responsiveness. Awaiting a settled promise stays inside the same turn.'
+  },
+  {
+    q: 'Your handler is 45 ms and the interaction measures 435 ms. What should you investigate first?',
+    options: [
+      'what ran just before it, in the Bottom-Up view',
+      'the number of DOM nodes the handler updates',
+      'whether the click listener is registered twice'
+    ],
+    answer: 0,
+    why: 'Nearly 400 ms is not your handler, so it is input delay plus presentation. Identify the script holding the thread before the tap; often it is a third-party tag and the fix is a loading decision.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"A user says a button feels slow. How do you find out why?"',
+    answer: 'Split the delay into three parts and measure each: <b>input delay</b> — how long the tap sat queued behind work already running; <b>processing</b> — how long my handler took; <b>presentation delay</b> — the style, layout and paint after it. I record a profile with <b>4× CPU throttling</b>, read the Interactions track, and check the Bottom-Up view of whatever task ran immediately before the tap.<br><br><i>Likely follow-up:</i> "Which one is usually the problem?" Input delay, and usually from scripts we did not write. That matters because optimising the handler — the instinct — often moves the total by a few percent.'
+  },
+  {
+    prompt: '"Why is 50 ms the long-task threshold, and what is INP\'s good threshold?"',
+    answer: 'A response should land within roughly 100&nbsp;ms to feel instant. A tap arrives at an uncontrolled moment inside a running task, so in the worst case it waits almost the whole task; keeping tasks under 50&nbsp;ms leaves about 50&nbsp;ms for the handler and the paint. INP is good at <b>≤ 200&nbsp;ms</b> at the 75th percentile of real users, needs work to 500&nbsp;ms, poor above that.<br><br><i>Likely follow-up:</i> "Lab or field?" The 50 ms long-task flag is a lab signal from a profile; INP is a field metric from real users. A clean lab profile with bad field INP usually means real devices, real networks, or a third party you did not load locally.'
+  },
+  {
+    prompt: 'The add-to-cart drill: 300 ms reviews-app task, then a 45 ms handler, then a 90 ms render. Give the number, the dominant part, and the plan.',
+    answer: 'Worst case the tap arrives at the start of the reviews task, so input delay approaches 300&nbsp;ms; add 45&nbsp;ms processing and 90&nbsp;ms presentation and the interaction is around <b>400–435&nbsp;ms</b> — firmly in "needs work". The dominant part is <b>input delay</b>, and none of it is our code. I would refuse to spend hours micro-optimising the 45&nbsp;ms handler: the best possible outcome there is about 10% of the number.<br><br>Plan, cheapest first: (1) delay the reviews script until after first interaction or until its section scrolls into view, so it is never in the way of the first tap; (2) if it must load early, load it in a way that breaks its work into smaller tasks — many tags support a lazy or deferred mode; (3) attack the 90&nbsp;ms render by shrinking what the handler invalidates, which is Chapter 2 work.<br><br><i>Likely follow-up:</i> "The app cannot be removed — now what?" In order of cost: defer it behind an interaction or an <code>IntersectionObserver</code>; ask the vendor for a lighter embed; iframe it so its work does not sit on our main thread; and if none of that is possible, document the ceiling it puts on INP so the client owns the trade-off rather than us.'
+  }
+]);
+</script>
+</body>
+</html>

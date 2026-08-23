@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0019 · Resource hints: preconnect, preload, prefetch, fetchpriority — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 3 · Network &amp; Delivery · Protocol · Lesson 0019</p>
+<h1>Resource hints: <code>preconnect</code>, <code>preload</code>, <code>prefetch</code>, <code>fetchpriority</code></h1>
+<p class="subtitle">The browser starts a fetch when it discovers the URL. Everything in this lesson is a way to say "you will need this — start earlier" — and each hint moves a different block of lesson 0017's timeline.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #5 (judge someone else's work) — hints are the most commonly cargo-culted lines in any theme's <code>&lt;head&gt;</code>, and half of them are doing nothing.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~30 minutes you can pick the correct hint for a given problem in one sentence, explain why adding more of them makes things worse, and audit a <code>&lt;head&gt;</code> full of inherited hints and say which to delete.
+</div>
+
+<h2>1. Each hint removes a different block</h2>
+<p>
+  Lesson 0017 gave the four blocks before a first byte: DNS, TCP, TLS, then the request. A hint does not make the network
+  faster — it <b>moves work earlier</b>, so it overlaps other work instead of queueing behind it. Which block it moves is
+  the whole difference between the hints:
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 260" role="img" aria-label="dns-prefetch covers the DNS block, preconnect covers DNS TCP and TLS, preload starts the request early, fetchpriority reorders known fetches and prefetch targets the next navigation">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <rect class="box" x="110" y="26" width="90" height="30" rx="4"/>
+  <text class="mono sm" x="132" y="46">DNS</text>
+  <rect class="box" x="200" y="26" width="90" height="30" rx="4"/>
+  <text class="mono sm" x="224" y="46">TCP</text>
+  <rect class="box" x="290" y="26" width="90" height="30" rx="4"/>
+  <text class="mono sm" x="314" y="46">TLS</text>
+  <rect class="box hot" x="380" y="26" width="110" height="30" rx="4"/>
+  <text class="mono sm" x="396" y="46">REQUEST</text>
+  <rect class="box good" x="490" y="26" width="110" height="30" rx="4"/>
+  <text class="mono sm" x="502" y="46">bytes</text>
+
+  <line class="rule" x1="110" y1="86" x2="380" y2="86" style="stroke:var(--accent)"/>
+  <line class="rule" x1="110" y1="80" x2="110" y2="92" style="stroke:var(--accent)"/>
+  <line class="rule" x1="380" y1="80" x2="380" y2="92" style="stroke:var(--accent)"/>
+  <text class="mono sm" x="110" y="106">preconnect</text>
+  <text class="sub" x="200" y="106">— opens the connection before you need it (~3 RTTs earlier)</text>
+
+  <line class="rule thin" x1="110" y1="130" x2="200" y2="130"/>
+  <line class="rule thin" x1="110" y1="124" x2="110" y2="136"/>
+  <line class="rule thin" x1="200" y1="124" x2="200" y2="136"/>
+  <text class="mono sm" x="110" y="150">dns-prefetch</text>
+  <text class="sub" x="200" y="150">— resolves the name only; cheap, and mostly superseded</text>
+
+  <line class="rule" x1="380" y1="176" x2="490" y2="176" style="stroke:var(--accent-2)"/>
+  <line class="rule" x1="380" y1="170" x2="380" y2="182" style="stroke:var(--accent-2)"/>
+  <line class="rule" x1="490" y1="170" x2="490" y2="182" style="stroke:var(--accent-2)"/>
+  <text class="mono sm" x="380" y="196">preload</text>
+  <text class="sub" x="440" y="196">— starts the fetch now, at high priority, for THIS page</text>
+
+  <line class="rule thin" x1="16" y1="212" x2="704" y2="212"/>
+  <text class="mono sm" x="16" y="232">fetchpriority</text>
+  <text class="sub" x="120" y="232">— reorders fetches the browser already knows about. Relative, not absolute.</text>
+  <text class="mono sm" x="16" y="252">prefetch</text>
+  <text class="sub" x="120" y="252">— for the NEXT navigation, lowest priority, may be dropped entirely.</text>
+</svg>
+<figcaption>Pick the hint by naming the block you want moved. If you cannot name the block, you do not need a hint.</figcaption>
+</figure>
+
+<h2>2. The four, with the mistake that comes with each</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Hint</th><th>Use it when</th><th>The usual mistake</th></tr>
+<tr><td><code>&lt;link rel="preconnect" href="https://fonts.gstatic.com" crossorigin&gt;</code></td><td>you know an origin will be needed early and cannot avoid it</td><td>preconnecting to eight origins — sockets and bandwidth are finite, so keep it to two or three that matter</td></tr>
+<tr><td><code>&lt;link rel="preload" as="font" type="font/woff2" href=&quot;…&quot; crossorigin&gt;</code></td><td>a resource is <b>critical</b> but <b>discovered late</b> — a font referenced inside CSS, a hero image built by script</td><td>preloading something the parser would have found anyway: no gain, and you compete with what actually matters</td></tr>
+<tr><td><code>&lt;link rel="prefetch" href=&quot;/collections/all&quot;&gt;</code></td><td>you are fairly confident where the user goes next</td><td>prefetching many pages on a phone — you spend the customer's data on a guess</td></tr>
+<tr><td><code>&lt;img fetchpriority="high" …&gt;</code></td><td>the LCP image should outrank other images the browser already found</td><td>marking several things <code>high</code> — priority is an ordering, so if everything is high nothing is</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — the three ways <code>preload</code> backfires</span>
+  <p><b>1. Missing or wrong <code>as</code>.</b> Without it the browser cannot guess the priority or apply the right
+  Content Security Policy, and it may fetch the file <em>twice</em>.</p>
+  <p><b>2. Missing <code>crossorigin</code> on a font.</b> Fonts are fetched in anonymous mode, so a preload without
+  <code>crossorigin</code> does not match the real request and you download the font twice.</p>
+  <p><b>3. Preloading and not using it.</b> Chrome logs a warning: <i>"The resource … was preloaded using link preload but
+  not used within a few seconds"</i>. That is pure wasted bandwidth on a mobile connection, and it is the most common
+  leftover in an inherited theme.</p>
+</div>
+
+<h2>3. Preferring the plain fix over the hint</h2>
+<p>
+  A hint is a patch over a discovery problem. It is usually better to remove the discovery problem, and knowing which to
+  reach for is the senior judgement here:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Problem</th><th>Hint answer</th><th>Better answer</th></tr>
+<tr><td>Hero image found late because it is lazy-loaded</td><td><code>preload</code> it</td><td><b>remove <code>loading="lazy"</code></b> and add <code>fetchpriority="high"</code> — the parser then finds it immediately (lesson 0016)</td></tr>
+<tr><td>Font found late because it lives inside a stylesheet</td><td><code>preload</code> the font file</td><td>self-host it and preload it — or accept a system font for the first paint with <code>font-display: swap</code></td></tr>
+<tr><td>Third-party origin is slow to connect</td><td><code>preconnect</code></td><td><b>delete the origin</b>, or defer the script so its connection is off the critical path (lesson 0017)</td></tr>
+<tr><td>Script-built image URLs are invisible to the preload scanner</td><td><code>preload</code> each one</td><td>put the real <code>src</code> in the markup, so the scanner from lesson 0011 does the work for free</td></tr>
+</table>
+</div>
+<p>
+  Read the right-hand column again: three of the four better answers are just "let the browser discover it normally".
+  Hints are for the cases where you genuinely cannot.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser only starts fetching a file when it reads the line that mentions it. If an important file is mentioned
+    somewhere deep — inside another file, or in code that runs later — it starts late, and everything waits. These
+    instructions let you say up front: "look up this company's address now", or "open the line to them now", or "start
+    downloading this exact file now". You are not making the network faster. You are starting the wait earlier, so it
+    happens while other work is going on.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> Cooking. You put the water on to boil before you start chopping, because the boiling will happen
+    anyway and it may as well happen while your hands are busy. That is <code>preconnect</code> and <code>preload</code>:
+    the same total work, started sooner.
+  </p>
+  <p>
+    <b>Where it breaks.</b> In a kitchen you can put six pans on and it costs only attention. Here every early fetch
+    competes for one connection budget and one radio. Preconnect to eight origins and you have not started eight things
+    early — you have made them queue against each other and stolen bandwidth from the file that mattered. And
+    <code>prefetch</code> has no kitchen equivalent at all: it is cooking a meal the guest may never order, paid for with
+    their data.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People treat hints as free speed and add them in bulk. Priority is <b>relative</b>: marking five things high is the
+    same as marking none. Bandwidth is <b>shared</b>: an early fetch you did not need delays one you did. The second
+    sticking point is confusing <code>preload</code> with <code>prefetch</code>. <code>preload</code> is "this page, now,
+    high priority — I promise to use it". <code>prefetch</code> is "maybe the next page, whenever there is nothing better
+    to do, feel free to discard it". One word apart, opposite urgency.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a teammate who added <code>preconnect</code> for all eleven third-party origins in
+    <code>theme.liquid</code> and reports "no improvement". Explain why, and say which two you would keep. Then <b>send it
+    to me</b> — I am checking that you talk about competition for a shared budget rather than saying "too many hints is
+    bad practice".
+  </p>
+</div>
+
+<h2>5. Point at it: check every hint is earning its place <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>List what the page already asks for.</b> In the Console:
+  <code>[...document.querySelectorAll('link[rel*="pre"],link[rel="modulepreload"]')].map(l =&gt; l.rel + ' → ' + l.href)</code>.
+  On an inherited theme this list is usually longer than anyone expects, and nobody knows who added what.</li>
+  <li><b>Find the wasted ones.</b> Reload with the Console open and search for the word <b>preloaded</b>. Chrome's
+  "preloaded but not used" warning names each hint that is pure waste. Deleting those is a free, zero-risk win — and it is
+  gate #3 for this core.</li>
+  <li><b>Check the priorities.</b> Network panel &rarr; right-click the header row &rarr; enable <b>Priority</b>. Sort by it.
+  Your LCP image should be at or near the top; if a chat widget's script is above it, that is the ticket.</li>
+  <li><b>Verify a preconnect actually helped.</b> Compare the <b>Timing</b> tab of the first request to that origin, with
+  and without the hint. With a working <code>preconnect</code>, DNS, connection and SSL show as already done. If they do
+  not, the hint fired too late or the origin was wrong — a preconnect placed after the blocking scripts in the head does
+  almost nothing.</li>
+  <li><b>Watch for the double download.</b> Filter the Network panel by the font's filename after adding a font preload.
+  Two entries means a mismatch: usually a missing <code>crossorigin</code> or a wrong <code>as</code>.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">An inherited <code>theme.liquid</code> head contains: <code>preconnect</code> to 7 origins; <code>preload as="script"</code> for <code>theme.js</code> which is also loaded with <code>defer</code> two lines below; a font <code>preload</code> with no <code>crossorigin</code>; <code>prefetch</code> for three collection pages; and no hint at all for the hero image, which sits inside a slider section with <code>loading="lazy"</code>. The console shows two "preloaded but not used" warnings, and the font appears twice in the Network panel.</p>
+  Before flipping the recall cards: go line by line and say keep, fix or delete, with the reason in mechanism terms. Then the interviewer's follow-up: after your clean-up the LCP improves by 700 ms — which single change do you believe was responsible, and how would you prove it rather than claiming it?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Make a page that loads a font from a stylesheet — the classic late-discovery case. Type it by hand:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;link rel="stylesheet" href=&quot;styles.css&quot;&gt;
+&lt;h1&gt;Late-discovered font&lt;/h1&gt;
+
+<span class="cmt">/* styles.css */</span>
+@font-face { font-family: T; src: url('/font.woff2') format('woff2'); font-display: swap }
+h1 { font-family: T, serif }</code></pre>
+  <p><b>Predict before running:</b> in the Network waterfall, when does <code>font.woff2</code> start relative to
+  <code>styles.css</code>? Serve it, throttle to <i>Slow 4G</i>, and look. The font cannot start until the CSS has
+  arrived <em>and</em> been parsed <em>and</em> matched to an element — a serial chain, exactly like the
+  <code>@import</code> problem in lesson 0010.</p>
+  <p><b>Now add the hint</b> and predict how the waterfall changes before you reload:</p>
+  <pre><code>&lt;link rel="preload" as="font" type="font/woff2" href=&quot;/font.woff2&quot; crossorigin&gt;</code></pre>
+  <p>The font's bar should now start next to the stylesheet's rather than after it.</p>
+  <p><b>Break it on purpose, twice.</b> First remove <code>crossorigin</code>, reload, and count the
+  <code>font.woff2</code> entries — predict the number first. Then put <code>crossorigin</code> back and remove
+  <code>as="font"</code>, and watch the Priority column change. Two one-word edits, two different failures, both common in
+  real themes.</p>
+  <p><b>Third round — prove that priority is relative.</b> Add four images and mark them all high:</p>
+  <pre><code>&lt;img src=&quot;a.jpg&quot; fetchpriority="high"&gt;&lt;img src=&quot;b.jpg&quot; fetchpriority="high"&gt;
+&lt;img src=&quot;c.jpg&quot; fetchpriority="high"&gt;&lt;img src=&quot;d.jpg&quot; fetchpriority="high"&gt;</code></pre>
+  <p>Predict: does <code>a.jpg</code> arrive sooner than it did with no hints at all? Then mark only <code>a.jpg</code>
+  high and the other three <code>low</code>, and compare. Watching the first version achieve nothing is the most useful
+  five minutes in this lesson.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>resource hints: preconnect, preload, prefetch, fetchpriority</b> done only if all three held, from memory: (1) you explained the eleven-preconnect problem as competition for a shared budget — the teach-back in section 4; (2) you predicted the double font download, and predicted that four <code>high</code> images would gain nothing; (3) you audited a real <code>&lt;head&gt;</code>, found a "preloaded but not used" warning or a mis-ordered Priority column, and deleted or fixed it. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://web.dev/articles/preload-critical-assets">web.dev — Preload critical assets</a> (15 min), which is blunt about when preload hurts. Then keep <a href="https://developer.chrome.com/docs/devtools/network">Chrome DevTools — Network</a> open for the Priority column, because judging a hint without it is guessing.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Speculation Rules and prerendering</b> <span class="pill depth">depth</span> — the modern, much more powerful version
+  of <code>prefetch</code>. <b><code>modulepreload</code> and module graph warming</b> <span class="pill depth">depth</span>.
+  <b>Early Hints (HTTP 103)</b> <span class="pill depth">depth</span> — hints sent before the HTML exists, which needs
+  server control we usually lack. <b>Priority Hints across HTTP/2 stream priorities</b>
+  <span class="pill depth">depth</span>. <b>Font loading strategy in full</b> <span class="pill depth">depth</span> — the
+  <code>font-display</code> and metric-matching half of the font problem. Next core lesson:
+  <a href="0020-waterfall-vs-parallel-network-panel.html">0020 · reading a waterfall</a>, which is how you find the
+  late-discovery problems this lesson patches.
+</div>
+
+<p class="ask">Anything unclear — why fonts need <code>crossorigin</code>, how many preconnects is too many, whether to prefetch on mobile? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>A hint does not speed up the network. It <b>starts the wait earlier</b>, so it overlaps other work.</li>
+    <li>Pick by block: <code>dns-prefetch</code> = DNS · <code>preconnect</code> = DNS + TCP + TLS · <code>preload</code> = the request itself.</li>
+    <li><code>preload</code> is "this page, now, I will use it". <code>prefetch</code> is "maybe next page, lowest priority, discardable".</li>
+    <li><code>fetchpriority</code> <b>reorders</b> fetches the browser already knows about. Priority is relative — everything high means nothing is.</li>
+    <li>Three preload failures: missing <code>as</code>, missing <code>crossorigin</code> on a font, and never using it (Chrome warns).</li>
+    <li>Keep <code>preconnect</code> to two or three origins. Sockets and bandwidth are shared and finite.</li>
+    <li>Prefer removing the discovery problem: real <code>src</code> in the markup, no <code>loading="lazy"</code> on the hero, one fewer origin.</li>
+    <li>Audit with the Console warning and the Network panel's <b>Priority</b> column, never by reading the head and hoping.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>if you cannot name the block a hint moves, delete the hint.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/network-delivery.html">Cheat sheet: network &amp; delivery</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0020-waterfall-vs-parallel-network-panel.html">Next: 0020 · the waterfall &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What does preconnect actually do for you?',
+    options: [
+      'performs DNS, TCP and TLS before you need them',
+      'downloads the resource at a higher priority',
+      'keeps an idle connection open for the whole visit'
+    ],
+    answer: 0,
+    why: 'It moves the three setup round trips earlier so they overlap other work. It fetches nothing, which is why it helps only when you will definitely use that origin soon.'
+  },
+  {
+    q: 'What is the difference between preload and prefetch?',
+    options: [
+      'this page at high priority versus maybe later',
+      'a stylesheet fetch versus a plain script fetch',
+      'a same-origin fetch versus a cross-origin one'
+    ],
+    answer: 0,
+    why: 'preload is an urgent fetch for the current navigation that you promise to use; prefetch is a lowest-priority speculative fetch for a future navigation that the browser may discard.'
+  },
+  {
+    q: 'A font preload downloads the file twice. What is the likeliest cause?',
+    options: [
+      'the crossorigin attribute is missing from the hint',
+      'the font-display value conflicts with the preload',
+      'two stylesheets reference the same font family'
+    ],
+    answer: 0,
+    why: 'Fonts are fetched in anonymous mode, so a preload without crossorigin does not match the real request and both happen. A missing or wrong "as" value causes similar duplication.'
+  },
+  {
+    q: 'You mark four images fetchpriority="high". What is the effect on the first one?',
+    options: [
+      'roughly none, because priority is relative',
+      'it arrives four times sooner than before',
+      'it is downgraded, since only one may be high'
+    ],
+    answer: 0,
+    why: 'Priority is an ordering among known requests. Raising everything raises nothing, and you also lose the chance to mark the genuinely unimportant ones low.'
+  },
+  {
+    q: 'How does Chrome tell you a preload was pointless?',
+    options: [
+      'a console warning that it was not used in time',
+      'a red entry in the Network panel initiator column',
+      'a failed status code on the preload link element'
+    ],
+    answer: 0,
+    why: 'It logs that the resource was preloaded but not used within a few seconds. Searching the console for "preloaded" on an inherited theme usually finds free wins with no risk.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"When would you use preload, and when would you not?"',
+    answer: 'Use it when a resource is <b>critical</b> and <b>discovered late</b> — a font referenced from inside a stylesheet, or an image whose URL only exists after script runs. Do not use it for anything the parser or the preload scanner would find on its own: there is no gain, and the early fetch competes with resources that matter. And always include the correct <code>as</code>, plus <code>crossorigin</code> for fonts.<br><br><i>Likely follow-up:</i> "How do you know it helped?" Compare the Network waterfall before and after: the resource\'s bar should start next to its parent request rather than after it. And check the console for the "preloaded but not used" warning, which means it helped nothing at all.'
+  },
+  {
+    prompt: '"Someone preconnects to eleven origins and sees no improvement. Why?"',
+    answer: 'Because connections compete for a shared budget. Sockets and bandwidth are finite, so opening eleven connections early does not start eleven things sooner — it makes them contend with each other and steals capacity from the resource that actually blocks rendering. Preconnect is worth it for the two or three origins you know are needed early; beyond that it is noise, and it can be a net loss.<br><br><i>Likely follow-up:</i> "So which two would you keep?" The ones on the critical path — typically the font host if fonts are render-relevant, and whichever origin serves the LCP image. Everything else is better fixed by deferring the script or removing the origin.'
+  },
+  {
+    prompt: 'The inherited head drill: go line by line, then justify the 700 ms LCP win.',
+    answer: '<b>7 preconnects</b> — delete all but two: keep the origin serving the LCP image and the font host if fonts block rendering. Reason: shared connection and bandwidth budget. <b>preload of theme.js which is also deferred below</b> — delete the preload. The parser finds it immediately, so the hint adds nothing and raises its priority above resources that matter more. <b>Font preload with no crossorigin</b> — fix, do not delete: add <code>crossorigin</code>, which also removes the double download visible in the panel. <b>3 prefetched collection pages</b> — delete on mobile unless there is analytics showing that is where users go; it spends the customer\'s data on a guess. <b>Hero image with loading="lazy" inside a slider</b> — the real bug: remove <code>lazy</code>, put a real <code>src</code> in the markup, add <code>fetchpriority="high"</code>. The two console warnings identify the wasted preloads and should be zero when you are done.<br><br><i>Likely follow-up:</i> "Which change earned the 700 ms, and how do you prove it?" Almost certainly the hero image, because it addressed <b>LCP load delay</b> — the element LCP measures was not even being discovered until the slider initialised. But believing that without evidence is exactly the mistake this course is against. To prove it: revert the clean-up, then apply <b>only</b> the hero change and record three runs with the same throttling, comparing the LCP marker on the Timings track; then apply the rest and compare again. If the hero change alone accounts for most of the 700 ms, say so with the numbers. If it does not, the honest report says which change did — and either way I would confirm it against field data over the following weeks rather than closing the ticket on one lab run.'
+  }
+]);
+</script>
+</body>
+</html>

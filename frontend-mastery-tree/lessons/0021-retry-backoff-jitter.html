@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0021 · Retry with exponential backoff and jitter — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 3 · Network &amp; Delivery · Request discipline · Lesson 0021</p>
+<h1>Retry with exponential backoff and jitter</h1>
+<p class="subtitle">The last core of Chapter 3. Every other lesson made a request faster; this one decides what happens when it fails — and a careless retry is the one front-end mistake that can take a store down instead of just making it slow.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #3 (say what the design gives up) and ability #4 (debug with no ready answer) — "the customer was charged twice" starts here.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can write a retry that helps instead of harming, say which HTTP statuses may be retried and which must never be, and explain why a retried add-to-cart can double a customer's order.
+</div>
+
+<h2>1. Why retrying at all, and why not immediately</h2>
+<p>
+  Mobile networks fail transiently: a handover between towers, a dropped packet, a server restarting behind a load
+  balancer. A large share of failures succeed on a second attempt seconds later. So retrying is right. The question is
+  <em>when</em>.
+</p>
+<p>
+  Reason it through. A request failed. The most likely cause of a <code>503</code> or a timeout is that the server is
+  <b>already struggling</b>. Now imagine ten thousand storefront visitors whose requests all failed in the same second:
+</p>
+<ul>
+  <li><b>Retry immediately</b> &rarr; ten thousand extra requests arrive at a server that could not handle the first ten
+  thousand. You have doubled the load at the exact worst moment. This is a <b>retry storm</b>, and it turns a wobble into
+  an outage.</li>
+  <li><b>Retry on a fixed timer</b> — say every 2 seconds &rarr; the failures were synchronised, so the retries are
+  synchronised too. You have built a pulse: a spike every two seconds, forever, which prevents recovery instead of
+  waiting for it.</li>
+  <li><b>Exponential backoff</b> — 1 s, 2 s, 4 s, 8 s &rarr; each round gives the server exponentially more room. Load
+  falls away instead of piling on.</li>
+  <li><b>Backoff plus jitter</b> — randomise each delay &rarr; the clients are no longer in lockstep, so the retries
+  arrive spread out rather than as a wave (<a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library</a>).</li>
+</ul>
+<p>
+  Backoff protects the <b>server</b>. Jitter protects it from your <b>other clients</b>. You need both, and they solve
+  different problems — that distinction is the interview answer.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 250" role="img" aria-label="Exponential backoff doubles the delay each attempt, and full jitter picks a random point inside each interval so clients do not retry in lockstep">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">WAIT BEFORE ATTEMPT n  ·  bar = the interval  ·  amber tick = where full jitter lands</text>
+
+  <text class="mono sm" x="16" y="52">attempt 2</text>
+  <rect class="box" x="110" y="36" width="30" height="20" rx="3"/>
+  <line class="rule" x1="128" y1="36" x2="128" y2="56" style="stroke:var(--accent-2)"/>
+  <text class="sub" x="150" y="51">base 1s</text>
+
+  <text class="mono sm" x="16" y="84">attempt 3</text>
+  <rect class="box" x="110" y="68" width="60" height="20" rx="3"/>
+  <line class="rule" x1="132" y1="68" x2="132" y2="88" style="stroke:var(--accent-2)"/>
+  <text class="sub" x="180" y="83">2s</text>
+
+  <text class="mono sm" x="16" y="116">attempt 4</text>
+  <rect class="box" x="110" y="100" width="120" height="20" rx="3"/>
+  <line class="rule" x1="196" y1="100" x2="196" y2="120" style="stroke:var(--accent-2)"/>
+  <text class="sub" x="240" y="115">4s</text>
+
+  <text class="mono sm" x="16" y="148">attempt 5</text>
+  <rect class="box" x="110" y="132" width="240" height="20" rx="3"/>
+  <line class="rule" x1="168" y1="132" x2="168" y2="152" style="stroke:var(--accent-2)"/>
+  <text class="sub" x="360" y="147">8s</text>
+
+  <text class="mono sm" x="16" y="180">attempt 6</text>
+  <rect class="box" x="110" y="164" width="480" height="20" rx="3"/>
+  <line class="rule" x1="430" y1="164" x2="430" y2="184" style="stroke:var(--accent-2)"/>
+  <text class="sub" x="600" y="179">16s (cap it)</text>
+
+  <line class="rule thin" x1="16" y1="200" x2="704" y2="200"/>
+  <text class="mono sm" x="16" y="222">delay = random(0, min(cap, base × 2^attempt))</text>
+  <text class="sub" x="16" y="242">Backoff gives the server room. Jitter stops ten thousand clients arriving in the same instant. Both, or neither works.</text>
+</svg>
+<figcaption>"Full jitter": compute the exponential interval, then pick a random point inside it. Three lines of code, and it is the difference between helping a recovery and preventing one.</figcaption>
+</figure>
+
+<h2>2. What may be retried — and what must never be</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Outcome</th><th>Retry?</th><th>Why</th></tr>
+<tr><td>Network error, <code>fetch</code> rejected</td><td><b>yes</b></td><td>the request may never have reached the server</td></tr>
+<tr><td><code>408</code>, <code>425</code>, <code>429</code>, <code>500</code>, <code>502</code>, <code>503</code>, <code>504</code></td><td><b>yes</b></td><td>transient or explicitly "try later" — and for <code>429</code>/<code>503</code>, obey <code>Retry-After</code> instead of your own maths</td></tr>
+<tr><td><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>422</code></td><td><b>no</b></td><td>the request itself is wrong. Retrying gets the same answer more expensively</td></tr>
+<tr><td>A timeout on a <b>non-idempotent</b> request</td><td><b>only with protection</b></td><td>you do not know whether the server did the work. See below</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — the one that costs money</span>
+  <p>
+    <code>POST /cart/add.js</code> times out. Did the item go in the cart? <b>You cannot tell.</b> A timeout means you
+    stopped waiting, not that nothing happened. Retry blindly and the customer may get two of the item — or on a
+    payment-adjacent endpoint, be charged twice.
+  </p>
+  <p>
+    Three defences, in order of strength: (1) an <b>idempotency key</b> — send a unique id with the request so the server
+    can recognise a repeat and return the first result, which requires server cooperation; (2) <b>reconcile</b> — after a
+    timeout, re-read the state (<code>GET /cart.js</code>) and only act on what it says; (3) <b>ask the user</b> — show a
+    failure and a manual retry button, which is honest and often the right product decision. On a Shopify storefront you
+    rarely control the endpoint, so (2) and (3) are the realistic ones.
+  </p>
+</div>
+
+<h2>3. A retry you could actually ship</h2>
+<pre><code>const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+async function request(url, opts = {}, { attempts = 4, base = 500, cap = 8000, timeout = 10000 } = {}) {
+  for (let n = 0; n &lt; attempts; n++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() =&gt; ac.abort(), timeout);   <span class="cmt">// never hang forever</span>
+    try {
+      const res = await fetch(url, { ...opts, signal: ac.signal });
+      if (res.ok) return res;
+      if (!RETRYABLE.has(res.status) || n === attempts - 1) {
+        throw new HttpError(res.status, res);               <span class="cmt">// 422 must not be retried</span>
+      }
+      const after = Number(res.headers.get('Retry-After'));  <span class="cmt">// the server may tell you</span>
+      await wait(after ? after * 1000 : backoff(n, base, cap));
+    } catch (err) {
+      if (err.name !== 'AbortError' &amp;&amp; !(err instanceof TypeError)) throw err;  <span class="cmt">// not a transport failure</span>
+      if (n === attempts - 1) throw err;
+      await wait(backoff(n, base, cap));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+const backoff = (n, base, cap) =&gt; Math.random() * Math.min(cap, base * 2 ** n);  <span class="cmt">// full jitter</span>
+const wait = ms =&gt; new Promise(r =&gt; setTimeout(r, ms));</code></pre>
+<p>
+  Every line is one decision from this lesson: a <b>timeout</b> so nothing hangs (using
+  <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortController">AbortController</a> — the cancellation a
+  promise could not give you in lesson 0008), a <b>status allow-list</b>, <b>Retry-After</b> taking priority over your own
+  maths, <b>full jitter</b>, a <b>cap</b>, and a <b>bounded attempt count</b>. Note what is missing on purpose: this
+  helper does not retry <code>POST</code>s safely. That decision belongs to the caller, who knows whether the endpoint is
+  idempotent.
+</p>
+<div class="note">
+  <span class="label">The other half is the interface</span>
+  A retry that takes 15 seconds while the button sits there doing nothing is a worse experience than a fast failure. Show
+  the state — a disabled button with "Retrying…" — keep the total bounded to a few seconds for anything a customer is
+  waiting on, and always leave a manual retry. Silent retries are for background work, never for a tap.
+</div>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    When a request fails, trying again usually works, because most failures are brief. But the most likely reason it
+    failed is that the other side is overloaded — so trying again straight away makes things worse. So you wait, and each
+    time you fail you wait about twice as long. And because thousands of people's requests failed at the same moment, you
+    also add a random amount to your wait, so everyone does not come back at once and knock the server over again.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A busy phone line. If you redial the instant it is engaged, you are part of the reason it stays
+    engaged. Waiting longer each time helps, and waiting a <em>random</em> amount helps more, because otherwise everyone
+    who got the engaged tone at 10:00 redials together at 10:02.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A phone call either connects or it does not, and you know which. A network request can
+    <b>succeed without you hearing about it</b> — the server did the work and the answer got lost. Redialling is
+    harmless; retrying an order is not. That gap is the whole idempotency problem, and no amount of good backoff maths
+    addresses it.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Two. First: believing a timeout means nothing happened. It means <b>you stopped waiting</b> — the server may have
+    completed the work. Anyone who internalises this writes different code around carts and payments for the rest of their
+    career. Second: retrying everything. A <code>422</code> is the server telling you the request is wrong; retrying it
+    four times just says the same wrong thing four times, more slowly, while showing the customer a spinner. Retry
+    <b>transport failures and explicit try-later statuses</b>, nothing else.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a teammate whose pull request adds "retry 5 times, every 500 ms" to the theme's add-to-cart
+    call. Name both bugs — the load one and the correctness one — and say what you would ship instead. Then <b>send it to
+    me</b>. If your answer only mentions backoff, you missed the expensive half.
+  </p>
+</div>
+
+<h2>5. Point at it: make failures happen on purpose <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Offline and back.</b> Network panel &rarr; throttling dropdown &rarr; <b>Offline</b>. Trigger your request, watch it
+  reject, then switch back to <i>Slow 4G</i> and watch the retry succeed. Every retry attempt appears as its own row, so
+  you can literally count them and read the gaps between their start times.</li>
+  <li><b>Verify the jitter.</b> Log <code>Date.now()</code> before each attempt and check the gaps are growing
+  <em>and</em> uneven. Two runs producing identical delays means you wrote backoff without jitter — the most common
+  half-done version.</li>
+  <li><b>Block one URL.</b> Right-click a request &rarr; <b>Block request URL</b>, then reload. This is the cheapest way to
+  see what your UI does when one endpoint fails while everything else works — and it is where you discover the spinner
+  that never stops. Gate #3 for this core is doing this on your own theme's cart request and watching the interface, not
+  just the console.</li>
+  <li><b>Prove the timeout.</b> Point a request at a slow endpoint and confirm your <code>AbortController</code> fires.
+  A retry helper with no timeout will sit forever on a connection that never answers, and no amount of attempts
+  configuration saves you.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's add-to-cart posts to <code>/cart/add.js</code>. On flaky mobile connections, support receives occasional reports of "I added one and got two". You find that a previous developer wrapped the call in a retry: 3 attempts, 400 ms apart, retrying on <em>any</em> failure including a timeout, with no request timeout of its own and no user-visible state.</p>
+  Before flipping the recall cards: list every distinct defect in that description — there are at least four — and say which one causes the duplicate line items. Then the interviewer's follow-up: you cannot add an idempotency key because you do not own the endpoint. Describe exactly what you would ship, including what the customer sees.
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Type this by hand. It is a failing endpoint plus a retry, so you can watch the delays:</p>
+  <pre><code>python3 - &lt;&lt;'PY'
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+n = {'count': 0}
+class H(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/flaky':
+            n['count'] += 1
+            code = 200 if n['count'] % 4 == 0 else 503   <span class="cmt"># fails 3 times, then works</span>
+            self.send_response(code)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers(); self.wfile.write(b'attempt %d' % n['count']); return
+        super().do_GET()
+HTTPServer(('', 8000), H).serve_forever()
+PY</code></pre>
+  <p>Now the client, in the Console of <code>http://localhost:8000</code>:</p>
+  <pre><code>const wait = ms =&gt; new Promise(r =&gt; setTimeout(r, ms));
+
+async function go(jitter) {
+  const t0 = Date.now();
+  for (let n = 0; n &lt; 5; n++) {
+    const res = await fetch('/flaky');
+    console.log(`attempt ${n + 1} at +${Date.now() - t0}ms → ${res.status}`);
+    if (res.ok) return;
+    const interval = Math.min(8000, 500 * 2 ** n);
+    await wait(jitter ? Math.random() * interval : interval);
+  }
+}
+await go(false);   <span class="cmt">// backoff only</span></code></pre>
+  <p><b>Predict before running:</b> write down the five timestamps you expect with <code>jitter = false</code>. Then run it.
+  You should see roughly +0, +500, +1500, +3500 — the doubling, exactly as designed.</p>
+  <p><b>Now run <code>await go(true)</code> three times</b> and predict how the timestamps differ between runs. With jitter
+  they change every run; without it they are identical. Now picture ten thousand browsers running the first version at the
+  same moment — that is the retry storm, and you have just seen why it happens.</p>
+  <p><b>Break it the expensive way.</b> Change the endpoint to a <code>POST</code> that appends a line to a file, make it
+  sleep 3 seconds before responding, and give your client a 1-second timeout so it always gives up and retries:</p>
+  <pre><code>  <span class="cmt">// server: time.sleep(3) then append to a list; client: AbortController with 1000ms</span></code></pre>
+  <p>Predict how many lines end up in the file after "one" click. Then look. Every attempt succeeded on the server and
+  every one looked like a failure to you — that is the duplicate cart item, reproduced on your own machine. Nothing about
+  backoff or jitter would have prevented it.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>retry with exponential backoff + jitter</b> done only if all three held, from memory: (1) you reviewed the "retry 5 times every 500 ms" pull request and named <em>both</em> bugs — the teach-back in section 4; (2) you predicted the five timestamps before running the no-jitter version, and predicted the duplicate count in the timeout experiment; (3) you used <b>Block request URL</b> or <b>Offline</b> on your own theme's cart request and watched what the interface actually did. Two out of three is zero out of three. <b>This completes the 21-item core across Chapters 1–3</b> — take the review session, then open the depth queue on The Map.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">AWS Builders' Library — Timeouts, retries and backoff with jitter</a> (25 min). It is written by people who have watched retry storms take down real systems, and it is the clearest first-party explanation of why jitter matters as much as backoff.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Idempotency keys in depth</b> <span class="pill depth">depth</span> — the server-side half, named in the trap.
+  <b>Circuit breakers</b> <span class="pill depth">depth</span> — stopping requests altogether after repeated failure,
+  which is the next step up from backoff. <b>In-flight deduplication and coalescing</b>
+  <span class="pill depth">depth</span> — not sending the same request twice at once in the first place.
+  <b>Offline mutation queues and background sync</b> <span class="pill depth">depth</span> — the service-worker answer to
+  "retry later, properly". <b><code>AbortController</code> and cancellation propagation</b>
+  <span class="pill depth">depth</span> — used here, studied properly later. That is the whole 21-item core. Next: the
+  <b>depth queue</b> on <a href="../index.html">The Map</a>, starting with hoisting and the temporal dead zone.
+</div>
+
+<p class="ask">Anything unclear — why full jitter rather than half, how to reconcile a cart after a timeout, what to show the customer while retrying? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Retrying is right — most failures are brief. Retrying <b>immediately</b> is wrong, because the likeliest cause is an overloaded server.</li>
+    <li><b>Exponential backoff</b> protects the server. <b>Jitter</b> protects it from your other clients being in lockstep. You need both.</li>
+    <li>Full jitter: <code>delay = random(0, min(cap, base × 2^attempt))</code>. Always cap the delay and bound the attempts.</li>
+    <li>Retry transport failures and <code>408</code>/<code>425</code>/<code>429</code>/<code>5xx</code>. <b>Never</b> retry <code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>422</code>.</li>
+    <li>Obey <code>Retry-After</code> when the server sends it — it beats your own arithmetic.</li>
+    <li>A <b>timeout means you stopped waiting</b>, not that nothing happened. Retrying a non-idempotent request can double an order.</li>
+    <li>Without an idempotency key, the honest options are <b>reconcile</b> (re-read the state) or <b>ask the user</b>.</li>
+    <li>Every request needs a timeout (<code>AbortController</code>), and every retry a visible state. Silent retries are for background work only.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>good backoff maths never makes an unsafe retry safe.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/network-delivery.html">Cheat sheet: network &amp; delivery</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="../index.html">The depth queue &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Why not retry a failed request immediately?',
+    options: [
+      'the likeliest cause is a server already overloaded',
+      'the browser rejects two identical requests in a row',
+      'the connection needs time to complete a new handshake'
+    ],
+    answer: 0,
+    why: 'An immediate retry adds load at the worst possible moment, and when many clients fail together it doubles the traffic that caused the failure. That is a retry storm.'
+  },
+  {
+    q: 'What does jitter add that exponential backoff alone does not?',
+    options: [
+      'it desynchronises many clients from each other',
+      'it shortens the total time before the first retry',
+      'it detects whether the server has recovered yet'
+    ],
+    answer: 0,
+    why: 'Backoff gives the server exponentially more room, but clients that failed together would still retry together. Randomising each delay spreads the retries out instead of arriving as a wave.'
+  },
+  {
+    q: 'Which response should never be retried?',
+    options: [
+      '422, because the request itself is invalid',
+      '503, because the server is currently unavailable',
+      '429, because too many requests were sent'
+    ],
+    answer: 0,
+    why: 'A 422 means the server understood and rejected the content, so a repeat gets the same answer more slowly. The other two are explicit try-later signals, and both may carry Retry-After.'
+  },
+  {
+    q: 'A POST times out. What do you know about whether the server did the work?',
+    options: [
+      'nothing — you only know you stopped waiting',
+      'that it failed, because no response arrived',
+      'that it succeeded, since the request was sent'
+    ],
+    answer: 0,
+    why: 'A timeout is a client-side decision to give up. The server may have completed the work and the response was lost, which is exactly how a retried add-to-cart produces two line items.'
+  },
+  {
+    q: 'Without control of the endpoint, how do you make a retried cart write safe?',
+    options: [
+      're-read the cart state and reconcile from that',
+      'send the same request again with a longer timeout',
+      'add a random identifier to the request body'
+    ],
+    answer: 0,
+    why: 'Reconciling with a fresh read tells you what actually happened. An identifier only helps if the server is written to recognise it, and a longer timeout changes nothing about the ambiguity.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How would you implement a retry?"',
+    answer: 'Bounded attempts, a per-request <b>timeout</b> with <code>AbortController</code>, and a status <b>allow-list</b>: retry transport failures and 408, 425, 429 and 5xx, never 400, 401, 403, 404 or 422. Between attempts, wait <b>random(0, min(cap, base × 2^attempt))</b> — exponential backoff with full jitter — unless the server sent <code>Retry-After</code>, which wins. And whatever a customer is waiting on gets a visible state and a manual retry.<br><br><i>Likely follow-up:</i> "Why both backoff and jitter?" They solve different problems. Backoff stops <em>me</em> hammering a struggling server; jitter stops <em>all the clients</em> arriving in the same instant because they all failed in the same instant.'
+  },
+  {
+    prompt: '"What is the risk of retrying a POST?"',
+    answer: 'That the first attempt actually succeeded. A timeout means I stopped waiting, not that nothing happened — the server may have added the item and the response was lost. Retrying then performs the work twice: two line items, or on a payment path a double charge.<br><br><i>Likely follow-up:</i> "How do you make it safe?" Best: an <b>idempotency key</b> the server recognises, so a repeat returns the original result — that needs server cooperation. Otherwise <b>reconcile</b>: after a timeout, re-read the state and act on what it says. Or <b>ask the user</b>, which is honest and often the correct product answer for a single tap.'
+  },
+  {
+    prompt: 'The add-to-cart drill: list every defect, name the one causing duplicates, then say what you would ship with no idempotency key.',
+    answer: 'Defects: (1) <b>fixed 400 ms interval</b> — no backoff, so it adds load to a server that is probably struggling; (2) <b>no jitter</b> — all affected clients retry in lockstep; (3) <b>retries on any failure</b>, including statuses like 422 that will never succeed; (4) <b>no request timeout</b>, so an attempt can hang indefinitely and the "3 attempts" bound is meaningless; (5) <b>a non-idempotent POST retried blindly</b>; (6) <b>no user-visible state</b>, so the customer sees a dead button and taps again, adding more attempts.<br><br>The duplicates come from (5) combined with (4): a slow response is treated as a failure, the retry succeeds, and both writes land.<br><br><i>Likely follow-up:</i> "No idempotency key — what do you ship?" A single attempt with a real timeout of a few seconds. On a transport failure or a 5xx, do <b>not</b> re-post: instead <code>GET /cart.js</code> and compare against what we intended. If the item is there, treat it as success and update the drawer. If it is not, show an explicit failure with a <b>Retry</b> button and let the customer choose — one tap, one write, with the button disabled while in flight so it cannot be double-fired. Background, non-mutating requests can keep a proper backoff-with-jitter retry; a mutation a customer is watching gets one attempt and an honest error. I would also log the reconcile outcome, so we can see how often this path fires rather than waiting for support tickets.'
+  }
+]);
+</script>
+</body>
+</html>

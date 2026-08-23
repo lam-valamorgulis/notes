@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0015 · The 16.67 ms frame budget — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Frame budget · Lesson 0015</p>
+<h1>The 16.67 ms frame budget</h1>
+<p class="subtitle">Every lesson in Chapter 2 has described work. This one gives that work a deadline — and the deadline is set by hardware, not by the browser, so it is not negotiable.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #3 (say what the design gives up) — a budget turns "this feels janky" into arithmetic you can do before writing the code.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can say how much time a smooth animation actually has, name every piece of work competing for it, place <code>requestAnimationFrame</code> in the frame exactly, and calculate how many frames a 300 ms task destroys.
+</div>
+
+<h2>1. Where the number comes from</h2>
+<p>
+  A 60&nbsp;Hz screen refreshes 60 times per second. One second divided by 60 is <b>16.67&nbsp;ms</b>. To show something
+  new at a refresh, every piece of work for that frame must be finished before it. Miss it, and the screen shows the
+  <em>previous</em> frame again — a dropped frame, which the eye reads as a stutter.
+</p>
+<p>
+  So the real rule is not "16.67&nbsp;ms". It is <b>one refresh interval</b>. A 120&nbsp;Hz phone gives you
+  8.3&nbsp;ms; a 90&nbsp;Hz tablet 11.1&nbsp;ms. Quoting 16.67 as a law rather than as the 60&nbsp;Hz case is a small tell
+  in an interview.
+</p>
+<p>
+  And you do not get all of it. The browser needs part of the interval for its own bookkeeping and for compositing, so
+  the practical guidance is to keep <b>your</b> work — script plus the style and layout it causes — near
+  <b>10&nbsp;ms</b>. Everything below is how that 10 ms gets spent.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 250" role="img" aria-label="One frame divided into input, script, style, layout, paint and composite inside the 16.67 millisecond deadline; a second row shows one long script overrunning the deadline so a frame is dropped">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="16">ONE FRAME AT 60Hz = 16.67ms  ·  vertical lines are screen refreshes</text>
+
+  <line class="rule" x1="60" y1="26" x2="60" y2="200" style="stroke:var(--accent)"/>
+  <line class="rule" x1="293" y1="26" x2="293" y2="200" style="stroke:var(--accent)"/>
+  <line class="rule" x1="526" y1="26" x2="526" y2="200" style="stroke:var(--accent)"/>
+
+  <text class="mono sm" x="16" y="52">on budget</text>
+  <rect class="box" x="60" y="36" width="14" height="28" rx="3"/>
+  <rect class="box hot" x="74" y="36" width="70" height="28" rx="3"/>
+  <rect class="box" x="144" y="36" width="28" height="28" rx="3"/>
+  <rect class="box" x="172" y="36" width="42" height="28" rx="3"/>
+  <rect class="box" x="214" y="36" width="42" height="28" rx="3"/>
+  <rect class="box good" x="256" y="36" width="28" height="28" rx="3"/>
+  <text class="sub" x="60" y="82">1 input · 5 script (incl. rAF) · 2 style · 3 layout · 3 paint · 2 composite = 16ms — frame delivered</text>
+
+  <text class="mono sm" x="16" y="132">over budget</text>
+  <rect class="box bad" x="60" y="116" width="410" height="28" rx="3"/>
+  <text class="mono sm" x="150" y="135">one 25ms script task</text>
+  <rect class="box" x="470" y="116" width="42" height="28" rx="3"/>
+  <rect class="box" x="512" y="116" width="42" height="28" rx="3"/>
+  <text class="sub" x="60" y="162">style, layout and paint cannot even start until the script ends</text>
+
+  <path class="flow amber" d="M293,190 L293,150"/>
+  <text class="cap amber" x="300" y="186">NOTHING NEW TO SHOW HERE &rarr; FRAME DROPPED</text>
+
+  <line class="rule thin" x1="16" y1="212" x2="704" y2="212"/>
+  <text class="sub" x="16" y="232">A 300ms task at 60Hz misses 18 refreshes in a row. That is not &quot;a bit slow&quot; — it is a third of a second frozen.</text>
+</svg>
+<figcaption>The deadline comes from the screen. Your code cannot ask for an extension; it can only fit, or drop a frame.</figcaption>
+</figure>
+
+<h2>2. What happens inside one frame, in order</h2>
+<p>
+  The browser's per-frame sequence — the spec calls it "update the rendering" — is worth knowing precisely, because
+  <em>where</em> your callback sits decides whether your work lands in this frame or the next:
+</p>
+<ol>
+  <li>Run one <b>task</b> (lesson 0005), then drain <b>microtasks</b> (lesson 0006).</li>
+  <li>Handle pending <b>input</b> events.</li>
+  <li>Run <b><code>requestAnimationFrame</code></b> callbacks — <em>just before</em> style and layout.</li>
+  <li><b>Recalculate style</b>, then <b>layout</b>.</li>
+  <li>Deliver <b><code>ResizeObserver</code></b> and <b><code>IntersectionObserver</code></b> records (after layout, which
+  is exactly why they cost you no forced layout — lesson 0014).</li>
+  <li><b>Paint</b>, then <b>composite</b>.</li>
+  <li>If time is left over, run <b><code>requestIdleCallback</code></b> callbacks.</li>
+</ol>
+<div class="table-scroll">
+<table>
+<tr><th>Callback</th><th>Runs</th><th>Use it for</th></tr>
+<tr><td><code>requestAnimationFrame</code></td><td>once per frame, before style/layout</td><td>visual writes, per-frame animation steps</td></tr>
+<tr><td><code>setTimeout(fn, 0)</code></td><td>a task, whenever the loop gets to it</td><td>yielding, not animating — it has no relationship to the frame</td></tr>
+<tr><td><code>requestIdleCallback</code></td><td>leftover time, may be skipped for many frames</td><td>non-visual, non-urgent work: analytics, prefetch, cleanup</td></tr>
+<tr><td><code>ResizeObserver</code> / <code>IntersectionObserver</code></td><td>after layout, before paint</td><td>reading geometry for free</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — <code>requestAnimationFrame</code> is not a speed-up</span>
+  Putting slow work inside <code>rAF</code> does not make it fit the budget; it guarantees the work lands <em>inside the
+  frame</em>, where it now delays style, layout and paint directly. <code>rAF</code> is for <b>scheduling visual writes at
+  the right moment</b>, and for throttling scroll or resize handlers to at most one run per frame. If the work itself is
+  8&nbsp;ms, <code>rAF</code> just makes it 8&nbsp;ms of your 10.
+</div>
+
+<h2>3. Doing the arithmetic before you write the code</h2>
+<p>
+  This is the habit worth building. Before implementing an animation, add up what each frame must do:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Plan</th><th>Per-frame cost</th><th>Verdict at 60 Hz</th></tr>
+<tr><td>Animate <code>transform</code> on one layer</td><td>composite only, off the main thread</td><td>fits, and survives a busy main thread</td></tr>
+<tr><td>Animate <code>max-height</code> on a deep menu</td><td>layout + paint + composite on a large subtree</td><td>usually over budget on mobile</td></tr>
+<tr><td>Scroll handler reading <code>getBoundingClientRect()</code> for 24 cards</td><td>a forced layout per read, several ms, several times per frame</td><td>over budget — use an observer</td></tr>
+<tr><td>Rebuilding 200 nodes' <code>innerHTML</code> per frame</td><td>parse + style + layout of the whole subtree</td><td>far over budget; diff instead, or do it once</td></tr>
+</table>
+</div>
+<p>
+  Note what this table is really saying: Chapter 2's lessons were not four separate topics. They are four inputs to one
+  subtraction.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The screen redraws itself about sixty times a second, on a fixed rhythm nobody can change. For each redraw the
+    browser must have a finished picture ready in time — about sixteen thousandths of a second. If it is not ready, the
+    screen simply shows the old picture again, and the movement looks broken. So all the work for one step of an
+    animation has to fit inside that gap: reacting to the finger, running your code, working out positions, colouring in,
+    and sticking it together.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A hand-drawn flip-book being filmed at a fixed rate. The camera clicks every sixteen
+    milliseconds whether or not your next page is drawn. Miss it and the camera photographs the previous page twice — the
+    motion jerks. You cannot ask the camera to wait.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A flip-book artist can draw ahead and build a buffer. The browser mostly cannot: the next
+    frame usually depends on state that only exists now — the current scroll position, the finger's position, the latest
+    data. The one real exception is a composited animation, where the compositor <em>can</em> keep moving an
+    already-drawn page without you. That exception is why <code>transform</code> is not just a preference.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People treat <code>requestAnimationFrame</code> as a performance fix. It is a <b>timing</b> tool. It says "run this
+    at the right point in the frame", not "make this cheap" — and code inside it is competing for the same 10&nbsp;ms as
+    everything else, now with less room to recover. The second sticking point: quoting 16.67&nbsp;ms as if it were a law
+    of the web. It is the 60&nbsp;Hz case. The real statement is "one refresh interval", and plenty of phones refresh
+    faster than that, which makes the budget <em>smaller</em>, not larger.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a designer who asks for a scroll-linked animation that fades and moves twelve elements at
+    once. Explain the budget in everyday words, say which version of their idea fits and which does not, and offer the
+    compromise. No jargon: not "composite", not "frame budget", until you have said it plainly. Then <b>send it to
+    me</b> — the skill here is saying "yes, with this constraint" rather than "no".
+  </p>
+</div>
+
+<h2>5. Point at it: read the frames track <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Live, in one number.</b> DevTools &rarr; Command Menu &rarr; "Show Rendering" &rarr; <b>Frame rendering stats</b>.
+  An overlay shows the frame rate and the count of dropped frames. Throttle the CPU 4× and interact — the number you
+  care about is the one under throttling.</li>
+  <li><b>Per frame, in a profile.</b> <b>Performance</b> &rarr; record an animation. The <b>Frames</b> track draws one
+  block per frame; hover for its duration. Frames that missed the deadline are marked, and clicking one selects exactly
+  the work that overran.</li>
+  <li><b>Where the time went.</b> With a frame selected, read the <b>Summary</b> donut: scripting, rendering (style plus
+  layout), painting, system. That split tells you which of Chapter 2's lessons to apply — script means chunk it, rendering
+  means lesson 0013 or 0014, painting means fewer or smaller paints.</li>
+  <li><b>Prove where <code>rAF</code> sits.</b> Log inside a <code>rAF</code> callback and inside a
+  <code>ResizeObserver</code>. The observer always reports <em>after</em> the <code>rAF</code> of the same frame, because
+  layout happened in between. Seeing that order confirms section 2 with two <code>console.log</code> calls, and it is
+  gate #3 for this core.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme has a scroll-linked hero: on every <code>scroll</code> event it reads <code>window.scrollY</code>, reads <code>getBoundingClientRect()</code> on four elements, then writes <code>top</code> and <code>opacity</code> on each. On a mid-range Android, Frame rendering stats shows 22 fps while scrolling and a rising dropped-frame count.</p>
+  Before flipping the recall cards: work out roughly how many times per second that handler runs versus how many frames exist, name every budget item it is spending, and give the version you would ship. Then the interviewer's follow-up: after your fix the scroll is smooth but the effect lags the finger by about one frame — explain why, and say whether you would accept it.
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>One file. Type it by hand — this is a stopwatch for frames:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;div id="out" style="font:14px monospace"&gt;&lt;/div&gt;
+&lt;button id="load"&gt;Add 25ms of work per frame&lt;/button&gt;
+&lt;script&gt;
+  let last = performance.now(), heavy = false, worst = 0;
+  load.onclick = () =&gt; heavy = !heavy;
+
+  function frame(now) {
+    const delta = now - last; last = now;
+    if (delta &gt; worst) worst = delta;
+    out.textContent = `frame gap ${delta.toFixed(1)}ms · worst ${worst.toFixed(1)}ms`;
+    if (heavy) { const end = performance.now() + 25; while (performance.now() &lt; end) {} }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+&lt;/script&gt;</code></pre>
+  <p><b>Predict before clicking:</b> what is the frame gap at rest, and what will it become with 25 ms of work added? Then
+  click. At rest it hovers near 16.7 (or 8.3 on a 120 Hz screen). With the work it jumps to roughly 33 — one frame's worth
+  of overrun costs a whole extra frame, because the next refresh has already been missed.</p>
+  <p><b>Now prove the ordering in section 2.</b> Add this and predict which of the three lines logs first:</p>
+  <pre><code>  const box = document.body;
+  new ResizeObserver(() =&gt; console.log('3 · observer, after layout')).observe(box);
+  requestAnimationFrame(() =&gt; console.log('2 · rAF, before style'));
+  queueMicrotask(() =&gt; console.log('1 · microtask, before the frame work'));
+  box.style.padding = '30px';   <span class="cmt">// dirty layout so the observer fires</span></code></pre>
+  <p>Predict the order, then read the console. You have just verified the frame anatomy from lesson 0006 through to this
+  lesson with four lines.</p>
+  <p><b>Third round — the honest fix.</b> Write a scroll handler the wrong way and then the right way:</p>
+  <pre><code>  <span class="cmt">// wrong: work per scroll event, and a forced layout inside it</span>
+  addEventListener('scroll', () =&gt; { document.body.style.setProperty('--y', scrollY + 'px'); });
+
+  <span class="cmt">// right: at most one write per frame</span>
+  let queued = false;
+  addEventListener('scroll', () =&gt; {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() =&gt; { document.body.style.setProperty('--y', scrollY + 'px'); queued = false; });
+  });</code></pre>
+  <p>Predict what changes and what does not: the number of writes drops to one per frame, the total scroll work drops, and
+  the effect is now at most one frame behind the finger. That last part is the trade — name it out loud before you accept
+  it.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>16.67 ms budget: script, style, layout, paint, composite</b> done only if all three held, from memory: (1) you explained the budget and the compromise to a designer — the teach-back in section 4; (2) you predicted the frame gap before and after adding 25 ms, and predicted the microtask / rAF / observer order; (3) you read a real Frames track and a frame's Summary split. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.chrome.com/docs/devtools/performance">Chrome DevTools — Performance</a> (25 min, hands on the tool, not just reading), then <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/requestAnimationFrame">MDN — requestAnimationFrame</a> for the callback's exact position. Spec anchor for the frame sequence: <a href="https://html.spec.whatwg.org/multipage/webappapis.html#event-loops">HTML Standard § event loops</a>, the "update the rendering" steps.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The observers in detail</b> <span class="pill depth">depth</span> — <code>IntersectionObserver</code>,
+  <code>ResizeObserver</code>, <code>MutationObserver</code> each deserve their own pass; here they were only a position in
+  the frame. <b><code>requestIdleCallback</code> and scheduler priorities</b> <span class="pill depth">depth</span>.
+  <b>Raster, tiling and GPU upload</b> <span class="pill depth">depth</span> — what "composite" costs underneath.
+  <b>The Web Animations API and CSS scroll-driven animations</b> <span class="pill depth">depth</span> — the platform way
+  to get the drill's effect with no JavaScript per frame, and the right answer once you know this lesson. Next core
+  lesson: <a href="0016-lcp-cls-inp.html">0016 · LCP, CLS, INP</a> — the last core of Chapter 2, and the one the client
+  actually reads.
+</div>
+
+<p class="ask">Anything unclear — why one frame of overrun costs two frames, where <code>rAF</code> sits relative to input, how to do a scroll effect with no per-frame JavaScript? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>The deadline is <b>one refresh interval</b>: 16.67 ms at 60 Hz, 8.3 ms at 120 Hz. Hardware sets it, not the browser.</li>
+    <li>Miss it and the screen repeats the previous frame — a <b>dropped frame</b>, seen as a stutter.</li>
+    <li>You get roughly <b>10 ms</b> for script plus the style and layout it causes; the browser needs the rest.</li>
+    <li>Frame order: task &rarr; microtasks &rarr; input &rarr; <b>rAF</b> &rarr; style &rarr; layout &rarr; <b>observers</b> &rarr; paint &rarr; composite &rarr; idle callbacks.</li>
+    <li><code>rAF</code> is a <b>timing</b> tool, not a speed-up. Use it to write visuals once per frame and to throttle scroll and resize handlers.</li>
+    <li>Observers deliver <b>after layout</b>, which is why they hand you geometry with no forced layout.</li>
+    <li>A 300 ms task drops about <b>18 frames</b> at 60 Hz. Do this arithmetic before writing the animation, not after the complaint.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>the frame deadline is set by the screen — your only choice is what you fit inside it.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0016-lcp-cls-inp.html">Next: 0016 · LCP, CLS, INP &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Where does the 16.67 ms figure come from?',
+    options: [
+      'one second divided by a 60 hertz refresh rate',
+      'the average time a browser needs to paint once',
+      'a limit the specification places on frame work'
+    ],
+    answer: 0,
+    why: 'It is the refresh interval of a 60 Hz screen. On a 120 Hz device the budget is 8.3 ms, so the real rule is one refresh interval rather than a fixed number.'
+  },
+  {
+    q: 'Your frame work takes 25 ms at 60 Hz. What does the user see?',
+    options: [
+      'the previous frame repeated, then a jump',
+      'a smoothly slowed but continuous animation',
+      'the browser lowering the screen refresh rate'
+    ],
+    answer: 0,
+    why: 'The refresh arrives with nothing new ready, so the old frame is shown again and the update lands at the following refresh. One overrun therefore costs a whole extra frame.'
+  },
+  {
+    q: 'When do requestAnimationFrame callbacks run within a frame?',
+    options: [
+      'after input handling, just before style and layout',
+      'after paint, so the frame is already on screen',
+      'at the same point as a setTimeout with zero delay'
+    ],
+    answer: 0,
+    why: 'That position is the point of the API: writes made there are folded into the same frame\'s style and layout, with no extra pass and no forced layout.'
+  },
+  {
+    q: 'Why do ResizeObserver callbacks not force a layout?',
+    options: [
+      'they are delivered after layout has already run',
+      'they read cached values from the previous frame',
+      'they run on the compositor rather than main thread'
+    ],
+    answer: 0,
+    why: 'The browser delivers observer records after layout and before paint, so the geometry is already computed. That is why replacing measuring code with an observer removes forced layouts entirely.'
+  },
+  {
+    q: 'A task takes 300 ms at 60 Hz. Roughly how many frames are lost?',
+    options: [
+      'about eighteen consecutive frames',
+      'about five, since paint can still proceed',
+      'none, because the task is not visual work'
+    ],
+    answer: 0,
+    why: '300 divided by 16.67 is about 18. Nothing can be rendered while the task holds the main thread, which is the same run-to-completion rule from the event-loop lessons seen from the rendering side.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How much time does an animation frame have, and for what?"',
+    answer: 'One <b>refresh interval</b> — 16.67 ms at 60 Hz, 8.3 ms at 120 Hz. Inside it the browser must handle input, run tasks and microtasks, run <code>requestAnimationFrame</code> callbacks, recalculate style, lay out, deliver observers, paint and composite. Because the browser needs part of that for itself, aim to keep your script plus the style and layout it causes near <b>10 ms</b>.<br><br><i>Likely follow-up:</i> "What happens on a 120 Hz phone?" The budget halves. Faster hardware makes the deadline tighter, not looser — which is why a "smooth on my phone" claim needs the refresh rate attached to it.'
+  },
+  {
+    prompt: '"Does requestAnimationFrame make things faster?"',
+    answer: 'No — it is a <b>timing</b> tool. It runs your callback once per frame, just before style and layout, so visual writes land in the current frame with no extra pass. It does not reduce the cost of the work: 8 ms of work inside <code>rAF</code> is still 8 ms of a ~10 ms budget, and now it sits directly in front of style and layout.<br><br><i>Likely follow-up:</i> "So what is it genuinely good for?" Two things: writing visual updates at the right moment, and throttling a scroll or resize handler down to at most one run per frame, which is usually a large win because those events fire far more often than frames exist.'
+  },
+  {
+    prompt: 'The scroll-linked hero drill: 22 fps on Android, handler reads scrollY and four rects then writes top and opacity. Do the arithmetic and give the fix.',
+    answer: 'Scroll events fire far more often than frames — commonly dozens of times per second and not aligned to the refresh — so the handler may run several times per frame, and every run does four <code>getBoundingClientRect()</code> reads. Each read after a write is a <b>forced layout</b> (lesson 0014), and writing <code>top</code> is a geometry change, so every run also costs layout, paint and composite (lesson 0013). That is three of Chapter 2\'s costs stacked inside a 16.67 ms budget, several times over — 22 fps is the arithmetic working out.<br><br>What I would ship: throttle to one update per frame with <code>requestAnimationFrame</code>; stop measuring — publish <code>scrollY</code> into a CSS custom property or use an <code>IntersectionObserver</code> for the threshold logic; and animate <code>transform</code> and <code>opacity</code> instead of <code>top</code> so the update is composite-only.<br><br><i>Likely follow-up:</i> "Now the effect lags the finger by one frame — why, and is that acceptable?" Because the scroll position is read in the <code>rAF</code> callback for the <em>next</em> frame, so the visual is always one refresh behind the position that produced it. At 60 Hz that is under 17 ms, which is below the threshold most people can notice on a fade or a parallax, so yes — I would accept it and say so explicitly. If it were unacceptable, the honest answer is not more JavaScript but a CSS scroll-driven animation, where the compositor reads the scroll position itself and no per-frame script exists at all.'
+  }
+]);
+</script>
+</body>
+</html>

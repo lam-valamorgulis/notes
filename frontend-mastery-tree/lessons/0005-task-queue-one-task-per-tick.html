@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0005 · The task queue &amp; one task per tick — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Event loop · Lesson 0005</p>
+<h1>The task queue &amp; one task per tick</h1>
+<p class="subtitle">Lesson 0001 left a hole: if nothing else can run while the stack has anything on it, how does a click ever get handled? This lesson fills the hole — and the answer explains almost every "why is my page frozen" ticket you will ever get.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #1 (explain from first principles) and ability #2 (predict an unseen case) — output ordering questions are unpredictable until this model is exact, then they are trivial.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~30 minutes you can say what <code>setTimeout(fn, 0)</code> really promises, predict the order of any mix of synchronous code and timers, and explain to a client why "the button did nothing for two seconds" is not a slow button.
+</div>
+
+<h2>1. Deriving the loop from the one-stack rule</h2>
+<p>
+  Start from what we already proved. There is one call stack per tab, and while anything is on it nothing else runs
+  (lesson 0001). Now add an obvious fact: a user can click while your code is running. Both cannot be true unless
+  something outside the stack is <b>holding the click</b> until the stack is free.
+</p>
+<p>
+  So there must be a queue, and something that feeds it into the stack. Next question: <em>when</em> is it allowed to
+  feed? Two options, and only one of them can work:
+</p>
+<ul>
+  <li><b>Interrupt the running code</b> — pause a half-finished function, run the click handler, resume. This would let
+  a handler observe an object halfway through being updated. Every function in the language would have to be written
+  as if it could be frozen between any two lines. Nobody could write correct code.</li>
+  <li><b>Wait until the stack is empty</b> — let the current work finish completely, then take the next item. No
+  function can ever be observed mid-update. This is the choice the platform made, and the
+  <a href="https://html.spec.whatwg.org/multipage/webappapis.html#event-loops">HTML Standard § event loops</a> writes it
+  down as the processing model.</li>
+</ul>
+<p>
+  That is the <b>event loop</b>: pick one <b>task</b> from a task queue, run it until the stack is empty, then look
+  again. The guarantee has a name — <b>run-to-completion</b> — and everything else in this lesson is a consequence of it.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 280" role="img" aria-label="The event loop takes one task at a time from the task queue and runs it on the call stack until the stack is empty, then a render opportunity may follow">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">CALL STACK</text>
+  <rect class="box dim" x="16" y="30" width="150" height="30" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="mono sm" x="30" y="50">(empty)</text>
+  <line class="rule" x1="12" y1="66" x2="170" y2="66"/>
+  <text class="sub" x="16" y="86">the loop may only pick</text>
+  <text class="sub" x="16" y="102">a task when this is empty</text>
+
+  <text class="cap amber" x="240" y="18">EVENT LOOP</text>
+  <path class="flow amber" d="M300,40 C250,40 250,100 300,100"/>
+  <text class="mono sm" x="216" y="66">pick ONE</text>
+  <text class="sub" x="216" y="120">then look again</text>
+
+  <text class="cap" x="420" y="18">TASK QUEUE</text>
+  <rect class="box hot" x="420" y="28" width="280" height="32" rx="5"/>
+  <text class="mono sm" x="434" y="48">click handler (task source: UI)</text>
+  <rect class="box" x="420" y="66" width="280" height="32" rx="5"/>
+  <text class="mono sm" x="434" y="86">setTimeout callback (timers)</text>
+  <rect class="box" x="420" y="104" width="280" height="32" rx="5"/>
+  <text class="mono sm" x="434" y="124">message / network event</text>
+  <path class="flow" d="M416,44 L176,44"/>
+
+  <line class="rule thin" x1="12" y1="170" x2="708" y2="170"/>
+  <text class="cap" x="16" y="196">ONE TURN OF THE LOOP</text>
+  <rect class="box" x="16" y="208" width="180" height="34" rx="5"/>
+  <text class="mono sm" x="30" y="230">1. run one task</text>
+  <path class="flow" d="M200,225 L232,225"/>
+  <rect class="box" x="238" y="208" width="212" height="34" rx="5"/>
+  <text class="mono sm" x="252" y="230">2. drain ALL microtasks</text>
+  <path class="flow" d="M454,225 L486,225"/>
+  <rect class="box good" x="492" y="208" width="212" height="34" rx="5"/>
+  <text class="mono sm" x="506" y="230">3. maybe render a frame</text>
+  <text class="sub" x="238" y="262">lesson 0006</text>
+  <text class="sub" x="492" y="262">lessons 0015 · 0016</text>
+</svg>
+<figcaption>One task, then microtasks to empty, then a possible frame. Step 2 is lesson 0006; step 3 is the frame budget. This lesson is step 1 and the promise it makes.</figcaption>
+</figure>
+
+<h2>2. What <code>setTimeout(fn, 0)</code> actually promises</h2>
+<p>
+  Read the name honestly: <code>setTimeout</code> does not run anything. It <b>queues a task</b>, and the delay is a
+  <em>minimum</em> wait before the task becomes eligible. So the real promise is:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>What people think it means</th><th>What it means</th></tr>
+<tr><td>"run this in 0 ms"</td><td>"queue a task; it may run after ≥0 ms, once the current task ends and the queue reaches it"</td></tr>
+<tr><td>"run this next"</td><td>"run this after every microtask, and after any task already queued ahead of it"</td></tr>
+<tr><td>"a way to go faster"</td><td>"a way to <em>yield</em> — to end the current task so the browser can render or handle input"</td></tr>
+</table>
+</div>
+<p>
+  Two bare facts to keep, both mandated rather than derivable — mark them as facts, not logic. Nested timers are
+  clamped to a minimum of about <b>4 ms</b> after five levels of nesting, and timers in background tabs are throttled
+  much harder. Do not build timing on <code>setTimeout</code>; use it to yield.
+</p>
+
+<pre><code>console.log('1');
+setTimeout(() =&gt; console.log('2'), 0);
+console.log('3');
+<span class="cmt">// → </span><span class="out">1  3  2</span><span class="cmt">   — the script is itself one task, and it runs to completion first</span></code></pre>
+
+<div class="soundbite">
+  <span class="label">Say it this way</span>
+  <p>The whole script is one task. A timer callback is a different task. There is no way for the second to start until the first has completely finished — not "usually", never.</p>
+</div>
+
+<h2>3. The consequence you will be paid to understand</h2>
+<p>
+  If one task must run to completion, then a task that takes 2 seconds blocks <b>everything</b> for 2 seconds: clicks,
+  scrolling, animation, paint. The click is not lost — it is sitting in the queue, waiting its turn. The user sees a
+  dead page and clicks again, which queues a second task behind the first.
+</p>
+<pre><code>btn.addEventListener('click', () =&gt; {
+  const end = Date.now() + 2000;
+  while (Date.now() &lt; end) {}          <span class="cmt">// one task, two seconds</span>
+  render();                             <span class="cmt">// the user sees nothing until here</span>
+});</code></pre>
+<p>
+  This is the mechanism behind the words "long task" and "input delay", which are their own core (lesson 0007) and the
+  basis of the INP metric (lesson 0016). Note what the fix cannot be: there is no way to ask the browser to interrupt
+  you. You must <b>end your task</b> — split the work and yield — and that is only possible because you understand
+  the loop.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser has one worker and a waiting line of jobs. The worker takes the first job and finishes it completely.
+    It will not put a job down half done, not even for a moment, because a half-done job could leave things in a broken
+    state. Only when its hands are empty does it look at the line again. Your click is a job in that line. If the job
+    the worker is holding takes two seconds, your click waits two seconds — it was never lost, it was queued.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A single cashier at a shop with one queue. Each customer is served completely before the next
+    is called. A customer with a huge trolley does not get interrupted so that someone with one item can pay.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A real cashier can say "one moment" and call a colleague, and a real customer can give up
+    and leave. Neither is possible here: there is exactly one cashier and no second till, and a queued click cannot
+    withdraw itself. Worse, the customer being served is allowed to add new items to their own trolley forever — which
+    is how one bad loop freezes a page permanently. The only cure is that the code itself chooses to stop and rejoin
+    the queue later.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    The mistake is reading <code>setTimeout(fn, 0)</code> as "run now, in parallel". Nothing in a browser tab runs in
+    parallel with your JavaScript (workers aside, which have their own stack and their own loop). Zero means "as soon
+    as possible", and "possible" starts only when your current task has finished. The second sticking point is
+    believing the browser <em>can</em> interrupt a long function if it really needs to. It cannot. Every "make it
+    responsive" technique — chunking, <code>await</code>, <code>requestIdleCallback</code>, <code>scheduler.yield</code> —
+    is a way of <b>voluntarily ending your task early</b>. Nothing more.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a client-facing project manager who asks: <i>"why does the page ignore my clicks for two
+    seconds after I press Add to cart, and then do all of them at once?"</i> No jargon at all — you may not use
+    "thread", "task" or "queue" without explaining it in everyday words first. Then <b>send it to me</b>. This one is
+    also the exact answer that wins a senior interview, because most candidates explain it to the interviewer and not
+    to the client.
+  </p>
+</div>
+
+<h2>5. Point at it: tasks in the Performance panel <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li>Open any storefront. DevTools &rarr; <b>Performance</b> &rarr; record for a few seconds while you interact, then stop.</li>
+  <li>In the flame chart, the grey bars on the <b>Main</b> track labelled <i>Task</i> are literally the unit from this
+  lesson. Click one: the summary names its <b>duration</b> and its cause (Event: click, Timer Fired, Parse HTML).</li>
+  <li>Any task over 50&nbsp;ms gets a red triangle and the label <b>Long task</b>. That red corner is the browser
+  telling you a user's click had to wait. Hover to see by how much.</li>
+  <li>Now prove run-to-completion by hand. In the Console:
+  <code>setTimeout(() =&gt; console.log('timer'), 0); const e = Date.now() + 1000; while (Date.now() &lt; e) {}; console.log('sync done');</code>
+  &mdash; the timer was eligible after 0&nbsp;ms and still printed second. That output <em>is</em> the mechanism.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's collection page filters 900 products in JavaScript on every checkbox change. QC writes: "after ticking a filter the page hangs for about a second, and if I tick three filters quickly nothing happens for three seconds and then it jumps to the final state."</p>
+  Before flipping the recall cards: explain the three-second version in terms of tasks and the queue, and say why the intermediate states were never painted. Then the interviewer's follow-up: name two mechanically different fixes — one that keeps all the work on the main thread, one that does not — and say what each gives up.
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type this by hand and <b>write the expected output on paper before running</b>:</p>
+  <pre><code>console.log('A');
+setTimeout(() =&gt; console.log('B'), 0);
+setTimeout(() =&gt; console.log('C'), 100);
+console.log('D');</code></pre>
+  <p>Then a harder one. Predict all four lines, in order, before running:</p>
+  <pre><code>console.log('1');
+setTimeout(() =&gt; {
+  console.log('2');
+  setTimeout(() =&gt; console.log('3'), 0);
+  console.log('4');
+}, 0);
+console.log('5');</code></pre>
+  <p>If you predicted <code>1 5 2 4 3</code> you have the model. If you predicted <code>1 5 2 3 4</code> you are still
+  treating a nested <code>setTimeout</code> as "run now" — re-read section 2 before continuing.</p>
+  <p><b>Now break the page on purpose.</b> In the Console on any page:</p>
+  <pre><code>document.body.addEventListener('click', () =&gt; console.log('click at', Date.now()));
+const end = Date.now() + 3000;
+console.log('blocking from', Date.now());
+while (Date.now() &lt; end) {}            <span class="cmt">// click the page NOW, several times</span>
+console.log('unblocked at', Date.now());</code></pre>
+  <p>Click the page four or five times while it is frozen. Predict first: are the clicks lost, or do they all arrive
+  afterwards? Read the timestamps — they show the clicks queued during the block and ran after it. You have just
+  measured input delay with two <code>console.log</code> calls.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>task (macrotask) queue &amp; one-task-per-tick</b> done only if all three held, from memory: (1) you explained run-to-completion to a non-technical person — the teach-back in section 4; (2) you predicted <code>1 5 2 4 3</code> before running it; (3) you found a <i>Task</i> bar in the Performance panel and read its duration and cause. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://jakearchibald.com/2015/tasks-microtasks-queues-and-schedules/">Jake Archibald — "Tasks, microtasks, queues and schedules"</a> (25 min, with a step-by-step animation you can scrub). It is still the clearest explanation of this model anywhere, and its predict-the-output style is exactly our gate rule. Spec anchor: <a href="https://html.spec.whatwg.org/multipage/webappapis.html#event-loops">HTML Standard § Event loops</a> — read the numbered steps of "spin the event loop" once, slowly, and notice how short they are.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The microtask queue</b> — the next core lesson (0006), and the reason <code>await</code> does not behave like
+  <code>setTimeout</code>. <b><code>requestAnimationFrame</code>'s exact position in the frame</b>
+  <span class="pill depth">depth</span> — it is a callback list, not a task queue; we meet it in lesson 0015 for the
+  frame budget. <b>Nested microtask starvation</b> <span class="pill depth">depth</span>. <b>Web Workers</b>
+  <span class="pill depth">depth</span> — a second stack and a second loop, the "does not stay on the main thread" fix
+  in the drill above. Next core lesson: <a href="0006-microtask-queue-drains-before-render.html">0006 · the microtask queue</a>.
+</div>
+
+<p class="ask">Anything unclear — why interruption was rejected as a design, what "task source" means, how to split a long filter loop in your own theme? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>One stack, one thread — so queued work can only start when the stack is <b>empty</b>. That is the event loop.</li>
+    <li><b>Run-to-completion</b>: a task is never interrupted mid-way. Chosen deliberately, so no function can be observed half-updated.</li>
+    <li>The whole script is one task. A timer callback, a click handler, a message event are separate tasks.</li>
+    <li><code>setTimeout(fn, 0)</code> means "queue a task, eligible after ≥0 ms" — never "run now" and never "run next".</li>
+    <li>A 2-second task blocks clicks, scroll and paint for 2 seconds. The clicks are <b>queued</b>, not lost, then run in a burst.</li>
+    <li>You cannot be interrupted. Every responsiveness technique is a way to <b>end your own task early</b>.</li>
+    <li>Nested timers are clamped to about 4 ms, and background tabs are throttled harder — bare facts, not logic.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>the browser cannot take the work out of your hands — you have to put it down.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/event-loop.html">Cheat sheet: event loop</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0006-microtask-queue-drains-before-render.html">Next: 0006 · microtasks &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'When may the event loop start the next queued task?',
+    options: [
+      'only once the call stack has become empty',
+      'as soon as the delay of that task has elapsed',
+      'whenever the browser needs to paint a frame'
+    ],
+    answer: 0,
+    why: 'Run-to-completion. The current task keeps the stack until it finishes; only then can the loop pick the next one. The delay decides eligibility, not the moment of execution.'
+  },
+  {
+    q: 'console.log(1); setTimeout(()=>console.log(2),0); console.log(3); — what prints?',
+    options: [
+      '1 3 2',
+      '1 2 3',
+      '3 1 2'
+    ],
+    answer: 0,
+    why: 'The script is itself one task and runs to completion, so both synchronous logs happen first. The timer callback is a separate task that can only start after the script task ends.'
+  },
+  {
+    q: 'Why did the platform choose run-to-completion over interrupting a running function?',
+    options: [
+      'so no function can be observed half-updated',
+      'so timers can fire at exactly the right time',
+      'so the garbage collector can run more often'
+    ],
+    answer: 0,
+    why: 'An interruptible function could be paused between any two lines, letting other code see broken invariants. Every function would need to defend against that, which is unwritable in practice.'
+  },
+  {
+    q: 'A click handler runs a 2-second synchronous loop. What happens to clicks during it?',
+    options: [
+      'they queue and all run once it finishes',
+      'they are dropped, because the page is busy',
+      'they interrupt the loop between iterations'
+    ],
+    answer: 0,
+    why: 'The clicks become queued tasks. Nothing is lost and nothing interrupts: the moment the stack empties, the loop runs them one after another, which is why the page appears to catch up in a burst.'
+  },
+  {
+    q: 'Where does DevTools name a single unit of this model on screen?',
+    options: [
+      'Performance panel, Main track, the Task bars',
+      'Sources panel, Scope pane, the Local entry',
+      'Network panel, Waterfall column, the Queued bar'
+    ],
+    answer: 0,
+    why: 'Record a profile and the Main track shows grey Task bars with their duration and cause; anything over 50 ms is flagged as a long task with a red corner.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Walk me through the event loop."',
+    answer: 'There is one call stack per tab, and queued work can only begin when it is empty. The loop takes one <b>task</b> — a script, an event callback, a timer callback — and runs it <b>to completion</b>. Then it drains the microtask queue, then the browser may render a frame, then it looks for the next task.<br><br><i>Likely follow-up:</i> "Why to completion, rather than interrupting?" Because an interruptible function could be paused between any two lines and observed in a broken half-updated state. Run-to-completion is a correctness guarantee that costs responsiveness, and every yielding technique exists to pay that cost back.'
+  },
+  {
+    prompt: '"What does setTimeout with a delay of zero actually do?"',
+    answer: 'It queues a task and says the task becomes <b>eligible</b> after at least 0 ms. It does not run anything now, and it does not run next: everything already queued goes first, and the whole microtask queue is drained before any task at all. In practice its real use is to <b>yield</b> — to end the current task so the browser can handle input or paint.<br><br><i>Likely follow-up:</i> "Is 0 really 0?" No. After about five levels of nesting the delay is clamped to roughly 4 ms, and background tabs are throttled much harder. Never build timing on it.'
+  },
+  {
+    prompt: 'The collection-filter drill: three quick filter clicks freeze the page for three seconds and then jump straight to the final state. Explain it, and give two mechanically different fixes.',
+    answer: 'Each checkbox change queued a task that runs ~1 second of filtering, and each runs to completion before the next starts, so the three add up to three seconds. No intermediate state was painted because rendering only gets a chance <b>between</b> tasks, and each task ended by immediately handing over to the next queued one.<br><br>Fix one, stay on the main thread: split the filtering into chunks and yield between them (<code>await</code> a macrotask, or <code>scheduler.yield()</code> where available) so the browser gets render opportunities. Gives up: total work takes slightly longer, and you must handle a newer filter arriving mid-run. Fix two, leave the main thread: move filtering into a Web Worker and post the result back. Gives up: no DOM access in the worker, data must be copied or transferred, and more code to maintain.<br><br><i>Likely follow-up:</i> "Which would you ship first?" Chunk-and-yield, because it is a small diff and measurable in the Performance panel the same day; the worker is the right answer only once the data set keeps growing.'
+  }
+]);
+</script>
+</body>
+</html>

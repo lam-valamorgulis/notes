@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0012 · Cascade, specificity, inheritance &amp; layers — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Style · Lesson 0012</p>
+<h1>Cascade, specificity, inheritance &amp; layers</h1>
+<p class="subtitle">Many rules match one element and set the same property. Exactly one wins. Almost everyone believes specificity decides that — specificity is step four of five, and the steps above it are the ones that decide real arguments.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #5 (judge someone else's work) — this is the mechanism behind every <code>!important</code> in a theme, and behind whether adding one is right.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can look at two conflicting rules and name the winner and the step that decided it, in one sentence — and you can say why adding <code>!important</code> to beat an app's CSS is sometimes the correct engineering answer and sometimes debt.
+</div>
+
+<h2>1. Why a total ordering has to exist</h2>
+<p>
+  An element has one computed value per property. Two rules that both say <code>color</code> cannot both apply. So the
+  engine needs a rule that <b>always</b> produces exactly one winner — no ties, no "it depends", no randomness, or the
+  same page would render differently twice.
+</p>
+<p>
+  That is what the cascade is: a sequence of tie-breakers applied in a fixed order, ending in one that can never tie.
+  Per <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_cascade/Cascade">MDN — CSS cascade</a> and
+  <a href="https://drafts.csswg.org/css-cascade-5/">CSS Cascade 5</a>:
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 300" role="img" aria-label="The cascade as five ordered tie-breakers: origin and importance, then context, then layer order, then specificity, then order of appearance">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="16">APPLIED IN THIS ORDER. THE FIRST STEP THAT SEPARATES THEM WINS.</text>
+
+  <rect class="box" x="16" y="26" width="470" height="40" rx="5"/>
+  <text class="mono sm" x="30" y="44">1 · ORIGIN &amp; IMPORTANCE</text>
+  <text class="sub" x="30" y="60">author vs user vs browser, and whether it is !important</text>
+
+  <path class="flow" d="M120,68 L120,82"/>
+  <rect class="box dim" x="16" y="86" width="470" height="40" rx="5"/>
+  <text class="mono sm" x="30" y="104">2 · CONTEXT</text>
+  <text class="sub" x="30" y="120">shadow DOM boundaries — rare in a theme</text>
+
+  <path class="flow" d="M120,128 L120,142"/>
+  <rect class="box" x="16" y="146" width="470" height="40" rx="5"/>
+  <text class="mono sm" x="30" y="164">3 · LAYER ORDER  (@layer)</text>
+  <text class="sub" x="30" y="180">later layer wins — and UNLAYERED beats every layer</text>
+
+  <path class="flow" d="M120,188 L120,202"/>
+  <rect class="box hot" x="16" y="206" width="470" height="40" rx="5"/>
+  <text class="mono sm" x="30" y="224">4 · SPECIFICITY</text>
+  <text class="sub" x="30" y="240">(ids) — (classes, attributes, pseudo-classes) — (types)</text>
+
+  <path class="flow" d="M120,248 L120,262"/>
+  <rect class="box good" x="16" y="266" width="470" height="30" rx="5"/>
+  <text class="mono sm" x="30" y="286">5 · ORDER OF APPEARANCE — last one wins, never ties</text>
+
+  <path class="flow amber" d="M584,226 L494,226"/>
+  <text class="cap amber" x="512" y="204">MOST PEOPLE</text>
+  <text class="cap amber" x="512" y="220">START HERE</text>
+  <text class="sub" x="500" y="252">and lose arguments</text>
+  <text class="sub" x="500" y="268">about steps 1 and 3</text>
+</svg>
+<figcaption>Five steps, checked top to bottom. Step 5 cannot tie, which is why the cascade always produces exactly one winner.</figcaption>
+</figure>
+
+<h2>2. Specificity is three numbers, not one</h2>
+<p>
+  Specificity is a triple: <b>(ids, classes/attributes/pseudo-classes, types/pseudo-elements)</b>, compared left to
+  right like a version number. The columns do not carry:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Selector</th><th>Specificity</th><th>Beats</th></tr>
+<tr><td><code>#cart</code></td><td>1-0-0</td><td>everything below</td></tr>
+<tr><td><code>.drawer.is-open</code></td><td>0-2-0</td><td><code>.drawer</code>, and any number of types</td></tr>
+<tr><td><code>.drawer</code></td><td>0-1-0</td><td><code>ul li a span b i</code> (0-0-6) — <b>eleven types would still lose</b></td></tr>
+<tr><td><code>a:hover</code></td><td>0-1-1</td><td><code>a</code></td></tr>
+<tr><td><code>[data-open="true"]</code></td><td>0-1-0</td><td>same weight as a class</td></tr>
+<tr><td><code>:where(.a, #b)</code></td><td>0-0-0</td><td>nothing — always loses on step 4</td></tr>
+<tr><td><code>:is(.a, #b)</code></td><td>1-0-0</td><td>takes its <em>most specific</em> argument</td></tr>
+<tr><td><code>* </code>, <code>:root</code> vs <code>html</code></td><td>0-0-0 / 0-1-0 / 0-0-1</td><td><code>:root</code> is a pseudo-class, so it outranks <code>html</code></td></tr>
+</table>
+</div>
+<p>
+  A style attribute (<code>style="color:red"</code>) is not part of this triple at all — it is handled earlier, and only
+  an <code>!important</code> declaration can beat it.
+</p>
+<div class="trap">
+  <span class="label">Trap — what <code>!important</code> really is</span>
+  <code>!important</code> does not make a rule "more specific". It moves the declaration into a <b>different bucket at
+  step 1</b>, which is checked before layers and long before specificity. That is why a single
+  <code>.btn { color: red !important }</code> beats <code>#page #main .btn.primary</code>. And when two
+  <code>!important</code> author declarations collide, you are back to steps 3, 4 and 5 <em>between them</em> — which is
+  how an <code>!important</code> arms race starts.
+</div>
+
+<h2>3. Layers, and the trap that matters for app CSS</h2>
+<p>
+  <code>@layer</code> gives you step 3: an explicit ordering that beats specificity entirely. Declare the order once and
+  a later layer wins no matter how weak its selectors are:
+</p>
+<pre><code>@layer reset, theme, sections, utilities;
+
+@layer sections { .card .title { font-size: 1rem } }   <span class="cmt">// 0-2-0</span>
+@layer utilities { .text-lg { font-size: 2rem } }      <span class="cmt">// 0-1-0, and it WINS</span></code></pre>
+<p>
+  Two rules about layers you must be able to state, because they decide whether layering a theme is safe:
+</p>
+<ul>
+  <li><b>Unlayered normal declarations beat every layer.</b> Anything outside a layer is treated as the last, strongest
+  layer. So if you move your theme CSS into layers and an app injects unlayered CSS, <b>the app now wins by default</b> —
+  the opposite of what people expect when they reach for layers.</li>
+  <li><b>For <code>!important</code>, layer order is reversed.</b> An <code>!important</code> declaration in an
+  <em>earlier</em> layer beats one in a later layer. That is deliberate: it lets a base layer defend a rule it truly must
+  keep.</li>
+</ul>
+
+<h2>4. Inheritance is a different mechanism</h2>
+<p>
+  The cascade only runs where a declaration <em>exists</em> for that element and property. When nothing matched,
+  inheritance asks the parent — but only for <b>inherited properties</b> (<code>color</code>, <code>font-*</code>,
+  <code>line-height</code>, <code>visibility</code>). Non-inherited ones (<code>display</code>, <code>padding</code>,
+  <code>border</code>, <code>background</code>) fall back to their initial value instead.
+</p>
+<p>
+  So "why is my heading blue when I never set it" is a cascade question, and "why is my heading blue when nothing
+  matches it" is an inheritance question. Different mechanism, different place to look. The four keywords let you steer
+  it: <code>inherit</code> (take the parent's), <code>initial</code> (the property's spec default),
+  <code>unset</code> (inherit if inherited, else initial), <code>revert</code> (go back to what the previous origin
+  said, usually the browser's own stylesheet).
+</p>
+
+<h2>5. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    Several style rules can want to set the same thing on the same element, and only one can win. So the browser runs
+    down a fixed checklist of questions and stops at the first one that separates them: <em>did anyone mark theirs as
+    urgent? · which group was declared to matter more? · which selector is more precise? · which was written last?</em>
+    The last question can never tie, so there is always exactly one winner. Most people only know the "more precise"
+    question, which is why they argue about the wrong thing.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A dress code with a chain of authority. A legally required rule beats the company handbook,
+    which beats your team's convention, which beats "whatever the last email said". You do not compare the wording of two
+    rules until you know they came from the same level.
+  </p>
+  <p>
+    <b>Where it breaks.</b> In a real organisation, a very detailed team rule can sometimes override a vague company one.
+    Here it never can: a weak rule in a stronger bucket beats an extremely precise rule in a weaker one, always. And one
+    twist no organisation has — for urgent rules the group order runs <b>backwards</b>, so the base group defends itself
+    against the ones above it.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Two, and both cost real hours. First: treating specificity as a single number. It is three numbers compared left to
+    right, so one class beats any number of element selectors — <code>0-1-0</code> versus <code>0-0-11</code> is not
+    close. Second: believing <code>!important</code> is "very specific". It is a <b>different step</b>, checked earlier,
+    which is exactly why it wins so easily and why two of them collapse back into an ordinary specificity fight. If you
+    can say "different bucket, not bigger number" you will never mis-diagnose one again.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences reviewing a pull request that adds <code>!important</code> to five theme rules to beat a
+    review app's stylesheet. Say what the author actually did in cascade terms, when that is the right call, and what
+    will happen in six months. Then <b>send it to me</b> — I am looking for you to defend <code>!important</code> as a
+    legitimate tool <em>and</em> name its cost, rather than calling it bad practice.
+  </p>
+</div>
+
+<h2>6. Point at it: the Styles pane is the cascade <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Read the winner.</b> DevTools &rarr; <b>Elements</b> &rarr; select a node. The <b>Styles</b> pane lists every
+  matching rule in cascade order, strongest at the top, with losing declarations <s>struck through</s>. Hover a struck
+  declaration and DevTools tells you what beat it.</li>
+  <li><b>Find the true source.</b> The <b>Computed</b> tab shows the final value per property; expand one and it names
+  the exact rule and file that won. This is the fastest way to answer "where is this coming from" in a theme with app CSS
+  in it.</li>
+  <li><b>See inheritance separately.</b> Scroll to the bottom of the Styles pane: the <i>Inherited from</i> sections are
+  a different mechanism, not more matching rules. Notice that only inherited properties appear there.</li>
+  <li><b>Prove the layer rule yourself.</b> In the Styles pane, layered rules are grouped under their
+  <code>@layer</code> name. Add an unlayered rule with a weaker selector and watch it win — the surprising half of
+  section 3, in front of you. That is gate #3 for this core.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A product page's Add to cart button must be <code>#1F6C8C</code>. The theme sets <code>.product-form .btn { background: #1F6C8C }</code>. A subscriptions app injects <code>&lt;style&gt;.btn { background: #333 !important }&lt;/style&gt;</code> late in the body. A previous developer "fixed" it with <code>#MainContent .product-form .btn { background: #1F6C8C }</code>, which did not work, and then with inline <code>style="background:#1F6C8C"</code> on the Liquid element, which did.</p>
+  Before flipping the recall cards: explain, step by step, why the very specific selector lost and why the inline style also lost until — actually check this — did it? State what happens between an inline style and an <code>!important</code> app rule, and give the fix you would ship. Then the interviewer's follow-up: how would you make this class of conflict cheap to fix for the next twenty tickets, and what does your approach give up?
+</div>
+
+<h2>7. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>One HTML file, typed by hand. <b>Predict the colour after each block before you reload.</b></p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;style&gt;
+  ul li a span      { color: green }   /* 0-0-4 */
+  .label            { color: red }     /* 0-1-0 */
+&lt;/style&gt;
+&lt;ul&gt;&lt;li&gt;&lt;a href=&quot;#&quot;&gt;&lt;span class="label"&gt;Which colour?&lt;/span&gt;&lt;/a&gt;&lt;/li&gt;&lt;/ul&gt;</code></pre>
+  <p>Red. Four element selectors cannot out-vote one class, because the columns never carry.</p>
+  <p><b>Round two — the buckets.</b> Add this and predict again:</p>
+  <pre><code>  #page .label    { color: blue }               /* 1-1-0 */
+  span            { color: orange !important }  /* 0-0-1, different bucket */</code></pre>
+  <p>Orange. Say the reason out loud before you reload: importance is step 1, specificity is step 4.</p>
+  <p><b>Round three — layers, including the surprise.</b> Predict all three states:</p>
+  <pre><code>@layer base, overrides;
+@layer base      { .label { color: teal } }
+@layer overrides { span   { color: purple } }   /* weaker selector, later layer → wins */
+.label { color: black }                          /* UNLAYERED → beats both layers */</code></pre>
+  <p>Then <b>break it the way an app would</b>: put the unlayered rule in a second <code>&lt;style&gt;</code> block with a
+  deliberately weak selector, and confirm it still wins over your carefully layered theme. That is the exact reason
+  layering a Shopify theme needs a decision, not a habit.</p>
+  <p><b>Round four — inheritance versus cascade.</b> Predict what each child shows:</p>
+  <pre><code>&lt;div style="color: crimson; padding: 20px"&gt;
+  &lt;p&gt;inherits colour?&lt;/p&gt;
+  &lt;p style="color: inherit"&gt;same thing, explicitly&lt;/p&gt;
+  &lt;p style="padding: inherit"&gt;inherits padding?&lt;/p&gt;
+&lt;/div&gt;</code></pre>
+  <p>Colour inherits with no help. Padding does not inherit by default but <em>can</em> be told to. Seeing those two
+  behave differently is the whole point of section 4.</p>
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>cascade, specificity, inheritance, layers</b> done only if all three held, from memory: (1) you reviewed the <code>!important</code> pull request in cascade terms — the teach-back in section 5; (2) you predicted red, then orange, then all three layer states, before reloading; (3) you watched an unlayered weak rule beat a layered strong one in the Styles pane. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_cascade/Cascade">MDN — CSS cascade</a> (20 min). Then read the ordering list in <a href="https://drafts.csswg.org/css-cascade-5/">CSS Cascade 5</a> itself — it is short, numbered, and settles every argument you will have about this for the rest of your career.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Style recalculation cost and selector matching performance</b> <span class="pill depth">depth</span> — this lesson
+  is which rule wins; that one is what it costs to find out. <b>Custom properties</b>
+  <span class="pill depth">depth</span> — they inherit and resolve at runtime, which makes them a different game.
+  <b>Shadow DOM and step 2</b> <span class="pill depth">depth</span>. <b><code>@scope</code>, nesting, and
+  <code>@container</code></b> <span class="pill depth">depth</span>. Next core lesson:
+  <a href="0013-layout-paint-composite-triggers.html">0013 · layout vs paint vs composite</a>, where a style change stops
+  being free.
+</div>
+
+<p class="ask">Anything unclear — whether to layer a Shopify theme, when <code>!important</code> is the professional choice, why <code>:where()</code> exists? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Five ordered steps: <b>origin &amp; importance</b> &rarr; context &rarr; <b>layer order</b> &rarr; <b>specificity</b> &rarr; <b>order of appearance</b>. The first step that separates two rules decides.</li>
+    <li>Specificity is <b>three numbers</b> compared left to right. One class (0-1-0) beats any number of element selectors.</li>
+    <li><code>!important</code> is a <b>different bucket at step 1</b>, not a bigger number. Two of them fall back to steps 3–5 between themselves.</li>
+    <li><b>Unlayered normal declarations beat every layer</b> — so layering your theme hands the win to unlayered app CSS.</li>
+    <li>For <code>!important</code>, <b>layer order reverses</b>: an earlier layer wins.</li>
+    <li><b>Inheritance is not the cascade.</b> It only fills in where nothing matched, and only for inherited properties.</li>
+    <li><code>:where()</code> is 0-0-0; <code>:is()</code> takes its most specific argument. Use them to choose your own weight.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>find out which step separates the two rules before you touch either selector.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0013-layout-paint-composite-triggers.html">Next: 0013 · layout, paint, composite &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'ul li a span (0-0-4) versus .label (0-1-0) on the same element. Which wins?',
+    options: [
+      '.label, because one class outranks any types',
+      'ul li a span, because it has four selectors',
+      'neither, so the browser uses the parent value'
+    ],
+    answer: 0,
+    why: 'Specificity is three columns compared left to right and they never carry. A single class in the second column beats any number of type selectors in the third.'
+  },
+  {
+    q: 'What does !important actually change about a declaration?',
+    options: [
+      'its bucket in step one, before specificity runs',
+      'its specificity, raising it above any id count',
+      'its position, moving it to the end of the file'
+    ],
+    answer: 0,
+    why: 'Importance is decided at step one, long before specificity at step four. That is why a weak important rule beats a very precise normal one, and why two important rules fall back to ordinary tie-breakers.'
+  },
+  {
+    q: 'A theme is fully inside @layer blocks and an app injects unlayered CSS. Who wins?',
+    options: [
+      'the app, since unlayered beats every layer',
+      'the theme, since its layers were declared first',
+      'whichever selector has the higher specificity'
+    ],
+    answer: 0,
+    why: 'Unlayered normal declarations are treated as the last and strongest layer. This is the surprise that makes layering a theme a decision rather than a habit.'
+  },
+  {
+    q: 'Nothing matches your paragraph, yet its colour is not black. Which mechanism is that?',
+    options: [
+      'inheritance, because colour is an inherited one',
+      'the cascade, because a rule matched a parent',
+      'the initial value defined for that property'
+    ],
+    answer: 0,
+    why: 'The cascade only runs where a declaration exists for that element. With nothing matching, an inherited property takes the parent value, while a non-inherited one would fall back to its initial value.'
+  },
+  {
+    q: 'Where does DevTools tell you which rule beat which?',
+    options: [
+      'the Styles pane, with struck-through declarations',
+      'the Layout pane, in the grid overlay settings',
+      'the Sources panel, in the linked stylesheet file'
+    ],
+    answer: 0,
+    why: 'Styles lists matching rules in cascade order, strongest first, with overridden declarations struck through; the Computed tab then names the exact rule and file that supplied the final value.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How does the browser decide which CSS rule wins?"',
+    answer: 'It applies ordered tie-breakers and stops at the first one that separates them: <b>origin and importance</b>, then context, then <b>layer order</b>, then <b>specificity</b>, then <b>order of appearance</b>. The last step can never tie, so there is always exactly one winner.<br><br><i>Likely follow-up:</i> "Where does specificity sit in that?" Fourth. Which is why arguments about selector precision often miss the point — if the two rules are in different importance buckets or different layers, specificity is never even consulted.'
+  },
+  {
+    prompt: '"Is !important bad practice?"',
+    answer: 'It is a tool with a known cost. Mechanically it moves a declaration into a different bucket at step one, so it wins without touching selectors. That is the <b>right</b> call when you must beat CSS you do not control — a third-party app injecting <code>!important</code> late in the body leaves you no cascade room below it. The cost is that the next person needs another <code>!important</code> to beat yours, and now specificity fights resume inside the important bucket.<br><br><i>Likely follow-up:</i> "So how do you keep it under control?" Confine it to a single, documented file whose job is "overrides for third-party CSS", never sprinkle it through component styles, and record which app each rule is fighting so it can be deleted when the app goes.'
+  },
+  {
+    prompt: 'The Add to cart drill: why did #MainContent .product-form .btn lose, what about the inline style, and what would you ship?',
+    answer: 'The very specific selector lost at <b>step one</b>: the app\'s declaration is <code>!important</code>, so it sits in a stronger bucket and specificity is never compared. Nothing you write as a normal declaration can beat it — an id-heavy selector is the wrong lever entirely.<br><br>The inline style: a <code>style</code> attribute is stronger than any normal author rule, but it is still a <b>normal</b> declaration, so an <code>!important</code> author rule beats it too. So the honest answer is that the inline fix should <em>not</em> have worked — if it appeared to, either the app\'s stylesheet had not loaded at that moment (a race, which will come back), or the rule being fought was a different one. That is worth verifying in the Styles pane before believing the fix.<br><br>What I would ship: one override rule with <code>!important</code>, in a dedicated third-party-overrides stylesheet loaded after the app, with a comment naming the app and the date.<br><br><i>Likely follow-up:</i> "How do you make the next twenty tickets cheap?" One file that owns all app conflicts, one selector convention, and a note per rule. Given the unlayered-beats-layered rule, keeping the theme unlayered is the safer default here — layering it would hand the app the win before importance is even needed. What that gives up is the elegance of layer-based ordering inside our own CSS, and we accept that in exchange for predictable fights with code we do not control.'
+  }
+]);
+</script>
+</body>
+</html>

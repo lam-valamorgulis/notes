@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0008 · The promise state machine &amp; resolution procedure — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Async primitives · Lesson 0008</p>
+<h1>The promise state machine &amp; resolution procedure</h1>
+<p class="subtitle">A promise is not "async syntax". It is a tiny state machine with three states, two one-way transitions and one hard guarantee — and every rule about <code>await</code>, chaining and error handling is a consequence of those.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #3 (say what the design gives up) and ability #4 (debug with no ready answer) — a swallowed rejection in a cart request is invisible until you know where the state went.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can say what a promise guarantees that a callback cannot, explain why handlers are <em>always</em> asynchronous, and find the exact line where an error in an AJAX cart chain disappeared.
+</div>
+
+<h2>1. The three problems callbacks could not solve</h2>
+<p>
+  Before promises, an async operation took a callback. Three things went wrong constantly, and each one is a rule the
+  promise had to invent:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Callback problem</th><th>The rule promises answer it with</th></tr>
+<tr><td>The callback ran <b>twice</b> (a retry fired the old one too)</td><td>state changes <b>once</b>, and only from <code>pending</code></td></tr>
+<tr><td>The callback <b>never</b> ran, or ran with both an error and a value</td><td>exactly one of two outcomes: a <b>value</b> or a <b>reason</b></td></tr>
+<tr><td>You could not attach a handler <b>after</b> the operation finished</td><td>the result is <b>kept</b>, so a late handler still gets it</td></tr>
+</table>
+</div>
+<p>
+  Put those three together and you are forced into a state machine. There must be a "not finished yet" state
+  (<code>pending</code>), two terminal states (<code>fulfilled</code>, <code>rejected</code>), and the transitions must
+  be one-way and once-only. The word for "no longer pending" is <b>settled</b>. This is not a design opinion — it is
+  what the three requirements above leave you with, and the spec writes it out at
+  <a href="https://tc39.es/ecma262/#sec-promise-objects">ECMA-262 § Promise Objects</a>.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 260" role="img" aria-label="A promise starts pending and moves once, one way, to either fulfilled with a value or rejected with a reason; later transitions are ignored and handlers always run as microtasks">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <rect class="box hot" x="24" y="98" width="160" height="56" rx="6"/>
+  <text class="mono" x="40" y="122">PENDING</text>
+  <text class="sub" x="40" y="140">no value yet</text>
+
+  <path class="flow good" d="M190,116 C300,116 330,60 420,60" style="stroke:var(--good)"/>
+  <text class="mono sm" x="252" y="94">resolve(value)</text>
+  <path class="flow" d="M190,138 C300,138 330,196 420,196" style="stroke:var(--warn)"/>
+  <text class="mono sm" x="252" y="176">reject(reason)</text>
+
+  <rect class="box good" x="424" y="34" width="270" height="52" rx="6"/>
+  <text class="mono" x="440" y="56">FULFILLED</text>
+  <text class="sub" x="440" y="74">holds a value &mdash; settled, frozen</text>
+
+  <rect class="box bad" x="424" y="170" width="270" height="52" rx="6"/>
+  <text class="mono" x="440" y="192">REJECTED</text>
+  <text class="sub" x="440" y="210">holds a reason &mdash; settled, frozen</text>
+
+  <path class="flow dash" d="M556,92 L556,164" style="stroke:var(--rule)"/>
+  <text class="sub" x="466" y="122">no transition between them,</text>
+  <text class="sub" x="466" y="138">and no way back to pending</text>
+
+  <text class="cap amber" x="24" y="196">A SECOND resolve/reject IS</text>
+  <text class="cap amber" x="24" y="212">SILENTLY IGNORED &mdash; NOT AN ERROR</text>
+  <text class="sub" x="24" y="240">Handlers attached with .then always run as MICROTASKS &mdash; even if it settled an hour ago.</text>
+</svg>
+<figcaption>Two transitions, one-way, once. Everything else about promises — chaining, <code>await</code>, error propagation — is bookkeeping on top of this picture.</figcaption>
+</figure>
+
+<h2>2. Why handlers are always asynchronous</h2>
+<p>
+  Here is a rule that looks like an inconvenience and is actually a safety guarantee. Even when a promise is
+  <em>already</em> settled, <code>.then</code> does not call your function immediately — it queues it as a microtask
+  (lesson 0006):
+</p>
+<pre><code>const p = Promise.resolve('done');   <span class="cmt">// already fulfilled</span>
+p.then(v =&gt; console.log('handler', v));
+console.log('after .then');
+<span class="cmt">// → </span><span class="out">after .then</span><span class="cmt">, then </span><span class="out">handler done</span></code></pre>
+<p>
+  Ask why, from first principles. If <code>.then</code> ran the handler synchronously when the value was ready, then
+  the same function would sometimes run before the next line and sometimes after — depending on cache timing you do not
+  control. Every caller would have to defend against both. The platform removes the choice: <b>always later, never
+  now</b>. One behaviour to reason about instead of two.
+</p>
+<div class="soundbite">
+  <span class="label">Say it this way</span>
+  <p>A promise gives up the chance to be fast in the easy case, to be predictable in every case. That is the trade, and naming it is ability #3.</p>
+</div>
+
+<h2>3. <code>then</code> returns a new promise — so errors have a path</h2>
+<p>
+  <code>.then</code> does not return the same promise; it returns a <b>new</b> one, whose state is decided by what your
+  handler did. Four rules, all derivable from "the new promise needs a state":
+</p>
+<ul>
+  <li>Handler <b>returns a plain value</b> &rarr; the new promise fulfils with it.</li>
+  <li>Handler <b>throws</b> &rarr; the new promise rejects with the thrown thing. This is why <code>try/catch</code>-style flow works across a chain.</li>
+  <li>Handler <b>returns a promise</b> &rarr; the new promise <b>adopts</b> it: it waits, then takes the same outcome. This step is the <em>resolution procedure</em>, and it costs <b>two extra microtask ticks</b> — a bare fact worth verifying by hand, in the live-coding step below.</li>
+  <li>No handler of the right kind &rarr; the state <b>passes through</b> to the next link. That is why one <code>.catch</code> at the end can catch a rejection from any earlier step.</li>
+</ul>
+<pre><code>fetch('/cart/add.js', { method: 'POST', body })
+  .then(r =&gt; r.json())            <span class="cmt">// throws on bad JSON → rejects the NEXT promise</span>
+  .then(cart =&gt; render(cart))     <span class="cmt">// skipped entirely if the step above rejected</span>
+  .catch(err =&gt; showError(err));  <span class="cmt">// one place to land, for either step</span></code></pre>
+<div class="trap">
+  <span class="label">Trap — the silent one, and it is everywhere in theme code</span>
+  <p>Two mistakes hide a real failure from you completely:</p>
+  <p><b>1. A chain with no <code>.catch</code>.</b> The rejection has nowhere to go and becomes an
+  <em>unhandled rejection</em> — a console warning many people never look at, with no visible break in the UI.</p>
+  <p><b>2. <code>fetch</code> does not reject on 404 or 500.</b> It rejects only on a <em>network</em> failure. A
+  <code>422</code> from a cart endpoint is a perfectly fulfilled promise, so your <code>.then</code> runs happily with
+  an error body and renders nonsense. You must check <code>response.ok</code> yourself. That is a platform decision,
+  not a promise rule.</p>
+</div>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    A promise is a small box with a label. At first the label says "waiting". Later, exactly once, someone writes on it
+    either "here is the answer" or "here is what went wrong" — and after that the label can never be changed again.
+    Because the box keeps what was written, you can come and read it whenever you like, even long after. And when you
+    ask the box to tell you, it always tells you a moment later, never in the same breath — so it behaves the same way
+    whether the answer arrived an hour ago or has not arrived yet.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A parcel tracking page. It says "in transit", then one day it says "delivered" or "lost". You
+    can check it whenever you want and it still tells you the outcome. Nobody can change "delivered" back to
+    "in transit".
+  </p>
+  <p>
+    <b>Where it breaks.</b> Tracking pages update themselves and you can refresh to see progress. A promise has no
+    progress: there is nothing between "waiting" and the final answer — no percentage, no partial value, no cancel
+    button. If you need progress or cancellation you need something else (a stream, or
+    <code>AbortController</code>). Pretending a promise can report progress is a design mistake, not a missing feature.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Two, and they cost real money. First: people think <code>fetch</code> rejects when the server returns an error.
+    It does not — <code>404</code> and <code>500</code> are <b>successful</b> promises with an unhappy body, so an
+    unchecked <code>response.ok</code> is a silent bug in a live cart. Second: people say "<code>.then</code> returns
+    the promise". It returns a <b>new</b> promise, which is the only reason a <code>throw</code> in step two can be
+    caught in step five. Say "new promise" out loud and the whole error model becomes obvious.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior who asks: <i>"my <code>.then</code> ran even though the server said 422, and the
+    page showed an empty cart. Isn't <code>.catch</code> supposed to handle that?"</i> Explain what the promise
+    actually promised, and what it never promised. Then <b>send it to me</b>. I am checking that you separate
+    <em>the request succeeded</em> from <em>the server was happy</em> — a distinction most candidates blur.
+  </p>
+</div>
+
+<h2>5. Point at it: read the state yourself <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>The state, in the Console.</b> Run <code>const p = new Promise(r =&gt; setTimeout(() =&gt; r(42), 3000)); p;</code>
+  &mdash; the Console prints <code>Promise {&lt;pending&gt;}</code>. Wait three seconds, type <code>p</code> again:
+  <code>Promise {&lt;fulfilled&gt;: 42}</code>. The state machine, on screen, with no library.</li>
+  <li><b>Once-only, proven.</b> Run
+  <code>const q = new Promise((res, rej) =&gt; { res('first'); res('second'); rej('nope'); }); q.then(console.log);</code>
+  &mdash; it logs <code>first</code>. No error, no warning. Silence is the mechanism: later transitions are ignored.</li>
+  <li><b>The unhandled rejection.</b> Run <code>Promise.reject(new Error('boom'))</code> with no <code>.catch</code>.
+  Read the exact console wording — <i>Uncaught (in promise)</i>. That is the message you will now recognise in a client's
+  console instead of scrolling past it.</li>
+  <li><b>Async stack traces.</b> In <b>Sources</b>, break inside a <code>.then</code> handler and look at the Call Stack
+  pane: DevTools shows the <em>async</em> frames that queued it, separated by a marker. You are reading across
+  microtask boundaries — the pane is stitching two turns of lesson 0005's loop together for you.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's AJAX add-to-cart does <code>fetch('/cart/add.js', …).then(r =&gt; r.json()).then(cart =&gt; renderDrawer(cart))</code> with no <code>.catch</code>. A customer adds a sold-out variant. Shopify replies <b>422</b> with a JSON body <code>{ description: "…is not available" }</code>. The drawer opens showing zero items, and the console shows one warning nobody noticed.</p>
+  Before flipping the recall cards: name the exact promise state after the <code>fetch</code>, say which line first behaves wrongly, and say which line produced the warning. Then the interviewer's follow-up: write the minimum correct version, and explain why adding a <code>.catch</code> alone would <em>not</em> fix this bug.
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type this by hand and predict the two lines' order before running:</p>
+  <pre><code>const p = Promise.resolve('ready');
+p.then(v =&gt; console.log('handler', v));
+console.log('sync line');</code></pre>
+  <p>Now the interleaving question — <b>write your prediction down</b>, all four letters, before running:</p>
+  <pre><code>Promise.resolve().then(() =&gt; console.log('a')).then(() =&gt; console.log('b'));
+Promise.resolve().then(() =&gt; console.log('c')).then(() =&gt; console.log('d'));</code></pre>
+  <p>The answer is <code>a c b d</code>, and you can derive it from lesson 0006 alone: the checkpoint drains what is
+  queued, and each <code>.then</code> only queues its successor once its own handler has run.</p>
+  <p><b>Now measure the resolution procedure's cost yourself</b> — this is the bare fact from section 3, made
+  observable. Predict which chain finishes first:</p>
+  <pre><code>Promise.resolve()
+  .then(() =&gt; Promise.resolve('PROMISE-RETURNING'))
+  .then(v =&gt; console.log(v));
+
+Promise.resolve()
+  .then(() =&gt; console.log('plain 1'))
+  .then(() =&gt; console.log('plain 2'))
+  .then(() =&gt; console.log('plain 3'));</code></pre>
+  <p>All three <code>plain</code> lines print before <code>PROMISE-RETURNING</code>, even though its chain is shorter —
+  adopting a returned promise costs two extra ticks. Verify it rather than believing either of us.</p>
+  <p><b>Break it the production way.</b> Point a <code>fetch</code> at a URL that returns a 404 and see for yourself:</p>
+  <pre><code>fetch('/this-path-does-not-exist.js')
+  .then(r =&gt; { console.log('then ran, ok =', r.ok, r.status); return r.json(); })
+  .then(d =&gt; console.log('parsed', d))
+  .catch(e =&gt; console.log('caught', e.message));</code></pre>
+  <p>Predict first: does <code>.catch</code> fire because of the 404, or because of something else? Run it. The
+  <code>.then</code> runs with <code>ok = false</code>, and the <code>.catch</code> only fires later, when the HTML
+  error page fails to parse as JSON. That gap — a real failure reported as a parse error — is the bug in the drill.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>promise state machine &amp; resolution procedure</b> done only if all three held, from memory: (1) you explained to a junior why a 422 does not reject — the teach-back in section 4; (2) you predicted <code>a c b d</code> and predicted which chain won the two-ticks race, before running either; (3) you watched a promise go from <code>&lt;pending&gt;</code> to <code>&lt;fulfilled&gt;</code> in the Console and saw a second <code>resolve</code> ignored. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise">MDN — Promise</a>, specifically the "Description" section on states and fates (15 min). Then the ground truth, and it is shorter than you expect: <a href="https://tc39.es/ecma262/#sec-promise-objects">ECMA-262 § Promise Objects</a> — find <i>NewPromiseResolveThenableJob</i> and you are looking straight at the two extra ticks.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b><code>all</code> / <code>allSettled</code> / <code>race</code> / <code>any</code> semantics</b>
+  <span class="pill depth">depth</span> — the combinators; easy once the state machine is exact.
+  <b><code>AbortController</code> and cancellation</b> <span class="pill depth">depth</span> — named in the Feynman
+  analogy as the thing a promise cannot do. <b>How <code>async</code>/<code>await</code> desugars to a generator plus a
+  driver</b> <span class="pill depth">depth</span>. <b>Async iterators and <code>for await</code></b>
+  <span class="pill depth">depth</span>. <b>Unhandled-rejection tracking in production</b>
+  <span class="pill depth">depth</span> — Chapter 7, observability. Next core lesson, and the last of Chapter 1's core:
+  <a href="0009-leak-shapes-detached-dom-listeners-timers.html">0009 · leak shapes</a>.
+</div>
+
+<p class="ask">Anything unclear — why "settled" and "resolved" are not the same word, where the two extra ticks come from, how to wrap the theme's cart requests once and correctly? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Three states — <code>pending</code>, <code>fulfilled</code>, <code>rejected</code> — two transitions, <b>one-way and once</b>. "Settled" means no longer pending.</li>
+    <li>A second <code>resolve</code> or <code>reject</code> is <b>silently ignored</b>. No error, no warning.</li>
+    <li>The outcome is <b>kept</b>, so a handler attached later still receives it — unlike an event, which is gone if you missed it.</li>
+    <li>Handlers <b>always</b> run as microtasks, even on an already-settled promise: predictability bought with a tick.</li>
+    <li><code>.then</code> returns a <b>new</b> promise. Return a value &rarr; fulfil; throw &rarr; reject; return a promise &rarr; adopt it (two extra ticks); no matching handler &rarr; pass through.</li>
+    <li><code>fetch</code> rejects only on <b>network</b> failure. A 404 or 422 is a fulfilled promise — check <code>response.ok</code> yourself.</li>
+    <li>A chain with no <code>.catch</code> turns a real failure into a console warning nobody reads.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>a promise guarantees the request finished, never that the answer was good.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/event-loop.html">Cheat sheet: event loop</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0009-leak-shapes-detached-dom-listeners-timers.html">Next: 0009 · leak shapes &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'How many times can a promise change state, and in which directions?',
+    options: [
+      'once, from pending to fulfilled or rejected',
+      'twice, if it is rejected and then retried',
+      'any number, as long as it ends up settled'
+    ],
+    answer: 0,
+    why: 'One transition, one way, once. That is what makes the outcome safe to read later, and it is why a second resolve call is simply ignored.'
+  },
+  {
+    q: 'const p = Promise.resolve(1); p.then(log); console.log("after"); — what prints first?',
+    options: [
+      'after, because handlers are always queued',
+      'the value, because the promise already settled',
+      'they interleave depending on the engine build'
+    ],
+    answer: 0,
+    why: 'A .then handler is always queued as a microtask, even for an already-settled promise. One behaviour in every case is worth more than being fast in the easy case.'
+  },
+  {
+    q: 'A .then handler throws an error. What happens to the promise .then returned?',
+    options: [
+      'it rejects with the thing that was thrown',
+      'it stays pending, and the error is rethrown',
+      'it fulfils with undefined and logs a warning'
+    ],
+    answer: 0,
+    why: 'The new promise needs a state, and a throw supplies a rejection reason. This is exactly why a single .catch at the end of a chain can handle a failure from any earlier step.'
+  },
+  {
+    q: 'fetch resolves and the server returned 422. What is the state of the fetch promise?',
+    options: [
+      'fulfilled, with a response whose ok is false',
+      'rejected, with an HTTP error as the reason',
+      'pending, until the response body is read'
+    ],
+    answer: 0,
+    why: 'fetch rejects only on network failure. The request completed, so the promise is fulfilled; the fact that the server was unhappy lives in response.ok and response.status, which you must check.'
+  },
+  {
+    q: 'Returning a promise from inside a .then handler costs what, compared to returning a value?',
+    options: [
+      'two extra microtask ticks before it settles',
+      'one extra full task, so a frame can render',
+      'nothing at all, the two are exactly the same'
+    ],
+    answer: 0,
+    why: 'The resolution procedure has to adopt the returned promise, which the spec does with an extra job plus an extra then. You can measure it by racing it against a three-step plain chain.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What does a promise actually guarantee?"',
+    answer: 'Three things a plain callback cannot. It settles <b>at most once</b>, so your handler cannot be called twice. It settles into exactly one of two outcomes, a <b>value</b> or a <b>reason</b>, never both. And it <b>keeps</b> that outcome, so a handler attached later still receives it. On top of those, handlers always run <b>asynchronously</b>, so the code around them behaves identically whether the answer was already there or not.<br><br><i>Likely follow-up:</i> "What does it not give you?" Progress and cancellation. There is nothing between pending and settled — no percentage, no partial result, no cancel. Those need a stream or an <code>AbortController</code>.'
+  },
+  {
+    prompt: '"Why does .then return a new promise instead of the same one?"',
+    answer: 'Because the result of the handler needs somewhere to live. Return a value and the new promise fulfils with it; throw and it rejects with what you threw; return a promise and the new one adopts that outcome, which costs two extra microtask ticks. If there is no handler of the matching kind, the state passes straight through to the next link.<br><br><i>Likely follow-up:</i> "So why can one .catch at the end handle everything?" Because each link passes its rejection down until something handles it. Nothing is caught along the way, so the last .catch sees a failure from any earlier step.'
+  },
+  {
+    prompt: 'The add-to-cart drill: 422 from Shopify, drawer shows zero items, one console warning. Diagnose it and write the correct version.',
+    answer: 'The <code>fetch</code> promise is <b>fulfilled</b> — the request itself worked, so nothing rejected. The first wrong line is <code>r.json()</code>: it happily parses the 422 error body, so <code>renderDrawer</code> then runs with an object that has no line items and draws an empty cart. The console warning is the unhandled rejection from a later step, and with no <code>.catch</code> it never reached the UI.<br><br>Minimum correct version:<br><code>const r = await fetch(url, opts);<br>const data = await r.json();<br>if (!r.ok) throw new CartError(data.description);<br>renderDrawer(data);</code><br>wrapped in a <code>try/catch</code> that shows the message.<br><br><i>Likely follow-up:</i> "Why is adding .catch not enough?" Because nothing was rejecting in the failure path we care about. A <code>.catch</code> would only catch the accidental parse error, and only when the body happens to be unparseable — it would still render an empty cart for a well-formed 422. The real fix is checking <code>response.ok</code> and turning a bad status into a rejection on purpose.'
+  }
+]);
+</script>
+</body>
+</html>

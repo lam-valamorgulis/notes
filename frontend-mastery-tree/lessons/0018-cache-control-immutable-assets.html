@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0018 · Cache-Control &amp; immutable assets — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 3 · Network &amp; Delivery · Caching · Lesson 0018</p>
+<h1><code>Cache-Control</code> &amp; immutable assets</h1>
+<p class="subtitle">Lesson 0017 made a request cheaper. This lesson makes it not happen. The difference between "fresh" and "revalidate" is one round trip on every page view — and most sites give it away by accident.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #3 (say what the design gives up) and ability #5 (judge someone else's work) — reading a response header and saying whether it is right is a five-second senior skill.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can read a <code>Cache-Control</code> header and say exactly what the browser will do on the next page view, explain why a one-year lifetime is <em>safer</em> than a one-hour one, and check what your own storefront is actually sending instead of assuming.
+</div>
+
+<h2>1. Two questions, three outcomes</h2>
+<p>
+  When the browser needs a URL it already has a copy of, it asks two questions in order. Everything about HTTP caching
+  falls out of them:
+</p>
+<ol>
+  <li><b>Is my copy still fresh?</b> — decided locally, from the response's freshness lifetime. If yes: use it.
+  <b>Zero network. Zero round trips.</b> The best possible outcome, and the only one that is actually free.</li>
+  <li><b>If not fresh, has it changed?</b> — a <b>conditional request</b> carrying the validator the server gave you
+  (<code>If-None-Match</code> with the <code>ETag</code>, or <code>If-Modified-Since</code>). The server may answer
+  <code>304 Not Modified</code> with no body. Cheap in bytes — and <b>still a full round trip</b>.</li>
+</ol>
+<p>
+  That second point is the one people miss. A <code>304</code> feels like a cache hit and costs like a request. On a
+  150 ms mobile connection, forty revalidations is six seconds of waiting to be told nothing changed
+  (<a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching">MDN — HTTP caching</a>).
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 260" role="img" aria-label="Decision flow: with no stored copy a full request is needed; a fresh stored copy costs nothing; a stale copy needs a conditional request that costs a round trip even when the answer is 304">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <rect class="box" x="16" y="20" width="170" height="34" rx="5"/>
+  <text class="mono sm" x="28" y="41">browser needs a URL</text>
+  <path class="flow" d="M190,37 L222,37"/>
+  <rect class="box" x="226" y="20" width="150" height="34" rx="5"/>
+  <text class="mono sm" x="238" y="41">stored copy?</text>
+
+  <path class="flow" d="M380,37 L420,37"/>
+  <text class="sub" x="386" y="30">no</text>
+  <rect class="box bad" x="424" y="20" width="280" height="34" rx="5"/>
+  <text class="mono sm" x="436" y="41">full request — up to 4 RTTs</text>
+
+  <path class="flow" d="M300,58 L300,84"/>
+  <text class="sub" x="306" y="76">yes</text>
+  <rect class="box" x="226" y="88" width="200" height="40" rx="5"/>
+  <text class="mono sm" x="238" y="106">still FRESH?</text>
+  <text class="sub" x="238" y="122">max-age not yet expired</text>
+
+  <path class="flow" d="M430,108 L462,108"/>
+  <text class="sub" x="436" y="100">yes</text>
+  <rect class="box good" x="466" y="88" width="238" height="40" rx="5"/>
+  <text class="mono sm" x="478" y="106">serve from cache</text>
+  <text class="sub" x="478" y="122">ZERO network. the only free case.</text>
+
+  <path class="flow" d="M300,132 L300,164"/>
+  <text class="sub" x="306" y="154">no</text>
+  <rect class="box hot" x="226" y="168" width="200" height="40" rx="5"/>
+  <text class="mono sm" x="238" y="186">conditional request</text>
+  <text class="sub" x="238" y="202">If-None-Match: &quot;abc123&quot;</text>
+
+  <path class="flow" d="M430,180 L462,180"/>
+  <rect class="box" x="466" y="160" width="238" height="30" rx="5"/>
+  <text class="mono sm" x="478" y="180">304 — no body, 1 RTT</text>
+  <path class="flow" d="M430,196 L462,208"/>
+  <rect class="box" x="466" y="194" width="238" height="30" rx="5"/>
+  <text class="mono sm" x="478" y="214">200 — new body, 1 RTT + bytes</text>
+
+  <text class="cap amber" x="16" y="244">immutable SAYS: SKIP THE BOTTOM TWO ROWS ENTIRELY, EVEN ON RELOAD</text>
+</svg>
+<figcaption>Only the green box is free. The goal of a caching strategy is to land in it as often as possible — and the way to do that is to make the URL, not the header, carry correctness.</figcaption>
+</figure>
+
+<h2>2. The directives you will actually meet</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Directive</th><th>What it means</th><th>When it is right</th></tr>
+<tr><td><code>max-age=31536000, immutable</code></td><td>fresh for a year; do not revalidate even on reload</td><td><b>fingerprinted assets</b> whose URL changes when the content changes</td></tr>
+<tr><td><code>no-cache</code></td><td><em>store it, but always revalidate before using it</em> — badly named</td><td>HTML, and anything where staleness is unacceptable but a 304 is fine</td></tr>
+<tr><td><code>no-store</code></td><td>never write it to any cache</td><td>personal or sensitive responses: cart contents, customer data</td></tr>
+<tr><td><code>private</code></td><td>the browser may store it, shared caches and CDNs may not</td><td>anything customer-specific behind a login</td></tr>
+<tr><td><code>public, s-maxage=600</code></td><td>a separate, usually shorter lifetime for shared caches</td><td>CDN-cached HTML that must update sooner than browsers do</td></tr>
+<tr><td><code>stale-while-revalidate=60</code></td><td>serve the stale copy instantly, refresh in the background</td><td>content where "slightly old, immediately" beats "current, after a round trip"</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — <code>no-cache</code> does not mean "do not cache"</span>
+  <code>no-cache</code> means "cache it, but check with me every time". The directive that means "do not keep this at all"
+  is <code>no-store</code>. Getting these backwards produces two different bugs: a needless round trip on every asset, or
+  a customer's cart contents sitting in a shared cache. Say the long form out loud —
+  "<em>no-cache</em> is <em>always revalidate</em>" — until it is automatic.
+</div>
+
+<h2>3. Why a one-year lifetime is the safe choice</h2>
+<p>
+  The instinct is that a long lifetime is risky: what if you need to change the file? Follow the reasoning through and the
+  instinct inverts.
+</p>
+<p>
+  If correctness comes from the <b>header</b>, you are always trading staleness against round trips, and there is no good
+  number: an hour is both too long to ship a fix and too short to avoid the traffic. If correctness comes from the
+  <b>URL</b> — <code>theme.a91f3c.js</code>, or a version query parameter that changes with the content — then the old
+  URL can never be wrong, because new content lives at a new URL. A year is safe, and <code>immutable</code> stops even
+  the reload-triggered revalidation.
+</p>
+<div class="diagram">  HTML          → no-cache (or a short max-age) + ETag   ... it names the asset URLs
+  hashed asset  → max-age=31536000, immutable            ... its URL changes when it changes
+  cart / account→ no-store, private                      ... never in a shared cache</div>
+<p>
+  This is the whole strategy, and it is three lines. Everything else is a variation.
+</p>
+
+<h2>4. What you control on a Shopify theme — and what you do not</h2>
+<p>
+  Be precise here, because the usual advice assumes you own the server. On a Shopify storefront you generally
+  <b>do not set these headers</b>: Shopify's CDN decides them for theme assets and for storefront HTML. What you do
+  control:
+</p>
+<ul>
+  <li><b>Which URL you ask for.</b> Using <code>{{ 'theme.js' | asset_url }}</code> gives you the platform's versioned
+  URL. Hand-writing a URL, or adding your own cache-busting parameter, can defeat a cache that was working.</li>
+  <li><b>Whether the request happens at all.</b> Lessons 0010, 0011 and 0017 — fewer origins, fewer files.</li>
+  <li><b>Your own <code>fetch</code> calls.</b> The <code>cache</code> option (<code>'default'</code>,
+  <code>'no-store'</code>, <code>'reload'</code>, <code>'force-cache'</code>) decides how a cart or section request uses
+  the cache. Sending <code>no-store</code> on a Section Rendering request that could have been cached is a real,
+  self-inflicted round trip.</li>
+  <li><b>Third-party assets.</b> You cannot change their headers, but you can read them, and "this app's script sends
+  <code>no-cache</code> so it costs a round trip on every page view" is a concrete line for a report.</li>
+</ul>
+<div class="note">
+  <span class="label">Verify, do not trust — including this page</span>
+  Header behaviour on any platform changes over time. Do not quote a value from a blog post or from this lesson: open the
+  Network panel on the storefront you are actually working on, click the asset, and read its real
+  <code>Cache-Control</code>. The habit of checking is the transferable skill; the specific values are not.
+</div>
+
+<h2>5. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser keeps copies of files it has already downloaded. Each copy comes with a note from the server saying how
+    long it can be trusted. If the time has not run out, the browser just uses its copy and asks nobody — instant. If the
+    time has run out, it still has to ask "has this changed?", and even a "no, it has not" answer takes a full trip to
+    the server and back. So the best thing you can do is make copies trustworthy for a very long time, and change the
+    file's <em>name</em> whenever its contents change.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A printed price list with a date on it. Inside its valid period the shop assistant quotes from it
+    directly. Once the date passes, they have to phone head office — and phoning to hear "prices unchanged" takes just as
+    long as phoning to get new prices.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A shop can decide to trust an old list a bit longer, or eyeball it, or ask a colleague. The
+    browser cannot improvise: it follows the note exactly. And there is a move the paper analogy has no equivalent for —
+    printing a <em>new list with a new title</em> so the old one can never be mistaken for current. That is fingerprinted
+    URLs, and it is what makes a one-year lifetime safe rather than reckless.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Two, and they are opposite mistakes. First: reading <code>no-cache</code> as "do not cache". It means "always check
+    first" — the never-store directive is <code>no-store</code>. Second: believing a <code>304</code> is free. It carries
+    no body, so it looks free in the Size column, and it costs a whole round trip, so it is not. Forty of them on a phone
+    is seconds. The mental model that fixes both: <b>ask whether the browser had to talk to the server at all</b>, not
+    how many bytes came back.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a teammate who says: <i>"I set <code>max-age</code> to five minutes on our assets so
+    customers always get the latest version"</i>. Explain what they actually bought and what it cost, and what to do
+    instead. No jargon: not "revalidation", not "fingerprinting", until you have said each plainly. Then <b>send it to
+    me</b> — I want to see you name the round trip.
+  </p>
+</div>
+
+<h2>6. Point at it: read the real headers <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Cache hits, in one column.</b> DevTools &rarr; <b>Network</b>, cache <em>enabled</em>, and navigate between two
+  pages of a storefront. Read the <b>Size</b> column: <code>(disk cache)</code> and <code>(memory cache)</code> are the
+  free green box from the diagram. A byte count means the network was used.</li>
+  <li><b>Find the round trips that returned nothing.</b> Filter the Status column for <code>304</code>. Every one is a
+  full round trip spent hearing "unchanged". Count them and multiply by a mobile RTT — that number belongs in your
+  report.</li>
+  <li><b>Read one asset's headers properly.</b> Click a theme asset &rarr; <b>Headers</b> &rarr; Response headers. Note its
+  <code>Cache-Control</code>, its <code>ETag</code>, and whether <code>immutable</code> is present. Then do the same for
+  the HTML document, and for one third-party script. Three headers, three different strategies — writing them down is
+  gate #3 for this core.</li>
+  <li><b>Prove the fetch option matters.</b> In the Console, run the same request twice:
+  <code>await fetch('/cart.js'); await fetch('/cart.js', { cache: 'no-store' });</code> and compare the two entries in the
+  Network panel. Same URL, different cache behaviour, decided entirely by your own code.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">On a client storefront, a page-to-page navigation shows 38 requests: 9 return <code>200</code> with bytes, 24 are <code>304</code>, and 5 come from disk cache. The 24 revalidations are all from one review app's origin, whose script and CSS carry <code>Cache-Control: no-cache</code>. The site's own theme assets are the 5 disk-cache hits. Mobile RTT in the field is about 170 ms.</p>
+  Before flipping the recall cards: work out what the 24 revalidations cost per page view, explain why the app's choice is not automatically wrong, and say what you would put in the report. Then the interviewer's follow-up: the merchant asks you to "cache the app's files harder". Can you? What can you actually do, and what would you refuse to do?
+</div>
+
+<h2>7. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Type this small server by hand — it is the only way to control headers on your own machine:</p>
+  <pre><code>python3 - &lt;&lt;'PY'
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+class H(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        if self.path.endswith('fresh.js'):
+            self.send_header('Cache-Control', 'max-age=600')
+        if self.path.endswith('check.js'):
+            self.send_header('Cache-Control', 'no-cache')
+        if self.path.endswith('never.js'):
+            self.send_header('Cache-Control', 'no-store')
+        super().end_headers()
+HTTPServer(('', 8000), H).serve_forever()
+PY</code></pre>
+  <p>Create <code>fresh.js</code>, <code>check.js</code>, <code>never.js</code> (any one-line content) and an
+  <code>index.html</code> that loads all three. Then open <code>http://localhost:8000</code> with the Network panel open
+  and <b>cache enabled</b>.</p>
+  <p><b>Predict before your second reload:</b> for each of the three files, will you see a byte count, a
+  <code>304</code>, or <code>(disk cache)</code>? Write all three down. Then reload and check.</p>
+  <p>Expected: <code>fresh.js</code> from cache with no request, <code>check.js</code> a <code>304</code>,
+  <code>never.js</code> a full <code>200</code> every time. Three headers, three completely different network costs, same
+  file size.</p>
+  <p><b>Now throttle to <i>Slow 4G</i> and reload again</b>, watching the timings. Predict which one's cost grows the
+  most. The <code>304</code> is the interesting case: still no bytes, and now clearly expensive — the point of section 1,
+  measured.</p>
+  <p><b>Break the fingerprinting idea on purpose.</b> Change <code>fresh.js</code>'s contents on disk and reload without
+  clearing the cache. Predict: does the browser pick up your change? It does not, for ten minutes — which is exactly the
+  behaviour that makes a long <code>max-age</code> dangerous <em>without</em> a content-based URL, and safe with one. Then
+  rename it to <code>fresh.v2.js</code>, update the HTML, and watch it load immediately.</p>
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b><code>Cache-Control</code> directives &amp; immutable assets</b> done only if all three held, from memory: (1) you explained the five-minute <code>max-age</code> mistake to a teammate — the teach-back in section 5; (2) you predicted all three files' network behaviour before reloading, and predicted that the renamed file would load at once; (3) you wrote down the real <code>Cache-Control</code> of a theme asset, the HTML, and a third-party script from a live storefront. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://web.dev/articles/http-cache">web.dev — HTTP cache</a> (20 min) for the decision tree, then <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control">MDN — <code>Cache-Control</code></a> as the directive-by-directive reference you come back to. The MDN <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching">HTTP caching guide</a> has the clearest explanation of revalidation flow.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b><code>ETag</code> versus <code>Last-Modified</code> in detail</b> <span class="pill depth">depth</span> — strong and
+  weak validators, and why an <code>ETag</code> can differ per server in a cluster. <b>CDN edge caching and
+  invalidation</b> <span class="pill depth">depth</span> — the shared-cache half, where <code>s-maxage</code> lives.
+  <b>The Cache API and <code>CacheStorage</code></b> <span class="pill depth">depth</span> — a cache <em>you</em> program,
+  not one you configure. <b>Service worker strategies</b> <span class="pill depth">depth</span>.
+  <b><code>stale-while-revalidate</code> as a design pattern</b> <span class="pill depth">depth</span> — named in the table.
+  Next core lesson: <a href="0019-resource-hints.html">0019 · resource hints</a>, which changes <em>when</em> a request
+  happens rather than whether.
+</div>
+
+<p class="ask">Anything unclear — why <code>immutable</code> exists on top of <code>max-age</code>, what to do when you cannot set headers, whether a <code>304</code> is ever worth it? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Two questions: <b>is it fresh?</b> (free if yes) and <b>has it changed?</b> (a full round trip, even for a <code>304</code>).</li>
+    <li>A <code>304</code> has no body and still costs one RTT. Judge caching by <b>whether the browser talked to the server</b>, not by bytes.</li>
+    <li><code>no-cache</code> = "store it, always revalidate". <code>no-store</code> = "never keep it". Do not swap them.</li>
+    <li>Correctness should come from the <b>URL</b>, not the header: fingerprinted assets get <code>max-age=31536000, immutable</code>.</li>
+    <li>Three-line strategy: HTML <code>no-cache</code> + <code>ETag</code>; hashed assets a year plus <code>immutable</code>; personal data <code>no-store, private</code>.</li>
+    <li><code>private</code> keeps a response out of shared caches; <code>s-maxage</code> gives CDNs their own shorter lifetime.</li>
+    <li>On a Shopify theme you usually <b>do not own these headers</b> — you own which URL you request, whether you request it, and your <code>fetch</code> <code>cache</code> option.</li>
+    <li>Always read the real header in the Network panel. Never quote one from memory, including from this lesson.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>a long lifetime is safe exactly when the URL changes with the content.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/network-delivery.html">Cheat sheet: network &amp; delivery</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0019-resource-hints.html">Next: 0019 · resource hints &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What does Cache-Control: no-cache instruct the browser to do?',
+    options: [
+      'store the response but revalidate before each use',
+      'never write the response into any cache at all',
+      'cache it only in memory and not on the disk'
+    ],
+    answer: 0,
+    why: 'It means always check with the server first. The directive that forbids storing anything is no-store, and confusing the two produces either needless round trips or cached personal data.'
+  },
+  {
+    q: 'A 304 Not Modified response carries no body. What does it cost?',
+    options: [
+      'one full round trip, despite the empty body',
+      'nothing at all, since the bytes came from cache',
+      'the same as a full response minus the payload'
+    ],
+    answer: 0,
+    why: 'The browser had to ask and wait for an answer, which is a round trip. On a 170 ms mobile connection two dozen of them per page view is several seconds spent hearing "unchanged".'
+  },
+  {
+    q: 'Why is max-age of one year safe for a fingerprinted asset?',
+    options: [
+      'new content is published at a new URL',
+      'browsers ignore lifetimes beyond a few days',
+      'the ETag still forces a check on every load'
+    ],
+    answer: 0,
+    why: 'Correctness comes from the URL rather than the header, so the old URL can never serve wrong content. That is what makes a long lifetime, plus immutable, the safe option rather than the risky one.'
+  },
+  {
+    q: 'Which header keeps a customer-specific response out of a shared CDN cache?',
+    options: [
+      'Cache-Control: private, and no-store if sensitive',
+      'Cache-Control: max-age=0 with a matching ETag',
+      'Cache-Control: public with a very low s-maxage'
+    ],
+    answer: 0,
+    why: 'private permits the browser to store it while forbidding shared caches. For genuinely sensitive responses such as cart or account data, no-store is the correct instruction.'
+  },
+  {
+    q: 'On a Shopify theme, which of these do you actually control?',
+    options: [
+      'the cache option on your own fetch calls',
+      'the Cache-Control header on theme assets',
+      'the edge cache lifetime of storefront HTML'
+    ],
+    answer: 0,
+    why: 'Shopify\'s CDN sets the headers for assets and storefront HTML. What is yours is which URL you request, whether you request it, and the cache mode of requests your JavaScript makes.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Walk me through what the browser does with a cached response."',
+    answer: 'It asks two things. <b>Is my copy fresh?</b> — decided locally from the freshness lifetime; if yes the copy is used with <b>no network at all</b>. If not fresh: <b>has it changed?</b> — a conditional request with <code>If-None-Match</code> or <code>If-Modified-Since</code>, which may come back <code>304 Not Modified</code> with no body but <b>still costs a full round trip</b>.<br><br><i>Likely follow-up:</i> "So how do you tell a real cache hit from a 304 in DevTools?" The Size column. <code>(disk cache)</code> or <code>(memory cache)</code> means no request happened; a <code>304</code> row means the browser went to the server and came back with nothing.'
+  },
+  {
+    prompt: '"What caching headers would you set for a site you controlled?"',
+    answer: 'Three lines. HTML gets <code>no-cache</code> — or a short <code>max-age</code> — plus an <code>ETag</code>, because it names the asset URLs and must not be stale. Fingerprinted assets get <code>max-age=31536000, immutable</code>, because their URL changes whenever their content does, so an old URL can never be wrong. Customer-specific responses get <code>no-store, private</code>.<br><br><i>Likely follow-up:</i> "Why not a middle value like an hour?" Because it is the worst of both: too long to ship an urgent fix, too short to avoid the revalidation traffic. Moving correctness into the URL removes the trade-off instead of splitting it.'
+  },
+  {
+    prompt: 'The 24-revalidation drill: cost per page view, whether the app is wrong, the report line, and "cache their files harder".',
+    answer: '24 revalidations at roughly 170 ms is on the order of <b>4 seconds of round-trip time per page view</b> — spread across parallel connections, so not 4 seconds of wall clock, but real time on the same radio and CPU, repeated on every navigation, returning zero bytes of new information.<br><br>Is the app wrong? Not automatically. <code>no-cache</code> is a defensible choice for a vendor who ships to thousands of shops from unversioned URLs: they cannot fingerprint per merchant, and being able to push a fix immediately may matter more to them than our round trips. It is a trade they made in their interest, not a mistake.<br><br>Report line: name the origin, the header, the count, and the estimated per-page cost — then note that our own theme assets are already served from disk cache, so this is not something we can fix in the theme.<br><br><i>Likely follow-up:</i> "Cache their files harder — can you?" Not directly: we do not control their headers, and a browser will not override them. What I can do: defer the app\'s scripts so their revalidations are off the critical path; ask the vendor for versioned URLs; and, if the app allows it, self-host the static part under our own fingerprinted URL. What I would refuse: proxying or re-hosting their script without permission and without a way to receive their updates — that turns a slow page into a broken one the first time they change something, and it makes us responsible for their security fixes.'
+  }
+]);
+</script>
+</body>
+</html>

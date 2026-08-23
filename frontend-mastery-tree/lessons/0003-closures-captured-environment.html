@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0003 · Closures — captured environment, not copied values — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Execution model · Lesson 0003</p>
+<h1>Closures — captured environment, not copied values</h1>
+<p class="subtitle">Lesson 0001 said a frame is thrown away when a function returns. Lesson 0002 said a function's box has an arrow to the box around it. Those two rules cannot both be true — and the way the engine resolves the conflict <em>is</em> the closure.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #1 (explain from first principles) and ability #3 (say what the design gives up) — a closure is not a feature that was added, it is a consequence you can derive.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can derive closures instead of remembering them, predict whether two functions share one variable or get one each, and name the exact price the language pays for this — the price you will meet again as a memory leak in lesson 0009.
+</div>
+
+<h2>1. The contradiction that forces closures to exist</h2>
+<p>
+  Two rules we already accepted, in order:
+</p>
+<ul>
+  <li><b>From 0001:</b> when a function returns, its frame is popped off the call stack. Gone.</li>
+  <li><b>From 0002:</b> a function's lexical environment holds an <em>arrow</em> to the environment that surrounded it in the source — fixed at creation, never changed.</li>
+</ul>
+<p>
+  Now write four lines that put the two rules against each other:
+</p>
+
+<pre><code>function makeCounter() {
+  let count = 0;                       <span class="cmt">// lives in makeCounter's box</span>
+  return function inc() { return ++count; };
+}
+const next = makeCounter();            <span class="cmt">// makeCounter has RETURNED</span>
+console.log(next(), next());           <span class="cmt">// → </span><span class="out">1 2</span></code></pre>
+
+<p>
+  <code>makeCounter</code> has returned. Rule one says its frame is gone. But <code>inc</code>'s arrow points at
+  <code>makeCounter</code>'s box, and <code>inc</code> is still alive in <code>next</code>. So either the arrow now
+  points at nothing — and <code>next()</code> should crash — or <b>the box outlived the frame</b>. It printed
+  <code>1 2</code>, so the box outlived the frame. There is no third option.
+</p>
+<p>
+  The engine can do this because the frame and the box are not the same thing and do not live in the same place.
+  Frames live on the <b>stack</b>, sized and freed in strict order. Environments live on the <b>heap</b>, freed only
+  when nothing can reach them any more (that reachability rule is its own core, lesson 0009). A returned function is
+  something that can reach its box. So the box is kept.
+</p>
+
+<div class="soundbite">
+  <span class="label">Say it this way</span>
+  <p>A closure is not a feature someone added to JavaScript. It is what you are left with when lexical arrows and heap reachability are both true at the same time.</p>
+</div>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 240" role="img" aria-label="Two panels: while makeCounter runs its frame is on the stack pointing at its environment in the heap; after it returns the frame is gone but the environment survives because the returned function still points at it">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">1 · WHILE makeCounter() RUNS</text>
+  <text class="sub" x="16" y="46">call stack</text>
+  <rect class="box hot" x="16" y="54" width="130" height="32" rx="5"/>
+  <text class="mono" x="30" y="75">makeCounter</text>
+  <rect class="box dim" x="16" y="90" width="130" height="32" rx="5"/>
+  <text class="mono sm" x="30" y="111">(script)</text>
+  <line class="rule" x1="12" y1="126" x2="150" y2="126"/>
+  <text class="sub" x="196" y="46">heap</text>
+  <rect class="box" x="190" y="54" width="140" height="68" rx="5"/>
+  <text class="mono sm" x="204" y="76">box #1</text>
+  <text class="mono" x="204" y="101">count: 0</text>
+  <path class="flow" d="M150,70 L184,80"/>
+  <text class="sub" x="16" y="160">the running frame can</text>
+  <text class="sub" x="16" y="176">reach its own box</text>
+
+  <line class="rule thin" x1="360" y1="10" x2="360" y2="215"/>
+
+  <text class="cap amber" x="392" y="18">2 · AFTER IT RETURNS</text>
+  <text class="sub" x="392" y="46">call stack</text>
+  <rect class="box dim" x="392" y="54" width="130" height="32" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="mono sm" x="406" y="75">popped</text>
+  <rect class="box dim" x="392" y="90" width="130" height="32" rx="5"/>
+  <text class="mono sm" x="406" y="111">(script)</text>
+  <line class="rule" x1="388" y1="126" x2="526" y2="126"/>
+  <text class="sub" x="566" y="46">heap</text>
+  <rect class="box hot" x="560" y="28" width="140" height="34" rx="5"/>
+  <text class="mono" x="574" y="50">fn inc</text>
+  <rect class="box" x="560" y="88" width="140" height="60" rx="5"/>
+  <text class="mono sm" x="574" y="108">box #1</text>
+  <text class="mono" x="574" y="132">count: 0</text>
+  <path class="flow amber" d="M630,66 L630,84"/>
+  <text class="sub" x="392" y="160">frame gone, box alive —</text>
+  <text class="sub" x="392" y="176">inc can still reach it, so</text>
+  <text class="sub" x="392" y="192">the engine may not free it</text>
+</svg>
+<figcaption>The frame is popped; the box is not. "Closure" is the name for the pair — the function plus the box it can still reach.</figcaption>
+</figure>
+
+<h2>2. Captured means shared, not copied</h2>
+<p>
+  This is the sentence in the lesson title, and it is where most wrong answers come from. <code>inc</code> does not
+  hold <em>the number 0</em>. It holds <em>the arrow to the box</em>. Every read of <code>count</code> walks that
+  arrow and reads whatever is in the box <em>right now</em>. So two functions created in the same box are talking
+  about the same variable:
+</p>
+
+<pre><code>function makeCounter() {
+  let count = 0;
+  return {
+    inc: () =&gt; ++count,
+    dec: () =&gt; --count,
+    read: () =&gt; count
+  };
+}
+const c = makeCounter();
+c.inc(); c.inc(); c.dec();
+console.log(c.read());   <span class="cmt">// → </span><span class="out">1</span></code></pre>
+
+<p>
+  Three separate functions, one box, one <code>count</code>. If capture were a copy, each would have its own
+  <code>0</code> and <code>read()</code> would print <code>0</code> forever. Per
+  <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Closures">MDN — Closures</a>, the function keeps
+  a reference to its lexical environment, not a snapshot of its values.
+</p>
+
+<h2>3. One box per call — which is why counters are independent</h2>
+<p>
+  A new box is created every time the outer function <em>runs</em>, not every time it is written. So:
+</p>
+
+<pre><code>const a = makeCounter();
+const b = makeCounter();
+a.inc(); a.inc();
+console.log(a.read(), b.read());   <span class="cmt">// → </span><span class="out">2 0</span></code></pre>
+
+<p>
+  Two calls, two boxes, two independent <code>count</code> variables. This single rule — <b>one box per execution,
+  shared by everything created inside that execution</b> — answers both classic puzzles:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Code shape</th><th>How many boxes</th><th>Result</th></tr>
+<tr><td><code>for (var i …)</code> + 3 callbacks</td><td>one — <code>var</code> binds to the whole function</td><td>all three read the same <code>i</code>, already <code>3</code></td></tr>
+<tr><td><code>for (let i …)</code> + 3 callbacks</td><td>three — a fresh block box per iteration</td><td>each callback reads its own <code>i</code>: <code>0 1 2</code></td></tr>
+<tr><td><code>makeCounter()</code> called twice</td><td>two — one per call</td><td>independent counters</td></tr>
+</table>
+</div>
+<p>
+  Lesson 0002 already showed the <code>var</code>/<code>let</code> loop. Nothing new was needed to explain it —
+  that is the sign the model is right.
+</p>
+
+<h2>4. What the design gives up</h2>
+<p>
+  Every mechanism trades something away, and being able to name the trade is what separates a senior answer from a
+  correct one. Closures buy you private state with no classes and no ceremony. The price:
+</p>
+<ul>
+  <li><b>Memory you did not ask for.</b> As long as the function is reachable, its whole box is reachable. Attach a
+  handler that closes over a big object, never remove the handler, and that object stays for the life of the page.
+  This is the leak shape in lesson 0009 — and it is the same rule, not a new one.</li>
+  <li><b>Surprise sharing.</b> Two functions in one box look independent in the source and are not. Bugs of the form
+  "why did the second card's button change the first card's total" are almost always one box where you assumed two.</li>
+  <li><b>Harder to reason about later.</b> The state is invisible: there is no property to log. You have to know
+  which box a function came from.</li>
+</ul>
+<div class="note">
+  <span class="label">One engine detail — a bare fact, not a derivation</span>
+  V8 does not necessarily keep <em>every</em> variable of the outer function alive: it allocates a context object for
+  the bindings the inner functions actually reference. So an unused huge array in the outer scope <em>may</em> be
+  collected. Treat this as an optimisation you can observe in a heap snapshot, never as a guarantee to design around —
+  the spec promises you the whole environment. Check it in DevTools rather than trusting either of us:
+  <a href="https://developer.chrome.com/docs/devtools/memory-problems/">Fix memory problems</a>.
+</div>
+
+<h2>5. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    A function is born inside a box of names. When the function is passed somewhere else and used later, it still
+    knows its box. Not a photocopy of the box — <b>the box itself</b>. So if anything changes a name in that box, the
+    function sees the new value, because it looks in the box every time. And the box cannot be thrown away while the
+    function is still around, because the function would have nowhere to look.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A shared kitchen notebook. Two cooks were trained in the same kitchen and both know where the
+    notebook is kept. One writes "salt: 2" in it; the other reads "2". They are not carrying copies — they walk to the
+    same notebook. A new kitchen, opened later, gets its own notebook, and cooks trained there cannot see the first one.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A cook can decide to stop using the notebook, and the notebook can be thrown out. Here it
+    is the other way round: the notebook is thrown out <em>only</em> when the last cook who knows about it is gone, and
+    the cook has no way to let go of it. You do not choose to keep the box; keeping the function keeps the box. That
+    reversal is the whole memory story of lesson 0009.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    The wrong mental model is "the function remembers the <b>value</b> it saw when it was created". People say this
+    with confidence and then cannot explain why <code>var</code> in a loop prints <code>3, 3, 3</code>. The right
+    model is "the function remembers <b>where to look</b>". Test yourself with one question: if capture were a copy,
+    could two arrow functions in the same box ever disagree about <code>count</code>? No — and they never do, because
+    there is one box. Second sticking point: a box is made per <em>call</em>, not per function-definition-in-the-source.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior who asks: <i>"I made two counters with the same factory function. Why don't
+    they share the number, when you told me closures share things?"</i> You must use the word "call" and you must not
+    use the word "instance". Then <b>send it to me</b> — the gap I am looking for is whether you separate
+    <em>one box per call</em> from <em>one box shared inside a call</em>.
+  </p>
+</div>
+
+<h2>6. Point at it: the Closure scope in DevTools <span class="pill soft">gate #3</span></h2>
+<p>You never have to believe any of this. Chrome names it on screen:</p>
+<ol>
+  <li>Paste the <code>makeCounter</code> code into the Console, then run <code>const c = makeCounter()</code>.</li>
+  <li>DevTools &rarr; <b>Sources</b> &rarr; set a breakpoint inside <code>inc</code> &rarr; call <code>c.inc()</code>.</li>
+  <li>The <b>Scope</b> pane shows <code>Local</code>, then an entry literally labelled
+  <b><code>Closure (makeCounter)</code></b> holding <code>count</code>. That entry is box #1 from the diagram — still
+  in the heap, long after the frame was popped. Expand it and watch <code>count</code> change as you call
+  <code>c.inc()</code> again.</li>
+  <li>Now the memory side: <b>Memory</b> panel &rarr; <i>Heap snapshot</i> &rarr; search for the string in your closed-over
+  data. The <b>Retainers</b> section names the function that is holding it. That is the leak-hunting move you will use
+  for real in lesson 0009.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A product grid renders 24 cards. The theme's <code>quantity-stepper.js</code> loops over the cards, and inside the loop it does <code>var input = card.querySelector('.qty');</code> and then attaches a <code>click</code> handler that reads <code>input.value</code>. QC reports that the plus button on <em>every</em> card changes the quantity of the <em>last</em> card only.</p>
+  Before flipping the recall cards: how many boxes exist here, which one do all 24 handlers point at, and what is the smallest one-word change that fixes it? Second question, the one an interviewer will ask next: after the fix, how many boxes are alive, and what does each one keep in memory?
+</div>
+
+<h2>7. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type this by hand — do not copy-paste, the typing is part of the exercise:</p>
+  <pre><code>function makeCounter() {
+  let count = 0;
+  return {
+    inc: () =&gt; ++count,
+    read: () =&gt; count
+  };
+}
+const a = makeCounter();
+const b = makeCounter();
+a.inc(); a.inc(); b.inc();
+console.log(a.read(), b.read());</code></pre>
+  <p><b>Predict on paper first:</b> two numbers, in order. Then run it.</p>
+  <p>Now break it on purpose — move <code>count</code> out of the function, one line up:</p>
+  <pre><code>let count = 0;                <span class="cmt">// now in the global box, not per call</span>
+function makeCounter() {
+  return { inc: () =&gt; ++count, read: () =&gt; count };
+}</code></pre>
+  <p>Predict again <em>before</em> running: what do the two numbers become, and why? Then run it. You have just
+  converted "one box per call" into "one box for the whole program" by moving a single line — that is the entire
+  mechanism, demonstrated in one edit.</p>
+  <p><b>Third round, the memory one.</b> Replace the counter's body with something big and watch it survive:</p>
+  <pre><code>function hold() {
+  const big = new Array(1e6).fill('x');   <span class="cmt">// ~ a few MB</span>
+  return () =&gt; big.length;                <span class="cmt">// the arrow keeps `big` reachable</span>
+}
+window.keep = hold();                     <span class="cmt">// now nothing can free it</span></code></pre>
+  <p>Take a heap snapshot, then run <code>window.keep = null</code>, force garbage collection (the bin icon), take a
+  second snapshot, and compare. You have just watched a closure hold and release a few megabytes on purpose.</p>
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>closures — captured environment, not copied values</b> done only if all three held, from memory: (1) you explained, in plain English with no jargon, why a returned function can still read the outer variable — the teach-back in section 5; (2) you predicted <code>2 0</code> and then the broken version's output before running either; (3) you saw the <code>Closure (makeCounter)</code> entry in the Scope pane with your own eyes. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Closures">MDN — Closures</a> (20 min). Read its "Creating closures in loops" and "Performance considerations" sections twice — they are this lesson's sections 3 and 4 in MDN's words. Spec anchor: <a href="https://tc39.es/ecma262/#sec-lexical-environments">ECMA-262 § Lexical Environments</a>, which never uses the word "closure" at all — because it does not need to.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Hoisting &amp; the temporal dead zone</b> <span class="pill depth">depth</span> — the first item in the depth
+  queue, and the reason a closure over a <code>let</code> can throw if called too early. <b>The module pattern's
+  history</b> (IIFE, UMD) <span class="pill depth">depth</span> — Chapter 4 covers modules properly. <b>WeakMap and
+  WeakRef</b> <span class="pill depth">depth</span> — the deliberate way to hold something without keeping it alive;
+  we meet it briefly in lesson 0009 and study it later. Next core lesson: <a href="0004-this-binding-call-site-bind-arrow.html">0004 · <code>this</code> binding</a>, the mechanism people confuse with this one.
+</div>
+
+<p class="ask">Anything unclear — why the box survives, why an engine may drop unused variables, how this shows up in your theme's event handlers? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>A <b>closure</b> = a function plus the lexical environment (box) it was created in. Not a feature — a consequence of lexical arrows + heap reachability.</li>
+    <li>Frames live on the <b>stack</b> and are popped on return; environments live on the <b>heap</b> and survive while anything can reach them.</li>
+    <li><b>Captured means shared, not copied.</b> The function holds the arrow, so it always reads the current value.</li>
+    <li><b>One box per call.</b> Two calls to the same factory give two independent boxes; everything created inside one call shares that one box.</li>
+    <li>The price: keeping the function keeps the whole box — that is the memory-leak shape in lesson 0009, not a separate rule.</li>
+    <li>DevTools names it out loud: the <b>Scope</b> pane's <code>Closure (fnName)</code> entry <em>is</em> the surviving box.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>a closure remembers where to look, never what it saw.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/execution-model.html">Cheat sheet: execution model</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0004-this-binding-call-site-bind-arrow.html">Next: 0004 · <code>this</code> binding &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What does a closure actually hold on to?',
+    options: [
+      'a reference to the environment it was created in',
+      'a private copy of every outer variable it uses',
+      'the source text of the function that made it'
+    ],
+    answer: 0,
+    why: 'A reference — the arrow. Reading a captured name walks that arrow into the live environment, which is why the value can change after the outer function returned.'
+  },
+  {
+    q: 'const a = makeCounter(); const b = makeCounter(); a.inc(); a.inc(); b.inc(); — what does a.read(), b.read() print?',
+    options: [
+      '2 1',
+      '3 3',
+      '1 1'
+    ],
+    answer: 0,
+    why: 'One box per call. Two calls to makeCounter made two boxes, each with its own count: a was incremented twice, b once.'
+  },
+  {
+    q: 'Why does the frame disappear on return while the environment does not?',
+    options: [
+      'frames are stack-allocated, environments are heap-allocated',
+      'frames are optional, environments are required by the spec',
+      'frames are cleared by the garbage collector on return'
+    ],
+    answer: 0,
+    why: 'The stack frees in strict order on return; the heap frees only when nothing can reach the object. A returned function can reach its environment, so the environment is kept.'
+  },
+  {
+    q: 'Three arrow functions are created in one call of the same outer function. How many copies of the outer variable exist?',
+    options: [
+      'one, shared by all three functions',
+      'three, one for each created function',
+      'four, one shared plus one each'
+    ],
+    answer: 0,
+    why: 'The box belongs to the call, not to each function. All three arrows point at the same environment, so all three see and change the same variable.'
+  },
+  {
+    q: 'Which DevTools label proves a closed-over variable is still alive?',
+    options: [
+      'Sources panel, Scope pane, the Closure (fn) entry',
+      'Elements panel, Styles pane, the Inherited section',
+      'Network panel, Timing tab, the Stalled duration'
+    ],
+    answer: 0,
+    why: 'Pause inside the inner function and the Scope pane lists Closure (outerFnName) with the captured bindings inside it — the surviving environment, rendered as UI.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Explain closures to me without using the word closure."',
+    answer: 'A function is created inside a set of names. It keeps a <b>reference</b> to that set, not a copy. So even after the outer call has finished and its stack frame is gone, the function can still read and change those names — because the names live on the <b>heap</b>, and something that can still reach them is holding them alive.<br><br><i>Likely follow-up:</i> "So what gets thrown away when the outer function returns?" Only the stack frame — the position in the code and the bookkeeping for that call. The environment survives exactly as long as something can reach it.'
+  },
+  {
+    prompt: '"Two counters from the same factory do not share their number, but two arrow functions inside one counter do. Reconcile those."',
+    answer: 'One box is created <b>per call</b> of the factory, and everything created <em>during</em> that call shares it. Two calls means two boxes, so two independent numbers. Two arrows created inside one call means one box, so one shared number. The unit of sharing is the call, not the function definition.<br><br><i>Likely follow-up:</i> "Where else does that rule show up?" A <code>for (let i …)</code> loop — the specification creates a fresh block environment per iteration, so callbacks made in different turns capture different boxes, which is the whole <code>var</code>-versus-<code>let</code> difference.'
+  },
+  {
+    prompt: 'The quantity-stepper drill: 24 cards, one `var input` in the loop, and every plus button edits the last card. What happened, and what does the fix change about memory?',
+    answer: 'One box. <code>var</code> binds to the enclosing <b>function</b>, so all 24 handlers captured the same <code>input</code> binding, whose final value is the last card\'s input. Changing <code>var</code> to <code>let</code> makes the loop create a <b>fresh block environment per iteration</b>, so each handler captures its own binding. On memory: before the fix, one box held one input reference. After it, 24 boxes each hold one — slightly more memory, and each one keeps its card\'s DOM node reachable for as long as the handler is attached.<br><br><i>Likely follow-up:</i> "Does that leak?" Only if the cards are removed from the DOM while the handlers stay attached — then you have detached nodes held by live closures, which is exactly the shape we hunt in lesson 0009.'
+  }
+]);
+</script>
+</body>
+</html>

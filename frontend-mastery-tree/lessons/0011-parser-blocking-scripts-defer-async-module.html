@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0011 · Parser-blocking scripts vs defer, async and module — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Parse · Lesson 0011</p>
+<h1>Parser-blocking scripts vs <code>defer</code>, <code>async</code> and module</h1>
+<p class="subtitle">Lesson 0010 ended with a script that stopped the page being read at all. This lesson explains why the parser has no choice, and what each of the four attributes actually changes — which is one of the cheapest performance wins in any theme.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #5 (judge someone else's work) — reviewing a <code>&lt;head&gt;</code> is a skill, and this is the mechanism you review it with.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~30 minutes you can read any script tag and say when it downloads, when it runs, and in what order relative to its neighbours — and you can defend the one case where <code>async</code> is wrong even though it sounds fastest.
+</div>
+
+<h2>1. Why the parser must stop</h2>
+<p>
+  The parser is building the DOM in document order. Then it meets a <code>&lt;script&gt;</code>. Ask what the script is
+  allowed to do at that moment. It can call <code>document.write('&lt;div&gt;')</code> and insert markup <em>at that exact
+  position</em>. It can read the DOM built so far. It can move nodes.
+</p>
+<p>
+  So the parser cannot continue past a classic script and hope, because the script may change the very bytes it would
+  read next. There is no safe way to run the two at once. It must stop, wait for the script (downloading it if needed),
+  run it to completion — remember run-to-completion from lesson 0005, this is the same one thread — and then resume.
+  That is what <b>parser-blocking</b> means, and it follows from <code>document.write</code> existing at all
+  (<a href="https://html.spec.whatwg.org/multipage/scripting.html#attr-script-async">HTML Standard § script attributes</a>).
+</p>
+<p>
+  Every one of the four modes below is a way of promising the parser "I will not do that", so it can keep going.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 300" role="img" aria-label="Four timelines comparing a classic script which stops parsing, defer which runs after parsing, async which runs as soon as it downloads, and a module which behaves like defer">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="16">TIME &rarr;   solid = parsing HTML  ·  dashed = waiting on network  ·  amber = script executes</text>
+
+  <text class="mono sm" x="16" y="52">classic</text>
+  <rect class="box" x="110" y="34" width="140" height="26" rx="4"/>
+  <rect class="box bad" x="250" y="34" width="150" height="26" rx="4" stroke-dasharray="5 4"/>
+  <rect class="box hot" x="400" y="34" width="60" height="26" rx="4"/>
+  <rect class="box" x="460" y="34" width="246" height="26" rx="4"/>
+  <text class="sub" x="110" y="78">the DOM stops growing for the whole download AND the execution</text>
+
+  <text class="mono sm" x="16" y="118">defer</text>
+  <rect class="box" x="110" y="100" width="510" height="26" rx="4"/>
+  <rect class="box hot" x="620" y="100" width="86" height="26" rx="4"/>
+  <path class="flow dash" d="M130,94 L378,94"/>
+  <text class="sub" x="130" y="88">downloaded in parallel, never blocks</text>
+  <text class="sub" x="110" y="144">runs after parsing finishes, in document order, before DOMContentLoaded</text>
+
+  <text class="mono sm" x="16" y="184">async</text>
+  <rect class="box" x="110" y="166" width="190" height="26" rx="4"/>
+  <rect class="box hot" x="300" y="166" width="60" height="26" rx="4"/>
+  <rect class="box" x="360" y="166" width="346" height="26" rx="4"/>
+  <text class="sub" x="110" y="210">runs the moment it arrives &mdash; interrupts parsing, and the order is a race</text>
+
+  <text class="mono sm" x="16" y="250">module</text>
+  <rect class="box" x="110" y="232" width="490" height="26" rx="4"/>
+  <rect class="box hot" x="600" y="232" width="106" height="26" rx="4"/>
+  <text class="sub" x="110" y="276">deferred by default, and it resolves its own import graph first</text>
+  <text class="sub" x="110" y="292">add async to a module and it behaves like the async row above</text>
+</svg>
+<figcaption>Only the first row stops the DOM. The other three exist because the script promised not to touch the parser's position.</figcaption>
+</figure>
+
+<h2>2. The table to memorise once and then derive forever</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Tag</th><th>Downloads</th><th>Executes</th><th>Order guaranteed</th><th>Blocks parser</th></tr>
+<tr><td><code>&lt;script&gt;</code> inline</td><td>—</td><td>immediately</td><td>yes</td><td><b>yes</b></td></tr>
+<tr><td><code>&lt;script src&gt;</code></td><td>when reached</td><td>as soon as it arrives</td><td>yes</td><td><b>yes</b></td></tr>
+<tr><td><code>&lt;script src defer&gt;</code></td><td>in parallel</td><td>after parsing, before <code>DOMContentLoaded</code></td><td><b>yes</b></td><td>no</td></tr>
+<tr><td><code>&lt;script src async&gt;</code></td><td>in parallel</td><td>the instant it arrives</td><td><b>no</b> — a race</td><td>no, but it interrupts</td></tr>
+<tr><td><code>&lt;script type="module"&gt;</code></td><td>in parallel, plus its imports</td><td>after parsing, like <code>defer</code></td><td>yes</td><td>no</td></tr>
+</table>
+</div>
+<p>
+  Two extra facts that decide real arguments:
+</p>
+<ul>
+  <li><b>The preload scanner.</b> While the parser is blocked, a second, lighter reader scans ahead for URLs and starts
+  downloading them. That is why <code>defer</code> and <code>async</code> can download in parallel at all — and why
+  resources hidden from the scanner (built by JavaScript, or reached through <code>@import</code>) are so much slower.</li>
+  <li><b><code>async</code> is only correct for code that depends on nothing and that nothing depends on.</b> Analytics,
+  yes. Your theme's slider, no — it will sometimes run before the DOM it needs exists, and the failure is
+  intermittent, which is the worst kind.</li>
+</ul>
+<div class="trap">
+  <span class="label">Trap — the Shopify one</span>
+  Liquid's <code>script_tag</code> filter renders a plain classic script: <code>{{ 'theme.js' | asset_url | script_tag }}</code>
+  becomes a <b>parser-blocking</b> tag with no <code>defer</code>. Write the tag by hand instead —
+  <code>&lt;script src=&quot;{{ 'theme.js' | asset_url }}&quot; defer&gt;&lt;/script&gt;</code> — and you have removed a blocker in one
+  line. Then check what the apps injected: app script tags are frequently classic, and each one is a full stop in the
+  middle of your <code>&lt;head&gt;</code>.
+</div>
+
+<h2>3. Why <code>defer</code> is almost always the right default</h2>
+<p>
+  Line the requirements up and only one option survives. Your theme code usually needs the DOM to exist, needs to run in
+  a predictable order relative to other files, and must not delay the first frame. <code>defer</code> gives all three.
+  <code>async</code> gives up order. Classic gives up the first frame. Putting a classic script at the end of
+  <code>&lt;body&gt;</code> — the old advice — is strictly worse than <code>defer</code> in the head, because the head
+  version starts downloading much earlier while still executing late.
+</p>
+<pre><code><span class="cmt">&lt;!-- in the head: downloads early, runs late, keeps order --&gt;</span>
+&lt;script src=&quot;{{ 'vendor.js' | asset_url }}&quot; defer&gt;&lt;/script&gt;
+&lt;script src=&quot;{{ 'theme.js'  | asset_url }}&quot; defer&gt;&lt;/script&gt;
+<span class="cmt">&lt;!-- vendor.js is guaranteed to run before theme.js --&gt;</span></code></pre>
+<p>
+  One consequence to keep in mind: <code>defer</code> scripts run <em>before</em> <code>DOMContentLoaded</code> fires. So
+  a <code>defer</code> script that itself waits for <code>DOMContentLoaded</code> still works — the event has not
+  happened yet. That is a common worry and it is unfounded.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser reads your page from top to bottom, building it as it goes. When it hits a piece of code, it has to
+    stop reading — because that code is allowed to write new page content right there, and the browser cannot read and
+    be rewritten at the same time. So it waits, fetches the code, runs it, and only then carries on reading. Unless you
+    add a word that promises the code will not do that. Then the browser fetches it in the background and reads on.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> Reading a recipe aloud to someone cooking. At step 5 the recipe says "call the author and ask
+    what to do next; they may add a step here". You must stop reading, make the call, hear the answer, and only then
+    continue — because the answer might change step 6. <code>defer</code> is the author promising in advance: "my note
+    only matters at the end, keep reading".
+  </p>
+  <p>
+    <b>Where it breaks.</b> A reader could skim ahead while on the phone, and in fact the browser <em>does</em> — the
+    preload scanner runs ahead and starts fetching things it spots. But that skim only finds addresses written plainly in
+    the page. Anything a script builds at runtime is invisible to it, so the skim cannot save you from work you hid.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People treat <code>async</code> as "the fast one" and <code>defer</code> as "the slow one". Wrong axis. Both download
+    at the same time; they differ in <b>when they run and whether order holds</b>. <code>async</code> is a race, and a
+    race is the wrong shape for code with dependencies. The second sticking point: thinking a classic script at the
+    bottom of <code>&lt;body&gt;</code> is equivalent to <code>defer</code>. It is not — it starts its download much
+    later, so it finishes later, for exactly the same benefit.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences reviewing a teammate's pull request that adds <code>async</code> to the theme's main script
+    "because it is faster". Say what will break, why it will break intermittently, and what to write instead. Then
+    <b>send it to me</b> — this is ability #5, and "intermittently" is the word I am looking for.
+  </p>
+</div>
+
+<h2>5. Point at it: see the stall and the order <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>The stall, in one picture.</b> DevTools &rarr; <b>Performance</b> &rarr; record a reload of any storefront. Find
+  the long <b>Parse HTML</b> block on the Main track and look for <b>Evaluate Script</b> entries nested inside it. A
+  script running <em>inside</em> the parse block is a parser-blocking script, drawn as such.</li>
+  <li><b>Who blocks whom.</b> <b>Network</b> &rarr; enable the <i>Waterfall</i> column and hover a script's bar. Read
+  <i>Queueing</i> and <i>Stalled</i>: a classic script found late shows a long queue; a <code>defer</code> script found
+  early shows an early start and a late effect.</li>
+  <li><b>Order, proven.</b> Add <code>console.log</code> to two <code>defer</code> scripts and reload ten times: the order
+  never changes. Switch both to <code>async</code> and reload ten times with throttling on: the order changes. Watching
+  it flip is gate #3 for this core, and it is also the argument you will use in code review.</li>
+  <li><b>Audit the theme you actually ship.</b> Run <code>document.querySelectorAll('script[src]:not([defer]):not([async])')</code>
+  in the Console of a real storefront and read the list. Every entry is a full stop in the parse. Most of them will not
+  be yours.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A client's <code>theme.liquid</code> head has, in order: a classic <code>vendor.js</code> (140 KB), <code>{{ 'theme.js' | asset_url | script_tag }}</code>, an <code>async</code> analytics tag, and a chat widget script with no attributes. The product page's slider "sometimes does not initialise on mobile, maybe one load in ten".</p>
+  Before flipping the recall cards: say which tags delay the DOM, then explain the one-in-ten slider failure — being precise about which mode causes an intermittent failure and why the odds change on mobile. Then the interviewer's follow-up: you cannot edit the chat widget's tag because an app injects it. What are your options, and what does each cost?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Create three files. First, two tiny scripts, typed by hand:</p>
+  <pre><code><span class="cmt">// a.js</span>
+console.log('A ran', Math.round(performance.now()),
+  'body children:', document.body ? document.body.children.length : 'no body');
+
+<span class="cmt">// b.js  (same two lines, with B)</span></code></pre>
+  <p>Then the page:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;script src=&quot;a.js&quot;&gt;&lt;/script&gt;
+&lt;script src=&quot;b.js&quot;&gt;&lt;/script&gt;
+&lt;body&gt;
+  &lt;p&gt;one&lt;/p&gt;&lt;p&gt;two&lt;/p&gt;&lt;p&gt;three&lt;/p&gt;
+&lt;/body&gt;</code></pre>
+  <p><b>Predict before running:</b> what does each script report for <code>body children</code>? Serve it with
+  <code>python3 -m http.server</code> and check. Both say "no body" — they ran before the body existed, because they
+  blocked the parser at the point they appear.</p>
+  <p><b>Now add <code>defer</code> to both</b> and predict the two numbers before reloading. Both report <code>3</code>:
+  parsing finished first. Same files, same order, completely different world.</p>
+  <p><b>Now make the order break.</b> Switch both to <code>async</code>, set Network throttling to <i>Slow 4G</i>, and
+  reload eight or nine times, watching the console order.</p>
+  <pre><code>&lt;script src=&quot;a.js&quot; async&gt;&lt;/script&gt;
+&lt;script src=&quot;b.js&quot; async&gt;&lt;/script&gt;</code></pre>
+  <p>Predict first: will B ever print before A? Make <code>b.js</code> much smaller than <code>a.js</code> to load the
+  dice, and you will see it flip. <b>You have just reproduced an intermittent bug on purpose</b> — the most valuable
+  thing in this session, because it is the failure you will be asked to explain one day with no reproduction steps.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>parser-blocking scripts vs defer vs async vs module</b> done only if all three held, from memory: (1) you explained the intermittent-failure argument to a teammate — the teach-back in section 4; (2) you predicted "no body" for the classic version and <code>3</code> for the deferred version before running them; (3) you saw the <code>async</code> order flip with throttling on, or found <b>Evaluate Script</b> nested inside <b>Parse HTML</b> in a real profile. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/script">MDN — the <code>&lt;script&gt;</code> element</a> (15 min) — the attribute table there is section 2 of this lesson, and it is worth reading the notes under it about modules. Spec anchor: <a href="https://html.spec.whatwg.org/multipage/scripting.html#attr-script-async">HTML Standard § script async/defer</a>.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The preload scanner in detail</b> <span class="pill depth">depth</span> — named twice here, and worth its own lesson.
+  <b>Module resolution, import maps and top-level await</b> <span class="pill depth">depth</span>.
+  <b><code>document.write</code>'s full behaviour</b> <span class="pill depth">depth</span> — it justified the design; you
+  will never write it. <b>Third-party tag management strategy</b> <span class="pill depth">depth</span> — the political
+  half of the drill's follow-up. Next core lesson: <a href="0012-cascade-specificity-inheritance-layers.html">0012 · the cascade</a>, where we stop asking when things arrive and start asking which rule wins.
+</div>
+
+<p class="ask">Anything unclear — why <code>async</code> failures are intermittent, whether to convert every app tag, how modules order their imports? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>A classic script must stop the parser because it may write markup at its own position. Everything else is a promise not to.</li>
+    <li><code>defer</code>: parallel download, runs <b>after parsing, in document order</b>, before <code>DOMContentLoaded</code>. The right default.</li>
+    <li><code>async</code>: parallel download, runs <b>the moment it arrives</b>, order is a race. Correct only for code with no dependencies in either direction.</li>
+    <li><code>type="module"</code>: deferred by default, plus its own import graph. Adding <code>async</code> makes it behave like <code>async</code>.</li>
+    <li>The <b>preload scanner</b> reads ahead while the parser is blocked — which is why parallel downloads happen, and why URLs built by JavaScript are slow.</li>
+    <li>Liquid's <code>script_tag</code> filter emits a <b>blocking</b> script. Write the tag by hand with <code>defer</code>.</li>
+    <li>A classic script at the end of <code>&lt;body&gt;</code> is worse than <code>defer</code> in the head: same late execution, much later download.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b><code>defer</code> and <code>async</code> both download early — they differ in whether order survives.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0012-cascade-specificity-inheritance-layers.html">Next: 0012 · the cascade &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Why must a classic script stop the HTML parser?',
+    options: [
+      'it may write markup at its own position',
+      'it must be compiled before the DOM is built',
+      'the parser and the engine share one memory pool'
+    ],
+    answer: 0,
+    why: 'document.write can insert content exactly where the script tag sits, so the parser cannot safely read ahead. Every other script mode is a promise not to do that.'
+  },
+  {
+    q: 'Two scripts have defer. What is guaranteed about them?',
+    options: [
+      'they run after parsing, in document order',
+      'they run as soon as each one has downloaded',
+      'they run only after the load event has fired'
+    ],
+    answer: 0,
+    why: 'defer keeps document order and runs after parsing completes, before DOMContentLoaded. That combination is what makes it safe for code with dependencies.'
+  },
+  {
+    q: 'When is async the wrong choice for a theme script?',
+    options: [
+      'whenever it depends on the DOM or another file',
+      'whenever the file is larger than a hundred KB',
+      'whenever the page also loads any deferred script'
+    ],
+    answer: 0,
+    why: 'async runs the instant it arrives, so it may run before the markup it needs exists or before a library it uses has loaded. The failure depends on download timing, which makes it intermittent.'
+  },
+  {
+    q: 'A script tag with type="module" and no other attribute behaves like which one?',
+    options: [
+      'defer, plus resolving its own import graph',
+      'async, because modules always load in parallel',
+      'a classic script, because modules are executable'
+    ],
+    answer: 0,
+    why: 'Modules are deferred by default and keep order, and the browser also fetches and evaluates their imports first. Adding async opts into the race instead.'
+  },
+  {
+    q: 'What lets a deferred script download while the parser is blocked elsewhere?',
+    options: [
+      'the preload scanner reading ahead for URLs',
+      'the compositor thread fetching in the background',
+      'the service worker prefetching from its cache'
+    ],
+    answer: 0,
+    why: 'A second lightweight reader scans the raw markup ahead of the parser and starts fetches early. It only sees URLs written plainly in the HTML, which is why script-built URLs and @import are so slow.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Explain defer versus async."',
+    answer: 'Both download <b>in parallel</b> with parsing, so neither blocks the DOM. They differ afterwards. <code>defer</code> runs <b>after parsing finishes, in document order</b>, before <code>DOMContentLoaded</code> — so dependencies hold. <code>async</code> runs <b>the moment its file arrives</b>, interrupting parsing, in whatever order the network delivers.<br><br><i>Likely follow-up:</i> "So which do you use?" <code>defer</code> for anything of ours, because our code has order and DOM dependencies. <code>async</code> only for a self-contained third party that nothing waits on, such as an analytics beacon.'
+  },
+  {
+    prompt: '"Is a script at the bottom of the body the same as defer?"',
+    answer: 'No, and it is strictly worse. Both execute after the markup above them exists, but a tag at the bottom is only <b>discovered</b> at the bottom, so its download starts late and finishes late. A <code>defer</code> tag in the head is discovered immediately, downloads in parallel with parsing, and still executes at the end.<br><br><i>Likely follow-up:</i> "Does the preload scanner not fix the bottom case?" It helps, because the scanner reads ahead of the parser and can start the fetch early — but only if the parser is not held up before it, and only for URLs written plainly in the HTML. <code>defer</code> in the head does not depend on that luck.'
+  },
+  {
+    prompt: 'The theme.liquid drill: which tags delay the DOM, and why does the slider fail one load in ten on mobile?',
+    answer: 'Delaying the DOM: the classic <code>vendor.js</code>, the <code>script_tag</code> output for <code>theme.js</code> (the Liquid filter emits a plain blocking tag), and the chat widget with no attributes. The <code>async</code> analytics tag does not block parsing, though it can interrupt it.<br><br>The slider failure is a <b>race</b>. If the slider or one of its dependencies is loaded with <code>async</code> — commonly a vendor bundle an app or a previous developer marked async — it runs whenever it arrives. Most loads it arrives after the markup exists; sometimes it wins the race and initialises against a DOM that is not there yet. On mobile the CPU is slower and the network more variable, so parsing takes longer relative to the download and the odds of arriving early go up. Nothing in the code changed — only the timing, which is why it is one in ten and unreproducible on a desktop.<br><br><i>Likely follow-up:</i> "The chat tag is app-injected and you cannot edit it — options?" In order of cost: use the app\'s own settings if it offers a deferred or lazy mode; move the app\'s script out of the theme and load it after first interaction with a small loader we own (costs: we now own its lifecycle); ask the merchant to raise it with the vendor (costs time, no code); or accept it and document the ceiling it puts on the metric, so the client owns the trade-off rather than us silently absorbing it.'
+  }
+]);
+</script>
+</body>
+</html>

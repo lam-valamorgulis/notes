@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0013 · Which properties trigger layout, paint or composite — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Layout &amp; paint · Lesson 0013</p>
+<h1>Which properties trigger layout, paint or composite</h1>
+<p class="subtitle">"Animate <code>transform</code>, not <code>left</code>" is advice you have read. This lesson is the reason, and the reason is not a trick — it is which stages of the pipeline the browser is forced to redo.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #3 (say what the design gives up) and ability #4 (debug with no ready answer) — a janky menu is not "a slow phone", it is a property choice you can name.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can look at any CSS animation or JavaScript style change and say which pipeline stages it costs, prove it with paint flashing, and explain why <code>will-change</code> on forty elements is a memory bug rather than an optimisation.
+</div>
+
+<h2>1. One rule generates the whole table</h2>
+<p>
+  Lesson 0010 gave the pipeline: <b>style &rarr; layout &rarr; paint &rarr; composite</b>. Each stage consumes the output
+  of the one before it. So there is only one rule to learn:
+</p>
+<div class="win">
+  <strong>The rule:</strong> a change invalidates the <em>earliest</em> stage it affects, and every stage after that must
+  run again. Nothing else about this topic needs memorising.
+</div>
+<p>
+  Now derive the three cases by asking what actually changed:
+</p>
+<ul>
+  <li>Changed the <b>geometry</b> — <code>width</code>, <code>height</code>, <code>padding</code>, <code>margin</code>,
+  <code>top</code>, <code>font-size</code>, adding a node? Boxes move, so <b>layout</b> must run, then paint, then
+  composite. And layout is not local: a box that grows can push its siblings and reflow its ancestors.</li>
+  <li>Changed only <b>appearance</b> — <code>background-color</code>, <code>color</code>, <code>box-shadow</code>,
+  <code>border-radius</code>, <code>outline</code>? Every box is exactly where it was, so layout is skipped, but the
+  pixels are wrong: <b>paint</b>, then composite.</li>
+  <li>Changed only <b>where an already-painted picture goes</b> — <code>transform</code>, <code>opacity</code> on a
+  composited layer? The layout is unchanged and the painted texture is unchanged. Only the <b>composite</b> step runs,
+  and it can happen on the compositor thread — off the main thread, so it survives a busy main thread
+  (<a href="https://web.dev/articles/animations-guide">web.dev — Animations guide</a>).</li>
+</ul>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 260" role="img" aria-label="Three rows showing which pipeline stages rerun: changing width reruns style layout paint and composite, changing background colour skips layout, changing transform runs only style and composite">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="160" y="18">STYLE</text>
+  <text class="cap" x="300" y="18">LAYOUT</text>
+  <text class="cap" x="440" y="18">PAINT</text>
+  <text class="cap" x="580" y="18">COMPOSITE</text>
+
+  <text class="mono sm" x="16" y="52">width / top</text>
+  <text class="sub" x="16" y="68">the whole bill</text>
+  <rect class="box bad" x="160" y="30" width="120" height="34" rx="5"/>
+  <rect class="box bad" x="300" y="30" width="120" height="34" rx="5"/>
+  <rect class="box bad" x="440" y="30" width="120" height="34" rx="5"/>
+  <rect class="box bad" x="580" y="30" width="120" height="34" rx="5"/>
+
+  <text class="mono sm" x="16" y="117">background</text>
+  <text class="sub" x="16" y="133">no geometry change</text>
+  <rect class="box" x="160" y="95" width="120" height="34" rx="5"/>
+  <rect class="box dim" x="300" y="95" width="120" height="34" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="sub" x="330" y="117">skipped</text>
+  <rect class="box" x="440" y="95" width="120" height="34" rx="5"/>
+  <rect class="box" x="580" y="95" width="120" height="34" rx="5"/>
+
+  <text class="mono sm" x="16" y="182">transform</text>
+  <text class="sub" x="16" y="198">opacity too</text>
+  <rect class="box" x="160" y="160" width="120" height="34" rx="5"/>
+  <rect class="box dim" x="300" y="160" width="120" height="34" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="sub" x="330" y="182">skipped</text>
+  <rect class="box dim" x="440" y="160" width="120" height="34" rx="5" stroke-dasharray="4 3" fill="none"/>
+  <text class="sub" x="470" y="182">skipped</text>
+  <rect class="box good" x="580" y="160" width="120" height="34" rx="5"/>
+
+  <line class="rule thin" x1="16" y1="216" x2="704" y2="216"/>
+  <text class="cap amber" x="16" y="238">ONLY THE BOTTOM ROW CAN RUN OFF THE MAIN THREAD</text>
+  <text class="sub" x="16" y="254">which is why a transform animation keeps moving while JavaScript is busy, and a left animation does not.</text>
+</svg>
+<figcaption>Same three rows, every time. The question is never "is this property fast" but "how early in the pipeline does it force a redo".</figcaption>
+</figure>
+
+<h2>2. The list worth keeping</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Change</th><th>Stages that rerun</th><th>Common mistake</th></tr>
+<tr><td><code>width</code>, <code>height</code>, <code>padding</code>, <code>margin</code>, <code>top</code>/<code>left</code>, <code>font-size</code>, <code>display</code></td><td>layout &rarr; paint &rarr; composite</td><td>animating <code>max-height</code> for an accordion — layout on every frame</td></tr>
+<tr><td><code>background</code>, <code>color</code>, <code>box-shadow</code>, <code>border-radius</code>, <code>visibility</code></td><td>paint &rarr; composite</td><td>animating <code>box-shadow</code> on hover across a whole grid</td></tr>
+<tr><td><code>transform</code>, <code>opacity</code></td><td>composite only</td><td>assuming it is free even without a layer — it needs to be composited to skip paint</td></tr>
+<tr><td><code>filter</code></td><td>usually composite, sometimes paint</td><td>treating every <code>filter</code> as cheap; measure it</td></tr>
+</table>
+</div>
+<p class="small">
+  The authoritative, browser-specific list of what forces what — including every JavaScript property read that forces
+  layout — is <a href="https://gist.github.com/paulirish/5d52fb081b3570c81e3a">Paul Irish's "What forces layout / reflow"</a>.
+  Bookmark it; do not memorise it.
+</p>
+
+<h2>3. Layers: what "composited" costs</h2>
+<p>
+  <code>transform</code> can skip paint only if the element has its own <b>compositor layer</b> — its own already-painted
+  texture that the compositor can move around. The browser promotes an element to a layer for reasons including a 3D
+  transform, <code>will-change: transform</code>, <code>video</code>, <code>canvas</code>, and some
+  <code>position: fixed</code> cases.
+</p>
+<p>
+  Layers are not free. Each one is a texture held in memory and uploaded to the GPU. Promote forty product cards and you
+  have bought forty textures to make one hover animation smooth — this is <b>layer explosion</b>, and on a mid-range
+  phone it can be slower overall than the thing you were fixing
+  (<a href="https://web.dev/articles/stick-to-compositor-only-properties-and-manage-layer-count">web.dev</a>).
+</p>
+<div class="trap">
+  <span class="label">Trap — <code>will-change</code> is a hint, not a fix</span>
+  <code>will-change: transform</code> tells the browser "prepare a layer, I am about to move this". Two rules follow.
+  Add it <b>shortly before</b> the animation and remove it after — a permanent <code>will-change</code> in a stylesheet
+  is a permanent memory cost for an animation that may never run. And it is never a repair for animating
+  <code>left</code>: the layer does not remove the layout, it only holds the painted result. Wrong property, wrong stage,
+  no rescue.
+</div>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    Putting a page on screen has three jobs, in order: work out where every box sits, fill in the colours, then stick the
+    finished pieces together. If you change something about size or position, all three jobs have to be done again. If
+    you only change a colour, the first job can be skipped. And if you only slide or fade something that was already
+    drawn, both of the first two jobs can be skipped — the browser just moves the picture it already has, which is why
+    that kind of movement stays smooth even when the page is busy.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A printed poster on a magnetic board. Changing the <em>size</em> of one poster means re-planning
+    the whole board, reprinting, and re-sticking. Changing its <em>colour</em> means reprinting that one poster and
+    re-sticking it. <em>Sliding</em> it two centimetres means only moving the magnet — nothing is re-planned and nothing
+    is reprinted.
+  </p>
+  <p>
+    <b>Where it breaks.</b> Magnets are free; layers are not. Every poster you make individually movable costs a sheet of
+    memory that stays used, and a phone has far less of it than a laptop. Also, the board never re-plans itself by
+    accident — a real page can be forced to re-plan in the middle of your code just because you asked how tall something
+    is, which is the next lesson.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People remember the conclusion — "use <code>transform</code>" — and lose the reason, so they cannot handle a new case.
+    The reason is <b>which stage is invalidated first</b>. Get that and you can classify a property you have never seen
+    in one question: does it change geometry, or only colour, or only where an existing picture sits? Second sticking
+    point: believing <code>will-change</code> makes slow things fast. It only prepares a layer. Animate
+    <code>height</code> with <code>will-change: height</code> and you still run layout every frame — plus you now pay for
+    a layer.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior who says: <i>"the mega-menu animation is janky on mobile so I added
+    <code>will-change: max-height</code> and it did not help"</i>. Explain what they measured, what they changed, and
+    what to change instead. Then <b>send it to me</b> — I want the words "which stage" in your answer.
+  </p>
+</div>
+
+<h2>5. Point at it: make the browser show you <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Paint flashing.</b> DevTools &rarr; Command Menu &rarr; "Show Rendering" &rarr; tick <b>Paint flashing</b>. Green
+  rectangles appear wherever the browser repaints. Hover a card, open a menu, scroll. An animation that flashes green on
+  every frame is repainting every frame; a <code>transform</code> animation on a layer flashes once and then stops.</li>
+  <li><b>Layer borders and the layer count.</b> Same panel, tick <b>Layer borders</b>. Then open the <b>Layers</b> panel:
+  it lists every compositor layer with an estimated memory size and <em>the reason it was promoted</em>. Read that reason
+  column — it is the fastest way to find a stray <code>will-change</code>.</li>
+  <li><b>Name the stages in a profile.</b> <b>Performance</b> &rarr; record an interaction. The Main track shows
+  <b>Recalculate Style</b>, <b>Layout</b>, <b>Paint</b> and <b>Composite Layers</b> as separate entries. Animate
+  <code>left</code>, record, and count the <b>Layout</b> entries per frame. Then animate <code>transform</code>, record
+  again, and watch them disappear. That before-and-after is gate #3 for this core.</li>
+  <li><b>Frame rate honestly.</b> Rendering panel &rarr; <b>Frame rendering stats</b>, with CPU throttled 4×. Judge
+  smoothness on the throttled number, never on your laptop's.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's mega-menu opens by animating <code>max-height</code> from 0 to 800px over 300 ms. On a mid-range Android it visibly stutters. A previous developer added <code>will-change: max-height</code> to the panel and <code>will-change: transform</code> to all 32 nav links, which did not help and made scrolling slightly worse.</p>
+  Before flipping the recall cards: name the stage the original animation pays on every frame, explain why both <code>will-change</code> additions were wrong — for two <em>different</em> reasons — and give the animation you would ship instead. Then the interviewer's follow-up: your replacement animates <code>transform</code>, but the menu must still push the page content down when open. How do you reconcile those, and what do you give up?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>One file. Type it by hand, and turn on <b>Paint flashing</b> before you run anything.</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;style&gt;
+  .box { position: absolute; top: 40px; width: 80px; height: 80px; background: #1F6C8C }
+  .slow { animation: moveLeft 2s infinite alternate }
+  .fast { animation: moveTx   2s infinite alternate; top: 160px }
+  @keyframes moveLeft { from { left: 0 }                 to { left: 300px } }
+  @keyframes moveTx   { from { transform: translateX(0) } to { transform: translateX(300px) } }
+&lt;/style&gt;
+&lt;div class="box slow"&gt;&lt;/div&gt;
+&lt;div class="box fast"&gt;&lt;/div&gt;</code></pre>
+  <p><b>Predict before running:</b> which box flashes green every frame, and which one flashes once? Then record a
+  Performance profile of five seconds and count <b>Layout</b> entries. The two boxes move identically on screen and cost
+  completely different amounts.</p>
+  <p><b>Now prove the composite claim.</b> Add a button that blocks the main thread for two seconds:</p>
+  <pre><code>&lt;button onclick="const e=Date.now()+2000; while(Date.now()&lt;e){}"&gt;Block 2s&lt;/button&gt;</code></pre>
+  <p>Predict first: during the freeze, do <b>both</b> boxes stop, or only one? Click it and watch. The
+  <code>transform</code> box keeps sliding because its animation runs on the compositor thread; the <code>left</code> box
+  freezes with the main thread. This single experiment explains more than any article — and it connects straight back to
+  lesson 0005.</p>
+  <p><b>Third round — the layer cost.</b> Generate a page with 300 promoted elements and watch the Layers panel:</p>
+  <pre><code>document.body.innerHTML = Array.from({length: 300}, (_, i) =&gt;
+  `&lt;div style="will-change:transform;width:40px;height:40px;background:#C86A08;display:inline-block"&gt;&lt;/div&gt;`
+).join('');</code></pre>
+  <p>Predict, then check the Layers panel's memory estimate and scroll the page. Then remove
+  <code>will-change:transform</code> and compare. You have just measured the price of the "optimisation" people paste
+  everywhere.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>which properties trigger layout vs paint vs composite</b> done only if all three held, from memory: (1) you explained "which stage is invalidated first" to a junior — the teach-back in section 4; (2) you predicted which box keeps moving during the two-second block, before clicking; (3) you counted <b>Layout</b> entries in a profile for both animations, or watched paint flashing differ between them. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://web.dev/articles/animations-guide">web.dev — Animations guide</a> (20 min), then <a href="https://web.dev/articles/stick-to-compositor-only-properties-and-manage-layer-count">Stick to compositor-only properties and manage layer count</a> (10 min) for the layer half. Keep <a href="https://gist.github.com/paulirish/5d52fb081b3570c81e3a">Paul Irish's list</a> as the reference you check, not the thing you learn.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Paint order and layerization rules in detail</b> <span class="pill depth">depth</span> — <em>why</em> the browser
+  chooses to promote something. <b>Raster, tiling and GPU texture upload</b> <span class="pill depth">depth</span> — what
+  a layer actually is in memory. <b>Formatting contexts, flexbox and grid algorithms</b>
+  <span class="pill depth">depth</span> — how layout computes geometry; this lesson only cared <em>that</em> it must.
+  <b><code>contain</code> and <code>content-visibility</code></b> <span class="pill depth">depth</span> — limiting how far
+  a layout invalidation spreads. Next core lesson: <a href="0014-layout-thrashing-forced-sync-layout.html">0014 · layout thrashing</a>, where reading a single property costs you a layout you never asked for.
+</div>
+
+<p class="ask">Anything unclear — when an element gets its own layer, why <code>filter</code> is ambiguous, how to animate a real accordion without layout? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>One rule: a change invalidates the <b>earliest stage it affects</b>, and every later stage reruns.</li>
+    <li>Geometry (<code>width</code>, <code>top</code>, <code>padding</code>, <code>font-size</code>) &rarr; <b>layout + paint + composite</b>. Layout can spread to siblings and ancestors.</li>
+    <li>Appearance only (<code>background</code>, <code>color</code>, <code>box-shadow</code>) &rarr; <b>paint + composite</b>.</li>
+    <li><code>transform</code> and <code>opacity</code> on a composited layer &rarr; <b>composite only</b>, and it runs off the main thread.</li>
+    <li>That last point is why a <code>transform</code> animation keeps moving while JavaScript is blocked, and a <code>left</code> animation freezes.</li>
+    <li>Layers cost GPU memory. <b>Layer explosion</b> from scattered <code>will-change</code> can be slower than the jank it was meant to fix.</li>
+    <li><code>will-change</code> prepares a layer — it never removes a layout. Add it just before, remove it after.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>ask which stage the change invalidates, not whether the property is "fast".</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0014-layout-thrashing-forced-sync-layout.html">Next: 0014 · layout thrashing &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'You animate height from 0 to 400px. Which stages run every frame?',
+    options: [
+      'layout, then paint, then composite, every frame',
+      'paint and composite only, since size is cached',
+      'composite only, because the pixels do not change'
+    ],
+    answer: 0,
+    why: 'Height is geometry, so layout is invalidated and everything after it must rerun. Layout can also spread to siblings and ancestors, which is why accordion animations are the classic jank source.'
+  },
+  {
+    q: 'Why does a transform animation keep moving while JavaScript blocks for two seconds?',
+    options: [
+      'compositing can run on its own separate thread',
+      'transforms are precomputed for the entire run',
+      'the animation is throttled to the timer queue'
+    ],
+    answer: 0,
+    why: 'A composited transform changes only where an already-painted texture is placed, and the compositor thread does that work independently of the blocked main thread.'
+  },
+  {
+    q: 'What does will-change: transform actually do?',
+    options: [
+      'asks the browser to prepare a compositor layer',
+      'makes any animated property skip the layout step',
+      'raises the animation priority above other frames'
+    ],
+    answer: 0,
+    why: 'It is a hint to promote the element so a texture is ready. It cannot remove a layout, so pairing it with an animated height helps nothing while still costing memory.'
+  },
+  {
+    q: 'Thirty-two elements each carry will-change in the stylesheet permanently. What is the cost?',
+    options: [
+      'a GPU texture per element, held for the page',
+      'an extra style recalculation on every frame',
+      'a duplicated paint pass for each promoted node'
+    ],
+    answer: 0,
+    why: 'Every layer is a texture in memory, uploaded to the GPU, kept for as long as the promotion lasts. On a mid-range phone that can cost more than the jank it was meant to fix.'
+  },
+  {
+    q: 'Which DevTools tool shows you exactly where repainting happens?',
+    options: [
+      'the Rendering panel, with Paint flashing enabled',
+      'the Layout pane, with the grid overlay enabled',
+      'the Coverage tab, recorded during the animation'
+    ],
+    answer: 0,
+    why: 'Paint flashing draws a green rectangle over any region the browser repaints, so an animation that flashes on every frame is repainting on every frame — visible in a second, with no profile needed.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Why is animating transform better than animating left?"',
+    answer: 'Because of which pipeline stage each one invalidates. <code>left</code> changes geometry, so <b>layout</b> must rerun, then paint, then composite — every frame, on the main thread. A composited <code>transform</code> changes neither the geometry nor the painted texture, so only <b>composite</b> runs, and it runs on the compositor thread.<br><br><i>Likely follow-up:</i> "Prove it without a profiler." Block the main thread for two seconds. The transform animation keeps moving; the <code>left</code> animation freezes. That difference is the compositor thread, visible with no tooling.'
+  },
+  {
+    prompt: '"When would you not want a compositor layer?"',
+    answer: 'Whenever the element is not actually being animated. A layer is a texture held in memory and uploaded to the GPU, so promoting many elements — usually through a stylesheet-wide <code>will-change</code> — costs real memory and can make scrolling worse on a mid-range phone. The Layers panel shows the estimate per layer and the reason it was promoted.<br><br><i>Likely follow-up:</i> "So how should will-change be used?" As a short-lived hint: add it just before the animation starts, remove it when the animation ends. And never as a repair for animating a geometry property, because a layer does not remove a layout.'
+  },
+  {
+    prompt: 'The mega-menu drill: max-height animation, two wrong will-change additions. Diagnose all three, then reconcile transform with pushing content down.',
+    answer: 'The original animation pays <b>layout</b> on every frame, because <code>max-height</code> is geometry — and menu content is deep, so the reflow is not cheap. First wrong addition: <code>will-change: max-height</code> prepares a layer, and a layer cannot remove a layout, so nothing improved. Second wrong addition: <code>will-change: transform</code> on 32 links promoted 32 elements that are never animated, buying 32 textures — which is why scrolling got slightly worse. Two different mistakes: the first was the wrong <em>stage</em>, the second was the wrong <em>elements</em>.<br><br>What I would ship: animate <code>transform: translateY(-100%) → 0</code> on the panel with <code>overflow: hidden</code> on its wrapper, plus <code>opacity</code> if a fade is wanted. Composite only, smooth under load.<br><br><i>Likely follow-up:</i> "But it must push the content down." Then a layout change is genuinely part of the design, and pretending otherwise is dishonest. Options: (a) overlay the menu instead of pushing, which is a design change to agree with the client and the cheapest technically; (b) keep the push but make it one single layout at the start and animate the panel\'s transform inside a container whose height is set once, so you pay layout once rather than per frame; (c) accept per-frame layout and reduce its cost with <code>contain</code> on the panel so the invalidation does not spread to the whole page. What each gives up: (a) the visual behaviour the designer asked for; (b) a small jump at the start of the animation; (c) still the most expensive stage, just bounded — and it needs measuring on a throttled device before believing it.'
+  }
+]);
+</script>
+</body>
+</html>

@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0020 · Waterfall vs parallel — reading the Network panel — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 3 · Network &amp; Delivery · Request discipline · Lesson 0020</p>
+<h1>Waterfall vs parallel — reading the Network panel</h1>
+<p class="subtitle">Every other lesson in Chapter 3 gave you a cause. This one is the diagnosis: the shape of a waterfall tells you the dependency structure of your page, and a staircase is always a bug.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #4 (debug with no ready answer) and ability #5 (judge someone else's work) — reading a waterfall out loud in front of a client is the single most useful network skill you can have.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can open a storefront's Network panel and say, in under a minute, which requests are on a dependency chain, which are waiting on a queue, which are waiting on the server, and which of those is actually your problem.
+</div>
+
+<h2>1. Two shapes, and only one of them is fine</h2>
+<p>
+  The browser fetches in parallel whenever it can. So if requests appear one after another, stepping down and to the
+  right, something <b>prevented</b> parallelism — each URL was only discovered after the previous response arrived. That
+  staircase costs the full setup and download of every step, one after another.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 250" role="img" aria-label="A staircase waterfall where each request starts only after the previous finishes, next to a block where all four requests start together">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18" style="fill:var(--warn)">SERIAL — A STAIRCASE</text>
+  <rect class="box bad" x="30" y="34" width="70" height="18" rx="3"/>
+  <text class="sub" x="104" y="47">index.html</text>
+  <rect class="box bad" x="100" y="60" width="70" height="18" rx="3"/>
+  <text class="sub" x="174" y="73">loader.js</text>
+  <rect class="box bad" x="170" y="86" width="70" height="18" rx="3"/>
+  <text class="sub" x="244" y="99">widget.js</text>
+  <rect class="box bad" x="240" y="112" width="70" height="18" rx="3"/>
+  <text class="sub" x="314" y="125">data.json</text>
+  <line class="rule" x1="30" y1="146" x2="310" y2="146"/>
+  <line class="rule" x1="30" y1="140" x2="30" y2="152"/>
+  <line class="rule" x1="310" y1="140" x2="310" y2="152"/>
+  <text class="sub" x="30" y="166">4 × (setup + wait + download)</text>
+  <text class="sub" x="30" y="182">each URL only existed after the</text>
+  <text class="sub" x="30" y="198">previous response was parsed</text>
+
+  <line class="rule thin" x1="356" y1="10" x2="356" y2="230"/>
+
+  <text class="cap" x="380" y="18" style="fill:var(--good)">PARALLEL — A BLOCK</text>
+  <rect class="box good" x="395" y="34" width="70" height="18" rx="3"/>
+  <text class="sub" x="469" y="47">index.html</text>
+  <rect class="box good" x="395" y="60" width="70" height="18" rx="3"/>
+  <text class="sub" x="469" y="73">app.css</text>
+  <rect class="box good" x="395" y="86" width="70" height="18" rx="3"/>
+  <text class="sub" x="469" y="99">app.js</text>
+  <rect class="box good" x="395" y="112" width="70" height="18" rx="3"/>
+  <text class="sub" x="469" y="125">hero.jpg</text>
+  <line class="rule" x1="395" y1="146" x2="465" y2="146"/>
+  <line class="rule" x1="395" y1="140" x2="395" y2="152"/>
+  <line class="rule" x1="465" y1="140" x2="465" y2="152"/>
+  <text class="sub" x="395" y="166">1 × the slowest one</text>
+  <text class="sub" x="395" y="182">every URL was visible in the</text>
+  <text class="sub" x="395" y="198">markup, so the scanner found</text>
+  <text class="sub" x="395" y="214">them all at once</text>
+
+  <text class="cap amber" x="16" y="240">A STAIRCASE IS NEVER A NETWORK PROBLEM. IT IS A DISCOVERY PROBLEM.</text>
+</svg>
+<figcaption>When you see steps, do not ask "why is the network slow". Ask "what stopped the browser from knowing about step 4 at the start".</figcaption>
+</figure>
+
+<p>
+  The usual causes of a staircase, in the order you should check them:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Cause</th><th>Tell</th><th>Fix</th></tr>
+<tr><td>A script that fetches another script</td><td>the <b>Initiator</b> column names a <code>.js</code> file, not the document</td><td>put the real URL in the markup, or preload it (lesson 0019)</td></tr>
+<tr><td><code>@import</code> in CSS</td><td>a stylesheet whose initiator is another stylesheet</td><td>replace with a <code>&lt;link&gt;</code> (lesson 0010)</td></tr>
+<tr><td>Redirect chain</td><td>status <code>301</code>/<code>302</code> rows, each a full round trip</td><td>link to the final URL; never link to a redirect in a template</td></tr>
+<tr><td>Font inside a stylesheet</td><td>font starts only after the CSS is parsed and matched</td><td>preload with <code>crossorigin</code> (lesson 0019)</td></tr>
+<tr><td>Image <code>src</code> set by JavaScript</td><td>image initiator is a script; the preload scanner never saw it</td><td>real <code>src</code> in the HTML, and <code>fetchpriority</code> if it is the LCP element</td></tr>
+</table>
+</div>
+
+<h2>2. The timing rows, and what each one blames</h2>
+<p>
+  Click any request, open <b>Timing</b>, and read down. Each row points at a different team:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Row</th><th>Long means</th><th>Whose problem</th></tr>
+<tr><td><b>Queueing</b> / <b>Stalled</b></td><td>waiting for a connection or behind higher-priority requests</td><td>yours — too many requests, or bad priorities</td></tr>
+<tr><td><b>DNS</b>, <b>Initial connection</b>, <b>SSL</b></td><td>a new origin's setup cost</td><td>yours — origin count (lesson 0017)</td></tr>
+<tr><td><b>Waiting (TTFB)</b></td><td>the server is thinking</td><td>the platform, the app, or Liquid — <b>not</b> front-end</td></tr>
+<tr><td><b>Content Download</b></td><td>bytes, or TCP slow start on a fresh connection</td><td>yours — size, format, compression</td></tr>
+</table>
+</div>
+<p>
+  This table is what makes you useful in a meeting. "The 900 ms is <b>Waiting</b>, on the server, on a request our theme
+  does not control" is a completely different ticket from "the 900 ms is <b>Content Download</b> of an unoptimised hero
+  image". Both look like "the site is slow" without the panel.
+</p>
+<div class="trap">
+  <span class="label">Trap — the Initiator column is the answer to most questions</span>
+  It is off-screen by default on narrow windows and almost nobody enables it. Right-click the table header, tick
+  <b>Initiator</b>, and every mystery request now names the file and line that caused it. Nine out of ten "where is this
+  request coming from" questions end there — including "which app is loading this".
+</div>
+
+<h2>3. What to check, in order, on a storefront you have never seen</h2>
+<ol>
+  <li><b>Set the conditions first.</b> Disable cache, throttle to <i>Slow 4G</i>, CPU 4×. An un-throttled waterfall on
+  office wifi hides everything in Chapter 3.</li>
+  <li><b>Count.</b> The footer shows requests, transferred bytes and load times. Note them; they are the before-numbers
+  for whatever you do next.</li>
+  <li><b>Look at the shape.</b> Any staircase? Follow it with the Initiator column.</li>
+  <li><b>Sort by <i>Time</i>, then by <i>Size</i>.</b> The two lists are usually different, and the difference tells you
+  whether you have a latency problem or a bytes problem.</li>
+  <li><b>Group by domain.</b> Enable the Domain column and sort. That is your origin count from lesson 0017, and it is
+  usually the biggest number nobody has looked at.</li>
+  <li><b>Check the <i>Priority</i> column</b> against what matters: the LCP image should not be below a chat widget
+  (lesson 0019).</li>
+  <li><b>Filter <code>304</code></b> — round trips that returned nothing (lesson 0018).</li>
+</ol>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The panel draws one bar per file, positioned by when it started and how long it took. If the bars all start together,
+    the browser knew about everything at once and fetched them side by side — good. If they form a staircase, each file
+    was only discovered after the one above it had arrived, so the waits happened one after another instead of at the same
+    time. And when you click a single bar, it splits the wait into parts, which tells you whether you were queuing,
+    connecting, waiting for the server to think, or downloading.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> Sending four people to fetch four things. If you hand out all four lists at the door, they go at
+    once and you wait for the slowest. If each list is hidden inside the previous person's bag, they go one at a time and
+    you wait for all four.
+  </p>
+  <p>
+    <b>Where it breaks.</b> You can send a hundred people; the browser cannot. There is a limit on parallel connections
+    per origin — around six on HTTP/1.1 — so beyond that, requests queue even when every URL was known from the start.
+    That is why the <em>Queueing</em> row exists and why "make it all parallel" has a ceiling.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People read the total and stop. The total tells you there is a problem; the <b>shape</b> tells you the kind, and the
+    <b>Timing rows</b> tell you the owner. Second sticking point: blaming the network for a staircase. A staircase is a
+    discovery problem — the fix is in your markup or your CSS, not in your hosting. Third: judging any of this without
+    throttling, which makes every one of Chapter 3's mechanisms invisible.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a project manager who forwards a client email saying "the site is slow" with a screenshot of
+    the Network panel. Explain what you can and cannot tell from that screenshot, and name the one extra thing you need.
+    Then <b>send it to me</b> — the skill is asking for the right missing information instead of guessing from a picture.
+  </p>
+</div>
+
+<h2>5. Point at it: read a real waterfall out loud <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li>Open any storefront you did not build. Network panel, cache disabled, <i>Slow 4G</i>, CPU 4×, reload.</li>
+  <li>Enable the columns that matter: right-click the header row and tick <b>Initiator</b>, <b>Priority</b>,
+  <b>Protocol</b>, <b>Domain</b>.</li>
+  <li>Narrate it, out loud, in this order: how many requests, how many origins, is there a staircase, what is the slowest
+  single request, and which Timing row dominates it. If you cannot do all five in a minute, do it again on another site
+  until you can. That fluency is gate #3 for this core.</li>
+  <li>Export the evidence: right-click &rarr; <b>Save all as HAR</b>. A HAR file is the honest attachment for a ticket —
+  it survives, and anyone can reload it into their own panel.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">On Slow 4G a product page takes 6.1 s to load. The waterfall shows: the document at 400 ms TTFB; then a block of theme CSS and JS, all parallel, finishing by 1.4 s; then a four-step staircase — <code>app-loader.js</code> → <code>bundle.js</code> → <code>config.json</code> → <code>reviews.css</code> — ending at 4.9 s; and finally the hero image, starting at 5.0 s and finishing at 6.0 s, whose Initiator column names <code>slider.js</code>. Of the six seconds, only 900 ms is Content Download in total.</p>
+  Before flipping the recall cards: name each of the two problems in mechanism terms, say which one you would fix first and why, and say what "only 900 ms is Content Download" tells you about the whole page. Then the interviewer's follow-up: the merchant's developer replies that the site is slow "because Shopify's servers are slow" — using only this waterfall, how do you answer, and what would you concede?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Build a staircase on purpose. Four files, typed by hand:</p>
+  <pre><code><span class="cmt">&lt;!-- index.html --&gt;</span>
+&lt;!doctype html&gt;
+&lt;script src=&quot;a.js&quot;&gt;&lt;/script&gt;
+
+<span class="cmt">// a.js</span>
+const s = document.createElement('script'); s.src = 'b.js'; document.head.append(s);
+
+<span class="cmt">// b.js</span>
+fetch('data.json').then(r =&gt; r.json()).then(d =&gt; console.log('done', d));
+
+<span class="cmt">// data.json</span>
+{ "ok": true }</code></pre>
+  <p>Serve it, throttle to <i>Slow 4G</i>, disable the cache, reload with the Network panel open.
+  <b>Predict first:</b> will the four bars form a block or a staircase, and what will the Initiator column say for each?
+  Then look. Every URL was hidden inside the previous response, so nothing could be discovered early — including by the
+  preload scanner from lesson 0011.</p>
+  <p><b>Now flatten it</b> and predict the new total before reloading:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;link rel="preload" as="fetch" href=&quot;data.json&quot; crossorigin&gt;
+&lt;script src=&quot;a.js&quot; defer&gt;&lt;/script&gt;
+&lt;script src=&quot;b.js&quot; defer&gt;&lt;/script&gt;</code></pre>
+  <p>All three now start together, and the total drops to roughly the slowest one plus a little. Same bytes, same files,
+  one third of the wall clock — because you changed <em>when things were discovered</em>, not how fast the network is.</p>
+  <p><b>Third round — make the Timing rows tell you different stories.</b> Add a slow endpoint to your server and fetch
+  it:</p>
+  <pre><code>python3 - &lt;&lt;'PY'
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+import time
+class H(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/slow':
+            time.sleep(1.5)                      <span class="cmt"># server thinking time</span>
+            self.send_response(200); self.send_header('Content-Type','text/plain')
+            self.end_headers(); self.wfile.write(b'ok'); return
+        super().do_GET()
+HTTPServer(('', 8000), H).serve_forever()
+PY</code></pre>
+  <p>Fetch <code>/slow</code> and a large static file, and predict which Timing row dominates each: <b>Waiting (TTFB)</b>
+  for the first, <b>Content Download</b> for the second. Being able to tell those two apart at a glance is what stops you
+  optimising images when the problem is a server.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>waterfall vs parallel: reading the Network panel</b> done only if all three held, from memory: (1) you answered the "site is slow, here is a screenshot" email — the teach-back in section 4; (2) you predicted the staircase and its initiators, and predicted which Timing row would dominate each of the two requests; (3) you narrated a real storefront's waterfall — requests, origins, shape, slowest request, dominant row — in about a minute. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly, with the panel open beside it: <a href="https://developer.chrome.com/docs/devtools/network">Chrome DevTools — Network</a> (25 min). Read the "Timing breakdown phases" section twice; it is the table in section 2 in Chrome's own words, and it is the part people skip.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>HTTP/1.1 head-of-line blocking and the six-connection limit</b> <span class="pill depth">depth</span> — named in the
+  analogy's limit; it is why Queueing exists. <b>HTTP/2 multiplexing and stream priority</b>
+  <span class="pill depth">depth</span>. <b>In-flight deduplication and request coalescing</b>
+  <span class="pill depth">depth</span> — the same URL requested twice at once. <b>Streaming responses and incremental
+  parsing</b> <span class="pill depth">depth</span>. <b>Analysing a HAR file programmatically</b>
+  <span class="pill depth">depth</span> — Chapter 7. Next core lesson, and the last of Chapter 3's core:
+  <a href="0021-retry-backoff-jitter.html">0021 · retry with backoff and jitter</a>, which is what to do when a request
+  fails rather than when it is slow.
+</div>
+
+<p class="ask">Anything unclear — why Queueing happens when everything is parallel, how to read a redirect chain, what to attach to a ticket? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Bars starting together = the browser knew all the URLs. A <b>staircase</b> = each URL was discovered only after the previous response.</li>
+    <li>A staircase is a <b>discovery problem</b>, not a network problem. The fix is in your markup or CSS.</li>
+    <li>The <b>Initiator</b> column answers "where is this request coming from" — enable it, it is off by default.</li>
+    <li>Timing rows blame different owners: <b>Queueing/Stalled</b> = your request count and priorities · <b>DNS/connection/SSL</b> = origin count · <b>Waiting (TTFB)</b> = the server · <b>Content Download</b> = bytes and slow start.</li>
+    <li>Parallelism has a ceiling: roughly six connections per origin on HTTP/1.1, which is what <b>Queueing</b> is showing you.</li>
+    <li>Always: cache disabled, <i>Slow 4G</i>, CPU 4×. Without throttling, Chapter 3 is invisible.</li>
+    <li>Sort by <b>Time</b> and by <b>Size</b> separately — the difference says latency problem or bytes problem.</li>
+    <li>Attach a <b>HAR</b> file to the ticket, not a screenshot.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>read the shape first, then the timing rows — the total tells you nothing about the cause.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/network-delivery.html">Cheat sheet: network &amp; delivery</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0021-retry-backoff-jitter.html">Next: 0021 · retry &amp; backoff &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Requests form a staircase in the waterfall. What does that mean?',
+    options: [
+      'each URL was discovered after the previous response',
+      'the network throttling profile is set too slowly',
+      'the server is limiting how many you may request'
+    ],
+    answer: 0,
+    why: 'The browser fetches in parallel whenever it can, so serial bars mean serial discovery. The fix is in the markup or CSS that hid the URLs, not in the network.'
+  },
+  {
+    q: 'A request has a long Waiting for the first byte and a short download. Who owns it?',
+    options: [
+      'the server or platform doing the thinking',
+      'the front end, for shipping too many bytes',
+      'the browser, for queueing it behind others'
+    ],
+    answer: 0,
+    why: 'That row is time between the request being sent and the first byte returning, which is server work. Optimising images or scripts cannot change it.'
+  },
+  {
+    q: 'Which Network panel column tells you what caused a mystery request?',
+    options: [
+      'Initiator, which names the file and the line',
+      'Priority, which names the requesting subsystem',
+      'Protocol, which names the connection type used'
+    ],
+    answer: 0,
+    why: 'It is off by default and answers most "where does this come from" questions instantly, including which third-party app is loading something.'
+  },
+  {
+    q: 'All URLs are in the markup, yet some requests still show Queueing. Why?',
+    options: [
+      'parallel connections per origin are limited',
+      'the preload scanner processes markup in batches',
+      'queued requests are always cache revalidations'
+    ],
+    answer: 0,
+    why: 'There is a ceiling — around six connections per origin on HTTP/1.1 — so beyond that requests wait even when every URL was known from the start. Priority decides who waits.'
+  },
+  {
+    q: 'What should you attach to a ticket about a slow page?',
+    options: [
+      'a HAR export of the recorded network activity',
+      'a screenshot of the waterfall at full width',
+      'the total transferred size and request count'
+    ],
+    answer: 0,
+    why: 'A HAR can be reloaded into anyone\'s Network panel with every timing row and header intact, so the next person can check your conclusion instead of trusting a picture.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How do you read a network waterfall?"',
+    answer: 'Shape first, then rows. Bars that start together mean the browser knew all the URLs and fetched in parallel; a <b>staircase</b> means each URL was only discovered after the previous response, which is a discovery problem in the markup or CSS. Then click the slowest bar and read the Timing rows: <b>Queueing</b> and <b>Stalled</b> point at request count and priority, <b>DNS/connection/SSL</b> at origin count, <b>Waiting</b> at the server, <b>Content Download</b> at bytes.<br><br><i>Likely follow-up:</i> "What conditions do you set first?" Cache disabled, network throttled to Slow 4G, CPU 4× slower. Without those the whole of this chapter is invisible, and the conclusions do not transfer to a customer\'s phone.'
+  },
+  {
+    prompt: '"The total load time is 6 seconds. What does that tell you?"',
+    answer: 'That there is a problem, and nothing about its cause. Six seconds could be one slow server response, a chain of four serially discovered files, twelve origins each paying a handshake, or one enormous image. The total is the symptom; the <b>shape</b> gives the kind and the <b>Timing rows</b> give the owner.<br><br><i>Likely follow-up:</i> "What single view would you look at first?" The shape, with the Initiator column enabled. A staircase is both the most common and the most fixable pattern, and the initiator names the exact file that caused each step.'
+  },
+  {
+    prompt: 'The 6.1 s product page drill: name the two problems, pick the first fix, interpret the 900 ms, then answer "Shopify\'s servers are slow".',
+    answer: 'Problem one: a <b>four-step staircase</b> of app files, 1.4 s to 4.9 s — a discovery chain, where each URL only existed after the previous response was parsed. Problem two: the <b>hero image discovered by <code>slider.js</code></b>, starting at 5.0 s — the LCP element was invisible to the preload scanner, so its load delay is enormous (lesson 0016).<br><br>Fix first: the hero image. It is a one-line change — real <code>src</code> in the markup plus <code>fetchpriority="high"</code>, no lazy attribute — and it moves the metric the client is judged on. The app staircase is a bigger job and partly outside our control.<br><br>"Only 900 ms is Content Download" means this is a <b>latency and discovery problem, not a bytes problem</b>. Compressing images or minifying JavaScript would touch about 15% of the time. That single sentence should redirect the whole ticket.<br><br><i>Likely follow-up:</i> "Their developer blames Shopify\'s servers." The waterfall answers it: the document\'s TTFB is 400 ms, which is the only part that is server time on our side, and it is a small fraction of 6.1 s. The remaining five and a half seconds are client-side discovery — a chain of app scripts and a script-injected hero image — all visible in the Initiator column. What I would concede honestly: 400 ms of TTFB is not <em>good</em>, and on a heavy Liquid template it is worth investigating separately, along with any app that adds server-side work. But it is not the cause of this page being six seconds, and I would show the HAR rather than argue.'
+  }
+]);
+</script>
+</body>
+</html>

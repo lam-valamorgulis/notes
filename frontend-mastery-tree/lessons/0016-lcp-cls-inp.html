@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0016 · LCP, CLS, INP — definition and measurement — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Frame budget · Lesson 0016</p>
+<h1>LCP, CLS, INP — definition and measurement</h1>
+<p class="subtitle">The last core of Chapter 2, and the only one a client will ever quote at you. Three numbers that turn "the site feels slow" into three separate, fixable engineering problems.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #5 (judge work and say what is wrong) and ability #3 (name the trade) — these metrics are how a merchant's complaint becomes a ticket you can price.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~40 minutes you can define each metric precisely, name the four parts LCP breaks into, calculate a CLS score by hand, and say which of Chapter 2's lessons fixes each — plus explain why your green Lighthouse score and the client's red Search Console report are both correct.
+</div>
+
+<h2>1. Why exactly three</h2>
+<p>
+  A customer's experience of a page has three separate failure modes, and they need three separate numbers because they
+  have three separate causes:
+</p>
+<ul>
+  <li><b>Did the main thing appear quickly?</b> &rarr; <b>LCP</b>, Largest Contentful Paint. A loading problem.</li>
+  <li><b>Did it stay still while I read it?</b> &rarr; <b>CLS</b>, Cumulative Layout Shift. A stability problem.</li>
+  <li><b>Did it respond when I touched it?</b> &rarr; <b>INP</b>, Interaction to Next Paint. A responsiveness problem
+  (lesson 0007's mechanism, given a score).</li>
+</ul>
+<p>
+  Collapsing them into one score would hide the cause. A page can load instantly and jump under your thumb; it can be
+  rock-steady and take 600 ms to react. Per <a href="https://web.dev/articles/vitals">web.dev — Core Web Vitals</a>, each
+  is judged at the <b>75th percentile of real users</b> — so "good" means three in four visits were good, not the average.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 220" role="img" aria-label="Threshold bars for LCP good under 2.5 seconds, CLS good under 0.1, and INP good under 200 milliseconds, with needs-improvement and poor bands beyond">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="150" y="18">GOOD</text>
+  <text class="cap amber" x="368" y="18">NEEDS WORK</text>
+  <text class="cap" x="530" y="18" style="fill:var(--warn)">POOR</text>
+
+  <text class="mono sm" x="16" y="52">LCP</text>
+  <text class="sub" x="16" y="68">loading</text>
+  <rect class="box good" x="110" y="34" width="240" height="30" rx="4"/>
+  <text class="mono sm" x="124" y="54">&le; 2.5 s</text>
+  <rect class="box hot" x="350" y="34" width="120" height="30" rx="4"/>
+  <text class="mono sm" x="364" y="54">&le; 4 s</text>
+  <rect class="box bad" x="470" y="34" width="230" height="30" rx="4"/>
+  <text class="mono sm" x="484" y="54">&gt; 4 s</text>
+
+  <text class="mono sm" x="16" y="112">CLS</text>
+  <text class="sub" x="16" y="128">stability</text>
+  <rect class="box good" x="110" y="94" width="240" height="30" rx="4"/>
+  <text class="mono sm" x="124" y="114">&le; 0.1</text>
+  <rect class="box hot" x="350" y="94" width="120" height="30" rx="4"/>
+  <text class="mono sm" x="364" y="114">&le; 0.25</text>
+  <rect class="box bad" x="470" y="94" width="230" height="30" rx="4"/>
+  <text class="mono sm" x="484" y="114">&gt; 0.25</text>
+
+  <text class="mono sm" x="16" y="172">INP</text>
+  <text class="sub" x="16" y="188">response</text>
+  <rect class="box good" x="110" y="154" width="240" height="30" rx="4"/>
+  <text class="mono sm" x="124" y="174">&le; 200 ms</text>
+  <rect class="box hot" x="350" y="154" width="120" height="30" rx="4"/>
+  <text class="mono sm" x="364" y="174">&le; 500 ms</text>
+  <rect class="box bad" x="470" y="154" width="230" height="30" rx="4"/>
+  <text class="mono sm" x="484" y="174">&gt; 500 ms</text>
+
+  <text class="sub" x="110" y="210">All three are judged at the 75th percentile of real visits — not the average, and not your laptop.</text>
+</svg>
+<figcaption>Three numbers, three causes, three different chapters of fixes. Memorise the six thresholds; they end arguments.</figcaption>
+</figure>
+
+<h2>2. LCP splits into four parts — and that is the whole diagnosis</h2>
+<p>
+  LCP is the render time of the largest contentful element in the viewport: usually a hero image, a video poster, a
+  background image, or a block of text. Chasing "make LCP faster" is hopeless; splitting it is easy
+  (<a href="https://web.dev/articles/lcp">web.dev — LCP</a>):
+</p>
+<div class="diagram">  |----- TTFB -----|-- load delay --|---- load time ----|-- render delay --|
+  request sent     HTML arrives      image starts        image finished      LCP
+                   (server time)     downloading         downloading         painted
+
+  fix: hosting,    fix: make it      fix: fewer bytes,   fix: unblock the
+  Liquid, CDN      DISCOVERABLE      right format,       main thread and
+                   (no lazy, no      right size,         the CSS above it
+                   JS-built src,     priority hint
+                   preload if late)</div>
+<p>
+  Two of those four are the ones that bite a Shopify theme:
+</p>
+<ul>
+  <li><b>Load delay</b> — the browser found the hero image late. Causes: <code>loading="lazy"</code> on the hero (the most
+  common single mistake in this whole lesson), a <code>src</code> built by JavaScript so the preload scanner from lesson
+  0011 never sees it, or the image hidden inside a slider that initialises after hydration. The hero image should be
+  eagerly loaded and carry <code>fetchpriority="high"</code>.</li>
+  <li><b>Render delay</b> — the bytes arrived and the browser still could not paint, because render-blocking CSS or a long
+  task was in the way. That is lessons 0010 and 0007, showing up in a metric.</li>
+</ul>
+
+<h2>3. CLS is a score you can compute by hand</h2>
+<p>
+  For each unexpected shift: <b>impact fraction × distance fraction</b>. Impact fraction is the share of the viewport
+  covered by the moving content, before and after, combined. Distance fraction is how far it moved, as a share of the
+  viewport's largest dimension. CLS is the largest <em>burst</em> of shifts within a 5-second window
+  (<a href="https://web.dev/articles/cls">web.dev — CLS</a>).
+</p>
+<p>
+  Worked example, the one every merchant has: an app injects a 100&nbsp;px announcement bar at the top of an
+  800&nbsp;px-tall viewport, pushing everything down.
+</p>
+<div class="diagram">  content occupying the viewport, then pushed down 100px
+  impact fraction  = affected area / viewport   ≈ 1.0    (the whole screen moved)
+  distance fraction = 100px / 800px             = 0.125
+  layout shift score = 1.0 x 0.125              = 0.125   →  already "needs work"</div>
+<p>
+  One banner. One shift. Past the good threshold. That is why "we will just inject it at the top" is never a free
+  decision — and the fix is not to remove the banner, it is to <b>reserve its space before it arrives</b>.
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Cause of shift</th><th>Fix</th></tr>
+<tr><td>Images with no dimensions</td><td><code>width</code> and <code>height</code> attributes, or <code>aspect-ratio</code> in CSS</td></tr>
+<tr><td>Injected banners, apps, ads, embeds</td><td>reserve a fixed-height container, or overlay instead of push</td></tr>
+<tr><td>Web font swap changing text height</td><td><code>font-display: optional</code>/<code>swap</code> plus <code>size-adjust</code>, and match the fallback metrics</td></tr>
+<tr><td>Animating <code>height</code>/<code>top</code></td><td>animate <code>transform</code> instead — lesson 0013, again</td></tr>
+<tr><td>Content inserted above what the user is reading</td><td>insert below, or only in response to their own interaction</td></tr>
+</table>
+</div>
+<p class="small">
+  One relief: a shift within 500&nbsp;ms of a user interaction is <em>expected</em> and excluded. Opening an accordion is
+  not penalised. Injecting a banner on its own is.
+</p>
+
+<h2>4. Field versus lab — why both reports are right</h2>
+<p>
+  You run Lighthouse: green. The client sends a Search Console screenshot: red. Nobody is lying.
+</p>
+<div class="table-scroll">
+<table>
+<tr><th></th><th>Lab (Lighthouse, DevTools)</th><th>Field (CrUX, Search Console, RUM)</th></tr>
+<tr><td>Who</td><td>you, once, on your device</td><td>real visitors, 28-day rolling window, 75th percentile</td></tr>
+<tr><td>INP</td><td>not measurable — no real interactions. Lighthouse reports <b>TBT</b> as a proxy</td><td>measured from actual taps</td></tr>
+<tr><td>CLS</td><td>only shifts during the short synthetic load</td><td>the whole visit, including shifts you never scrolled to</td></tr>
+<tr><td>Good for</td><td>debugging a change you just made</td><td>deciding what to work on at all</td></tr>
+</table>
+</div>
+<p>
+  The professional habit: <b>field data chooses the work, lab data verifies the fix</b>. Getting that backwards is how
+  teams spend a sprint on a metric no customer was suffering.
+</p>
+
+<h2>5. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    Three separate questions about a page, each with its own score. <em>Did the big thing on the screen show up
+    quickly?</em> <em>Did the page stay still while I was reading it, or did it jump and make me tap the wrong thing?</em>
+    <em>When I tapped, how long before anything visibly happened?</em> Each one is measured on real visitors' phones, and
+    the score has to be good for three visits out of four — so one fast test on a developer's laptop proves nothing.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A restaurant review with three separate marks: how long the food took, whether the table wobbled,
+    and how long the waiter took to notice you. Averaging them into one star rating would hide which one to fix.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A restaurant is judged by its average night. These are judged at the <b>75th percentile</b> —
+    close to the worst quarter of visits, which means the slow phone on a bad connection counts far more than your test
+    does. And the measurement window keeps moving: a fix takes weeks to show up in the field, because the 28-day window
+    has to refill. There is no "we deployed it, refresh the report".
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Three, and each one produces wasted work. First: treating LCP as one thing. It is four — server time, discovery
+    delay, download time, render delay — and until you know which part dominates, any fix is a guess. Second: thinking a
+    green Lighthouse score means the site is fine. Lighthouse cannot measure INP at all, and it only sees shifts during a
+    short synthetic load. Third: believing CLS is about "how much moved". It is about <b>how much of the screen moved,
+    times how far</b> — which is why one small banner at the top can score worse than a large change in a corner.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a merchant who writes: <i>"Google says our Core Web Vitals fail on mobile but your test
+    says the site is fast — which is it?"</i> Explain both being true, say which one you will act on and why, and set an
+    honest expectation about when the report will change. Then <b>send it to me</b> — the words I am looking for are
+    "real visitors" and "75 out of 100", not "percentile".
+  </p>
+</div>
+
+<h2>6. Point at it: measure all three yourself <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Which element is the LCP?</b> DevTools &rarr; <b>Performance</b> &rarr; record a reload. On the <b>Timings</b>
+  track, click the <b>LCP</b> marker: the summary names the exact element and links it in the Elements panel. Half the
+  time it is not the element anyone assumed.</li>
+  <li><b>See shifts happen.</b> Rendering panel &rarr; tick <b>Layout Shift Regions</b>. Reload and watch: every shifting
+  area flashes blue. Then the <b>Experience</b> section of a performance recording lists each shift with its score and the
+  nodes involved.</li>
+  <li><b>All three, in the Console, on any page.</b> Paste this and interact for a few seconds:
+  <pre><code>new PerformanceObserver(l =&gt; l.getEntries().forEach(e =&gt;
+  console.log('LCP', Math.round(e.startTime), e.element)
+)).observe({ type: 'largest-contentful-paint', buffered: true });
+
+new PerformanceObserver(l =&gt; l.getEntries().forEach(e =&gt; {
+  if (!e.hadRecentInput) console.log('shift', e.value.toFixed(4), e.sources?.[0]?.node);
+})).observe({ type: 'layout-shift', buffered: true });
+
+new PerformanceObserver(l =&gt; l.getEntries().forEach(e =&gt;
+  console.log('interaction', e.name, Math.round(e.duration) + 'ms')
+)).observe({ type: 'event', durationThreshold: 40, buffered: true });</code></pre>
+  Three observers, three metrics, no libraries. This is gate #3 for this core — and it is also how you demonstrate a
+  problem to a client in a screen share.</li>
+  <li><b>Then check the field.</b> Search Console &rarr; Core Web Vitals, or the CrUX data shown in PageSpeed Insights.
+  Compare it with what you just measured and note the gap; the gap is the device and network you are not testing on.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A client's Search Console reports mobile LCP 4.8 s (poor), CLS 0.19 (needs work), INP 260 ms (needs work). You inspect the theme: the hero image is inside the slider section and carries <code>loading="lazy"</code>; an app injects a 90 px announcement bar after page load on an 800 px viewport; product images have no <code>width</code>/<code>height</code>; and a reviews script runs a 280 ms task during load. Your own Lighthouse run scores 96.</p>
+  Before flipping the recall cards: assign each observed problem to the metric it damages and to the LCP sub-part where relevant, then order the whole list by value-for-effort. Then the interviewer's follow-up: you ship every fix on Monday and the client emails on Wednesday saying Search Console is unchanged — what do you tell them, and what do you show them instead?
+</div>
+
+<h2>7. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>One file. Type it by hand — you are going to cause a bad CLS on purpose and then measure it:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;style&gt;body{margin:0;font:16px system-ui} .row{padding:24px;border-bottom:1px solid #ddd}&lt;/style&gt;
+&lt;div id="app"&gt;&lt;/div&gt;
+&lt;script&gt;
+  app.innerHTML = '&lt;div class="row"&gt;product row&lt;/div&gt;'.repeat(20);
+
+  new PerformanceObserver(l =&gt; l.getEntries().forEach(e =&gt; {
+    if (!e.hadRecentInput) console.log('shift score', e.value.toFixed(4));
+  })).observe({ type: 'layout-shift', buffered: true });
+
+  <span class="cmt">// the app banner, arriving 1.5s late, pushing everything down</span>
+  setTimeout(() =&gt; {
+    const bar = document.createElement('div');
+    bar.style.cssText = 'height:90px;background:#C86A08';
+    document.body.prepend(bar);
+  }, 1500);
+&lt;/script&gt;</code></pre>
+  <p><b>Predict before running:</b> calculate the shift score by hand first — impact fraction times distance fraction, with
+  your own window height. Then run it and compare your arithmetic with the number the observer prints. Being within a few
+  hundredths means you understand the formula rather than the slogan.</p>
+  <p><b>Now fix it two ways</b> and predict the score for each before testing:</p>
+  <pre><code>  <span class="cmt">// fix A — reserve the space up front</span>
+  document.body.style.paddingTop = '90px';   <span class="cmt">// then the bar is position:absolute at the top</span>
+
+  <span class="cmt">// fix B — overlay instead of push</span>
+  bar.style.cssText += ';position:fixed;top:0;left:0;right:0';</code></pre>
+  <p>Both should print nothing at all. Zero shifts, same banner, same pixels of information — the difference is entirely
+  whether existing content moved.</p>
+  <p><b>Third round — break LCP on purpose.</b> Add a large hero image and test three versions, predicting the LCP time
+  for each:</p>
+  <pre><code>  &lt;img src=&quot;hero.jpg&quot; width="1200" height="600" loading="lazy"&gt;                  <span class="cmt">// 1</span>
+  &lt;img src=&quot;hero.jpg&quot; width="1200" height="600"&gt;                                 <span class="cmt">// 2</span>
+  &lt;img src=&quot;hero.jpg&quot; width="1200" height="600" fetchpriority="high"&gt;            <span class="cmt">// 3</span></code></pre>
+  <p>Throttle to <i>Slow 4G</i> and record each. Version 1 is dramatically worse, and the LCP marker will name the image
+  as the element — the single most common real-world LCP bug, reproduced by you in one attribute. Keep the
+  <code>width</code> and <code>height</code> on all three: that is the CLS half, and it costs nothing.</p>
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>LCP, CLS, INP — definition and measurement</b> done only if all three held, from memory: (1) you explained the lab-versus-field answer to a merchant — the teach-back in section 5; (2) you calculated a shift score by hand before the observer printed it, and predicted the three LCP versions' order; (3) you found the LCP element in a real profile and watched Layout Shift Regions flash. Two out of three is zero out of three. <b>This completes Chapter 2's core</b> — do the weekly review before Chapter 3.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly, in this order: <a href="https://web.dev/articles/vitals">web.dev — Core Web Vitals</a> (10 min) for the frame, then <a href="https://web.dev/articles/lcp">LCP</a> and <a href="https://web.dev/articles/cls">CLS</a> (15 min each) for the definitions and the sub-parts. <a href="https://web.dev/articles/optimize-inp">Optimize INP</a> you already read in lesson 0007 — reread its first section with this lesson's field-versus-lab distinction in mind.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The observers as APIs</b> <span class="pill depth">depth</span> — <code>IntersectionObserver</code> and friends in
+  their own right. <b>TTFB, and everything server-side behind it</b> <span class="pill depth">depth</span> — Chapter 3
+  covers the network from the client side, and lesson 0017 starts on the round trips inside that first bar.
+  <b>Font loading strategy</b> <span class="pill depth">depth</span> — named in the CLS table, worth its own lesson.
+  <b>Setting up real-user monitoring</b> <span class="pill depth">depth</span> — Chapter 7, observability. Next core
+  lesson: <a href="0017-dns-tcp-tls-handshake-rtt.html">Chapter 3, 0017 · what a request costs in round trips</a>.
+</div>
+
+<p class="ask">Anything unclear — how the 75th percentile is chosen, why interaction-caused shifts are excluded, which sub-part of LCP your theme is losing? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Three failure modes, three numbers: <b>LCP</b> loading, <b>CLS</b> stability, <b>INP</b> response.</li>
+    <li>Thresholds: LCP <b>≤ 2.5 s</b>, CLS <b>≤ 0.1</b>, INP <b>≤ 200 ms</b> — all at the <b>75th percentile of real visits</b>.</li>
+    <li>LCP splits into four: <b>TTFB · load delay · load time · render delay</b>. Diagnose the part, never the whole.</li>
+    <li><code>loading="lazy"</code> on the hero image is the classic LCP bug. Load it eagerly, consider <code>fetchpriority="high"</code>.</li>
+    <li>Shift score = <b>impact fraction × distance fraction</b>. One 90 px banner on an 800 px viewport can score 0.11.</li>
+    <li>Shifts within 500 ms of a user interaction are excluded — opening an accordion is fine, injecting a banner is not.</li>
+    <li><b>Field data chooses the work; lab data verifies the fix.</b> Lighthouse cannot measure INP at all.</li>
+    <li>Field reports lag: the window is 28 days rolling, so a Monday fix is not visible on Wednesday.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>never optimise a Core Web Vital before you know which sub-part of it is losing.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0017-dns-tcp-tls-handshake-rtt.html">Next: Chapter 3 &rarr; 0017</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'At what point are the Core Web Vitals judged?',
+    options: [
+      'the 75th percentile of real visits to the page',
+      'the average of all real visits over a month',
+      'the median of three lab runs on a test device'
+    ],
+    answer: 0,
+    why: 'Good means three visits in four were good, so slow phones on poor connections weigh heavily. It is why a fast result on a developer laptop proves nothing about the score.'
+  },
+  {
+    q: 'Which four parts does LCP break into?',
+    options: [
+      'TTFB, load delay, load time, render delay',
+      'DNS, connect, download, decode and paint',
+      'queueing, script, layout, paint and composite'
+    ],
+    answer: 0,
+    why: 'Server time, then how late the element was discovered, then how long its bytes took, then whatever stopped the browser painting once they arrived. Until you know which dominates, any fix is a guess.'
+  },
+  {
+    q: 'A 90px banner is injected at the top of an 800px viewport, pushing content down. Score?',
+    options: [
+      'about 0.11, from impact times distance',
+      'about 0.90, since ninety pixels moved',
+      'zero, because the banner is new content'
+    ],
+    answer: 0,
+    why: 'Impact fraction is close to 1 because the whole visible area moved, and distance fraction is 90 divided by 800, which is roughly 0.11. New content does not excuse the shift; only a recent user interaction does.'
+  },
+  {
+    q: 'Which attribute on a hero image most often ruins LCP?',
+    options: [
+      'loading set to lazy on the largest element',
+      'width and height set explicitly in the markup',
+      'alt text describing the product in the image'
+    ],
+    answer: 0,
+    why: 'Lazy loading delays discovery and download of the very element LCP measures. Explicit width and height are the opposite: they cost nothing and prevent layout shift.'
+  },
+  {
+    q: 'Your Lighthouse score is 96 and Search Console reports failing vitals. What is true?',
+    options: [
+      'both are right; they measure different things',
+      'Search Console is stale and can be ignored',
+      'Lighthouse is wrong unless run three times'
+    ],
+    answer: 0,
+    why: 'Lighthouse is one synthetic run on your device and cannot measure INP at all; Search Console is real visitors at the 75th percentile over 28 days. Field data chooses the work, lab data verifies the fix.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"Define the three Core Web Vitals and their thresholds."',
+    answer: '<b>LCP</b> — when the largest contentful element in the viewport is rendered; good at <b>≤ 2.5 s</b>. <b>CLS</b> — the largest burst of unexpected layout shift, scored as impact fraction times distance fraction; good at <b>≤ 0.1</b>. <b>INP</b> — from a tap or key press to the next paint that shows the result; good at <b>≤ 200 ms</b>. All three at the <b>75th percentile of real visits</b>.<br><br><i>Likely follow-up:</i> "Why three rather than one?" Because they have different causes and different fixes. One score would tell a merchant that something is wrong without telling anyone which of loading, stability or responsiveness to work on.'
+  },
+  {
+    prompt: '"How do you actually improve LCP?"',
+    answer: 'By splitting it first. <b>TTFB</b> is hosting, the platform and the CDN. <b>Load delay</b> is discoverability — remove <code>loading="lazy"</code> from the hero, never build its <code>src</code> in JavaScript, and add <code>fetchpriority="high"</code> or a preload if it is found late. <b>Load time</b> is bytes: right format, right dimensions, responsive sources. <b>Render delay</b> is render-blocking CSS and long tasks in the way. Whichever part dominates is the only one worth working on.<br><br><i>Likely follow-up:</i> "How do you know which element LCP even is?" Record a reload in the Performance panel and click the LCP marker on the Timings track — it names the element. It is frequently not the one the team assumed.'
+  },
+  {
+    prompt: 'The Search Console drill: LCP 4.8 s, CLS 0.19, INP 260 ms, local Lighthouse 96. Assign each fault, order the work, then answer the Wednesday email.',
+    answer: 'Assignments: <code>loading="lazy"</code> on the hero &rarr; <b>LCP, load delay</b>. Hero inside a slider that initialises late &rarr; <b>LCP, load delay</b> again, and possibly render delay. The 280 ms reviews task &rarr; <b>INP</b> (input delay, lesson 0007) and <b>LCP render delay</b>, because it holds the main thread during load. The 90 px injected bar &rarr; <b>CLS</b>, roughly 0.11 on its own. Product images with no dimensions &rarr; <b>CLS</b>, the rest of the 0.19.<br><br>Order by value for effort: (1) remove <code>loading="lazy"</code> and add <code>fetchpriority="high"</code> — one line, largest LCP win; (2) add <code>width</code> and <code>height</code> to product images — mechanical, removes most of the CLS; (3) reserve space for the announcement bar or make it an overlay — small change, kills the biggest single shift; (4) defer the reviews script until after first interaction — bigger job, needs the app\'s cooperation, fixes INP and part of LCP; (5) get the hero out of the slider\'s deferred initialisation, which is the most invasive change.<br><br><i>Likely follow-up:</i> "Wednesday, and the report is unchanged." I tell them that is expected: the field report is a <b>28-day rolling window at the 75th percentile</b>, so two days of good traffic cannot move it yet, and I would not expect a clear signal for two to four weeks. What I show them instead: a before-and-after lab recording of the same page, the LCP marker moving, the layout-shift regions no longer flashing, and — if we have real-user monitoring — our own field numbers for visits since the deploy. If we do not have that monitoring, adding it is the honest next ticket, because otherwise every fix ends in this same conversation.'
+  }
+]);
+</script>
+</body>
+</html>

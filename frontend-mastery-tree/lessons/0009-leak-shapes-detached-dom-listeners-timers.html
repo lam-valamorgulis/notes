@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0009 · Leak shapes: detached DOM, listeners, timers, closures — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Memory · Lesson 0009</p>
+<h1>Leak shapes: detached DOM, listeners, timers, closures</h1>
+<p class="subtitle">The garbage collector does not free what you have stopped using. It frees what you can no longer reach. Every memory leak you will ever debug is one accidental rope — and there are only four common ropes.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #4 (debug a problem with no ready answer) — the last core of Chapter 1, and the one that pays for itself the first time a client says "the site gets slower the longer I browse".</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~40 minutes you can take a heap snapshot, find a detached DOM subtree, name the exact line holding it, and say which of the four shapes it is — without guessing.
+</div>
+
+<h2>1. Reachability, not usage</h2>
+<p>
+  Start from the engine's position. It cannot know what your code will use next; that would need to predict the future.
+  It can only know what your code <b>can still get to</b>. So it defines a set of <b>roots</b> — things that are alive
+  by definition — and keeps everything reachable from them:
+</p>
+<ul>
+  <li>the global object and its properties (<code>window</code>, anything you hung off it);</li>
+  <li>every frame currently on the call stack, and its variables (lesson 0001);</li>
+  <li><b>things the platform itself holds</b>: the live document tree, registered event listeners, pending timers, in-flight requests.</li>
+</ul>
+<p>
+  Then it does mark-and-sweep: walk every rope from every root, mark what you touch, free the rest. The consequence is
+  the sentence that fixes leaks: <b>a leak is not "memory that is unused" — it is memory you no longer want that is
+  still reachable.</b> The bug is never in the collector. The bug is a rope you forgot.
+</p>
+<p>
+  And now lesson 0003 pays off directly. A closure keeps its whole box alive, so <em>a rope to a function is a rope to
+  everything that function could see</em>. Nothing new to learn; the same rule, applied to memory.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 270" role="img" aria-label="Roots hold ropes to objects; a detached DOM subtree is held by two separate ropes, one through a global object and one through a timer closure, so cutting only one rope keeps it alive">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="16">GC ROOTS — ALIVE BY DEFINITION</text>
+  <rect class="box" x="16" y="24" width="150" height="34" rx="5"/>
+  <text class="mono sm" x="28" y="45">window / globals</text>
+  <rect class="box" x="182" y="24" width="130" height="34" rx="5"/>
+  <text class="mono sm" x="194" y="45">call stack</text>
+  <rect class="box" x="328" y="24" width="150" height="34" rx="5"/>
+  <text class="mono sm" x="340" y="45">pending timers</text>
+  <rect class="box dim" x="494" y="24" width="210" height="34" rx="5"/>
+  <text class="mono sm" x="506" y="45">live document tree</text>
+
+  <path class="flow" d="M80,62 L110,104"/>
+  <rect class="box" x="40" y="110" width="180" height="42" rx="5"/>
+  <text class="mono sm" x="52" y="128">app.slideshow</text>
+  <text class="sub" x="52" y="144">you forgot to null this</text>
+
+  <path class="flow" d="M400,62 L360,104"/>
+  <rect class="box" x="260" y="110" width="190" height="42" rx="5"/>
+  <text class="mono sm" x="272" y="128">closure box of tick()</text>
+  <text class="sub" x="272" y="144">setInterval never cleared</text>
+
+  <rect class="box bad" x="490" y="110" width="214" height="42" rx="5"/>
+  <text class="mono sm" x="502" y="128">detached &lt;div&gt;</text>
+  <text class="sub" x="502" y="144">+ 400 child nodes</text>
+
+  <path class="flow amber" d="M224,131 L256,131"/>
+  <path class="flow amber" d="M454,131 L486,131"/>
+  <path class="flow dash" d="M598,62 L598,104" style="stroke:var(--rule)"/>
+  <text class="sub" x="504" y="80">removed from the page</text>
+
+  <line class="rule thin" x1="16" y1="186" x2="704" y2="186"/>
+  <text class="cap amber" x="16" y="212">TWO ROPES REACH IT. CUT ONE AND IT IS STILL KEPT.</text>
+  <text class="sub" x="16" y="234">Not being in the document has nothing to do with being collectable. Being unreachable does.</text>
+  <text class="sub" x="16" y="252">400 nodes, their styles and their listeners stay in memory until the last rope is cut.</text>
+</svg>
+<figcaption>The picture to hold in your head when you read the <b>Retainers</b> list in a heap snapshot: DevTools is showing you the ropes, and you must cut all of them.</figcaption>
+</figure>
+
+<h2>2. The four shapes</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Shape</th><th>The rope</th><th>What it keeps</th><th>The fix</th></tr>
+<tr><td><b>Detached DOM</b></td><td>a variable, array or <code>Map</code> still referencing a removed node</td><td>the node <em>and its whole subtree</em></td><td>null the reference when you remove the node; key caches with <code>WeakMap</code></td></tr>
+<tr><td><b>Listeners</b></td><td><code>addEventListener</code> on a long-lived target (<code>window</code>, <code>document</code>) whose handler closes over your component</td><td>the handler's box &rarr; the component &rarr; its DOM</td><td><code>removeEventListener</code> with the same reference, or one <code>AbortController</code> per instance</td></tr>
+<tr><td><b>Timers</b></td><td><code>setInterval</code> never cleared (a pending timer is a root)</td><td>the callback's box, forever</td><td><code>clearInterval</code> on teardown; prefer <code>rAF</code> loops that stop themselves</td></tr>
+<tr><td><b>Closures</b></td><td>any surviving function created in a big scope</td><td>every binding its box holds</td><td>keep boxes small; do not close over a whole component when you need one id</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — the listener myth</span>
+  "Event listeners always leak" is false, and believing it wastes hours. If the <em>target node</em> and the handler both
+  become unreachable together, the collector takes both — no <code>removeEventListener</code> needed. The leak happens
+  when the target <b>outlives</b> the component: <code>window</code>, <code>document</code>, or a node you kept a
+  reference to. So the question is never "did I remove the listener?" but <b>"what is the listener attached to, and how
+  long does that thing live?"</b>
+</div>
+
+<h2>3. The shape that bites Shopify themes specifically</h2>
+<p>
+  Theme sections are re-rendered by the theme editor and by the Section Rendering API. Each re-render calls your
+  <code>init</code> again on fresh markup — and if <code>init</code> attaches to something long-lived, every re-render
+  adds a new rope while the old markup is thrown away:
+</p>
+<pre><code><span class="cmt">// leaks once per section re-render</span>
+function init(section) {
+  const slides = section.querySelectorAll('.slide');
+  window.addEventListener('resize', () =&gt; layout(slides));   <span class="cmt">// window outlives the section</span>
+  setInterval(() =&gt; advance(slides), 4000);                  <span class="cmt">// a pending timer is a root</span>
+}
+document.addEventListener('shopify:section:load', e =&gt; init(e.target));</code></pre>
+<pre><code><span class="cmt">// one controller per instance — one line cuts every rope</span>
+function init(section) {
+  const slides = section.querySelectorAll('.slide');
+  const ac = new AbortController();
+  window.addEventListener('resize', () =&gt; layout(slides), { signal: ac.signal });
+  const id = setInterval(() =&gt; advance(slides), 4000);
+  section.addEventListener('shopify:section:unload', () =&gt; {
+    ac.abort();            <span class="cmt">// removes every listener registered with this signal</span>
+    clearInterval(id);     <span class="cmt">// the timer root goes away</span>
+  }, { once: true });
+}</code></pre>
+<p class="small">
+  <code>AbortController</code> as a listener remover:
+  <a href="https://developer.mozilla.org/en-US/docs/Web/API/AbortController">MDN — AbortController</a>. It is the same
+  object used to cancel a <code>fetch</code>, which is the cancellation a promise could not give you in lesson 0008.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser cleans up by asking one question about every object: <b>can I still get to it?</b> It starts from a few
+    places it knows are in use, follows every rope, and throws away whatever it never touched. It never asks "do you
+    still want this". So a thing you stopped caring about stays in memory as long as one rope still reaches it — and
+    ropes are easy to leave behind: a name you forgot to clear, a timer still ticking, a handler still listening on
+    something that lives as long as the page.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A warehouse clear-out. The team walks in from the loading doors, follows every labelled path,
+    and marks every crate it can reach. Anything unmarked gets thrown out — including crates that are perfectly full,
+    if no path leads to them. A crate you no longer want survives simply because one old path still points at it.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A warehouse manager can look at a crate and decide it is junk. The collector cannot: it has
+    no opinion about value, only about paths. And unlike a warehouse, here removing a crate from the shop floor — taking
+    a node out of the page — does not remove any path to it. That single mismatch is the whole detached-DOM bug.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Two, and they are the reason leak hunts go in circles. First: people think <code>element.remove()</code> frees the
+    element. It only unlinks it from the document; if any JavaScript still references it, the node and its <em>entire
+    subtree</em> stay. Second: people believe every listener must be removed by hand. Not true — if the target dies with
+    the handler, both are collected. What matters is <b>how long the target lives</b>. Ask that question and you will
+    stop removing listeners that never leaked while missing the one on <code>window</code> that does.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior who asks: <i>"I called <code>drawer.remove()</code>, so why does the Memory panel
+    still show 400 detached nodes after ten opens?"</i> You may not use the words "garbage collection" or "reference"
+    without explaining them plainly first. Then <b>send it to me</b> — I am checking that you say <em>reachable</em>
+    rather than <em>used</em>, because that one word swap is what makes the fix findable.
+  </p>
+</div>
+
+<h2>5. Point at it: find the rope in a heap snapshot <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>See the trend first.</b> DevTools &rarr; <b>Performance monitor</b> (Command Menu &rarr; "Show Performance
+  monitor"). Watch <b>JS heap size</b> and <b>DOM Nodes</b> while you open and close a drawer ten times. A staircase
+  that never comes back down is a leak; a sawtooth is healthy.</li>
+  <li><b>The three-snapshot technique.</b> <b>Memory</b> &rarr; <i>Heap snapshot</i>. Take snapshot 1. Do the action ten
+  times. Take snapshot 2. Do it ten more times. Take snapshot 3. Then compare 3 against 2 with the
+  <b>Comparison</b> view: whatever keeps growing between two identical rounds is the leak, and everything that merely
+  appeared once is noise. Documented in
+  <a href="https://developer.chrome.com/docs/devtools/memory-problems/">Chrome DevTools — Fix memory problems</a>.</li>
+  <li><b>Name the shape.</b> In a snapshot, type <code>Detached</code> into the class filter. Each
+  <code>Detached HTMLDivElement</code> is a removed node still held. Select one and read the <b>Retainers</b> pane at
+  the bottom — it names the object and the property holding it, and often the file and line. That retainer chain is the
+  rope in the diagram.</li>
+  <li><b>Confirm the timer shape.</b> With the leak reproduced, run
+  <code>for (let i = 1; i &lt; 9999; i++) clearInterval(i)</code> in the Console, force garbage collection with the bin
+  icon, and re-snapshot. If the detached nodes disappear, a pending timer was the root — a crude test, and it answers
+  the question in ten seconds.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A client reports the storefront "gets sluggish after browsing for a while", worst on collection pages with infinite scroll. You watch the Performance monitor: DOM Nodes climbs from 1,800 to 14,000 over five minutes of scrolling and never drops, and JS heap follows it. A snapshot comparison shows thousands of <code>Detached HTMLImageElement</code> entries, and the Retainers pane keeps naming an array called <code>observedCards</code> inside the lazy-loading module.</p>
+  Before flipping the recall cards: name the shape, explain why the images were detached but not freed, and give the fix. Then the interviewer's follow-up: the module needs to remember which cards it has already handled — how do you keep that memory without keeping the nodes alive?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch HTML file. Type this leak by hand — you are building the bug on purpose:</p>
+  <pre><code>const kept = [];
+function openDrawer() {
+  const el = document.createElement('div');
+  el.innerHTML = '&lt;p&gt;row&lt;/p&gt;'.repeat(400);
+  document.body.append(el);
+  kept.push(el);                      <span class="cmt">// the rope</span>
+  setTimeout(() =&gt; el.remove(), 50);  <span class="cmt">// unlinked, but still reachable</span>
+}
+for (let i = 0; i &lt; 10; i++) openDrawer();</code></pre>
+  <p><b>Predict first:</b> after the timeouts run, how many detached nodes will a snapshot show? Then check: Memory
+  &rarr; Heap snapshot &rarr; filter <code>Detached</code>. Read the Retainers pane and find <code>kept</code> by name.
+  Seeing your own variable named in DevTools is the moment this becomes a skill instead of a warning.</p>
+  <p><b>Now fix it and prove the fix.</b> Change one line — <code>kept.push(el)</code> becomes nothing, or clear the
+  array in the timeout — force garbage collection with the bin icon, snapshot again, and confirm the detached count is
+  zero. Same page, same 4,000 nodes created, no leak.</p>
+  <p><b>Third round: the listener shape.</b> Predict which of these two leaks, then test both:</p>
+  <pre><code><span class="cmt">// A</span>
+const a = document.createElement('button');
+a.addEventListener('click', () =&gt; console.log('a'));
+document.body.append(a); a.remove();
+
+<span class="cmt">// B</span>
+const b = document.createElement('button');
+window.addEventListener('resize', () =&gt; b.focus());
+document.body.append(b); b.remove();</code></pre>
+  <p>A does not leak: the button and its handler became unreachable together. B leaks: <code>window</code> is a root, it
+  holds the handler, the handler's box holds <code>b</code>. Now fix B with an <code>AbortController</code> and confirm
+  the detached button disappears. If you can explain the difference between A and B out loud, you have this core.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>leak shapes: detached DOM, listeners, timers, closures</b> done only if all three held, from memory: (1) you explained "reachable, not used" in plain words — the teach-back in section 4; (2) you predicted which of A and B leaks, before testing; (3) you found a <code>Detached</code> element in a real heap snapshot and read its retainer chain. Two out of three is zero out of three. <b>This is the last core of Chapter 1</b> — when it is marked, take the weekly review session before starting Chapter 2.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly, with DevTools open beside it: <a href="https://developer.chrome.com/docs/devtools/memory-problems/">Chrome DevTools — Fix memory problems</a> (30 min). Do the three-snapshot walkthrough on your own theme rather than on their demo page; the muscle memory only forms on code you know.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Stack vs heap allocation</b> <span class="pill depth">depth</span> — used informally here, studied properly later.
+  <b>Generational, incremental and concurrent GC</b> <span class="pill depth">depth</span> — <em>how</em> the collector
+  runs without freezing the page; fascinating, and it does not change a single fix in this lesson.
+  <b><code>WeakMap</code>, <code>WeakRef</code>, <code>FinalizationRegistry</code></b> <span class="pill depth">depth</span>
+  — named in the table and in the drill's follow-up, because a <code>WeakMap</code> is the honest answer there.
+  <b>Reading the allocation timeline</b> <span class="pill depth">depth</span>. That is Chapter 1's core complete —
+  next comes <a href="0010-cssom-and-render-blocking-css.html">Chapter 2, lesson 0010</a>, where we stop asking what
+  runs and start asking what the customer actually sees.
+</div>
+
+<p class="ask">Anything unclear — why a subtree is kept by one node, when a listener genuinely needs removing, how to audit your own theme's sections? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>The collector frees what is <b>unreachable</b>, never what is "unused". A leak is something you no longer want with a rope still attached.</li>
+    <li><b>Roots</b>: globals, the call stack, and platform-held things — the live document, registered listeners, pending timers, in-flight requests.</li>
+    <li><code>element.remove()</code> unlinks a node from the page. It frees nothing if JavaScript still references it — and one held node keeps its <b>whole subtree</b>.</li>
+    <li>Four shapes: <b>detached DOM</b>, <b>listeners on long-lived targets</b>, <b>uncleared timers</b>, <b>closures over too much</b>. All four are the same rule.</li>
+    <li>Listeners do not always leak. Ask <b>how long the target lives</b>, not "did I remove it".</li>
+    <li>A closure keeps its whole box (lesson 0003), so a rope to a function is a rope to everything it could see.</li>
+    <li>Method: Performance monitor for the trend, <b>three snapshots</b> for the culprit, <b>Retainers</b> for the line to change.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>ask "what still points at this?", never "why has this not been freed?"</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/memory-and-leaks.html">Cheat sheet: memory &amp; leaks</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0010-cssom-and-render-blocking-css.html">Next: Chapter 2 &rarr; 0010</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What does the garbage collector actually free?',
+    options: [
+      'objects that no root can reach any more',
+      'objects your code has stopped reading from',
+      'objects older than the current generation'
+    ],
+    answer: 0,
+    why: 'Reachability is the only question it can answer. It cannot know what you still intend to use, so a thing you no longer want survives as long as one rope from a root still reaches it.'
+  },
+  {
+    q: 'You call el.remove() but a module array still holds el. What stays in memory?',
+    options: [
+      'el and every one of its descendant nodes',
+      'only el itself, since children were unlinked',
+      'nothing, because it left the document tree'
+    ],
+    answer: 0,
+    why: 'remove() only unlinks it from the document. The node is still reachable through the array, and a node keeps its whole subtree, so the entire detached tree stays.'
+  },
+  {
+    q: 'Which listener genuinely leaks a removed component?',
+    options: [
+      'one on window whose handler holds the node',
+      'one on the removed node itself, never removed',
+      'both leak equally, listeners are always kept'
+    ],
+    answer: 0,
+    why: 'window is a root, so it holds the handler, whose closure holds the node. A listener on the node itself dies with the node when both become unreachable together.'
+  },
+  {
+    q: 'Why is a never-cleared setInterval a leak even if nothing else references its callback?',
+    options: [
+      'a pending timer is itself a root that holds it',
+      'intervals copy their callback once per firing',
+      'the callback is promoted to the old generation'
+    ],
+    answer: 0,
+    why: 'The platform holds pending timers, so the callback stays reachable, and the callback keeps its whole closure box — including any DOM it can see.'
+  },
+  {
+    q: 'Which DevTools pane names the exact thing holding a detached node?',
+    options: [
+      'Memory panel, a snapshot, the Retainers pane',
+      'Sources panel, while paused, the Scope pane',
+      'Performance panel, the Bottom-Up call tree'
+    ],
+    answer: 0,
+    why: 'Filter a heap snapshot for Detached, select an entry, and Retainers lists the chain of objects and properties keeping it — usually down to a file and line.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What causes a memory leak in a browser?"',
+    answer: 'A reference you forgot. The collector frees whatever is <b>unreachable</b> from its roots — globals, the call stack, and platform-held things like the live document, registered listeners and pending timers. It never asks whether you still want something. So a leak is memory you no longer want that is still reachable, and the fix is always to cut the last rope.<br><br><i>Likely follow-up:</i> "Name the common shapes." Detached DOM held by a variable or cache; a listener on a long-lived target like <code>window</code>; an uncleared <code>setInterval</code>; and a closure that captured more than it needed. They are four faces of one rule.'
+  },
+  {
+    prompt: '"Do you have to remove every event listener to avoid leaks?"',
+    answer: 'No, and believing so sends you fixing the wrong lines. If the target node and the handler become unreachable together, the collector takes both. The leak happens when the <b>target outlives the component</b> — <code>window</code>, <code>document</code>, or a node something else is still holding. The useful question is how long the target lives.<br><br><i>Likely follow-up:</i> "What is the cleanest way to clean up when it does matter?" One <code>AbortController</code> per instance: pass <code>{ signal }</code> to every <code>addEventListener</code>, then a single <code>abort()</code> on teardown removes all of them, with no need to keep each handler reference around.'
+  },
+  {
+    prompt: 'The infinite-scroll drill: DOM nodes climb to 14,000, snapshots show thousands of detached images retained by an `observedCards` array. Name the shape, the fix, and how to keep the "already handled" memory.',
+    answer: 'Shape: <b>detached DOM held by a cache</b>. The lazy-loading module pushed every card into <code>observedCards</code> and never removed entries, so when older cards were recycled out of the page the array kept each node — and each node kept its subtree, including the images. They were detached but perfectly reachable, so nothing could be freed.<br><br>Fix: remove the entry when the card leaves — and <code>IntersectionObserver.unobserve(el)</code> as well, since an observer keeps its own reference to what it watches.<br><br><i>Likely follow-up:</i> "It still needs to remember which cards it handled — how?" Use a <code>WeakMap</code> or <code>WeakSet</code> keyed by the node. It answers "have I seen this node" without being a rope: when the node becomes otherwise unreachable, the entry disappears with it. If the bookkeeping only needs an id, store the id string instead of the node — the smallest thing that answers the question is always the right thing to hold.'
+  }
+]);
+</script>
+</body>
+</html>

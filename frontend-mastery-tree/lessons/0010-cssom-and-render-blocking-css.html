@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0010 · CSSOM construction &amp; render-blocking CSS — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Parse · Lesson 0010</p>
+<h1>CSSOM construction &amp; render-blocking CSS</h1>
+<p class="subtitle">Chapter 1 answered "what runs". Chapter 2 answers "what the customer sees, and when". It starts with the reason a storefront can be fully downloaded and still show a white screen.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #1 (explain from first principles) and ability #3 (say what the design gives up) — "render-blocking" is a deliberate trade the browser makes on your behalf, and you can change the terms.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can look at a theme's <code>&lt;head&gt;</code> and say which lines delay the first pixel, prove it in the Performance panel, and name the fix for each one — with the cost of that fix.
+</div>
+
+<h2>1. Why the browser refuses to paint early</h2>
+<p>
+  The HTML parser is incremental: it turns bytes into tokens into DOM nodes as they arrive, and it does not need the
+  whole file to start. So why not paint the first paragraph the moment it exists?
+</p>
+<p>
+  Because painting means committing pixels, and a rule further down the CSS could change every one of them. One line —
+  <code>body { display: none }</code>, a different font size, a dark background — arriving after you painted would force
+  you to throw the frame away and paint again. The customer would see a flash of unstyled content, then a jump. Two bad
+  frames are worse than one late frame.
+</p>
+<p>
+  So the browser makes a rule: <b>build the complete CSSOM before producing the first frame</b>. CSS is
+  <b>render-blocking</b>. Note the precise wording, because the imprecise version causes wrong fixes:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th></th><th>Parser-blocking</th><th>Render-blocking</th></tr>
+<tr><td>Stops HTML being turned into DOM</td><td><b>yes</b></td><td>no — parsing continues</td></tr>
+<tr><td>Stops the first frame being painted</td><td>yes, as a side effect</td><td><b>yes</b>, that is the point</td></tr>
+<tr><td>Classic example</td><td>a plain <code>&lt;script&gt;</code> (lesson 0011)</td><td>a <code>&lt;link rel="stylesheet"&gt;</code> in <code>&lt;head&gt;</code></td></tr>
+</table>
+</div>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 250" role="img" aria-label="Two lanes: HTML bytes become the DOM and CSS bytes become the CSSOM; both are needed before the render tree, layout, paint and composite can produce the first frame">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <rect class="box" x="16" y="40" width="110" height="32" rx="5"/>
+  <text class="mono sm" x="26" y="60">HTML bytes</text>
+  <path class="flow" d="M130,56 L146,56"/>
+  <rect class="box" x="150" y="40" width="100" height="32" rx="5"/>
+  <text class="mono sm" x="160" y="60">DOM</text>
+
+  <rect class="box" x="16" y="98" width="110" height="32" rx="5"/>
+  <text class="mono sm" x="26" y="118">CSS bytes</text>
+  <path class="flow" d="M130,114 L146,114"/>
+  <rect class="box" x="150" y="98" width="100" height="32" rx="5"/>
+  <text class="mono sm" x="160" y="118">CSSOM</text>
+
+  <path class="flow" d="M254,56 L276,66"/>
+  <path class="flow" d="M254,112 L276,90"/>
+  <rect class="box hot" x="280" y="60" width="120" height="34" rx="5"/>
+  <text class="mono sm" x="290" y="81">render tree</text>
+  <path class="flow" d="M404,77 L420,77"/>
+  <rect class="box" x="424" y="60" width="100" height="34" rx="5"/>
+  <text class="mono sm" x="434" y="81">layout</text>
+  <path class="flow" d="M528,77 L544,77"/>
+  <rect class="box" x="548" y="60" width="70" height="34" rx="5"/>
+  <text class="mono sm" x="558" y="81">paint</text>
+  <path class="flow" d="M622,77 L638,77"/>
+  <rect class="box good" x="642" y="60" width="70" height="34" rx="5"/>
+  <text class="mono sm" x="648" y="81">frame</text>
+
+  <line class="rule" x1="266" y1="20" x2="266" y2="150" style="stroke:var(--warn)" stroke-dasharray="5 4"/>
+  <text class="cap" x="16" y="176" style="fill:var(--warn)">NOTHING CROSSES THIS LINE UNTIL BOTH LANES ARE READY</text>
+  <text class="sub" x="16" y="196">That is all &quot;render-blocking&quot; means: the CSSOM must be complete first.</text>
+
+  <line class="rule thin" x1="16" y1="212" x2="704" y2="212"/>
+  <text class="sub" x="16" y="232">The trap: a stylesheet also blocks the next &lt;script&gt; from running &mdash; and that script blocks the parser.</text>
+  <text class="sub" x="16" y="248">So slow CSS can stall DOM building too, indirectly. Lesson 0011 finishes that story.</text>
+</svg>
+<figcaption>The critical rendering path. Everything in Chapter 2 is a question about one of these boxes, or about which of them a change makes the browser redo.</figcaption>
+</figure>
+
+<h2>2. The four things that make CSS block longer than it should</h2>
+<ol>
+  <li><b>More stylesheets than round trips allow.</b> Each <code>&lt;link&gt;</code> is a separate request the browser must
+  finish. Four sheets on a slow connection is four chances to be the slowest one — and the first frame waits for the
+  slowest, not the average.</li>
+  <li><b><code>@import</code> inside a stylesheet.</b> The browser cannot know about the imported file until it has
+  downloaded and parsed the importing file. That is a <em>serial</em> round trip, discovered late, invisible in the HTML.
+  It is the single worst pattern in this lesson.</li>
+  <li><b>No <code>media</code> attribute.</b> A sheet that only matters for print or for wide screens still blocks
+  rendering unless you say so. <code>media="print"</code> and
+  <code>media="(min-width: 60em)"</code> make it non-blocking when it does not apply — the browser still downloads it, at
+  a lower priority, but does not wait for it.</li>
+  <li><b>A stylesheet before a script.</b> A script can ask for computed styles, so the browser will not run it until the
+  CSSOM is ready. The script then blocks the parser. One slow sheet quietly becomes a DOM-building delay.</li>
+</ol>
+
+<h2>3. What you can actually do, and what each fix costs</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Move</th><th>What it buys</th><th>What it gives up</th></tr>
+<tr><td>Inline the CSS the first screen needs, load the rest with <code>media="print" onload="this.media='all'"</code></td><td>the first frame stops waiting on the network entirely</td><td>the inlined bytes are not cacheable across pages, and you must keep the "first screen" list honest as the design changes</td></tr>
+<tr><td>Delete unused CSS (Coverage tab)</td><td>less to download <em>and</em> less to parse and match</td><td>real risk: a rule used only on a template you did not test</td></tr>
+<tr><td>Replace <code>@import</code> with a <code>&lt;link&gt;</code></td><td>removes a serial round trip</td><td>nothing. Do it today</td></tr>
+<tr><td>Add <code>media</code> to conditional sheets</td><td>they stop blocking the first frame</td><td>nothing, if the condition is right</td></tr>
+<tr><td>Merge sheets into one</td><td>fewer requests to wait on</td><td>one cache key: any change invalidates everything (Chapter 3, lesson 0018)</td></tr>
+</table>
+</div>
+<div class="trap">
+  <span class="label">Trap — the fix that makes it worse</span>
+  Loading all CSS asynchronously without inlining the critical part does not remove the wait, it moves it: the browser
+  now paints an unstyled page and then repaints. That is a real <b>layout shift</b> in front of the customer, and CLS is
+  a ranked metric (lesson 0016). Async CSS is only correct <em>with</em> inlined critical CSS. Never one without the other.
+</div>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser reads your page text and builds a list of things to show. It also reads your style file and builds a list
+    of how things should look. It will not draw anything until the second list is finished — because a line at the very
+    end of the style file could change the colour, the size or even the visibility of everything. Drawing first and
+    fixing after would make the page flash and jump, so the browser chooses to wait.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A theatre. The actors are ready and the set is built, but the curtain stays down until the
+    lighting desk has its full cue sheet. One cue on the last page could black out the stage, so raising the curtain
+    early risks showing the audience something wrong.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A theatre could raise the curtain anyway and accept a bad first minute — and in fact you
+    <em>can</em> tell the browser to do that, which is what async CSS does. The analogy also hides the nastier part: the
+    lighting desk can hold up the actors too. A stylesheet delays the next script, and that script stops the page being
+    read at all. There is no equivalent of that in a theatre.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People mix up the two words. <b>Render-blocking</b> means "no pixels yet" — the DOM keeps being built the whole time.
+    <b>Parser-blocking</b> means "no more DOM" and that is a script's doing, not a stylesheet's. Say the wrong one in an
+    interview and the follow-up will find you out. The second sticking point: assuming a <code>media</code> attribute
+    prevents the download. It does not — the file is still fetched, just at a lower priority and without holding up the
+    first frame.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a client asking: <i>"Lighthouse says 'eliminate render-blocking resources' — is that a bug
+    you introduced?"</i> Explain what the browser is doing and why it is usually right to do it, then say what you would
+    change. No jargon: not "CSSOM", not "critical path", until you have said it plainly. Then <b>send it to me</b>.
+  </p>
+</div>
+
+<h2>5. Point at it: watch the first frame wait <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Find the blockers.</b> DevTools &rarr; <b>Network</b> &rarr; reload with <i>Slow 4G</i> throttling. Sort by
+  <b>Priority</b>: stylesheets requested from <code>&lt;head&gt;</code> show as <i>Highest</i>. Note the finish time of
+  the slowest one.</li>
+  <li><b>Compare it to the first paint.</b> <b>Performance</b> &rarr; record a reload. On the <i>Frames</i> track, find
+  the first real frame and read its timestamp. It should sit just after the slowest blocking stylesheet finished — not
+  after the HTML finished. Seeing those two numbers line up <em>is</em> gate #3 for this core.</li>
+  <li><b>See the parse work itself.</b> In the same profile, the Main track shows <b>Parse Stylesheet</b> and
+  <b>Recalculate Style</b> entries. That is CSSOM construction and style matching, measured in milliseconds — on a
+  throttled CPU it is rarely negligible.</li>
+  <li><b>Measure the waste.</b> Command Menu &rarr; "Show Coverage" &rarr; reload. Every red bar is CSS you downloaded,
+  parsed and waited for, and did not use on this page. Write the percentage down; it is the strongest argument you will
+  have in the next planning meeting.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A client's <code>theme.liquid</code> head contains, in this order: <code>base.css</code> (180 KB), <code>vendor-slider.css</code>, a review app's <code>widget.css</code>, a stylesheet whose first line is <code>@import url("fonts.css")</code>, and a <code>print.css</code> with no <code>media</code> attribute. LCP on mobile is 4.2 s; the Coverage tab reports 71% of CSS unused on the home page.</p>
+  Before flipping the recall cards: list the five lines in the order you would fix them, and for each say whether the win is fewer round trips, fewer bytes, or no blocking at all. Then the interviewer's follow-up: which of your fixes could break the site in a way QC on the home page would <em>not</em> catch, and how would you protect against it?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Make a folder with two files. First, generate a deliberately fat stylesheet from the terminal:</p>
+  <pre><code>python3 -c "print('\n'.join(f'.pad-{i}{{padding:{i}px}}' for i in range(60000)))" &gt; slow.css</code></pre>
+  <p>Then type this HTML by hand:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;link rel="stylesheet" href=&quot;slow.css&quot;&gt;
+&lt;h1&gt;Storefront&lt;/h1&gt;
+&lt;p&gt;If you can read this, the CSSOM was ready.&lt;/p&gt;</code></pre>
+  <p>Serve it (<code>python3 -m http.server</code>), open it with Network throttled to <i>Slow 4G</i>, and
+  <b>predict first:</b> do you see the heading immediately, late, or not at all? Then reload and watch. White screen
+  until the stylesheet lands — that is render-blocking, on your own machine.</p>
+  <p><b>Now make it non-blocking</b> and predict what changes visually before running it:</p>
+  <pre><code>&lt;link rel="stylesheet" href=&quot;slow.css&quot; media="print" onload="this.media='all'"&gt;</code></pre>
+  <p>The text appears at once, then restyles when the sheet arrives. You have just traded a late correct frame for an
+  early wrong one — the exact trade in section 3's trap. Watch the jump and decide for yourself whether a customer would
+  prefer it.</p>
+  <p><b>Third round: prove the script interaction.</b> Add this line <em>after</em> the blocking stylesheet:</p>
+  <pre><code>&lt;script&gt;console.log('script ran at', Math.round(performance.now()));&lt;/script&gt;
+&lt;p id="late"&gt;Parsed after the script.&lt;/p&gt;</code></pre>
+  <p>Predict: does the <code>&lt;p id="late"&gt;</code> element exist in the DOM before the stylesheet finishes
+  downloading? Test it by logging <code>document.getElementById('late')</code> from the script. It is <code>null</code>,
+  and the timestamp is late — a stylesheet delayed a script, and the script stopped the parser. That chain is lesson
+  0011's opening.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>CSSOM construction &amp; render-blocking CSS</b> done only if all three held, from memory: (1) you explained to a non-technical person why the browser waits — the teach-back in section 4; (2) you predicted the white screen, and predicted that <code>#late</code> would be <code>null</code>, before testing either; (3) you lined up the slowest blocking stylesheet's finish time with the first frame in a real profile. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/Performance/Guides/Critical_rendering_path">MDN — Critical rendering path</a> (20 min), then <a href="https://web.dev/articles/critical-rendering-path">web.dev — Critical rendering path</a> for the same model with measurement advice attached. Keep both open while you do the Coverage step; the numbers mean more next to the diagram.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The HTML tokenizer's own rules</b> <span class="pill depth">depth</span> — how bytes become tokens, and what
+  happens with malformed markup. <b>The preload scanner</b> <span class="pill depth">depth</span> — the second, faster
+  reader that finds resources ahead of the parser; it is why <code>@import</code> is so bad, and it earns its own
+  lesson. <b><code>content-visibility</code> and <code>contain</code></b> <span class="pill depth">depth</span> —
+  telling the browser it may skip work entirely. <b>Font loading and FOIT/FOUT</b>
+  <span class="pill depth">depth</span>. Next core lesson: <a href="0011-parser-blocking-scripts-defer-async-module.html">0011 · parser-blocking scripts</a>, which finishes the story this lesson's third experiment started.
+</div>
+
+<p class="ask">Anything unclear — why the browser cannot paint a partial page, whether inlining critical CSS is worth it on a Shopify theme, how to find the real "first screen" rules? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>HTML &rarr; DOM and CSS &rarr; CSSOM are two lanes; both must be ready before render tree, layout, paint and the first frame.</li>
+    <li><b>Render-blocking</b> = no pixels yet, parsing continues. <b>Parser-blocking</b> = no more DOM, and that is a script's doing.</li>
+    <li>The first frame waits for the <b>slowest</b> blocking stylesheet, not the average.</li>
+    <li><code>@import</code> hides a <b>serial</b> round trip that the HTML never reveals. Replace it with a <code>&lt;link&gt;</code>.</li>
+    <li><code>media</code> stops a sheet blocking the first frame but does <b>not</b> stop the download.</li>
+    <li>A stylesheet delays the next <code>&lt;script&gt;</code>, which then blocks the parser — slow CSS can delay the DOM indirectly.</li>
+    <li>Async CSS without inlined critical CSS trades a late frame for a visible restyle. Never ship one without the other.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>the browser waits for all the CSS so the customer only ever sees one version of the page.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0011-parser-blocking-scripts-defer-async-module.html">Next: 0011 · scripts &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Why does the browser wait for all CSS before the first paint?',
+    options: [
+      'a later rule could change what was already drawn',
+      'the layout engine needs the file size in advance',
+      'stylesheets are parsed on the compositor thread'
+    ],
+    answer: 0,
+    why: 'A rule at the end of the last stylesheet can change colour, size or visibility of anything. Painting first would mean showing a wrong frame and repainting, so the browser prefers one correct frame.'
+  },
+  {
+    q: 'A stylesheet in the head is downloading slowly. What is still happening?',
+    options: [
+      'HTML parsing continues and the DOM keeps growing',
+      'HTML parsing halts until the stylesheet arrives',
+      'layout runs on the nodes parsed so far already'
+    ],
+    answer: 0,
+    why: 'CSS is render-blocking, not parser-blocking. The DOM keeps being built; what waits is the first frame — and any script that comes after the stylesheet.'
+  },
+  {
+    q: 'What is wrong with @import at the top of a stylesheet?',
+    options: [
+      'the second file is discovered only after the first',
+      'imported rules always win over linked ones',
+      'the import is refetched on every page navigation'
+    ],
+    answer: 0,
+    why: 'The browser cannot see the imported URL until it has downloaded and parsed the importing file, so the round trips are serial and the preload scanner never gets a chance. Use a link element instead.'
+  },
+  {
+    q: 'What does media="print" on a stylesheet change?',
+    options: [
+      'it no longer delays the first frame on screen',
+      'it is not downloaded at all until you print',
+      'it is downloaded but never parsed into rules'
+    ],
+    answer: 0,
+    why: 'It stops the sheet being render-blocking for screen rendering. The file is still fetched, at a lower priority — which is exactly what the media-toggle trick for async CSS relies on.'
+  },
+  {
+    q: 'Which DevTools view quantifies CSS you waited for and never used?',
+    options: [
+      'the Coverage tab, opened from the Command Menu',
+      'the Sources panel, in the Page file tree view',
+      'the Network panel, sorted by the Priority column'
+    ],
+    answer: 0,
+    why: 'Coverage records which bytes of each file were actually applied during the load, with a red and blue bar per file. The unused percentage is the number to bring to a planning meeting.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What does render-blocking mean, exactly?"',
+    answer: 'It means the browser will not produce the <b>first frame</b> until the resource is ready — while HTML parsing carries on the whole time. It applies to stylesheets in the head, and the reason is correctness: a rule in the last stylesheet can change anything already drawn, so painting early would mean showing a wrong frame and then repainting.<br><br><i>Likely follow-up:</i> "How is that different from parser-blocking?" Parser-blocking stops the DOM being built at all, and that is a plain <code>&lt;script&gt;</code>, not a stylesheet. The subtle link between them: a stylesheet delays the execution of the next script, and that script blocks the parser — so slow CSS can stall DOM building indirectly.'
+  },
+  {
+    prompt: '"How would you get a first paint that does not wait for the network?"',
+    answer: 'Inline the CSS the first screen needs directly in the document, and load the rest without blocking — for example <code>media="print"</code> with an <code>onload</code> that switches it to <code>all</code>. The first frame then depends only on bytes that already arrived with the HTML.<br><br><i>Likely follow-up:</i> "What does that cost?" The inlined bytes are not shared or cached across pages, so every navigation pays for them again, and the "first screen" list has to be maintained as the design changes. And doing the async half <em>without</em> the inline half is worse than doing nothing: the customer sees an unstyled page and then a visible restyle, which is a layout shift you will be measured on.'
+  },
+  {
+    prompt: 'The theme.liquid drill: five head lines, LCP 4.2 s, 71% unused CSS. Give your order of work, then say which fix QC would not catch.',
+    answer: 'Order: (1) replace the <code>@import</code> with a <code>&lt;link&gt;</code> — removes a serial round trip, zero risk; (2) add <code>media="print"</code> to <code>print.css</code> — stops it blocking, zero risk; (3) the review app\'s <code>widget.css</code> — load it with the section it belongs to rather than in the head, removing a blocker we do not own; (4) split <code>base.css</code>: inline what the first screen needs and load the rest non-blocking — the biggest win and the most work; (5) delete unused rules using Coverage — fewer bytes and less style matching.<br><br>Wins by type: 1 is round trips, 2 and 3 are blocking, 4 is blocking plus bytes, 5 is bytes plus parse and match time.<br><br><i>Likely follow-up:</i> "Which one could break something QC misses?" Number 5, and number 4 for the same reason. Coverage only reports the pages you actually loaded, so a rule used solely on a template nobody opened — a gift-card page, a customer account, a rarely used section — looks unused and gets deleted. Protection: run Coverage across a list of every template plus every section in the theme editor, keep the deletion in its own commit so it can be reverted alone, and never bundle it with the inlining change.'
+  }
+]);
+</script>
+</body>
+</html>

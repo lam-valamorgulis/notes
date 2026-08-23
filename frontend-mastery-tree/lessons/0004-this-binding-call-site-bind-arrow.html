@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0004 · `this` binding: call-site, bind, arrow capture — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Execution model · Lesson 0004</p>
+<h1><code>this</code> binding: call-site, bind, arrow capture</h1>
+<p class="subtitle">Lessons 0002 and 0003 built one rule: names are resolved by where the code was <em>written</em>. <code>this</code> is the one thing in the language that breaks that rule — and an arrow function is what happens when you take the break away.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #4 (debug with no ready answer) — "<code>this</code> is undefined" is the single most common runtime error in hand-written theme JavaScript.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~30 minutes you can look at any call expression — including one buried in <code>addEventListener</code> — and say what <code>this</code> will be, before running it. And you can explain why an arrow function fixes it without saying the word "magic".
+</div>
+
+<h2>1. The problem <code>this</code> was invented to solve</h2>
+<p>
+  You have one behaviour and many objects that need it. Written the honest way, the object goes in as an argument:
+</p>
+<pre><code>function total(cart) { return cart.items.length; }
+total(cartA); total(cartB);</code></pre>
+<p>
+  That works, and it is explicit. But you want to <em>attach</em> the behaviour to the object, so the caller can write
+  <code>cartA.total()</code>. The function now has to receive the object without it appearing in the argument list. So
+  the language passes a <b>hidden extra argument</b>, and gives it a name: <code>this</code>.
+</p>
+<p>
+  Once you accept that <code>this</code> is a hidden argument, one question decides everything: <b>who fills it in?</b>
+  Not the place the function was written — the writer does not know which cart you will use. The only place that knows
+  is the <b>call site</b>: the exact expression that performs the call. That is the whole mechanism, and per
+  <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/this">MDN — <code>this</code></a>
+  it is decided fresh on every single call.
+</p>
+<div class="soundbite">
+  <span class="label">Say it this way</span>
+  <p>A variable name asks "where was I written?". <code>this</code> asks "how was I called?". Two different questions, two different answers, one line apart in the same function.</p>
+</div>
+
+<h2>2. The five call shapes, in the order the engine checks them</h2>
+<p>
+  There are only five ways a call can look, and each one fills the hidden argument differently. Read the chart top to
+  bottom and stop at the first "yes" — that is genuinely how to answer any interview question on this topic.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 330" role="img" aria-label="Decision chart: arrow function means no own this so the scope chain is used; otherwise new gives the fresh object, call apply or bind gives the passed value, a dotted call gives the object before the dot, and a bare call gives undefined in strict mode">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <rect class="box hot" x="14" y="14" width="330" height="44" rx="6"/>
+  <text class="mono sm" x="30" y="34">1. is it an ARROW function?</text>
+  <text class="sub" x="30" y="50">it has no `this` slot of its own</text>
+  <path class="flow amber" d="M348,36 L414,36"/>
+  <rect class="box" x="420" y="14" width="286" height="44" rx="6"/>
+  <text class="mono sm" x="434" y="34">resolve `this` like any NAME:</text>
+  <text class="mono sm" x="434" y="50">walk the scope chain outward</text>
+
+  <path class="flow" d="M180,58 L180,76"/>
+  <rect class="box" x="14" y="80" width="330" height="44" rx="6"/>
+  <text class="mono sm" x="30" y="100">2. called with `new Thing()`?</text>
+  <text class="sub" x="30" y="116">a construct call, not a normal call</text>
+  <path class="flow" d="M348,102 L414,102"/>
+  <rect class="box" x="420" y="80" width="286" height="44" rx="6"/>
+  <text class="mono sm" x="434" y="106">this = the brand-new object</text>
+
+  <path class="flow" d="M180,124 L180,142"/>
+  <rect class="box" x="14" y="146" width="330" height="44" rx="6"/>
+  <text class="mono sm" x="30" y="166">3. `fn.call(x)` / `.apply(x)` / `.bind(x)`?</text>
+  <text class="sub" x="30" y="182">the caller states it out loud</text>
+  <path class="flow" d="M348,168 L414,168"/>
+  <rect class="box" x="420" y="146" width="286" height="44" rx="6"/>
+  <text class="mono sm" x="434" y="172">this = x, exactly as given</text>
+
+  <path class="flow" d="M180,190 L180,208"/>
+  <rect class="box" x="14" y="212" width="330" height="44" rx="6"/>
+  <text class="mono sm" x="30" y="232">4. a dot: `obj.fn()`?</text>
+  <text class="sub" x="30" y="248">the receiver is part of the expression</text>
+  <path class="flow" d="M348,234 L414,234"/>
+  <rect class="box" x="420" y="212" width="286" height="44" rx="6"/>
+  <text class="mono sm" x="434" y="238">this = obj, the thing before the dot</text>
+
+  <path class="flow" d="M180,256 L180,274"/>
+  <rect class="box bad" x="14" y="278" width="330" height="44" rx="6"/>
+  <text class="mono sm" x="30" y="298">5. bare: `fn()`</text>
+  <text class="sub" x="30" y="314">nothing before it — nothing to pass</text>
+  <path class="flow" d="M348,300 L414,300"/>
+  <rect class="box bad" x="420" y="278" width="286" height="44" rx="6"/>
+  <text class="mono sm" x="434" y="298">this = undefined (strict / module)</text>
+  <text class="sub" x="434" y="314">globalThis in old sloppy-mode scripts</text>
+</svg>
+<figcaption>Stop at the first yes. Note what rule 1 really says: an arrow function has no <code>this</code> of its own, so the ordinary name-lookup of lesson 0002 takes over. There is no special arrow rule.</figcaption>
+</figure>
+
+<p>
+  Rule 4 is where the bugs live, because the dot can be <b>lost</b>. The dot is part of the call expression, not part of
+  the function. Take the function out of the object and the dot is gone:
+</p>
+
+<pre><code>const cart = {
+  items: ['tee', 'cap'],
+  count() { return this.items.length; }
+};
+
+cart.count();                    <span class="cmt">// → </span><span class="out">2</span><span class="cmt">  — rule 4, this = cart</span>
+const c = cart.count;
+c();                             <span class="cmt">// → </span><span class="out">TypeError</span><span class="cmt">  — rule 5, this = undefined</span>
+setTimeout(cart.count, 0);       <span class="cmt">// → </span><span class="out">TypeError</span><span class="cmt">  — same thing, one day later</span></code></pre>
+
+<div class="trap">
+  <span class="label">Trap</span>
+  <code>setTimeout(cart.count, 0)</code> looks like it "passes the method". It passes the <b>function value</b> and
+  throws the dot away. Later, the timer calls it bare — rule 5. This is the same bug as
+  <code>button.addEventListener('click', this.open)</code>, which is the most common broken line in hand-written
+  theme JavaScript. One exception worth knowing: for a <em>normal</em> function used as a DOM listener, the browser
+  calls it with <code>this</code> set to the element the listener is attached to — so you get the button, not your
+  object. Silent wrong answer instead of an error, which is worse.
+</div>
+
+<h2>3. Why an arrow function fixes it — and it is not a new rule</h2>
+<p>
+  An arrow function does not have its own <code>this</code>. Not "it copies the outer one" — it simply has no slot.
+  So when the body of an arrow function mentions <code>this</code>, the engine does what it does for any name it cannot
+  find locally: it follows the outer reference from lesson 0002, one step at a time, until it finds a <code>this</code>.
+</p>
+<pre><code>class CartDrawer {
+  constructor(el) {
+    this.el = el;
+    <span class="cmt">// arrow: no own this → the one found outward is the instance</span>
+    el.addEventListener('click', () =&gt; this.open());
+    <span class="cmt">// method reference: dot lost → this becomes the element</span>
+    el.addEventListener('click', this.open);
+  }
+  open() { this.el.classList.add('is-open'); }
+}</code></pre>
+<p>
+  Two consequences fall out of "no slot", and both are exam questions:
+</p>
+<ul>
+  <li><b><code>bind</code> cannot change an arrow's <code>this</code>.</b> There is nothing to bind. <code>arrow.call(x)</code> silently ignores <code>x</code>.</li>
+  <li><b>An arrow is the wrong tool for a method that needs a receiver.</b> Write <code>obj = { fn: () =&gt; this.x }</code> and <code>this</code> is whatever surrounded the object literal — almost never the object.</li>
+</ul>
+<p>
+  The third fix is older and still fine: <code>this.open = this.open.bind(this)</code> in the constructor. It builds a
+  new function whose hidden argument is pinned forever. Cost: one extra function object per instance, and a name that
+  now means something different from the prototype method with the same name.
+</p>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    When you call a function, the language quietly hands it one extra thing: "the object you are working on". Who
+    decides what that object is? Not the person who wrote the function. The person who <b>makes the call</b>, by the
+    shape of the call they write. Put something before the dot and that thing is handed over. Call the function with
+    nothing before it and nothing is handed over. Arrow functions refuse to accept this extra thing at all, so when
+    they need it they borrow it from the code around them.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A form that says "sign here on behalf of ______". The form is the function; the blank is
+    <code>this</code>. The person who hands you the form fills in the blank, not the person who printed it. Hand over
+    the same form with a different name in the blank and the same words now bind a different company.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A paper form keeps whatever was written in the blank. This blank is <b>wiped and refilled
+    on every single call</b> — the same function can be "on behalf of" a different object one line later. And an arrow
+    function is a form with no blank printed on it at all; asking it who it represents makes it look at the letterhead
+    of the page it was printed on.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    Everyone learns "<code>this</code> is the object the method belongs to" and it is wrong. A function does not belong
+    to an object; it is a value stored in a property. The dot is part of the <em>call</em>, and the moment you store
+    the function somewhere else — a variable, <code>setTimeout</code>, <code>addEventListener</code>, an array of
+    callbacks — the dot is gone and rule 5 applies. The second sticking point: people say an arrow "binds
+    <code>this</code> to the outer scope". It binds nothing. It has no slot, so ordinary name lookup runs. Say it the
+    second way and the follow-up question ("can you <code>bind</code> an arrow?") answers itself.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior who asks: <i>"my <code>addEventListener('click', this.open)</code> throws
+    <code>Cannot read properties of undefined</code>, but <code>() =&gt; this.open()</code> works. What is the
+    difference?"</i> You may not use the words "context" or "scope" without defining them first. Then <b>send it to
+    me</b> — I am checking whether you explain the arrow as <em>no slot</em> rather than as <em>copied this</em>.
+  </p>
+</div>
+
+<h2>5. Point at it: watch the slot change in DevTools <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li>Paste the <code>cart</code> object from section 2 into the Console.</li>
+  <li>DevTools &rarr; <b>Sources</b> &rarr; breakpoint on the <code>return</code> line inside <code>count</code>.</li>
+  <li>Call <code>cart.count()</code>. In the <b>Scope</b> pane, look at <code>Local</code>: there is an entry named
+  <code>this</code>, and it is the <code>cart</code> object.</li>
+  <li>Resume, then run <code>const c = cart.count; c();</code>. Same breakpoint, same function, same line — and
+  <code>this</code> in the Scope pane is now <code>undefined</code>. Nothing about the function changed. Only the call
+  changed. That is gate #3 for this core, in about forty seconds.</li>
+  <li>Bonus, for the arrow rule: breakpoint inside an arrow function and notice there is <b>no <code>this</code> entry
+  in <code>Local</code> at all</b> — DevTools shows it under the outer scope instead. The absence is the mechanism.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's <code>cart-drawer.js</code> has a class with <code>open()</code> and <code>close()</code>. The constructor does <code>this.overlay.addEventListener('click', this.close)</code>. Clicking the overlay does not close the drawer, and the console shows no error at all.</p>
+  Before flipping the recall cards: why is there <b>no error</b>, what is <code>this</code> inside <code>close</code> at that moment, and which two fixes would work? Then the interviewer's follow-up: which fix would you choose if the same handler must later be removed with <code>removeEventListener</code>, and why does that rule out one of them?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type this by hand:</p>
+  <pre><code>const cart = {
+  items: ['tee', 'cap'],
+  count() { return this.items.length; }
+};
+console.log(cart.count());</code></pre>
+  <p><b>Predict, then run.</b> Now add three lines and predict <em>each</em> one before running it — write the three answers on paper first:</p>
+  <pre><code>const c = cart.count;
+console.log(c());                      <span class="cmt">// a</span>
+console.log(c.call(cart));             <span class="cmt">// b</span>
+console.log(c.call({ items: [1,2,3] })); <span class="cmt">// c</span></code></pre>
+  <p>Line (c) is the one that teaches the most: the same function, given an object it has never seen, works fine —
+  because <code>this</code> was never about ownership.</p>
+  <p><b>Now break it in the way that hurts in production.</b> Write the listener bug on purpose:</p>
+  <pre><code>const box = document.createElement('div');
+document.body.append(box);
+const widget = {
+  name: 'drawer',
+  hello() { console.log('hello from', this.name); }
+};
+box.addEventListener('click', widget.hello);   <span class="cmt">// predict the output</span>
+box.click();</code></pre>
+  <p>Predict before running: an error, or a wrong answer? Then run it. You should see <code>hello from undefined</code>
+  — no exception, because for a normal function the DOM set <code>this</code> to the <code>div</code>, which simply has
+  no <code>name</code>. Fix it two ways (an arrow wrapper, then <code>.bind</code>) and confirm both.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b><code>this</code> binding: call-site, bind, arrow capture</b> done only if all three held, from memory: (1) you explained the arrow rule as "no slot, so name lookup runs" — the teach-back in section 4; (2) you predicted all three of (a), (b), (c) in the live-coding step before running them; (3) you watched the <code>this</code> entry in the Scope pane change between <code>cart.count()</code> and <code>c()</code>. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/this">MDN — <code>this</code></a> (20 min). Its table of cases is the chart in section 2, written out. Spec anchor for the honest version: <a href="https://tc39.es/ecma262/#sec-execution-contexts">ECMA-262 § Execution Contexts</a> — <code>this</code> is a field of the context, which is exactly why it is per-call.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>The prototype chain</b> <span class="pill depth">depth</span> — how <code>cart.count</code> is <em>found</em> before it is called; a different mechanism from who fills <code>this</code>. <b><code>class</code> fields and private <code>#</code> names</b> <span class="pill depth">depth</span>. <b><code>super</code>, and <code>this</code> inside getters/setters and <code>Proxy</code> traps</b> <span class="pill depth">depth</span>. Also skipped: why <code>bind</code> creates a genuinely new function object, which matters for <code>removeEventListener</code> — that is in the drill above, so answer it there. Next core lesson: <a href="0005-task-queue-one-task-per-tick.html">0005 · the task queue</a>, where we leave the stack and meet the loop that feeds it.
+</div>
+
+<p class="ask">Anything unclear — why the DOM overrides <code>this</code> for listeners, why <code>bind</code> is ignored on arrows, how to choose a fix in your own theme code? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li><code>this</code> is a <b>hidden extra argument</b>, filled in by the <b>call site</b>, fresh on every call.</li>
+    <li>Five shapes, checked in order: arrow (no slot) &rarr; <code>new</code> &rarr; <code>call</code>/<code>apply</code>/<code>bind</code> &rarr; dot &rarr; bare.</li>
+    <li>The dot belongs to the <b>call</b>, not to the function. Store the function elsewhere and the dot is lost.</li>
+    <li>An arrow function has <b>no <code>this</code> of its own</b>, so ordinary scope-chain lookup finds the outer one. Nothing is copied; <code>bind</code> has no effect.</li>
+    <li>A normal function used as a DOM listener gets <code>this</code> = the element — a silent wrong answer, not an error.</li>
+    <li><code>bind</code> returns a <b>new function object</b>, so the bound version cannot be removed with <code>removeEventListener</code> unless you kept a reference to it.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>names ask where they were written; <code>this</code> asks how it was called.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/execution-model.html">Cheat sheet: execution model</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0005-task-queue-one-task-per-tick.html">Next: 0005 · the task queue &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'What decides the value of `this` inside a normal function?',
+    options: [
+      'the shape of the expression that called it',
+      'the object whose property holds the function',
+      'the place in the file where it was written'
+    ],
+    answer: 0,
+    why: 'The call site, re-decided on every call. The second option is the popular wrong answer: a function is a value in a property, and the dot belongs to the call, not to the function.'
+  },
+  {
+    q: 'const c = cart.count; c(); in a module — what is `this` inside count?',
+    options: [
+      'undefined, because the call had no receiver',
+      'the cart object, because that is where it lives',
+      'globalThis, because modules run at top level'
+    ],
+    answer: 0,
+    why: 'A bare call passes no receiver, and module code is always strict, so `this` is undefined. Reading a property off it throws a TypeError.'
+  },
+  {
+    q: 'Why can `bind` not change `this` inside an arrow function?',
+    options: [
+      'an arrow has no `this` binding to overwrite',
+      'an arrow copies `this` before bind can run',
+      'bind only works on functions declared with function'
+    ],
+    answer: 0,
+    why: 'An arrow function has no `this` slot at all. `this` inside it is resolved by walking the scope chain, exactly like any other free name, so there is nothing for bind to set.'
+  },
+  {
+    q: 'el.addEventListener("click", widget.hello) where hello logs this.name — what happens on click?',
+    options: [
+      'it logs undefined, because this is the element',
+      'it throws, because this is undefined there',
+      'it logs the name, because the dot is preserved'
+    ],
+    answer: 0,
+    why: 'The dot was lost when the function value was passed, but the DOM calls a normal listener with `this` set to the element the listener is on. The element has no name property, so you get undefined — a silent wrong answer.'
+  },
+  {
+    q: 'Where in DevTools can you see `this` change without changing the function?',
+    options: [
+      'Sources panel, Scope pane, the Local section',
+      'Elements panel, Properties pane, the this row',
+      'Performance panel, Bottom-Up, the self time'
+    ],
+    answer: 0,
+    why: 'Pause on the same line for two different call shapes. `this` appears in Local for a normal function and shows the receiver the call site supplied — cart in one case, undefined in the other.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"How is `this` decided in JavaScript?"',
+    answer: 'It is a hidden extra argument, and the <b>call site</b> fills it in — freshly, on every call. Five shapes in order: an arrow function has no slot of its own; <code>new</code> passes the newly created object; <code>call</code>, <code>apply</code> and <code>bind</code> pass exactly what you name; a dotted call passes the object before the dot; a bare call passes nothing, so it is <code>undefined</code> in strict mode.<br><br><i>Likely follow-up:</i> "How is that different from how a variable is resolved?" A variable is resolved by where the code was written, at creation time. <code>this</code> is resolved by how the call was written, at call time. Same function, two lines apart, two different answers.'
+  },
+  {
+    prompt: '"Explain why an arrow function seems to fix `this` in a callback."',
+    answer: 'It does not fix anything — it <b>removes</b> the slot. An arrow function has no <code>this</code> of its own, so the name <code>this</code> inside it is resolved by the ordinary scope chain: the engine walks outward until it finds a <code>this</code>, which is the enclosing method\'s. Nothing is captured or copied.<br><br><i>Likely follow-up:</i> "So can you <code>bind</code> an arrow?" No. <code>arrow.call(x)</code> and <code>arrow.bind(x)</code> are silently ignored for <code>this</code>, because there is no binding to set. That is a good way to prove the "no slot" story rather than the "copied" story.'
+  },
+  {
+    prompt: 'The cart-drawer drill: `this.overlay.addEventListener("click", this.close)` fails silently. Diagnose it, and pick a fix that still allows removeEventListener.',
+    answer: 'Passing <code>this.close</code> passes the function value and drops the receiver. The DOM then calls it with <code>this</code> = the overlay element, so <code>this.el</code> is <code>undefined</code> and <code>classList</code> is never touched — no exception, nothing happens. Two fixes: wrap it, <code>() =&gt; this.close()</code>, or pin it, <code>this.close = this.close.bind(this)</code> in the constructor.<br><br><i>Likely follow-up:</i> "Which one survives removeEventListener?" Only if you keep the exact reference you added. Both the arrow and the bound function are <b>new function objects</b>, so <code>removeEventListener("click", this.close)</code> with the original method will not match. Store the handler once — <code>this._onClose = this.close.bind(this)</code> — add that, remove that.'
+  }
+]);
+</script>
+</body>
+</html>

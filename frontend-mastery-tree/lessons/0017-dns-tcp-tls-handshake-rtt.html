@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0017 · DNS, TCP and TLS — what a request costs in round trips — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 3 · Network &amp; Delivery · Protocol · Lesson 0017</p>
+<h1>DNS, TCP and TLS — what a request costs in round trips</h1>
+<p class="subtitle">Chapter 3 starts where Chapter 2's first bar ended. Before a single byte of your CSS can arrive, the browser has a conversation — and on a phone that conversation is measured in hundreds of milliseconds.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #1 (explain from first principles) and ability #3 (name the trade) — this is the lesson that makes "just add a CDN" or "just add another app" into a number.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can count the round trips a new origin costs, explain why a faster connection does not fix a slow site, and price the fourteenth third-party script in a theme without measuring anything.
+</div>
+
+<h2>1. The unit of cost is a round trip, not a kilobyte</h2>
+<p>
+  A request is a conversation across physical distance. The smallest possible exchange — say something, hear an answer —
+  is one <b>round-trip time</b>, one RTT. Nothing can be faster than that, because the signal has a speed limit.
+  Typical numbers: 10–30 ms on good wifi to a nearby server, <b>100–200 ms on mobile</b>, more on a poor connection or a
+  distant origin.
+</p>
+<p>
+  Now count what must happen before your CSS file's first byte, for a domain the browser has never spoken to:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Step</th><th>What it asks</th><th>Cost</th></tr>
+<tr><td><b>DNS</b></td><td>"what is the IP address for this name?"</td><td>~1 RTT (often 0, if cached by the OS or the resolver)</td></tr>
+<tr><td><b>TCP handshake</b></td><td>SYN &rarr; SYN-ACK &rarr; ACK: "can we talk?" "yes" "good"</td><td><b>1 RTT</b> before data may be sent</td></tr>
+<tr><td><b>TLS handshake</b></td><td>agree on keys and verify the certificate</td><td><b>1 RTT</b> on TLS 1.3, <b>2 RTTs</b> on TLS 1.2</td></tr>
+<tr><td><b>The request itself</b></td><td>GET the file, wait for the server to answer</td><td><b>1 RTT</b>, plus the server's own thinking time</td></tr>
+</table>
+</div>
+<p>
+  So a brand-new origin costs roughly <b>3 RTTs before your request is even sent</b>, and about 4 before the first byte
+  arrives. At 150 ms RTT that is <b>around 600 ms of doing nothing at all</b> — no bytes, no rendering, no progress. It is
+  the same 600 ms whether the file is 2 KB or 200 KB.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 220" role="img" aria-label="A new origin spends one round trip each on DNS, TCP and TLS before the request is sent, while a reused connection needs only the request round trip">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="16">EACH BLOCK = 1 ROUND TRIP  ·  AT 150ms RTT, EACH BLOCK = 150ms</text>
+
+  <text class="mono sm" x="16" y="52">new origin</text>
+  <rect class="box" x="110" y="34" width="100" height="30" rx="4"/>
+  <text class="mono sm" x="128" y="54">DNS</text>
+  <rect class="box" x="210" y="34" width="100" height="30" rx="4"/>
+  <text class="mono sm" x="228" y="54">TCP</text>
+  <rect class="box" x="310" y="34" width="100" height="30" rx="4"/>
+  <text class="mono sm" x="328" y="54">TLS</text>
+  <rect class="box hot" x="410" y="34" width="100" height="30" rx="4"/>
+  <text class="mono sm" x="422" y="54">REQUEST</text>
+  <rect class="box good" x="510" y="34" width="150" height="30" rx="4"/>
+  <text class="mono sm" x="522" y="54">bytes arrive</text>
+  <path class="flow amber" d="M510,86 L510,68"/>
+  <text class="cap amber" x="418" y="102">FIRST BYTE — 600ms IN</text>
+  <text class="sub" x="110" y="122">identical cost for a 2 KB file and a 200 KB file</text>
+
+  <line class="rule thin" x1="16" y1="136" x2="704" y2="136"/>
+
+  <text class="mono sm" x="16" y="172">reused</text>
+  <rect class="box hot" x="110" y="154" width="100" height="30" rx="4"/>
+  <text class="mono sm" x="122" y="174">REQUEST</text>
+  <rect class="box good" x="210" y="154" width="150" height="30" rx="4"/>
+  <text class="mono sm" x="222" y="174">bytes arrive</text>
+  <text class="sub" x="110" y="204">same connection, already open — one round trip instead of four. This is why origin count matters.</text>
+</svg>
+<figcaption>The whole of Chapter 3's advice — fewer origins, reuse connections, hint early, cache hard — is about deleting blocks from the top row.</figcaption>
+</figure>
+
+<h2>2. Two consequences that surprise people</h2>
+<h3>Bandwidth does not fix latency</h3>
+<p>
+  Doubling a customer's connection speed does nothing to the four blocks above; they are governed by distance and the
+  speed of light, not by capacity. This is the central argument of
+  <a href="https://hpbn.co/">High Performance Browser Networking</a>: for typical web pages, <b>latency is the
+  bottleneck, not bandwidth</b>. It is also why testing on office fibre hides almost every network problem your customers
+  have — throttle, or you are not testing.
+</p>
+<h3>TCP starts slowly, on purpose</h3>
+<p>
+  A new connection does not send at full speed. TCP <b>slow start</b> begins with a small congestion window — roughly
+  ten packets, about 14 KB — and doubles it each round trip until it sees loss. So a 100 KB stylesheet on a fresh
+  connection is not one transfer; it is several round trips of increasing size
+  (<a href="https://hpbn.co/building-blocks-of-tcp/">HPBN — Building blocks of TCP</a>).
+</p>
+<p>
+  That is where the old "keep critical CSS under 14 KB" rule came from, and it is the honest reason inlining the first
+  screen's CSS works so well: those bytes ride along in the HTML's very first window, with no extra round trip at all.
+</p>
+<div class="trap">
+  <span class="label">Trap — every third-party domain is a fresh bill</span>
+  A reviews app, a chat widget, a font host, an analytics endpoint and a pixel are five separate origins, so five DNS
+  lookups, five TCP handshakes and five TLS handshakes. HTTP/2 multiplexing does <b>not</b> help across origins — it
+  reuses <em>one</em> connection per origin. A theme with fourteen third-party origins has bought fourteen handshakes on
+  a 150 ms network, and no amount of minifying your own JavaScript touches that.
+</div>
+
+<h2>3. What you can do about it</h2>
+<div class="table-scroll">
+<table>
+<tr><th>Move</th><th>Blocks removed</th><th>What it gives up</th></tr>
+<tr><td>Serve assets from the same origin (Shopify's CDN for theme files)</td><td>all three setup blocks, after the first request</td><td>nothing for theme assets — this is the default and it is correct</td></tr>
+<tr><td><code>&lt;link rel="preconnect"&gt;</code> for an origin you know you will need</td><td>moves DNS + TCP + TLS earlier so they overlap other work</td><td>a wasted connection if you never use it; do not preconnect to more than a few</td></tr>
+<tr><td>Delete a third-party origin</td><td>3 blocks, permanently</td><td>a feature the merchant may want — this is a business conversation, not a code change</td></tr>
+<tr><td>Self-host a font instead of using a font CDN</td><td>3 blocks, and removes a single point of failure</td><td>you own updates and the cache policy</td></tr>
+<tr><td>Inline the first-screen CSS</td><td>a whole request, and it fits in the first congestion window</td><td>bytes repeated per navigation, not cacheable (lesson 0010)</td></tr>
+</table>
+</div>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    Getting a file from a server is like phoning someone far away. Before you can ask your question you have to look up
+    the number, wait for them to pick up, and agree you are both who you say you are. Each of those steps is one there
+    and back, and each there-and-back takes real time — on a phone network, maybe a sixth of a second. Do that with five
+    different companies and you have spent most of a second before anyone has answered a single question. Calling the
+    same person again is much faster, because the line is already open.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A phone call. Look up the number (DNS), the line connects (TCP), you confirm identities (TLS),
+    then you ask (the request). A wider phone line does not make the ringing shorter.
+  </p>
+  <p>
+    <b>Where it breaks.</b> On a phone, once connected you can talk as fast as you like. A new network connection starts
+    <em>deliberately quiet</em> and gets louder over several exchanges, because it does not yet know how much the route
+    can carry. So even after the greeting, the first pages of your answer arrive in small batches with waits in between —
+    which is why a small first payload arrives disproportionately sooner than a large one.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People measure size and ignore count. Two 50 KB files on one origin are much cheaper than two 5 KB files on two new
+    origins, and that ordering feels wrong until you count round trips. The second sticking point: believing HTTP/2 made
+    origins free. HTTP/2 multiplexes requests over <b>one connection per origin</b> — it removed the need to shard assets
+    across domains, and it did nothing about the setup cost of a domain you had no reason to talk to. The third: testing
+    on fast wifi and concluding the site is fine, when the whole of this lesson is invisible above about 30 ms RTT.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a merchant who wants to install a fifth app that adds a script from a new domain. Explain
+    what it costs before it does anything useful, in everyday words, and give them the decision rather than a refusal.
+    Then <b>send it to me</b> — the skill is quantifying it honestly ("about half a second on a phone, before the app
+    does any work") without exaggerating.
+  </p>
+</div>
+
+<h2>5. Point at it: the Timing tab is this lesson <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>See the blocks.</b> DevTools &rarr; <b>Network</b>, throttle to <i>Slow 4G</i>, reload with the cache disabled.
+  Click any request from a third-party domain &rarr; <b>Timing</b> tab. You will see the exact rows from section 1:
+  <i>DNS Lookup</i>, <i>Initial connection</i>, <i>SSL</i>, <i>Request sent</i>, <i>Waiting (TTFB)</i>,
+  <i>Content Download</i>. Read the millisecond values and add up the first three.</li>
+  <li><b>Compare a reused connection.</b> Now click a <em>later</em> request to the same domain. DNS, connection and SSL
+  are gone — the connection was reused. Those two screenshots side by side are gate #3 for this core.</li>
+  <li><b>Count the origins on a real storefront.</b> In the Console:
+  <pre><code>const origins = new Set(performance.getEntriesByType('resource').map(r =&gt; new URL(r.name).origin));
+console.log(origins.size, [...origins]);</code></pre>
+  Multiply <code>origins.size - 1</code> by three round trips, times a realistic mobile RTT. That single number is often
+  the most persuasive thing in a performance report.</li>
+  <li><b>Check the protocol too.</b> Right-click the Network table header &rarr; enable the <b>Protocol</b> column.
+  <code>h2</code> or <code>h3</code> means requests to that origin share one connection; <code>http/1.1</code> means the
+  browser is limited to about six parallel connections per origin, each with its own handshake.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A storefront on Slow 4G shows a 2.9 s LCP. The Network panel lists 41 requests across 12 distinct origins: the shop's own CDN, a font host, two review apps, a chat widget, an analytics endpoint, a pixel, a currency converter, and four more. Your own theme's JavaScript and CSS total 90 KB, all from the shop's origin. Total transferred: 1.4 MB.</p>
+  Before flipping the recall cards: estimate the round-trip cost of the eleven extra origins at 150 ms RTT, and say whether minifying the 90 KB of theme code is a good use of a day. Then the interviewer's follow-up: the merchant will not remove any app. Name three things you can still do, and be honest about which of them actually removes round trips and which only hides them.
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>No files needed — this one runs in the Console of any real storefront. Type it by hand:</p>
+  <pre><code>const rows = performance.getEntriesByType('resource').map(r =&gt; ({
+  origin: new URL(r.name).origin,
+  dns:  Math.round(r.domainLookupEnd - r.domainLookupStart),
+  tcp:  Math.round(r.connectEnd - r.connectStart),
+  ttfb: Math.round(r.responseStart - r.requestStart),
+  kb:   Math.round((r.transferSize || 0) / 1024)
+}));
+console.table(rows.filter(r =&gt; r.dns + r.tcp &gt; 0));   <span class="cmt">// only new connections show setup cost</span></code></pre>
+  <p><b>Predict before running:</b> how many rows will have a non-zero <code>dns</code> or <code>tcp</code> value — will it
+  be all 41 requests, or roughly one per origin? Run it and see. One per origin, because every later request reused the
+  connection. That table <em>is</em> section 1, measured on the client's own site.</p>
+  <p><b>Now measure the total you are paying:</b></p>
+  <pre><code>const setup = rows.reduce((n, r) =&gt; n + r.dns + r.tcp, 0);
+console.log('handshake time spent:', setup, 'ms across',
+  new Set(rows.map(r =&gt; r.origin)).size, 'origins');</code></pre>
+  <p>Run it once on fast wifi and once with <i>Slow 4G</i> throttling, and compare. The bytes did not change; the number
+  did. Predict the ratio before you look.</p>
+  <p><b>Third round — feel slow start.</b> Make two files locally, one 12 KB and one 300 KB, serve them with
+  <code>python3 -m http.server</code>, throttle to <i>Slow 4G</i>, and time each with the cache disabled. Predict first:
+  the big file is 25× the bytes — will it take 25× the time, more, or less? Then look at the <b>Content Download</b> row in
+  the Timing tab for each. The small file rides the first congestion window; the large one needs several round trips, so
+  the ratio is worse than the byte ratio suggests. That is the mechanism behind "inline the first screen".</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>DNS → TCP → TLS handshake cost in RTTs</b> done only if all three held, from memory: (1) you explained the cost of a new app's domain to a merchant — the teach-back in section 4; (2) you predicted that only one request per origin shows setup cost, before running <code>console.table</code>; (3) you compared the Timing tab of a first and a later request to the same origin. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://hpbn.co/building-blocks-of-tcp/">High Performance Browser Networking — Building blocks of TCP</a> (free, 30 min). It is the best explanation of slow start and of why latency beats bandwidth that exists, and the rest of Chapter 3 assumes it. Then keep <a href="https://developer.chrome.com/docs/devtools/network">Chrome DevTools — Network</a> open for the Timing-tab vocabulary.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>HTTP/1.1 head-of-line blocking and the six-connection limit</b> <span class="pill depth">depth</span> — mentioned in
+  the Protocol column step, worth its own lesson. <b>HTTP/2 multiplexing, streams and priority</b>
+  <span class="pill depth">depth</span>. <b>HTTP/3, QUIC and 0-RTT</b> <span class="pill depth">depth</span> — it merges
+  the TCP and TLS blocks, which changes the arithmetic here in your favour. <b>Compression: gzip versus brotli</b>
+  <span class="pill depth">depth</span> — bytes, not round trips. Next core lesson:
+  <a href="0018-cache-control-immutable-assets.html">0018 · <code>Cache-Control</code></a>, which removes the request
+  entirely rather than making it cheaper.
+</div>
+
+<p class="ask">Anything unclear — why TLS costs a round trip, what slow start means for your theme's bundle, how many origins is too many? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>The unit of network cost is the <b>round trip (RTT)</b>: 10–30 ms on good wifi, <b>100–200 ms on mobile</b>.</li>
+    <li>A new origin costs <b>DNS + TCP + TLS ≈ 3 RTTs</b> before the request is sent — about 600 ms at 150 ms RTT.</li>
+    <li>That cost is <b>identical for a 2 KB and a 200 KB file</b>. Count requests and origins, not just bytes.</li>
+    <li>A reused connection skips all three: one round trip instead of four.</li>
+    <li><b>Latency is the bottleneck, not bandwidth.</b> A faster connection does not shorten a handshake.</li>
+    <li><b>TCP slow start</b> begins at roughly 14 KB and doubles per round trip — which is why a small first payload arrives disproportionately sooner.</li>
+    <li>HTTP/2 reuses <b>one connection per origin</b>. It never makes an extra origin free.</li>
+    <li>Every third-party app domain is a fresh 3-RTT bill, before the app does anything useful.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>a new domain costs about half a second on a phone before it is any use at all.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/network-delivery.html">Cheat sheet: network &amp; delivery</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0018-cache-control-immutable-assets.html">Next: 0018 · Cache-Control &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'How many round trips before the first byte from a brand-new origin?',
+    options: [
+      'about four, counting DNS, TCP, TLS and the request',
+      'about one, since the request carries the handshake',
+      'about eight, two for each of the four setup steps'
+    ],
+    answer: 0,
+    why: 'DNS, the TCP handshake and the TLS handshake each cost about one round trip on modern TLS, and then the request itself costs another before the answer starts arriving.'
+  },
+  {
+    q: 'A customer upgrades to a much faster connection. What happens to the handshake time?',
+    options: [
+      'almost nothing, because it is latency-bound',
+      'it halves, because the packets travel faster',
+      'it disappears, since the connection is reused'
+    ],
+    answer: 0,
+    why: 'Handshakes are round trips governed by distance, not by capacity. This is why latency, not bandwidth, is the bottleneck for typical web pages, and why testing on office fibre hides the problem.'
+  },
+  {
+    q: 'Why does a 100 KB file on a fresh connection take more than the bytes suggest?',
+    options: [
+      'TCP slow start ramps the window over round trips',
+      'the server compresses it in fixed-size batches',
+      'the browser parses each chunk before requesting more'
+    ],
+    answer: 0,
+    why: 'A new connection begins with a small congestion window, roughly 14 KB, doubling each round trip. So large transfers need several round trips before reaching full speed.'
+  },
+  {
+    q: 'Does HTTP/2 make an extra third-party origin cheap?',
+    options: [
+      'no, it reuses one connection per origin only',
+      'yes, all origins share a single multiplexed link',
+      'yes, provided every origin supports h2 as well'
+    ],
+    answer: 0,
+    why: 'Multiplexing removed the need to shard assets across domains, but each origin still needs its own DNS lookup, TCP handshake and TLS handshake before anything useful happens.'
+  },
+  {
+    q: 'Where does DevTools show DNS, connection and SSL time for one request?',
+    options: [
+      'the Network panel, in that request\'s Timing tab',
+      'the Performance panel, on the Network track bar',
+      'the Application panel, under the Frames section'
+    ],
+    answer: 0,
+    why: 'Click the request and open Timing: it lists DNS Lookup, Initial connection, SSL, Request sent, Waiting for the first byte, and Content Download, each with a millisecond value.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What happens before the first byte of a file arrives?"',
+    answer: 'For an origin the browser has not used yet: a <b>DNS</b> lookup for the address, a <b>TCP handshake</b> to open the connection, a <b>TLS handshake</b> to agree keys and check the certificate, and then the <b>request</b> itself. That is roughly four round trips — about 600 ms at a mobile RTT of 150 ms — and it is the same whether the file is 2 KB or 200 KB.<br><br><i>Likely follow-up:</i> "And for the second file from that origin?" One round trip. The connection is already open, so DNS, TCP and TLS are all skipped — which is the entire reason origin count matters more than most people expect.'
+  },
+  {
+    prompt: '"Why does a faster connection not fix a slow page?"',
+    answer: 'Because most of the delay is <b>latency</b>, not <b>bandwidth</b>. Handshakes and request round trips are governed by distance and the speed of the signal, and extra capacity does not shorten them. TCP slow start adds to this: a new connection deliberately starts small — around 14 KB — and doubles each round trip, so early bytes are paced by round trips rather than by the link speed.<br><br><i>Likely follow-up:</i> "What follows from that in practice?" Test with throttling, because the whole effect is invisible above roughly 30 ms RTT. And prefer fewer origins and fewer requests over marginal byte savings, because bytes are the part a fast connection actually helps with.'
+  },
+  {
+    prompt: 'The 12-origin drill: estimate the handshake cost, judge the minify plan, then answer "we are keeping all the apps".',
+    answer: 'Eleven extra origins × roughly 3 round trips × 150 ms is on the order of <b>5 seconds of setup time</b> in total. It does not all land on the critical path — connections open in parallel and the browser has a limited number of parallel sockets — but it is spent on the same CPU and the same radio as everything else, and several of those handshakes will sit directly in front of resources that matter.<br><br>Minifying 90 KB of theme code for a day: <b>no</b>. It is already same-origin, already on an open connection, and the saving is maybe 20–30 KB of transfer against seconds of third-party setup. That is optimising the part we can see rather than the part that hurts.<br><br><i>Likely follow-up:</i> "No apps can be removed — three options, honestly labelled." (1) <b>Defer</b> the third-party scripts until after first interaction or until their section scrolls into view. This genuinely removes their handshakes from the critical path, though not from the page. (2) <b>Preconnect</b> to the two or three origins that must load early, so their handshakes overlap other work instead of queueing behind it. This <em>hides</em> the cost rather than removing it, and preconnecting to all eleven would make things worse by competing for bandwidth. (3) <b>Self-host what we legitimately can</b> — fonts, and any static asset the vendor allows — which removes those origins entirely. And the honest fourth line for the client: some of this cost cannot be engineered away, only chosen, so the app list is now a performance decision they own.'
+  }
+]);
+</script>
+</body>
+</html>

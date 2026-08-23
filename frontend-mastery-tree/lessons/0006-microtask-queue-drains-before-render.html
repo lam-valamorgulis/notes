@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0006 · The microtask queue drains to empty before render — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 1 · Language &amp; Runtime · Event loop · Lesson 0006</p>
+<h1>The microtask queue drains to empty before render</h1>
+<p class="subtitle">Lesson 0005 gave the browser one queue and one rule. That is not enough to make promises safe — so there is a second queue with a much stronger rule. Almost every "await should have let it paint" bug lives in the gap between them.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #2 (predict an unseen case) and ability #5 (judge someone else's work) — this is the mechanism that decides whether a code review comment about <code>await</code> is right or wrong.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can order any mix of synchronous code, <code>setTimeout</code>, <code>.then</code> and <code>await</code> with no doubt, and you can explain why a loading spinner added right before <code>await</code> sometimes never appears on screen.
+</div>
+
+<h2>1. Why one queue was not enough</h2>
+<p>
+  A promise chain is meant to read as one logical operation:
+  <code>fetch(…).then(parse).then(render)</code>. Ask the question this lesson exists to answer: <em>what if each
+  <code>.then</code> step were an ordinary task?</em>
+</p>
+<p>
+  Then a click, a timer, and a frame could all run <b>between</b> two steps of your chain. The user could see the page
+  painted after <code>parse</code> but before <code>render</code> — a half-finished operation, on screen, in front of a
+  customer. That is exactly the failure that run-to-completion was invented to prevent, leaking back in through the
+  side door.
+</p>
+<p>
+  So the platform adds a second queue with a stronger promise. After the current task ends, the loop performs a
+  <b>microtask checkpoint</b>: it runs microtasks until the queue is <b>empty</b> — including microtasks queued by
+  those microtasks — and only then may it render or take the next task
+  (<a href="https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide">MDN — Microtask guide</a>,
+  <a href="https://html.spec.whatwg.org/multipage/webappapis.html#event-loops">HTML Standard § event loops</a>).
+</p>
+
+<div class="table-scroll">
+<table>
+<tr><th></th><th>Task queue</th><th>Microtask queue</th></tr>
+<tr><td>How many run per turn</td><td><b>exactly one</b></td><td><b>all of them, until empty</b></td></tr>
+<tr><td>Something added while running</td><td>waits for a later turn</td><td>runs in <em>this</em> checkpoint</td></tr>
+<tr><td>Can a render happen in between</td><td>yes, between tasks</td><td><b>no</b> — never mid-drain</td></tr>
+<tr><td>Who queues one</td><td><code>setTimeout</code>, events, messages</td><td><code>.then</code>/<code>.catch</code>/<code>.finally</code>, <code>await</code> continuations, <code>queueMicrotask</code>, <code>MutationObserver</code></td></tr>
+</table>
+</div>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 250" role="img" aria-label="One turn of the loop: the task runs, then the microtask queue is drained to empty including microtasks added during the drain, then a render may happen, then the next task">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">ONE TURN OF THE EVENT LOOP &mdash; TIME RUNS RIGHT</text>
+
+  <rect class="box hot" x="16" y="30" width="180" height="40" rx="5"/>
+  <text class="mono sm" x="28" y="47">1 TASK</text>
+  <text class="sub" x="28" y="63">your click handler</text>
+
+  <rect class="box" x="196" y="30" width="230" height="40" rx="5"/>
+  <text class="mono sm" x="208" y="47">MICROTASK CHECKPOINT</text>
+  <text class="sub" x="208" y="63">drain until the queue is empty</text>
+
+  <rect class="box good" x="426" y="30" width="130" height="40" rx="5"/>
+  <text class="mono sm" x="438" y="47">RENDER</text>
+  <text class="sub" x="438" y="63">style, layout, paint</text>
+
+  <rect class="box dim" x="556" y="30" width="148" height="40" rx="5"/>
+  <text class="mono sm" x="568" y="47">NEXT TASK</text>
+  <text class="sub" x="568" y="63">a new turn</text>
+
+  <path class="flow dash" d="M240,74 L240,96"/>
+  <rect class="box" x="196" y="100" width="66" height="28" rx="4"/>
+  <text class="mono sm" x="208" y="119">m1</text>
+  <rect class="box" x="278" y="100" width="66" height="28" rx="4"/>
+  <text class="mono sm" x="290" y="119">m2</text>
+  <rect class="box hot" x="360" y="100" width="66" height="28" rx="4"/>
+  <text class="mono sm" x="372" y="119">m3</text>
+  <path class="flow amber" d="M344,114 L356,114"/>
+  <text class="sub" x="196" y="148">m2 queued m3 &mdash; so m3 still runs in THIS checkpoint,</text>
+  <text class="sub" x="196" y="164">before any paint. That is the &quot;to empty&quot; rule.</text>
+
+  <path class="flow dash" d="M620,74 L620,180"/>
+  <text class="sub" x="446" y="196">a setTimeout queued during the task</text>
+  <text class="sub" x="446" y="212">waits out here &mdash; after the paint</text>
+  <text class="cap amber" x="16" y="212">EVERYTHING LEFT OF &quot;RENDER&quot; IS INVISIBLE TO THE USER</text>
+</svg>
+<figcaption>The whole microtask drain happens <em>before</em> the frame. Nothing you do in a promise continuation is on screen until the render box is reached.</figcaption>
+</figure>
+
+<h2>2. The canonical ordering question</h2>
+<p>
+  Every senior interview in this branch asks a version of this. Read it, cover the answer, and predict:
+</p>
+<pre><code>console.log('script start');
+setTimeout(() =&gt; console.log('setTimeout'), 0);
+Promise.resolve()
+  .then(() =&gt; console.log('promise 1'))
+  .then(() =&gt; console.log('promise 2'));
+console.log('script end');</code></pre>
+<pre><code><span class="out">script start
+script end
+promise 1
+promise 2
+setTimeout</span></code></pre>
+<p>
+  Derive it, do not memorise it. The script is one task, so both synchronous lines print first. The stack empties, so
+  the checkpoint runs: <code>promise 1</code> runs, and its <code>.then</code> queues <code>promise 2</code> as a new
+  microtask — which the checkpoint must also drain, because it drains to <em>empty</em>. Only then is the timer's task
+  eligible. Change nothing about the code and the order can never change; this is not a race.
+</p>
+
+<h2>3. <code>await</code> is a microtask, and that is the bug</h2>
+<p>
+  An <code>await</code> splits a function in two. Everything after it becomes a <b>continuation</b> that is queued as a
+  microtask when the awaited promise settles. So:
+</p>
+<pre><code>btn.classList.add('is-loading');   <span class="cmt">// DOM changed — not painted yet</span>
+await Promise.resolve();           <span class="cmt">// yields to the MICROTASK queue only</span>
+filterNineHundredProducts();       <span class="cmt">// runs in the same turn, still before any paint</span>
+btn.classList.remove('is-loading');</code></pre>
+<p>
+  The spinner never appears. Not "sometimes" — never. The class was added, then the continuation ran, then the class
+  was removed, and the render box in the diagram was reached only after all of it. The user's screen never held the
+  loading state for a single frame.
+</p>
+<div class="trap">
+  <span class="label">Trap — the one that gets past code review</span>
+  "I added <code>await</code> so the browser can breathe" is wrong when you await an <b>already-settled</b> promise.
+  Awaiting a real <code>fetch</code> <em>does</em> let a frame in, because the continuation cannot run until the
+  network task arrives — the turn genuinely ends. To yield <b>on purpose</b> you must reach the task queue:
+  <code>await new Promise(r =&gt; setTimeout(r, 0))</code>, or <code>scheduler.yield()</code> where it exists, or two
+  nested <code>requestAnimationFrame</code> calls if what you need is "after the next paint".
+</div>
+
+<h2>4. The failure mode this queue creates</h2>
+<p>
+  A stronger rule buys a stronger failure. A long task delays the next frame; an <b>endless microtask chain never lets
+  a frame happen at all</b>:
+</p>
+<pre><code>function spin() { queueMicrotask(spin); }
+spin();   <span class="cmt">// the checkpoint can never reach "empty"</span></code></pre>
+<p>
+  The tab is now unrecoverable, and the Performance panel shows no long task to blame — because from the loop's point
+  of view the checkpoint simply has not finished. That is <b>microtask starvation</b>, its own core in the depth queue.
+  Knowing it exists is enough today; the point is that "drains to empty" is a promise the platform keeps even when it
+  is fatal.
+</p>
+
+<h2>5. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The worker takes one job from the main line and finishes it. Before it is allowed to look up at the shop again, it
+    must clear a small tray of follow-up notes on its desk — and if clearing a note creates another note, that one goes
+    in the same tray and must be cleared too. Only when the tray is completely empty does the worker look up, update
+    the display board, and call the next customer. Anything you write while the tray is being cleared is not on the
+    board yet. Nobody outside can see it.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> Sending an email. The main line is your inbox — one message at a time. The tray is the set of
+    "before I send this, also do X" notes attached to the message you are already handling. You finish all of them
+    before the message goes out, so nobody ever receives a half-written email.
+  </p>
+  <p>
+    <b>Where it breaks.</b> With email you could always give up and send it half done. Here you cannot: the tray must
+    reach empty, and a note is allowed to add another note forever. That is not a bug in the analogy, it is a real
+    property with a real consequence — an endless chain of notes freezes the shop with no long task to point at.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    The mistake is treating <code>await</code> and <code>setTimeout</code> as two flavours of "later". They are
+    different queues with different rules, and only one of them permits a paint. Say it precisely: <b>a microtask runs
+    before the next frame; a task runs after it.</b> The second sticking point is thinking the drain is "just the
+    microtasks that were already there". It is not — anything queued <em>during</em> the drain joins the same drain.
+    That is why <code>promise 2</code> beats <code>setTimeout</code> even though <code>setTimeout</code> was queued
+    first.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a teammate who wrote <i>"I added <code>await Promise.resolve()</code> before the heavy
+    loop so the spinner shows"</i> in a pull request. Explain why the spinner still will not show, and what to write
+    instead — without using the words "microtask" or "macrotask" until you have defined them in plain words. Then
+    <b>send it to me</b>. This is ability #5 in one paragraph: judging someone else's work in mechanism terms.
+  </p>
+</div>
+
+<h2>6. Point at it: prove the ordering in two places <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>Console, 20 seconds.</b> Paste the section-2 snippet. The output order is fixed, every time, on every
+  machine — a determinism you can lean on in an interview.</li>
+  <li><b>Performance panel.</b> Record while running a promise chain. Inside a single <i>Task</i> bar you will find a
+  child entry named <b>Run Microtasks</b>. Read what that nesting is telling you: the microtasks are <em>inside</em>
+  the task's own bar, not after it — the drain is part of the same turn.</li>
+  <li><b>The paint test.</b> Run this in the Console of any page:
+  <code>document.body.style.background='red'; await Promise.resolve(); const e=Date.now()+1500; while(Date.now()&lt;e){}; document.body.style.background='';</code>
+  &mdash; predict first, then run. You should never see red. Now replace <code>await Promise.resolve()</code> with
+  <code>await new Promise(r =&gt; setTimeout(r, 0))</code> and run again: red for a second and a half. Same code shape,
+  different queue, visible difference. That is gate #3 for this core.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A theme's "Add to cart" button does: add the class <code>is-loading</code>, <code>await</code> a helper that resolves immediately from a client-side cache, rebuild the cart drawer HTML for 400&nbsp;ms of synchronous work, then remove the class. QC's ticket: "no loading state on repeat adds, but it works the first time".</p>
+  Before flipping the recall cards: explain why the first add shows the spinner and the repeat add does not — the code path is identical. Then the interviewer's follow-up: give the smallest change that makes the spinner appear in both cases, and say what you would measure afterwards to prove it worked.
+</div>
+
+<h2>7. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>Open a scratch file. Type it by hand, and write your predicted output on paper <b>before</b> running:</p>
+  <pre><code>console.log('1');
+setTimeout(() =&gt; console.log('2'), 0);
+queueMicrotask(() =&gt; {
+  console.log('3');
+  queueMicrotask(() =&gt; console.log('4'));
+});
+Promise.resolve().then(() =&gt; console.log('5'));
+console.log('6');</code></pre>
+  <p>The answer is <code>1 6 3 5 4 2</code>. If you got the <code>4</code> before the <code>2</code>, you have the
+  "drains to empty" rule. If you put <code>4</code> after <code>2</code>, re-read section 1 before continuing.</p>
+  <p><b>Now the <code>await</code> version of the same idea:</b></p>
+  <pre><code>async function run() {
+  console.log('a');
+  await null;                <span class="cmt">// awaiting a non-promise still queues a microtask</span>
+  console.log('b');
+}
+run();
+console.log('c');</code></pre>
+  <p>Predict, then run: <code>a c b</code>. Everything after <code>await</code> is a continuation, and a continuation is
+  a microtask — even when there was nothing real to wait for.</p>
+  <p><b>Break it in the way that matters visually.</b> On any page, in a scratch file loaded in the browser:</p>
+  <pre><code>const box = document.body;
+box.style.outline = '8px solid red';
+await Promise.resolve();              <span class="cmt">// wrong queue</span>
+const end = Date.now() + 1200;
+while (Date.now() &lt; end) {}
+box.style.outline = '';</code></pre>
+  <p>Predict: do you see red? Run it. Then change one line to
+  <code>await new Promise(r =&gt; setTimeout(r, 0));</code> and run again. Watching the red appear the second time is
+  the moment this lesson stops being theory.</p>
+</div>
+
+<h2>8. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>microtask queue drains to empty before render</b> done only if all three held, from memory: (1) you explained to a teammate why <code>await Promise.resolve()</code> does not let the browser paint — the teach-back in section 5; (2) you predicted <code>1 6 3 5 4 2</code> before running it; (3) you ran the red-outline test both ways and saw the difference. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide">MDN — Using microtasks</a> (15 min), then scrub the animation in <a href="https://jakearchibald.com/2015/tasks-microtasks-queues-and-schedules/">Jake Archibald's article</a> again with this lesson in mind — the second read is where the ordering stops needing thought. Spec anchor: <a href="https://html.spec.whatwg.org/multipage/webappapis.html#event-loops">HTML Standard § Event loops</a>, the "perform a microtask checkpoint" step.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Nested microtask starvation</b> <span class="pill depth">depth</span> — named in section 4, studied later.
+  <b><code>requestAnimationFrame</code>'s exact slot in the frame</b> <span class="pill depth">depth</span> — it is not
+  a microtask and not a task; lesson 0015 places it. <b>How <code>async</code>/<code>await</code> desugars to a
+  generator plus a driver</b> <span class="pill depth">depth</span> — useful, not load-bearing for ordering.
+  <b>Why resolving a promise with another promise costs extra ticks</b> — that belongs to the promise state machine,
+  the next core lesson: <a href="0008-promise-state-machine.html">0008</a>. Next up though is
+  <a href="0007-long-tasks-starvation-input-delay.html">0007 · long tasks and input delay</a>, which turns these two
+  queues into a number you can show a client.
+</div>
+
+<p class="ask">Anything unclear — why a real <code>fetch</code> does let a frame in, what <code>MutationObserver</code> has to do with promises, how to yield properly in your own theme code? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>Two queues, two rules: <b>one task per turn</b>, but <b>all microtasks, until the queue is empty</b>.</li>
+    <li>A microtask queued <em>during</em> the drain joins the same drain. A task queued during a task waits for a later turn.</li>
+    <li>The checkpoint happens <b>before</b> the render step, so nothing done in a microtask is on screen yet.</li>
+    <li>Microtask sources: <code>.then</code>/<code>.catch</code>/<code>.finally</code>, every <code>await</code> continuation, <code>queueMicrotask</code>, <code>MutationObserver</code>.</li>
+    <li><code>await</code> on an already-settled value does <b>not</b> let the browser paint. To yield, reach the task queue: <code>await new Promise(r =&gt; setTimeout(r, 0))</code>.</li>
+    <li>An endless microtask chain freezes the tab with <b>no long task</b> to blame — a stronger rule buys a nastier failure.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>a microtask runs before the next frame, a task runs after it — so only a task lets the user see anything.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/event-loop.html">Cheat sheet: event loop</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0007-long-tasks-starvation-input-delay.html">Next: 0007 · long tasks &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'How many microtasks run at one microtask checkpoint?',
+    options: [
+      'all of them, including ones queued during it',
+      'one, exactly like a task from the task queue',
+      'all of the ones that existed when it started'
+    ],
+    answer: 0,
+    why: 'It drains to empty. A microtask queued by a microtask joins the same drain, which is why a chained .then still beats a setTimeout that was queued earlier.'
+  },
+  {
+    q: 'script start; setTimeout(log "T"); Promise.resolve().then(log "P1").then(log "P2"); script end — order?',
+    options: [
+      'start, end, P1, P2, T',
+      'start, end, T, P1, P2',
+      'start, P1, P2, end, T'
+    ],
+    answer: 0,
+    why: 'The script is one task and finishes first. Then the checkpoint drains both promise steps, because the second is queued during the drain. The timer task is only eligible after that.'
+  },
+  {
+    q: 'Why can a class added just before await Promise.resolve() never be seen?',
+    options: [
+      'the continuation runs before the render step',
+      'the class is applied only on the next frame',
+      'awaiting resets pending style changes first'
+    ],
+    answer: 0,
+    why: 'The continuation is a microtask, and the whole microtask drain sits before the render step of that turn. The class was added and removed without a frame in between.'
+  },
+  {
+    q: 'Which one genuinely lets the browser paint before your next line runs?',
+    options: [
+      'await new Promise(r => setTimeout(r, 0))',
+      'await Promise.resolve().then(() => {})',
+      'await queueMicrotask(() => undefined)'
+    ],
+    answer: 0,
+    why: 'Only that one reaches the task queue, which ends the current turn and allows a render opportunity. The other two stay inside the same microtask checkpoint.'
+  },
+  {
+    q: 'What does an endless queueMicrotask chain look like in the Performance panel?',
+    options: [
+      'a frozen tab with no long task flagged',
+      'a long task warning every fifty milliseconds',
+      'a growing series of dropped-frame markers'
+    ],
+    answer: 0,
+    why: 'From the loop\'s point of view the checkpoint has simply not finished, so no task boundary is ever reached and nothing is attributed as a long task. The tab is unrecoverable.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What is the difference between a task and a microtask?"',
+    answer: 'Both are queued work, but the rules differ. The loop runs <b>one task</b> per turn, then performs a <b>microtask checkpoint</b> that runs microtasks until the queue is <b>empty</b> — including any queued during the drain — and only then may the browser render or take the next task. So a microtask always runs <b>before the next frame</b>; a task always runs <b>after</b> one.<br><br><i>Likely follow-up:</i> "Name the sources of each." Tasks: <code>setTimeout</code>, DOM events, messages, network events. Microtasks: <code>.then</code>/<code>.catch</code>/<code>.finally</code>, every <code>await</code> continuation, <code>queueMicrotask</code>, <code>MutationObserver</code> callbacks.'
+  },
+  {
+    prompt: '"A colleague adds `await Promise.resolve()` before a heavy loop so the spinner shows. Review that."',
+    answer: 'It will not work, and the reason is mechanical rather than stylistic. Everything after <code>await</code> is a continuation queued as a <b>microtask</b>, and the entire microtask drain happens <b>before</b> the render step of the same turn. So the spinner class is added, the heavy loop runs, the class is removed, and the browser paints once at the end — the loading state never occupies a frame.<br><br><i>Likely follow-up:</i> "What should it be instead?" Anything that reaches the task queue and therefore ends the turn: <code>await new Promise(r =&gt; setTimeout(r, 0))</code>, <code>scheduler.yield()</code> where available, or two nested <code>requestAnimationFrame</code> calls when the requirement is specifically "after the next paint". And if the loop itself is 400 ms, yielding once only moves the freeze — chunk it.'
+  },
+  {
+    prompt: 'The add-to-cart drill: the spinner shows on the first add but not on repeats, with identical code. Explain and fix.',
+    answer: 'The first add awaits a <b>real network request</b>, so the continuation cannot run until the response task arrives. The turn genuinely ends, the browser gets a render opportunity, and the spinner is painted. The repeat add awaits a value that is already resolved from the client-side cache, so the continuation is just a microtask in the <em>same</em> turn: the 400 ms rebuild runs before any paint and the class is removed before the frame. Same code, two different queue paths.<br><br>Smallest fix: yield to the task queue before the heavy rebuild — <code>await new Promise(r =&gt; setTimeout(r, 0))</code> — so the spinner gets a frame in both paths.<br><br><i>Likely follow-up:</i> "What would you measure to prove it?" Record the interaction in the Performance panel and check that a frame is painted between the class change and the rebuild task, and that the rebuild now appears as its own task. If the rebuild is still one 400 ms task, INP is still bad — the spinner is honest now, but the work still needs chunking.'
+  }
+]);
+</script>
+</body>
+</html>

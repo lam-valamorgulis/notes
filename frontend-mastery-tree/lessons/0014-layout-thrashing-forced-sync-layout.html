@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0014 · Layout thrashing &amp; forced synchronous layout — Frontend Mastery Tree</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="breadcrumb"><a href="../index.html">&larr; The Map</a></p>
+
+<p class="kicker">Stratum 2 · Rendering Pipeline · Layout · Lesson 0014</p>
+<h1>Layout thrashing &amp; forced synchronous layout</h1>
+<p class="subtitle">The browser saves you work by doing layout once, at the end. Reading one innocent property in the wrong place cancels that saving — and doing it in a loop turns one layout into twenty-four.</p>
+<p class="expertise"><span class="pill core">core</span> <span><b>Domain expertise:</b> moves ability #4 (debug with no ready answer) — this bug has no error message, no stack trace, and a name most developers never learn.</span></p>
+
+<div class="win">
+  <strong>The win:</strong> after ~35 minutes you can spot the read-write loop in any file, find the "Forced reflow" warning in a profile, and make the same feature five to twenty times faster by moving lines rather than rewriting logic.
+</div>
+
+<h2>1. Why the browser is lazy on purpose</h2>
+<p>
+  Suppose you change six styles in one task. Laying out after each change would be six layouts for one visible result.
+  So the browser <b>batches</b>: it marks the affected boxes dirty, keeps running your code, and does style and layout
+  once, at the end of the task — the render step from lesson 0005's diagram. That is why a hundred DOM writes in a loop
+  can still be cheap.
+</p>
+<p>
+  Now break it. Your code asks for a number that depends on geometry:
+</p>
+<pre><code>el.style.width = '300px';           <span class="cmt">// marks layout dirty — no layout yet</span>
+const h = el.offsetHeight;          <span class="cmt">// you asked. the answer must be CORRECT.</span></code></pre>
+<p>
+  The browser cannot hand you a stale number, and it cannot predict one. So it stops, performs the whole pending layout
+  <b>right now</b>, mid-JavaScript, and returns the true value. That is a <b>forced synchronous layout</b>. Once per task
+  it is a fair price. Inside a loop it is a disaster:
+</p>
+<pre><code>cards.forEach(card =&gt; {
+  const h = tallest.offsetHeight;   <span class="cmt">// READ  → forces layout, because...</span>
+  card.style.height = h + 'px';     <span class="cmt">// WRITE → ...this dirtied it again last iteration</span>
+});</code></pre>
+<p>
+  Twenty-four cards, twenty-four full layouts in a single task. Nothing is wrong with either line. The <b>order</b> is
+  wrong. That pattern is <b>layout thrashing</b>.
+</p>
+
+<figure class="svg-fig">
+<svg viewBox="0 0 720 230" role="img" aria-label="Interleaving reads and writes forces one layout per iteration, while batching all reads then all writes needs a single layout at the end of the task">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+
+  <text class="cap" x="16" y="18">R = read a geometry property   ·   W = write a style   ·   TIME &rarr;</text>
+
+  <text class="mono sm" x="16" y="58">thrashing</text>
+  <rect class="box" x="110" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="120" y="59">R</text>
+  <rect class="box bad" x="138" y="40" width="44" height="28" rx="4"/><text class="mono sm" x="143" y="59">LAYOUT</text>
+  <rect class="box" x="182" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="191" y="59">W</text>
+  <rect class="box" x="210" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="220" y="59">R</text>
+  <rect class="box bad" x="238" y="40" width="44" height="28" rx="4"/><text class="mono sm" x="243" y="59">LAYOUT</text>
+  <rect class="box" x="282" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="291" y="59">W</text>
+  <rect class="box" x="310" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="320" y="59">R</text>
+  <rect class="box bad" x="338" y="40" width="44" height="28" rx="4"/><text class="mono sm" x="343" y="59">LAYOUT</text>
+  <rect class="box" x="382" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="391" y="59">W</text>
+  <rect class="box" x="410" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="420" y="59">R</text>
+  <rect class="box bad" x="438" y="40" width="44" height="28" rx="4"/><text class="mono sm" x="443" y="59">LAYOUT</text>
+  <rect class="box" x="482" y="40" width="28" height="28" rx="4"/><text class="mono sm" x="491" y="59">W</text>
+  <text class="sub" x="524" y="59">… × 24</text>
+  <text class="sub" x="110" y="86">one full layout per iteration, all inside a single task</text>
+
+  <line class="rule thin" x1="16" y1="104" x2="704" y2="104"/>
+
+  <text class="mono sm" x="16" y="148">batched</text>
+  <rect class="box" x="110" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="120" y="149">R</text>
+  <rect class="box" x="142" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="152" y="149">R</text>
+  <rect class="box" x="174" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="184" y="149">R</text>
+  <rect class="box" x="206" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="216" y="149">R</text>
+  <rect class="box" x="248" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="258" y="149">W</text>
+  <rect class="box" x="280" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="290" y="149">W</text>
+  <rect class="box" x="312" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="322" y="149">W</text>
+  <rect class="box" x="344" y="130" width="28" height="28" rx="4"/><text class="mono sm" x="354" y="149">W</text>
+  <rect class="box good" x="386" y="130" width="52" height="28" rx="4"/><text class="mono sm" x="391" y="149">LAYOUT</text>
+  <text class="sub" x="110" y="176">every read answered from the same clean layout, then one layout at the end of the task</text>
+
+  <text class="cap amber" x="16" y="206">SAME WORK. SAME RESULT. THE ONLY CHANGE IS THE ORDER OF THE LINES.</text>
+</svg>
+<figcaption>This is the whole fix: separate the reads from the writes. It is usually a five-line diff and a five-to-twenty-times speed-up.</figcaption>
+</figure>
+
+<h2>2. What counts as a read</h2>
+<p>
+  Any property or method whose answer depends on geometry will force a pending layout. The ones you will actually meet
+  in theme code:
+</p>
+<div class="table-scroll">
+<table>
+<tr><th>Category</th><th>Examples</th></tr>
+<tr><td>Box metrics</td><td><code>offsetTop</code>, <code>offsetLeft</code>, <code>offsetWidth</code>, <code>offsetHeight</code>, <code>clientWidth</code>, <code>clientHeight</code></td></tr>
+<tr><td>Rects</td><td><code>getBoundingClientRect()</code>, <code>getClientRects()</code></td></tr>
+<tr><td>Scroll</td><td><code>scrollTop</code>, <code>scrollLeft</code>, <code>scrollWidth</code>, <code>scrollHeight</code>, <code>scrollIntoView()</code></td></tr>
+<tr><td>Computed style</td><td><code>getComputedStyle(el)</code> then reading a layout-dependent property</td></tr>
+<tr><td>Window</td><td><code>innerWidth</code>/<code>innerHeight</code> in some cases, <code>scrollY</code>, <code>focus()</code></td></tr>
+</table>
+</div>
+<p class="small">
+  Full, engine-specific list: <a href="https://gist.github.com/paulirish/5d52fb081b3570c81e3a">Paul Irish — What forces layout / reflow</a>.
+  The point is not the list. The point is the question: <em>does this line ask for a number that depends on where boxes are?</em>
+</p>
+<div class="trap">
+  <span class="label">Trap — a read is only expensive if layout is dirty</span>
+  Reading <code>offsetHeight</code> a thousand times with no writes in between costs one layout, not a thousand: after the
+  first read, layout is clean and the rest are cheap lookups. So "never read <code>offsetHeight</code>" is the wrong
+  lesson. The expensive thing is a <b>write followed by a read</b>, repeatedly. Chase the alternation, not the property.
+</div>
+
+<h2>3. The three ways to fix it</h2>
+<ol>
+  <li><b>Batch: all reads, then all writes.</b> The default fix, and usually enough.
+  <pre><code>const heights = cards.map(c =&gt; c.offsetHeight);        <span class="cmt">// one layout, at the first read</span>
+cards.forEach((c, i) =&gt; c.style.height = heights[i] + 'px');  <span class="cmt">// writes only</span></code></pre></li>
+  <li><b>Let the platform tell you instead of asking.</b> <code>ResizeObserver</code> and
+  <code>IntersectionObserver</code> deliver geometry <em>after</em> layout has already run, so there is nothing to force.
+  Replacing a scroll handler that reads <code>getBoundingClientRect()</code> with an
+  <code>IntersectionObserver</code> removes the whole class of problem — and this is the single most common real fix in a
+  Shopify theme.</li>
+  <li><b>Avoid needing the number.</b> Equal-height cards want CSS grid, not measured heights. Sticky headers want
+  <code>position: sticky</code>, not a scroll listener. A layout you never read cannot be forced.</li>
+</ol>
+
+<h2>4. Explain it back <span class="pill soft">Feynman check</span></h2>
+<div class="feynman">
+  <span class="label">Part 1 · Plain words — no jargon at all</span>
+  <p>
+    The browser saves effort by waiting: you can change many things, and it works out the new positions once, at the end.
+    But the moment your code asks "how tall is this?", it cannot give an old answer — so it stops and works out every
+    position immediately, then answers. Ask, change something, ask again, change again, and you have made it do that full
+    calculation once for every item in your list, instead of once for the whole list.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 2 · One analogy, and where the analogy breaks</span>
+  <p>
+    <b>The analogy.</b> A stocktake. Your colleague is happy to count the whole warehouse once at the end of the day. But
+    every time you ask "how many of item 12 right now?", they must stop and recount everything, because you moved things
+    since the last count. Ask after every single move and the day is gone.
+  </p>
+  <p>
+    <b>Where it breaks.</b> A person would get annoyed, or guess, or say "roughly forty". The browser never guesses and
+    never complains — it silently does the full recount, every time, and your page just feels slow with no error anywhere.
+    That silence is why this bug survives in codebases for years.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 3 · The sticking point</span>
+  <p>
+    People take away "reading <code>offsetHeight</code> is slow" and then write anxious code that avoids reads while
+    keeping the alternation. Wrong lesson. A read is cheap when layout is clean; the cost comes from
+    <b>write &rarr; read &rarr; write &rarr; read</b>. Second sticking point: assuming this is about the number of DOM
+    operations. It is not — a thousand writes in a row are fine. It is about how many times you force the browser to
+    settle up.
+  </p>
+</div>
+<div class="feynman">
+  <span class="label">Part 4 · Teach it back to me</span>
+  <p>
+    Two or three sentences to a junior whose equal-height-cards function takes 180 ms on a collection page. Explain what
+    the browser is being forced to do, why moving two lines fixes it, and how they can prove the fix. Then <b>send it to
+    me</b> — I am checking that you say "because a write came before the read", not "because reading is slow".
+  </p>
+</div>
+
+<h2>5. Point at it: the browser will name this one for you <span class="pill soft">gate #3</span></h2>
+<ol>
+  <li><b>The warning nobody reads.</b> Chrome logs <i>"Forced reflow while executing JavaScript took Nms"</i> to the
+  Console when the cost is large enough. Search a client's console for "reflow" before you do anything else — it is a
+  free diagnosis.</li>
+  <li><b>The profile, unmistakable.</b> DevTools &rarr; <b>Performance</b> &rarr; record the interaction. Thrashing looks
+  like a picket fence: many short purple <b>Layout</b> bars in one task. Click one and the summary shows a red warning
+  triangle with <b>"Forced reflow is a likely performance bottleneck"</b>, and — the useful part — a link to the exact
+  line of your code that caused it.</li>
+  <li><b>Count them.</b> Note the number of <b>Layout</b> entries inside the task before your fix and after. Going from
+  24 to 1 is the evidence to put in the pull request, and it is gate #3 for this core.</li>
+  <li><b>Measure the wall-clock too.</b> Wrap the function in
+  <code>performance.mark</code>/<code>performance.measure</code>, or just <code>performance.now()</code> either side, with
+  CPU throttled 4×. A number the client can read beats a screenshot of a flame chart.</li>
+</ol>
+
+<div class="drill">
+  <span class="label">Work drill — do this on a real theme</span>
+  <p class="situation">A collection page has 24 product cards. To align the "Add to cart" buttons, <code>equalise()</code> loops the cards: it reads <code>card.querySelector('.title').offsetHeight</code>, then sets <code>card.querySelector('.title').style.minHeight</code>, then reads the card's own <code>offsetHeight</code> and writes it back to a wrapper. It runs on load, on resize, and after every filter change. The console shows three "Forced reflow" warnings per filter click.</p>
+  Before flipping the recall cards: count how many forced layouts one call performs, name the exact alternation causing it, and give the batched rewrite. Then the interviewer's follow-up: the resize handler makes it worse — what two separate problems does resize add, and how would you fix each?
+</div>
+
+<h2>6. Live coding session</h2>
+<div class="livecode">
+  <span class="label">Type it, predict it, break it</span>
+  <p>One file. Type it by hand — this is a measurement exercise, so the numbers are the output:</p>
+  <pre><code>&lt;!doctype html&gt;
+&lt;style&gt;.card { width: 200px; padding: 8px; border: 1px solid #ccc; margin: 4px }&lt;/style&gt;
+&lt;div id="grid"&gt;&lt;/div&gt;
+&lt;script&gt;
+  grid.innerHTML = '&lt;div class="card"&gt;card&lt;/div&gt;'.repeat(500);
+  const cards = [...document.querySelectorAll('.card')];
+
+  function thrash() {
+    const t = performance.now();
+    cards.forEach(c =&gt; { c.style.height = (c.offsetHeight + 1) + 'px'; });
+    return Math.round(performance.now() - t);
+  }
+
+  function batched() {
+    const t = performance.now();
+    const hs = cards.map(c =&gt; c.offsetHeight);          <span class="cmt">// all reads</span>
+    cards.forEach((c, i) =&gt; { c.style.height = (hs[i] + 1) + 'px'; }); <span class="cmt">// all writes</span>
+    return Math.round(performance.now() - t);
+  }
+
+  console.log('thrash', thrash(), 'ms');
+  console.log('batched', batched(), 'ms');
+&lt;/script&gt;</code></pre>
+  <p><b>Predict before running:</b> which is faster, and by roughly what factor? Write your guess down. Then run it with
+  CPU throttled 4× and compare. Most people guess "a bit faster" and are wrong by an order of magnitude.</p>
+  <p><b>Now see it, not just measure it.</b> Record a Performance profile while calling <code>thrash()</code> and count
+  the purple <b>Layout</b> bars. Then profile <code>batched()</code>. Find the "Forced reflow" warning triangle and click
+  through to the line it blames — your own <code>c.offsetHeight</code>.</p>
+  <p><b>Break the fix on purpose.</b> Add one write into the middle of the read loop:</p>
+  <pre><code>    const hs = cards.map(c =&gt; { c.style.opacity = '1'; return c.offsetHeight; });</code></pre>
+  <p>Predict: does <code>opacity</code> — a composite-only property from lesson 0013 — dirty layout and bring the
+  thrashing back? Run it and find out. The answer teaches you that "cheap property" and "does not invalidate layout" are
+  two different questions, and it is the most useful surprise in this lesson.</p>
+</div>
+
+<h2>7. Prove it</h2>
+<div id="quiz"></div>
+<div id="recall"></div>
+
+<div class="tip">
+  <span class="label">The gate — only now touch the tracker</span>
+  Open the <a href="../reference/frontend-mastery-tree.html">tree tracker</a> and mark <b>layout thrashing &amp; forced synchronous layout</b> done only if all three held, from memory: (1) you explained it as "a write came before the read" — the teach-back in section 4; (2) you predicted the speed factor before running the two functions; (3) you counted <b>Layout</b> entries in a real profile, before and after, and found the forced-reflow warning. Two out of three is zero out of three.
+</div>
+
+<div class="note">
+  <span class="label">Primary source</span>
+  Read once, slowly: <a href="https://gist.github.com/paulirish/5d52fb081b3570c81e3a">Paul Irish — What forces layout / reflow</a> (15 min, and keep it bookmarked), then the Layout section of <a href="https://developer.chrome.com/docs/devtools/performance">Chrome DevTools — Performance</a> so the picket-fence shape is familiar before you meet it on a client site.
+</div>
+
+<div class="note">
+  <span class="label">What this lesson skipped on purpose</span>
+  <b>Formatting contexts, flexbox and grid algorithms</b> <span class="pill depth">depth</span> — <em>how</em> layout
+  computes positions; this lesson only needed that it must. <b>Intrinsic sizing</b>
+  <span class="pill depth">depth</span> — why <code>min-content</code> can make a layout more expensive.
+  <b><code>contain</code> and <code>content-visibility</code></b> <span class="pill depth">depth</span> — bounding how far
+  an invalidation spreads, the honest fix when a layout is unavoidable. <b>The observers in depth</b>
+  <span class="pill depth">depth</span> — named in section 3 as the real-world fix, studied properly in the frame-budget
+  branch. Next core lesson: <a href="0015-frame-budget-16ms.html">0015 · the 16.67 ms frame budget</a>, which puts a
+  number on everything Chapter 2 has said so far.
+</div>
+
+<p class="ask">Anything unclear — which reads are safe, whether <code>requestAnimationFrame</code> helps here, how to replace a scroll handler with an observer in your theme? <b>Ask me.</b> I am your teacher; that is what this session is for.</p>
+
+<div class="remember">
+  <span class="label">Remember this</span>
+  <ul>
+    <li>The browser <b>batches</b> style and layout to the end of the task. That is why many writes in a row are cheap.</li>
+    <li>Reading a geometry property while layout is dirty <b>forces</b> the pending layout immediately, mid-JavaScript.</li>
+    <li><b>Layout thrashing</b> = write &rarr; read &rarr; write &rarr; read in a loop. N items become N full layouts in one task.</li>
+    <li>A read is cheap when layout is clean. Chase the <b>alternation</b>, not the property.</li>
+    <li>Fix one: <b>all reads, then all writes</b>. Usually a five-line diff.</li>
+    <li>Fix two: let the platform hand you geometry after layout — <code>ResizeObserver</code>, <code>IntersectionObserver</code>.</li>
+    <li>Fix three: do not need the number — CSS grid instead of measured heights, <code>position: sticky</code> instead of a scroll listener.</li>
+    <li>Chrome names it for you: a Console "Forced reflow" warning, and a red triangle on the <b>Layout</b> entry that links to your line.</li>
+  </ul>
+  <p class="one-thing">If you remember one thing: <b>never read geometry inside a loop that also writes styles.</b></p>
+</div>
+
+<div class="footer-nav">
+  <a href="../index.html">&larr; The Map</a>
+  <a href="../reference/rendering-pipeline.html">Cheat sheet: rendering pipeline</a>
+  <a href="../reference/glossary.html">Glossary</a>
+  <a href="0015-frame-budget-16ms.html">Next: 0015 · the frame budget &rarr;</a>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Why does reading offsetHeight sometimes cost a full layout?',
+    options: [
+      'the answer must be correct, so pending layout runs',
+      'the property is recomputed from scratch every time',
+      'reading any DOM property invalidates the layout tree'
+    ],
+    answer: 0,
+    why: 'The browser had queued the layout work for the end of the task. Asking for a geometry number means it cannot give a stale answer, so it performs the pending layout immediately.'
+  },
+  {
+    q: 'A loop over 24 cards writes a style and then reads offsetHeight each time. How many layouts?',
+    options: [
+      'twenty-four, one forced per iteration',
+      'one, because it is all inside a single task',
+      'two, one at the start and one at the end'
+    ],
+    answer: 0,
+    why: 'Each write dirties layout and each read forces it clean again, so the alternation produces one full layout per iteration inside the same task.'
+  },
+  {
+    q: 'You read offsetHeight a thousand times with no writes in between. What does it cost?',
+    options: [
+      'one layout, then cheap reads from clean state',
+      'one thousand layouts, one for every single read',
+      'nothing at all, since reads are always batched'
+    ],
+    answer: 0,
+    why: 'After the first read the layout is clean, so the rest are lookups. This is why "never read offsetHeight" is the wrong lesson: the alternation is what costs, not the property.'
+  },
+  {
+    q: 'What is the standard fix for a read-write loop?',
+    options: [
+      'collect every read first, then do every write',
+      'wrap each iteration in a requestAnimationFrame',
+      'replace the loop with a for statement instead'
+    ],
+    answer: 0,
+    why: 'All reads are answered from one clean layout, and the writes that follow are batched into a single layout at the end of the task. Same work, same result, different order.'
+  },
+  {
+    q: 'How does Chrome tell you this is happening without a profile?',
+    options: [
+      'a Console warning about a forced reflow taking Nms',
+      'a red badge on the Elements panel for that node',
+      'a dropped-frame counter in the Rendering overlay'
+    ],
+    answer: 0,
+    why: 'When the forced layout is expensive enough Chrome logs "Forced reflow while executing JavaScript took Nms". Searching a client console for the word reflow is a free diagnosis.'
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: '"What is layout thrashing?"',
+    answer: 'The browser normally batches style and layout to the end of the task. If your code <b>writes</b> a style and then <b>reads</b> a geometry property, the read cannot be answered from stale state, so the browser performs the pending layout immediately, mid-JavaScript — a forced synchronous layout. Do that in a loop and you turn one layout into one per iteration.<br><br><i>Likely follow-up:</i> "So is reading offsetHeight bad?" No. With layout clean, reads are cheap. The cost is the <b>alternation</b> of writes and reads, so the fix is to batch: all reads, then all writes.'
+  },
+  {
+    prompt: '"How would you find and prove this in a real codebase?"',
+    answer: 'First, search the Console for "Forced reflow" — Chrome logs it when the cost is significant. Then record a Performance profile of the interaction: thrashing shows as many short purple <b>Layout</b> bars inside one task, and the entry carries a warning triangle that links to the exact line. Prove the fix by counting Layout entries before and after, and by timing the function with <code>performance.now()</code> under 4× CPU throttling.<br><br><i>Likely follow-up:</i> "What if there is no warning?" The threshold for logging is generous, so a moderate case will not warn. The profile still shows the picket-fence shape, and the read-write alternation is visible in the code review before any tooling.'
+  },
+  {
+    prompt: 'The equalise() drill: 24 cards, four operations per card, three warnings per filter click. Count the layouts, rewrite it, and handle the resize problems.',
+    answer: 'Per call the loop does read-title-height, write-title-min-height, read-card-height, write-wrapper-height for each card. The write before each read is what forces layout, so it is roughly <b>two forced layouts per card — about 48 per call</b> — and it runs again on load, resize and every filter change.<br><br>Rewrite: read every title height into an array, take the maximum, then write <code>minHeight</code> to all titles; if the wrapper heights are still needed, read them all in a second pass and write them in a third. Reads and writes never alternate, so the whole call costs one or two layouts.<br><br><i>Likely follow-up:</i> "Resize makes it worse — what two problems?" First, <b>frequency</b>: resize fires many times per second, so even the batched version runs far too often — debounce it, or better, use a <code>ResizeObserver</code> so the browser hands you geometry <em>after</em> layout instead of you asking for it. Second, <b>the need itself</b>: equal heights across a grid is a CSS job. Using <code>display: grid</code> with matching rows removes the measuring code entirely, and a layout you never read can never be forced. I would ship the observer as the quick fix and the grid as the real one.'
+  }
+]);
+</script>
+</body>
+</html>
