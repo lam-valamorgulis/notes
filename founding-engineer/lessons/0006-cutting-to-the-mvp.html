@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B2 — Cutting to the MVP</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 2 · Build · Lesson B2</p>
+<h1>Cutting to the MVP</h1>
+<p class="subtitle">The smallest version that is still worth using once — and
+saying out loud what you left out on purpose.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>judge someone else's work and say
+what is wrong and why</i>. After this you can look at any first version and name
+the features that should not be there. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 6 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can take a feature list of twenty items and
+  cut it to a handful, with a written reason for every cut. And you can defend the
+  cuts to the person who wrote the list.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why cutting is the main skill, not a compromise</h2>
+
+<p>Start with the failure this prevents. A team writes down twenty features. They
+build fifteen of them. They launch after five months. Nobody uses it.</p>
+
+<p>Then the painful part. Eleven of those fifteen were never the reason anyone
+would have used it. That is not a discipline problem — the team worked hard. It is
+a <b>filter</b> problem, and the filter is easy to miss.</p>
+
+<p>So let us build the filter. Go back to
+<a href="0001-the-founding-engineer-job.html">F1</a>: the output of a month is an
+<b>answer</b>. Apply that to a feature list and the rest follows.</p>
+
+<h3>Step 1 — Every feature costs runway</h3>
+
+<p>Not just build time. Also design decisions, bugs, support questions, and code
+you keep working around forever. A feature costs you again every month, not
+once.</p>
+
+<h3>Step 2 — And every feature is a bet on an unsettled guess</h3>
+
+<p>You do not yet know if anyone wants the product. So every feature is built on
+top of an assumption that has not been tested. If the assumption is wrong, all of
+it was waste — not just the feature, the whole month.</p>
+
+<h3>Step 3 — Therefore each feature has to earn its place with an answer</h3>
+
+<p>The question for each item is not "is this useful?" Almost everything is
+useful. The question is: <b>does this change what we learn?</b> If the answer
+arrives the same either way, the feature is not part of the first version.</p>
+
+<h3>Step 4 — So define MVP properly, because the usual definition is wrong</h3>
+
+<p>The definition that works:</p>
+
+<div class="soundbite">
+  <span class="label">Definition</span>
+  <p>The smallest version that is <b>still worth using once</b>, for real, by
+  someone who is not your friend.</p>
+</div>
+
+<p>Read the three constraints in that sentence. <b>Worth using</b>, so not a demo.
+<b>Once</b>, so it does not have to be a habit yet. <b>Not your friend</b>, so
+politeness cannot carry it.</p>
+
+<h3>Step 5 — Two tests you can apply to any item on the list</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Test</th><th>How to run it</th><th>If it fails</th></tr>
+  <tr>
+    <td><b>The removal test</b></td>
+    <td>Take the feature out. Does the user still get the benefit, once?</td>
+    <td>Keep it. The benefit depends on it.</td>
+  </tr>
+  <tr>
+    <td><b>The answer test</b></td>
+    <td>Does having this change what we learn from the first ten users?</td>
+    <td>Cut it. It costs runway and buys nothing.</td>
+  </tr>
+</table>
+</div>
+
+<p>Note what happens when both are applied. Most items fail the second test even
+though they pass a "would users like this?" test. That gap is where months of a
+startup's life go.</p>
+
+<p class="note"><span class="label">Convention, not logic</span>
+The "three items or fewer" target in Block 04 is <b>this course's number</b>. The
+two tests decide what survives, and they might leave two items or four. Three is a
+signal that you ran the tests strictly. It is not a law, and no source gives a
+number here.</p>
+
+<h3>Step 6 — A human behind the screen is a valid implementation</h3>
+
+<p>This is the step that surprises engineers, and it is the most useful one.</p>
+
+<p>Your guess is about <b>desire</b>, not about automation. Say ten users request
+something and you do it by hand each night. You have learned exactly the same
+thing as if a job queue did it, and you learned it three weeks earlier. Lesson
+<a href="0009-first-ten-users-by-hand.html">L1</a> applies the same argument to
+finding the users.</p>
+
+<p>So for the first version: doing it by hand is not cheating. It is the correct
+engineering decision, because it answers the same question for less runway. You
+automate when the manual work stops fitting in your evening, and by then you know
+it is worth automating.</p>
+
+<h3>Step 7 — Deep satisfaction beats broad reach</h3>
+
+<p>YC's version of this is blunt and worth keeping: a small group of customers who
+love you beats a large group who kind of like you. Michael Seibel puts a number on
+it &mdash; ten customers with a burning problem beat a thousand with a passing
+annoyance.<sup>1</sup></p>
+
+<p>The reason is mechanical, not sentimental. Only people who love it give you the
+detailed, angry, specific feedback that tells you what to build next. People who
+are fine with it say nothing and leave quietly.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 260" role="img" aria-labelledby="b2title b2desc">
+  <title id="b2title">One job in the middle, everything else around it</title>
+  <desc id="b2desc">The one job the product must do sits in the centre. Eight
+  faded boxes with dashed edges sit around it, showing the features commonly built
+  first: sign-in with SSO, admin panel, settings screen, billing tiers, public API,
+  dark mode, mobile app, notifications. A dashed line joins each one to the
+  centre.</desc>
+
+  <circle cx="320" cy="130" r="66" class="dg-box"/>
+  <circle cx="320" cy="130" r="66" class="dg-fill-good" opacity="0.22"/>
+  <text x="320" y="124" class="dg-label dg-strong" text-anchor="middle">THE ONE JOB</text>
+  <text x="320" y="140" class="dg-small" text-anchor="middle">worth using once,</text>
+  <text x="320" y="152" class="dg-small" text-anchor="middle">by a stranger</text>
+
+  <rect x="34"  y="26"  width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="93"  y="43"  class="dg-small" text-anchor="middle" opacity="0.6">sign-in with SSO</text>
+  <rect x="252" y="18"  width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="311" y="35"  class="dg-small" text-anchor="middle" opacity="0.6">admin panel</text>
+  <rect x="470" y="26"  width="130" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="535" y="43"  class="dg-small" text-anchor="middle" opacity="0.6">settings screen</text>
+  <rect x="14"  y="118" width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="73"  y="135" class="dg-small" text-anchor="middle" opacity="0.6">billing tiers</text>
+  <rect x="500" y="118" width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="559" y="135" class="dg-small" text-anchor="middle" opacity="0.6">public API</text>
+  <rect x="34"  y="210" width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="93"  y="227" class="dg-small" text-anchor="middle" opacity="0.6">dark mode</text>
+  <rect x="252" y="220" width="118" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="311" y="237" class="dg-small" text-anchor="middle" opacity="0.6">mobile app</text>
+  <rect x="470" y="210" width="130" height="26" rx="4" class="dg-box" stroke-dasharray="4 3"/>
+  <text x="535" y="227" class="dg-small" text-anchor="middle" opacity="0.6">notifications</text>
+
+  <line x1="152" y1="39"  x2="262" y2="90"  class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="311" y1="44"  x2="316" y2="62"  class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="470" y1="39"  x2="378" y2="90"  class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="132" y1="131" x2="254" y2="130" class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="500" y1="131" x2="386" y2="130" class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="152" y1="221" x2="262" y2="170" class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="311" y1="220" x2="316" y2="198" class="dg-rule" stroke-dasharray="3 3"/>
+  <line x1="470" y1="221" x2="378" y2="170" class="dg-rule" stroke-dasharray="3 3"/>
+</svg>
+<figcaption>Any of these boxes can be the reason a first version ships late. None
+of them changes what you learn from your first ten users. Cut them, and write down
+that you cut them.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the definition of MVP with all three of its constraints. Then say the two
+  tests, and which one most features fail.
+</div>
+
+<h3>Step 8 — Say what you cut, out loud</h3>
+
+<p>Silence about a cut reads as "this is everything we thought of". Then, when the
+missing thing comes up, it looks like an oversight instead of a decision.</p>
+
+<p>So the first version ships with a written list: <b>not in this version</b>, and
+one reason each. That list is a professional signal. It shows the gaps are chosen.</p>
+
+<h3>Step 9 — Where this stops being true</h3>
+
+<p>Cutting has a floor. Some things cannot be partly built without the product
+being a lie: taking money, storing personal data, anything where a failure cannot
+be undone.</p>
+
+<p>Those sit on the careful side of the
+<a href="0008-walking-skeleton-quality-boundary.html">quality boundary</a> in B4.
+You do not cut them. You cut around them, or you do not launch that part at
+all.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://www.ycombinator.com/library/6f-how-to-plan-an-mvp">Michael
+Seibel, "How to plan an MVP", YC Startup Library</a> — initial feature set and the
+warning about falling in love with your MVP. The small-group-who-love-you point is
+from <a href="https://www.michaelseibel.com/blog/yc-s-essential-startup-advice">YC's
+Essential Startup Advice</a>, which is where the ten-versus-a-thousand wording
+comes from. The removal test and answer test are <b>this course's names</b> for
+applying it. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar">
+  <span class="who">Built the admin panel first</span>
+  It felt necessary — how else will you manage the data? Three weeks went into
+  screens that only you will ever see. With ten users, the admin panel is a
+  database client and a script.
+  <p><b>The tell:</b> more than a day of the first month went into a screen no
+  customer will open.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">Built for the objection, not the user — fails quietly</span>
+  Someone in a meeting asked "but what about permissions?" and permissions went
+  into version one. Nobody who actually has the problem asked for it. Objections
+  in meetings are cheap and they expand scope for free.
+  <p><b>The tell:</b> you can name the meeting a feature came from, but not the
+  user.</p>
+</div>
+
+<div class="scar">
+  <span class="who">An MVP that is a demo</span>
+  It looks right and it cannot be used for real work. Fake data, no saving, one
+  happy path. You will get compliments and no answers, because nobody depended on
+  it for anything.
+  <p><b>The tell:</b> nobody could get a real task finished with it today.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Automated what a human could do for ten users</span>
+  A job queue, retries and a dead-letter table, to handle four requests a day.
+  Two weeks of runway spent so that you did not have to spend twenty minutes an
+  evening. The queue was the right build — eight months too early.
+  <p><b>The tell:</b> your infrastructure could handle a hundred times your
+  current users.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Watch this next — the primary source</span>
+  <a href="https://www.ycombinator.com/library/6f-how-to-plan-an-mvp">"How to plan
+  an MVP" — Michael Seibel, YC Startup Library</a>. Short, and the clearest
+  statement of the "do not fall in love with your MVP" point: if you love it, you
+  will not let it change, and it has to change.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>Every feature costs you time now and forever, and you still do not know if
+anyone wants the product. So only build the parts that change what you learn.
+Everything else waits. If a person can do a step by hand for the first ten
+customers, let a person do it. And write down what you left out, so people can
+see you chose it.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>Open a food stall before you open a restaurant. One dish, one queue, real
+money from strangers. You find out today whether people like the food.</p>
+
+<p><b>Where the analogy breaks.</b> A food stall cannot become a restaurant by
+adding tables — it is a different business with different equipment. Software
+mostly <i>can</i> grow that way. So the real risk is not that your first version
+is too small. The risk is confusing <b>small</b> with <b>fake</b>: a stall still
+sells real food to real people who really pay.</p>
+
+<h3>The sticking point</h3>
+
+<p>People think MVP means low quality. It does not. It means <b>narrow</b>.</p>
+
+<p>The first version does one job, and it does that job properly — it saves, it
+does not lose data, it works twice. Narrow and solid is an MVP. Broad and flaky is
+a demo, and a demo teaches you nothing because nobody can depend on it.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>MVP</code>, <code>lovable</code>, <code>thin slice</code>,
+  <code>v0</code>, <code>concierge</code>, <code>wizard of oz</code>. Plain
+  version: "version one does one thing: it takes their weekly file and gives back
+  the report. I do the checking by hand every evening until it is too much work."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why doing part of the work by hand
+  is a good engineering decision for a first version — not a shortcut.</p>
+  <p>Say it, then send it. I am checking whether your answer mentions <b>what you
+  are trying to find out</b>. If it only talks about saving time, the reasoning is
+  half there.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"What I am trying to find out is whether people want this, and a human doing
+the step answers that question exactly as well as code doing it. So the automated
+version costs more runway and buys the same answer, which makes it the worse
+engineering choice right now. I automate when the manual work stops fitting in my
+evening — and by then I know it is worth building, because people are using it
+enough to make it painful."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — the cut list <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>For the problem from <a href="0003-choosing-which-problem.html">F3</a>,
+    write every feature you think the product needs. Aim for at least fifteen.
+    Do not filter while listing.</li>
+    <li>Run the <b>removal test</b> on each. Then the <b>answer test</b>.</li>
+    <li>Make two columns: <b>Keep</b> and <b>Not in version one</b>. Every row in
+    the second column gets a one-line reason.</li>
+    <li>For every kept row, write who does it: <b>code</b> or <b>me, by
+    hand</b>.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the Keep column has <b>three items or fewer</b> —
+  this course's target, not a rule — and at least one of them says "me, by hand".
+  Send it to me. If Keep has eight rows, you ran a usefulness test instead of the
+  answer test, and I will show you which rows gave it away.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — defend a cut <span class="needs">~30 min</span></span>
+  <ol>
+    <li>Pick the cut that would be hardest to defend to the person who asked for
+    it.</li>
+    <li>Record yourself defending it in under sixty seconds. No apology, no
+    "eventually we will".</li>
+    <li>Then record the version where they push back once.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> two recordings. Check that you named what the
+  cut <b>buys</b> — shipping two weeks earlier, learning sooner — rather than only
+  what it saves.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Every feature is a permanent bill and a bet on a guess you have not settled
+  yet.</li>
+  <li>The question is not "is it useful?" — it is "<b>does this change what we
+  learn?</b>"</li>
+  <li>MVP = smallest version <b>still worth using once</b>, by someone who is
+  <b>not your friend</b>.</li>
+  <li>Two tests: <b>removal</b> (does the benefit survive?) and <b>answer</b>
+  (does learning change?).</li>
+  <li>A human doing it by hand is a valid implementation. It buys the same answer
+  for less runway.</li>
+  <li>Narrow and solid is an MVP. Broad and flaky is a demo, and a demo teaches
+  nothing.</li>
+  <li>Write the "not in this version" list. Silence about a cut reads as an
+  oversight.</li>
+</ul>
+<p class="one-thing">If you remember one thing: cut until it is embarrassing, then
+check it still does one real job properly.</p>
+</div>
+
+<div class="ask">
+  Send me your two-column cut list. I will tell you which rows in Keep are hiding
+  from the answer test — there are usually two.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0005-appetite-not-estimate.html">← B1 — Appetite, not estimate</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0007-boring-stack-innovation-tokens.html">B3 — Boring stack →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "The test for keeping a feature in version one is:",
+    options: [
+      "does it change what we learn",
+      "does it help the user work",
+      "does it match the competitors",
+      "does it fit the current sprint"
+    ],
+    answer: 0,
+    why: "Almost every feature is useful, so usefulness cannot filter anything. Only features that change the answer you get from the first ten users earn their place."
+  },
+  {
+    q: "A correct definition of MVP includes the words:",
+    options: [
+      "worth using once, by strangers",
+      "cheapest version, shipped fast",
+      "core features only, no polish",
+      "first release, for user feedback"
+    ],
+    answer: 0,
+    why: "Worth using rules out a demo. Once means it need not be a habit yet. Strangers means politeness cannot carry it. All three constraints do real work."
+  },
+  {
+    q: "Doing a step by hand for the first ten users is:",
+    options: [
+      "the correct engineering decision",
+      "acceptable but slightly dishonest",
+      "wrong, it will not scale later",
+      "fine only for internal tools"
+    ],
+    answer: 0,
+    why: "The question you are answering is about desire, not automation. Manual work buys the same answer for less runway, and tells you when automating is worth it."
+  },
+  {
+    q: "MVP means narrow, not low quality, because:",
+    options: [
+      "nobody can depend on flaky software",
+      "polish is cheaper than extra features",
+      "users judge design before function",
+      "quality code is faster to extend"
+    ],
+    answer: 0,
+    why: "A broad, flaky version produces compliments and no answers, because nobody used it for real work. One job done properly produces real dependence and real feedback."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder wants nine features in version one. What do you say?",
+    answer: "\"Which of these changes what we learn from the first ten users?\" Then I go through the list with them and mark each one. Most will not change the answer. I am not arguing they are bad features — I am putting them in version two out loud, with a reason, so nobody thinks I forgot them."
+  },
+  {
+    prompt: "Someone says \"but that will not scale\". How do you answer?",
+    answer: "\"Correct, and that is the plan.\" Why: doing it by hand answers the same question as the automated version, three weeks sooner. When the manual work stops fitting in my evening, that is the signal to automate. By then I know it is worth building."
+  },
+  {
+    prompt: "Explain your cut list to a non-technical founder in under thirty seconds.",
+    answer: "\"Version one does one job: it takes their file and returns the report. Everything else — logins, settings, the dashboard, the mobile version — is on a second list with a reason next to each. I would rather show ten people something real in two weeks than show nobody something complete in two months.\""
+  },
+  {
+    prompt: "How do you tell an MVP from a demo?",
+    answer: "\"Could someone finish a real task with it today, and would their work still be there tomorrow?\" If yes, it is an MVP even if it is ugly. If no, it is a demo — and a demo only produces compliments, because nobody ever depended on it."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

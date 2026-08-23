@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L1 — The first ten users, by hand</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 3 · Live · Lesson L1</p>
+<h1>The first ten users, by hand</h1>
+<p class="subtitle">Recruit them one at a time. The point is not the ten users —
+it is what you learn standing next to them.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>explain it from first principles</i>.
+Almost everyone gets this backwards. The derivation is what makes the backwards
+version obviously wrong. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 9 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You will never again say "we need marketing" when
+  what you mean is "I have not asked anyone yet". And you will know exactly what
+  to do on the day your product first works.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why nobody arrives on their own</h2>
+
+<p>Here is the day this Lesson is about. The product works. It is deployed. You
+have a URL. Zero people are using it.</p>
+
+<p>Most engineers respond by building: a landing page, a blog, a launch plan. Let
+us derive why that is the wrong instinct.</p>
+
+<h3>Step 1 — Every way people normally find products needs a stock you do not have</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>How people normally arrive</th><th>What it needs first</th><th>Do you have it?</th></tr>
+  <tr><td>Search</td><td>Pages, links, and months of age</td><td>No</td></tr>
+  <tr><td>Word of mouth</td><td>Existing happy users</td><td>No</td></tr>
+  <tr><td>Reputation</td><td>A track record</td><td>No</td></tr>
+  <tr><td>Paid ads</td><td>Money, and a page that converts</td><td>No, and unproven</td></tr>
+</table>
+</div>
+
+<p>Three of these four multiply something you do not have. Zero times anything is
+zero.</p>
+
+<p>Ads are the exception: they turn money into visitors. But they need a page that
+converts, and yours is untested. So the result is <b>unknown</b>, not zero — and
+unknown is not an answer you can spend.</p>
+
+<h3>Step 2 — Therefore the first users must be fetched, not attracted</h3>
+
+<p>You go and get them, individually, by hand. Paul Graham's essay is the canonical
+statement: the most common unscalable thing founders have to do at the start is
+recruit users manually, and nearly all startups have to.<sup>1</sup></p>
+
+<h3>Step 3 — "It does not scale" is not an objection</h3>
+
+<p>This is where engineers get stuck, so let us be exact about it.</p>
+
+<p>You are not trying to build a user acquisition system. You are trying to buy an
+answer.</p>
+
+<p>Ten users bought by hand answer the question "does anyone want this at all?"
+They cannot tell you a <b>rate</b> — what share of people stay, or how often
+something breaks. That is fine. The rate question is not the one you are stuck on
+this month.</p>
+
+<p>So the unscalable work is not a temporary compromise. It is <b>research</b>.
+Graham's own words for it are "a necessary part of the feedback loop that makes the
+product good".<sup>1</sup> The words "research" and "sample" are ours.</p>
+
+<h3>Step 4 — Therefore over-serve them, deliberately</h3>
+
+<p>Now a second consequence, and it is the one that wins. With ten users you can do
+things no large company can afford to do:</p>
+
+<ul>
+  <li>Set the product up <i>for</i> them, in a call, while they watch.</li>
+  <li>Reply in minutes, not days.</li>
+  <li>Fix their bug the same afternoon and tell them it is fixed.</li>
+  <li>Ask them what happened, every week, by name.</li>
+</ul>
+
+<p>YC has a name for the extreme version, from Stripe's founders: the "Collison
+installation" — when someone said they would try it, the founders offered to set it
+up on their laptop right then.<sup>1</sup></p>
+
+<h3>Step 5 — Ten who love it beats a thousand who shrug</h3>
+
+<p>Mechanical reason, not a sentimental one. People who love your product complain
+in detail. They tell you exactly what is broken and what they wish it did, because
+they now depend on it. People who are mildly fine with it say nothing and quietly
+stop. Silence contains no information.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 270" role="img" aria-labelledby="l1title l1desc">
+  <title id="l1title">Channel thinking versus ten named people</title>
+  <desc id="l1desc">On the left, a funnel with ads, a landing page and sign-ups,
+  producing nothing because it multiplies a stock you do not have. On the right,
+  five named people with the next step written beside each one, and a note that
+  five more follow. Two of them have not yet said yes.</desc>
+
+  <!-- left: the funnel that produces nothing -->
+  <text x="30" y="30" class="dg-label dg-strong">What engineers build first</text>
+  <rect x="30" y="42"  width="220" height="26" rx="4" class="dg-box" opacity="0.6"/>
+  <text x="140" y="59" class="dg-small" text-anchor="middle">ads / posts / a blog</text>
+  <rect x="60" y="86"  width="160" height="26" rx="4" class="dg-box" opacity="0.6"/>
+  <text x="140" y="103" class="dg-small" text-anchor="middle">a landing page</text>
+  <rect x="95" y="130" width="90"  height="26" rx="4" class="dg-box" opacity="0.6"/>
+  <text x="140" y="147" class="dg-small" text-anchor="middle">sign-ups</text>
+  <text x="140" y="182" class="dg-label dg-strong" text-anchor="middle" fill="currentColor">0</text>
+  <text x="140" y="202" class="dg-small" text-anchor="middle">a channel multiplies a stock</text>
+  <text x="140" y="216" class="dg-small" text-anchor="middle">you do not have yet</text>
+
+  <line x1="320" y1="24" x2="320" y2="250" class="dg-rule" stroke-dasharray="4 4"/>
+
+  <!-- right: ten named people -->
+  <text x="350" y="30" class="dg-label dg-strong">What actually works</text>
+  <circle cx="366" cy="52"  r="7" class="dg-fill-good"/>
+  <text x="382" y="56"  class="dg-small">Anna &mdash; call Tuesday, set it up for her</text>
+  <circle cx="366" cy="76"  r="7" class="dg-fill-good"/>
+  <text x="382" y="80"  class="dg-small">Marco &mdash; replied, wants the CSV first</text>
+  <circle cx="366" cy="100" r="7" class="dg-fill-good"/>
+  <text x="382" y="104" class="dg-small">Priya &mdash; using it, bug on Safari</text>
+  <circle cx="366" cy="124" r="7" class="dg-good" fill="none" stroke-width="2"/>
+  <text x="382" y="128" class="dg-small">Tom &mdash; no reply yet, follow up Friday</text>
+  <circle cx="366" cy="148" r="7" class="dg-good" fill="none" stroke-width="2"/>
+  <text x="382" y="152" class="dg-small">Lena &mdash; said no, wrong team size</text>
+  <text x="382" y="176" class="dg-small">&hellip; five more, each with a name</text>
+
+  <text x="350" y="212" class="dg-small dg-strong">Every line here is a fact you can act on.</text>
+  <text x="350" y="228" class="dg-small">Including the one who said no, and the one who has not replied.</text>
+</svg>
+<figcaption>The left side feels like progress because it is work. It produces
+nothing at zero users. The right side is a list of names, and every line —
+including a refusal — is information.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say why every normal acquisition channel produces nothing at zero users. Then
+  say why "it does not scale" is not an objection to doing this.
+</div>
+
+<h3>Step 6 — Where to find the ten</h3>
+
+<p>You already did this work. In <a href="0003-choosing-which-problem.html">F3</a>
+you had to finish the sentence "I will find the next ten of these people at
+______". That named place is your list. And the people you interviewed in
+<a href="0002-the-mom-test.html">F2</a> are the warmest ten names you will ever
+have — they already told you the problem is real.</p>
+
+<h3>Step 7 — Where this reasoning stops</h3>
+
+<p>Two limits, and the first is the important one.</p>
+
+<p>Hand-recruiting stops working as a <b>growth strategy</b> at some point. No
+source names the number, and it depends on your price and your market. You will
+feel it when your week is all messages and no product.</p>
+
+<p>At that point you do need a repeatable channel, and picking one is a real skill.
+It is on <a href="../index.html#depth">the depth queue</a> for exactly that reason:
+it is a good problem that you have to earn.</p>
+
+<p>Second, over-serving distorts what you learn. If you set the product up for
+every user in person, you cannot tell whether the sign-up flow works. That is an
+acceptable trade at ten users — desire first, self-service later — but know that you
+are making it.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://paulgraham.com/ds.html">Paul Graham, "Do Things that Don't Scale"
+(2013)</a> — manual recruiting and the Collison installation. Graham calls the
+manual work "a necessary part of the feedback loop that makes the product good".
+The words <b>research</b>, <b>sample</b> and <b>instrument</b> are this course's,
+not his. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar slow">
+  <span class="who">Built a landing page and waited — fails quietly</span>
+  A good page, a waiting list form, a launch tweet. Fourteen emails collected over
+  three weeks. It feels like marketing, so nobody calls it avoidance. It is
+  avoidance: writing a page is comfortable and asking a named person is not.
+  <p><b>The tell:</b> you have a landing page and you have not sent ten personal
+  messages.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Burned the big list too early</span>
+  You had one good channel — a mailing list, a community you belong to, a
+  conference talk — and you used it on a version that was not ready. Two hundred
+  people came once. Now the channel is spent and the people remember it as bad.
+  <p><b>The tell:</b> your biggest launch happened before ten people had used it
+  twice.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Automated onboarding at five users</span>
+  A welcome email sequence, an in-app tour, a help centre. All of it built to
+  avoid the conversations that were the actual point. At five users the tour
+  replaced the only research instrument you had.
+  <p><b>The tell:</b> you know your activation rate and you have not spoken to a
+  user this week.</p>
+</div>
+
+<div class="scar">
+  <span class="who">"We need marketing"</span>
+  Said in month two, with nine users, none of whom were asked what they thought.
+  Sometimes true later. At this stage it is almost always a way of saying that
+  asking people is uncomfortable.
+  <p><b>The tell:</b> you cannot name your last five users.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://paulgraham.com/ds.html">"Do Things that Don't Scale" — Paul
+  Graham</a>. Twenty minutes, free, and the most useful thing written on this
+  subject. Read the section on Airbnb going door to door, then look at your own
+  landing page again.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>At the start, nobody knows you exist and nothing brings people to you. Search,
+word of mouth and reputation all need something you already have. Ads need a page
+you have not tested. So you go and find people one at a time and ask them. That does not
+work at a big scale, and it does not need to — you only need ten, because ten
+people using it for real tells you what you need to know.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>It is the first day of a market stall. You hand the food to one person and watch
+them eat it. Their face tells you more than a survey of a thousand people.</p>
+
+<p><b>Where the analogy breaks.</b> At a market, strangers walk past you for free —
+the crowd is provided. Online, nobody walks past you at all. There is no
+footfall. So you have to do a step the stall holder never does: find each person
+and bring them to the stall yourself.</p>
+
+<h3>The sticking point</h3>
+
+<p>Engineers hear "does not scale" as "wrong". It is a habit from building systems,
+where a solution that only handles ten cases is a bad solution.</p>
+
+<p>Flip the frame. You are not building a system here, you are running an
+experiment. A small study answers a small question. That is not a fault in the
+study — it is what it was built for.</p>
+
+<p>The ten are your instrument for answering one question. They are also your first
+ten real customers. You stop using the <b>method</b> later, not the people.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>growth</code>, <code>funnel</code>, <code>acquisition channel</code>,
+  <code>go to market</code>, <code>early adopters</code>,
+  <code>product-led growth</code>. Plain version: "I wrote to twenty people I found
+  in that forum, one message each, no template. Nine replied, four are using it,
+  and two of those I set up myself on a call."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why building a landing page is the
+  wrong first move when you have zero users.</p>
+  <p>Say it, then send it. I am looking for the multiplication idea — that a
+  channel needs a stock you do not have. If your answer is only "talking to people
+  is better", the reasoning is not there yet.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"A landing page is a machine for converting visitors, and I have no visitors.
+Every normal way of getting them — search, word of mouth, reputation — multiplies
+something I already have, and right now that is zero, so the answer stays zero
+however good the page is. The only source of users that does not need an existing
+stock is me writing to a named person and asking, which is why that is the first
+move and the page can wait."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — twenty names, ten messages <span class="needs">~4 hrs</span></span>
+  <ol>
+    <li>Open the place you named in
+    <a href="0003-choosing-which-problem.html">F3</a>. Write down <b>twenty real
+    names</b>: people or companies who have the problem. Real names, not
+    categories.</li>
+    <li>Write to ten of them. One at a time. <b>No template</b> — reference
+    something specific and true about them in the first sentence.</li>
+    <li>Ask for one thing only: fifteen minutes, or permission to set it up for
+    them.</li>
+    <li>Log every reply verbatim in a file, including the refusals and the
+    silence.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a list of twenty names, ten sent messages, and a
+  reply log. Send me the log. The refusals are the part I want to read — the exact
+  words of a "no" usually contain the reason your positioning is wrong.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — set one up by hand <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>Get one person on a call and set the product up for them while they
+    watch.</li>
+    <li>Do not explain what they should do. Stay quiet and watch where they
+    hesitate.</li>
+    <li>Write down every place they paused or asked "what does this mean?"</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a list of the hesitations. That list is your next
+  week of work, in priority order, and you did not have to guess it.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Every acquisition channel <b>multiplies</b> a stock you already have. At
+  zero, they all return zero.</li>
+  <li>So the first users are <b>fetched, not attracted</b>. One at a time, by
+  hand, by name.</li>
+  <li>"It does not scale" is not an objection. The unscalable work is
+  <b>research</b>.</li>
+  <li>The ten are your <b>instrument</b> for one question, and your first real
+  customers. Drop the method, not the people.</li>
+  <li><b>Over-serve them</b>: set it up for them, reply in minutes, fix it the
+  same day.</li>
+  <li>Ten who love it beat a thousand who shrug, because only love produces
+  detailed complaints.</li>
+  <li>Log the refusals. The exact words of a "no" usually name the real
+  problem.</li>
+</ul>
+<p class="one-thing">If you remember one thing: if you cannot name your last five
+users, you do not have a marketing problem.</p>
+</div>
+
+<div class="ask">
+  Send me your reply log, refusals included. I will show you which "no" is
+  actually a positioning bug you can fix this week.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0008-walking-skeleton-quality-boundary.html">← B4 — The walking skeleton</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0010-the-first-price.html">L2 — The first price →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "Normal acquisition channels return nothing at zero users because they:",
+    options: [
+      "multiply a stock you lack",
+      "require the money you lack",
+      "target the markets you lack",
+      "need the skills you lack"
+    ],
+    answer: 0,
+    why: "Search needs pages and age, word of mouth needs happy users, reputation needs a record. Each multiplies something existing, and zero times anything stays zero."
+  },
+  {
+    q: "\"Recruiting users by hand does not scale\" is not an objection because:",
+    options: [
+      "the work is research, not a system",
+      "the work becomes automated quite soon",
+      "the users will recruit their colleagues",
+      "the market is smaller than it appears"
+    ],
+    answer: 0,
+    why: "You are running an experiment, not building an acquisition machine. A small study answers a small question, and that is what it was built for."
+  },
+  {
+    q: "Ten users who love it beat a thousand who shrug because:",
+    options: [
+      "only love produces real complaints",
+      "only love produces steady revenue",
+      "small groups are easier to help",
+      "large groups distort your metrics"
+    ],
+    answer: 0,
+    why: "People who depend on it complain in specific, useful detail. People who are mildly fine with it say nothing and leave, and silence contains no information."
+  },
+  {
+    q: "The most valuable part of a reply log is usually:",
+    options: [
+      "the words of a refusal",
+      "the count of positive replies",
+      "the time taken to respond",
+      "the list of feature requests"
+    ],
+    answer: 0,
+    why: "A \"no\" often names the real reason your positioning is wrong, in words you would never have written yourself. Yes tells you less than a specific no."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder says \"we need to start marketing\". You have nine users.",
+    answer: "\"Which of the nine have we spoken to this week?\" Marketing multiplies something. Right now we have nothing to multiply, so the first job is ten people using it for real and telling us why. I would rather spend this week writing twenty personal messages than one campaign."
+  },
+  {
+    prompt: "Write the first line of a cold message. It must be specific and true about them, never a template.",
+    answer: "\"I read your post in [place] about spending Mondays reconciling the stock counts by hand.\" Then: \"That is exactly the thing I am working on.\" Why: one ask only — fifteen minutes, or let me set it up for you. Nothing else in the message."
+  },
+  {
+    prompt: "Someone offers to try it. What is the strongest possible next move?",
+    answer: "\"Can we do it together now, and I will set it up for you?\" That is the Collison installation. I get them past every place they would have given up, and I get to watch exactly where they hesitate — which is next week's work list, for free."
+  },
+  {
+    prompt: "Why do you write down the refusals?",
+    answer: "Because a \"no\" usually explains itself, and a \"yes\" usually does not. When someone says \"this looks like it is for bigger teams\", they have told me my positioning is wrong. Five refusals in a row saying the same thing are the clearest signal I will get all month."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

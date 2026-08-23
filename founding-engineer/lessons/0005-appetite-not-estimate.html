@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B1 — Appetite, not estimate</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 2 · Build · Lesson B1</p>
+<h1>Appetite, not estimate</h1>
+<p class="subtitle">Stop asking how long it will take. Ask how much time it is
+worth, then design something that fits.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>say why it was built this way, and
+what that choice gives up</i>. Appetite trades certainty about scope for certainty
+about time. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 5 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> The next time a founder asks "how long will this
+  take?", you can give a better answer than a number — and they will prefer it.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why estimates fail here specifically</h2>
+
+<p>Estimates are not evil. They work fine on work that is understood. The problem
+is that startup work is not understood yet, and there is a structural reason.</p>
+
+<h3>Step 1 — Scope is discovered while doing the work</h3>
+
+<p>When you start a new feature you do not know the edge cases, the third-party
+surprises, or the two extra screens the flow will turn out to need. You find them
+by building. That is not bad planning; it is the nature of new work.</p>
+
+<h3>Step 2 — So an estimate is a guess about an unknown quantity</h3>
+
+<p>You are asked "how long?" while the "what" is still moving. So the number you
+give is a guess about something not yet defined.</p>
+
+<h3>Step 3 — Two variables, and you only get to fix one</h3>
+
+<p>Here is the step that makes the whole Lesson click. Every piece of work has
+<b>scope</b> and <b>time</b>. You can fix one of them. The other must be allowed
+to move.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You fix…</th><th>Then this moves…</th><th>How bad can it get?</th></tr>
+  <tr>
+    <td>Scope (an estimate)</td>
+    <td>Time</td>
+    <td><b>Unbounded.</b> Six weeks becomes six months. There is no natural stop.</td>
+  </tr>
+  <tr>
+    <td>Time (an appetite)</td>
+    <td>Scope</td>
+    <td><b>Bounded.</b> Worst case you ship a smaller thing on the day you said.</td>
+  </tr>
+</table>
+</div>
+
+<p>Fix the scope, and the risk sits on the variable you cannot control. Fix the
+time, and the risk sits on the one you can. Cutting scope is a decision, not an
+accident.</p>
+
+<h3>Step 4 — Therefore: fix the time first</h3>
+
+<p>That fixed time is the <b>appetite</b>: how much time this problem is worth.
+It comes from the value of solving it, not from the design of the solution.
+Basecamp's <i>Shape Up</i> is where this is named and worked out
+properly.<sup>1</sup></p>
+
+<p>Two sentences that show the difference:</p>
+
+<div class="soundbite">
+  <span class="label">Estimate</span>
+  <p>"This will take about six weeks."</p>
+</div>
+
+<div class="soundbite">
+  <span class="label">Appetite</span>
+  <p>"This is worth two weeks to us. What can we build in two weeks that solves
+  most of it?"</p>
+</div>
+
+<h3>Step 5 — Therefore the design comes after the number</h3>
+
+<p>This feels backwards the first time. You set the budget, then you design to fit
+it. In <i>Shape Up</i> that design step is called <b>shaping</b>: roughing out a
+solution at the level of "these three screens and this rule", not at the level of
+a specification.<sup>1</sup></p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 230" role="img" aria-labelledby="b1title b1desc">
+  <title id="b1title">Fixed scope versus fixed time</title>
+  <desc id="b1desc">With fixed scope, time runs past the line by an unknown
+  amount. With fixed time, the work lands on the line and the scope inside it is
+  smaller but complete.</desc>
+
+  <!-- fixed scope -->
+  <text x="40" y="48" class="dg-label dg-strong">Fix the SCOPE &mdash; time moves</text>
+  <rect x="40" y="56" width="560" height="26" rx="4" class="dg-box"/>
+  <rect x="40" y="56" width="560" height="26" rx="4" class="dg-fill-warn" opacity="0.18"/>
+  <text x="50" y="73" class="dg-small">all the features, however long that turns out to be</text>
+  <text x="40" y="100" class="dg-small">Overrun is unbounded. Nothing in the plan says when to stop.</text>
+
+  <!-- fixed time -->
+  <text x="40" y="134" class="dg-label dg-strong">Fix the TIME &mdash; scope moves</text>
+  <rect x="40" y="142" width="380" height="26" rx="4" class="dg-box"/>
+  <rect x="40" y="142" width="380" height="26" rx="4" class="dg-fill-good" opacity="0.22"/>
+  <text x="50" y="159" class="dg-small">the part that solves most of it, finished and shipped</text>
+
+  <text x="440" y="152" class="dg-small">cut on purpose:</text>
+  <text x="440" y="164" class="dg-small">named, not forgotten</text>
+
+  <text x="40" y="216" class="dg-small">Same team, same weeks. The second one has a decision where the first one has a surprise.</text>
+
+  <!-- the deadline line is drawn LAST so the opaque bars cannot cover it -->
+  <line x1="420" y1="24" x2="420" y2="176" class="dg-warn" stroke-dasharray="5 4"/>
+  <text x="420" y="192" class="dg-label-strong" text-anchor="middle">the date you said</text>
+</svg>
+<figcaption>Fixing scope puts the risk on the variable you cannot control. Fixing
+time puts it on the one you can, because cutting scope is a decision you make on
+purpose.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say why fixing scope produces an unbounded overrun, and fixing time does not.
+  Then say where the appetite number comes from. If you said "from the design",
+  read Step 4 again.
+</div>
+
+<h3>Step 6 — Appetite without permission is just a deadline</h3>
+
+<p>This is the part most people skip, and it is the part that decides whether the
+idea helps you or hurts you.</p>
+
+<p>If the time is fixed <b>and</b> the scope is fixed, you have not got an
+appetite. You have a fixed deadline with a nicer name. So when you accept an
+appetite, you must say the trade out loud, in the same conversation:</p>
+
+<div class="soundbite">
+  <span class="label">Say this when you accept an appetite</span>
+  <p>"Two weeks works. To hold that date I will be cutting things as I go, and I
+  will tell you what I cut. If everything on this list has to ship, then it is
+  not a two-week job and we should talk about the value instead."</p>
+</div>
+
+<h3>Step 7 — Name the rabbit holes before you start</h3>
+
+<p>A <b>rabbit hole</b> is a part of the work that could quietly use up the whole
+budget: a data migration, a third-party integration with bad documentation, an
+edge case in permissions. <i>Shape Up</i> puts these in the pitch on purpose, so
+nobody discovers one in week five.<sup>1</sup></p>
+
+<p>Write them down before you start. A named risk is a decision. An unnamed one is
+a surprise you cannot plan for.</p>
+
+<h3>Step 8 — What is convention, and where this stops</h3>
+
+<p>Two honest notes.</p>
+
+<p><b>Convention, not logic:</b> Basecamp's six-week cycle. Six is their company's
+choice. The reasoning behind fixing the time is general; the specific length is
+not. Two weeks, three weeks and six weeks are all fine appetites.</p>
+
+<p><b>Where it stops:</b> appetite does not work when the scope genuinely cannot
+move. A tax rule, a payment integration that must be complete or not exist, a
+legal deadline. There, the honest answer is an estimate with a wide range, and
+you say which parts are the unknowns.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://basecamp.com/shapeup">Ryan Singer, <i>Shape Up</i></a> (free
+online) — appetite, shaping, the pitch, rabbit holes. The sentence to say in Step 6
+is <b>this course's own</b>: Shape Up assumes the team already has permission to
+cut. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar money">
+  <span class="who">Appetite without the authority to cut</span>
+  The team is given six weeks <i>and</i> the full feature list. Now both variables
+  are fixed, so the only thing left to move is quality and people's evenings.
+  This is the most common way the idea gets misused, and it is worse than plain
+  estimating.
+  <p><b>The tell:</b> nobody can name a single thing that is allowed to be cut.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">"Six weeks" heard as a promise — fails quietly</span>
+  You said two weeks meaning an appetite. The founder wrote it in a customer
+  email meaning a delivery date for everything discussed. Nobody lied. The word
+  did two jobs. It stays hidden until the demo.
+  <p><b>The tell:</b> you never said the sentence in Step 6 out loud.</p>
+</div>
+
+<div class="scar">
+  <span class="who">No rabbit holes named, so week five finds one</span>
+  Everything went well until the import needed to handle their old system's date
+  format, and that turned out to be four days of work. It was foreseeable in week
+  one by anyone who asked "what part of this scares me?"
+  <p><b>The tell:</b> your plan has no section listing what could use up the
+  budget.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Appetite set by excitement, not by value</span>
+  You gave it six weeks because it is the interesting problem, not because
+  solving it is worth six weeks of the company's runway. The number has to come
+  from the value side of the table.
+  <p><b>The tell:</b> you cannot say what the company gets for the six weeks in
+  one sentence.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://basecamp.com/shapeup"><i>Shape Up</i> by Ryan Singer</a>, free
+  online. Read Part One (shaping) and the chapter on the pitch. Skip the parts
+  about Basecamp's own team setup &mdash; about fifty people, with project teams of
+  one designer and one or two programmers. The reasoning transfers; their team
+  shape does not.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>Nobody can say how long new work will take, because you find out what the work
+is by doing it. So stop trying. Instead decide how much time the problem is
+<i>worth</i>, and then build the best thing that fits in that time. If it does not
+all fit, you cut, and you say what you cut.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>It is packing a suitcase. The suitcase is a fixed size. You do not measure your
+clothes and then buy a bag; you take the bag and choose what goes in. Choosing is
+the work.</p>
+
+<p><b>Where the analogy breaks.</b> Two ways, and both matter. You can buy a
+bigger suitcase; you cannot buy more runway. And you can see all your clothes
+laid out on the bed before you pack — you cannot see all the work before you
+start it. So real packing is easier than this. Leave room.</p>
+
+<h3>The sticking point</h3>
+
+<p>People think cutting scope means cutting quality. It does not.</p>
+
+<p>You cut whole features. You do not cut the care inside the features you keep.
+Half a feature built well is a feature. A whole feature built badly is a bug
+report.</p>
+
+<p>That distinction is what makes an appetite survivable. If holding the date meant
+shipping something broken, nobody would agree to one.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>timeboxing</code>, <code>right-sizing</code>, <code>scope creep</code>,
+  <code>circuit breaker</code>, <code>story points</code>. Plain version: "this is
+  worth two weeks to us. Here is what I think fits in two weeks, and here are the
+  three things I have left out on purpose."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why fixing the time is safer than
+  fixing the scope — without using the words "timebox" or "agile".</p>
+  <p>Say it out loud, then send it. I am looking for the word <b>unbounded</b> or
+  its plain equivalent, because that is the actual argument.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"You always find out what the work really is while you are doing it, so one of
+scope and time has to be allowed to move. If I fix the scope, the time moves and
+there is no limit on how far — nothing in the plan tells me when to stop. If I fix
+the time, the scope moves instead, and the worst case is that I ship something
+smaller on the day I promised, which is a decision I made rather than a surprise."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — write a one-page pitch <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>Take the winning problem from
+    <a href="0003-choosing-which-problem.html">F3</a> and pick one slice of it.</li>
+    <li>Write a single page with exactly these five headings:
+    <b>Problem</b> · <b>Appetite</b> · <b>Solution sketch</b> ·
+    <b>Rabbit holes</b> · <b>Not doing</b>.</li>
+    <li>Set the appetite first, before you write the solution. Justify the number
+    from value, in one sentence.</li>
+    <li>The solution sketch stays rough on purpose: boxes and arrows, or three
+    sentences per screen. No field lists.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a page a non-engineer could read in three
+  minutes and say yes or no to. Send it to me. The most common fault is a
+  solution sketch that has quietly become a specification — I will point at where
+  it happened.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — say the trade out loud <span class="needs">~20 min</span></span>
+  <ol>
+    <li>Record yourself saying the Step 6 sentence, in your own words, as if a
+    founder just gave you a two-week appetite and a nine-item list.</li>
+    <li>Then record the harder version: the founder pushes back and says all nine
+    items are required.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> two recordings. In the second one, check that you
+  moved the conversation to <b>value</b> rather than to hours. That is the move
+  that keeps the room.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>You discover the real scope <b>while</b> doing the work. So one of scope and
+  time must move.</li>
+  <li>Fix scope → time overruns are <b>unbounded</b>. Fix time → the worst case is
+  a smaller ship.</li>
+  <li><b>Appetite</b> = how much time this is worth, decided from value, before
+  any design.</li>
+  <li>Shaping comes <b>after</b> the number: rough boxes and rules, not a
+  specification.</li>
+  <li>Appetite without permission to cut is a deadline. Say the trade out loud
+  when you accept it.</li>
+  <li>Name the <b>rabbit holes</b> in week one. A named risk is a decision; an
+  unnamed one is an ambush.</li>
+  <li>Six weeks is Basecamp's convention, not a law. And appetite does not work
+  when scope truly cannot move.</li>
+</ul>
+<p class="one-thing">If you remember one thing: never answer "how long will it
+take?" — answer "how much is it worth?" instead.</p>
+</div>
+
+<div class="ask">
+  Send me your one-page pitch. I will read it as a founder would and tell you
+  whether I could say yes or no without asking you three questions first.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0004-the-kill-rule.html">← F4 — The kill rule</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0006-cutting-to-the-mvp.html">B2 — Cutting to the MVP →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "Fixing the scope instead of the time is risky because:",
+    options: [
+      "the overrun has no limit",
+      "the team loses its focus",
+      "the features become too small",
+      "the budget becomes hard to read"
+    ],
+    answer: 0,
+    why: "Nothing in a fixed-scope plan says when to stop, so six weeks can become six months. A fixed time caps the worst case at shipping something smaller on the day."
+  },
+  {
+    q: "The appetite number should come from:",
+    options: [
+      "how much solving it is worth",
+      "how long the design will take",
+      "how many screens it will need",
+      "how large the team currently is"
+    ],
+    answer: 0,
+    why: "Appetite is a value judgement made before any design. If the number comes out of the solution, you have written an estimate and renamed it."
+  },
+  {
+    q: "An appetite with no permission to cut scope is really:",
+    options: [
+      "a deadline with a nicer name",
+      "a normal estimate done well",
+      "a bet on the whole roadmap",
+      "a promise about the quality"
+    ],
+    answer: 0,
+    why: "Both variables are now fixed, so the only give left is quality and evenings. That is worse than plain estimating, because it hides the problem."
+  },
+  {
+    q: "You name rabbit holes in the pitch so that:",
+    options: [
+      "nobody discovers one in week five",
+      "the estimate becomes more accurate",
+      "the founder approves it more quickly",
+      "the solution sketch stays much rougher"
+    ],
+    answer: 0,
+    why: "A risk written down in week one is a decision you can make. The same risk found in week five is an ambush that eats the whole appetite."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder asks \"how long will this take?\"",
+    answer: "\"Before I answer that — how much is it worth to us? If it is worth two weeks, I will show you what fits in two weeks. If it is worth six, I will design something bigger.\" Why: this moves them from a guess about unknown work to a decision about value. That decision is theirs to make, not mine."
+  },
+  {
+    prompt: "You are given two weeks and nine required features. What do you say?",
+    answer: "\"Two weeks works, and I will hold the date. To hold it I will be cutting as I go and telling you what I cut. If all nine genuinely have to ship, then this is not a two-week job — so let us talk about whether it is worth more time, rather than pretending the list fits.\""
+  },
+  {
+    prompt: "Week three, and you have found a rabbit hole nobody named. What do you do?",
+    answer: "I say it the same day, not at the end. \"The import needs to handle their old date format. That is about four days. Three options: cut the import from this cycle, handle one format only, or extend. I recommend the second.\" Why: bad news early is a plan. Bad news late is an excuse."
+  },
+  {
+    prompt: "Someone says appetite is just agile timeboxing. How do you answer?",
+    answer: "\"The mechanism matters more than the name. The point is not the fixed length — it is that the scope is explicitly free, and someone is allowed to cut it during the work. If nobody may cut, then it is a deadline whatever we call it.\""
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

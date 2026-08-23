@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Map — Founding Engineer</title>
+<link rel="stylesheet" href="assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← All courses</a></p>
+<p class="kicker">The Map · single source of truth</p>
+<h1>Founding Engineer</h1>
+<p class="subtitle">How a real software product gets made inside a startup — from
+no idea at all, to strangers paying for it.</p>
+
+<div class="win">
+  <strong>The goal.</strong> Any early startup can hand you a vague idea, and you
+  can take it all the way to a live product with paying users — alone if you have
+  to — and say why each decision was right. Read
+  <a href="MISSION.md">MISSION.md</a> for the full version.
+</div>
+
+<h2>The big picture</h2>
+
+<p>Start with what a startup <em>is</em>. Steve Blank's definition does the work:
+a startup is a temporary organisation <b>searching</b> for a repeatable business
+model, while a company is a permanent one <b>executing</b> a model it already
+has.<sup>1</sup> Search and execute are opposite jobs. Almost every mistake in
+this course comes from doing the second one while you are still in the first.</p>
+
+<p>Searching costs money, and the money runs out. That is the whole shape of the
+problem: a fixed timer, and a guess you have to test before it stops. So the
+person who turns the guess into something real is not a code monkey. They are
+the constraint. That is
+<a href="lessons/0001-the-founding-engineer-job.html">the founding engineer's
+job</a>, and it is where this course starts.</p>
+
+<p>From there the course follows the order the work actually happens in, as three
+Tracks.</p>
+
+<p><b>Track 1 — Find.</b> You cannot build the right thing before you know what
+hurts. So first you learn to run a conversation without poisoning it:
+<a href="lessons/0002-the-mom-test.html">the Mom Test</a> — talk about their life,
+not your idea, because any question about the future comes back as a polite guess.
+Then <a href="lessons/0003-choosing-which-problem.html">choosing which problem</a>
+is worth a year of your life, using frequency, pain, who holds the budget, and
+whether you can find these people at all. Then the part nobody teaches:
+<a href="lessons/0004-the-kill-rule.html">the kill rule</a>, written down before
+you start, so you know in advance what evidence would make you stop. Without it,
+the runway makes the decision for you.</p>
+
+<p><b>Track 2 — Build.</b> Now the engineering, but with the objective function
+changed. You stop asking "how long will this take?" and start asking
+<a href="lessons/0005-appetite-not-estimate.html">"how much time is this
+worth?"</a> — appetite instead of estimate, because a fixed-scope overrun has no
+limit and a fixed-time one does. You learn
+<a href="lessons/0006-cutting-to-the-mvp.html">cutting to the MVP</a>, and to say
+out loud what you left out on purpose. You learn why the stack should be
+<a href="lessons/0007-boring-stack-innovation-tokens.html">boring</a>: you get
+about three novel choices, and a database is a terrible place to spend one. And
+you build a <a href="lessons/0008-walking-skeleton-quality-boundary.html">walking
+skeleton</a> — thin, ugly, deployed on day one — then go fast everywhere except the
+places where a failure loses data or loses trust. That line is the <b>quality
+boundary</b>, and knowing where it sits is most of the craft.</p>
+
+<p><b>Track 3 — Live.</b> A product nobody uses has taught you nothing. You get
+<a href="lessons/0009-first-ten-users-by-hand.html">the first ten users by
+hand</a>, one at a time, because every normal channel multiplies a stock you do
+not have yet. You set <a href="lessons/0010-the-first-price.html">the first
+price</a>, because charging is a test and not a reward. You pick
+<a href="lessons/0011-one-metric-that-matters.html">the one metric that
+matters</a> for the stage you are in and ignore the other thirty. And you learn
+<a href="lessons/0012-keeping-it-alive-alone.html">keeping it alive alone</a>:
+backups you have actually restored, errors that reach your phone, a deploy you are
+not afraid of on a Friday.</p>
+
+<p>Twelve ideas. Four per Track. That is the 20% core, and nothing else gets
+taught until those are solid — the rest is queued in
+<a href="#depth">the depth queue</a> below, in the open, so you can always see
+what is being deliberately skipped.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://steveblank.com/2010/01/25/whats-a-startup-first-principles/">Steve
+Blank, "What's A Startup? First Principles."</a> and
+<a href="https://steveblank.com/2012/03/05/search-versus-execute/">"Search versus
+Execute"</a>. Checked 2026-08-23.</p>
+
+<h2 id="core">The 20% core</h2>
+
+<div class="progress">
+  <div class="bar">
+    <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span>
+    <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span>
+    <span class="done"></span><span class="done"></span><span class="done"></span><span class="done"></span>
+  </div>
+  <p class="caption"><b>12 of 12 core Lessons written.</b> The whole core path is
+  live. Each bar is one core idea. Depth items are now unlocked — but only after
+  the tasks in the core Lessons are actually done, not just read.</p>
+</div>
+
+<div class="note">
+  <span class="label">Reading order</span>
+  Read them in order: <b>F1 → F2 → F3 → F4 → B1 → B2 → B3 → B4 → L1 → L2 → L3 →
+  L4</b>. The Lessons are chained — F3 uses the interview notes from F2, B2 uses
+  the problem from F3, L2 uses the price inputs from F2, and L4 needs the deployed
+  product from B4. Skipping one leaves the next one without its input.
+</div>
+
+<div class="tracks">
+  <div class="track-card c1">
+    <h3>Track 1 — Find</h3>
+    <p>Is there a real problem here, and is it worth a year?</p>
+    <p class="count">4 core · 4 written</p>
+  </div>
+  <div class="track-card c2">
+    <h3>Track 2 — Build</h3>
+    <p>Make the smallest real thing, and know what you cut.</p>
+    <p class="count">4 core · 4 written</p>
+  </div>
+  <div class="track-card c3">
+    <h3>Track 3 — Live</h3>
+    <p>Real users, real money, and staying alive alone.</p>
+    <p class="count">4 core · 4 written</p>
+  </div>
+</div>
+
+<div class="chapter">
+  <h3>Track 1 — Find <span class="pill">4 core</span></h3>
+  <ul class="lessons">
+    <li>
+      <span class="code">F1</span>
+      <a href="lessons/0001-the-founding-engineer-job.html">The job is not writing code</a>
+      <span class="pill core">core</span>
+      <span class="desc">Why the role exists at all. The runway is a timer, so the
+      scarce thing is learning per month, not lines per week.</span>
+    </li>
+    <li>
+      <span class="code">F2</span>
+      <a href="lessons/0002-the-mom-test.html">The Mom Test</a>
+      <span class="pill core">core</span>
+      <span class="desc">Talk about their life, not your idea. Ask about the last
+      time it happened, never about what they would do. Includes the evidence
+      ladder: rank an answer by what it cost the person to say it.</span>
+    </li>
+    <li>
+      <span class="code">F3</span>
+      <a href="lessons/0003-choosing-which-problem.html">Choosing which problem to build</a>
+      <span class="pill core">core</span>
+      <span class="desc">Four filters — frequency, pain in hours or money, who
+      signs, can you reach them. Score each 0 to 5 and multiply, so a single
+      <b>0</b> takes the whole score to zero.</span>
+    </li>
+    <li>
+      <span class="code">F4</span>
+      <a href="lessons/0004-the-kill-rule.html">The kill rule</a>
+      <span class="pill core">core</span>
+      <span class="desc">Write the evidence that would make you quit, while you
+      are still calm about the idea. A number, a date, an action — and three paths
+      out, not two.</span>
+    </li>
+  </ul>
+</div>
+
+<div class="chapter">
+  <h3>Track 2 — Build <span class="pill">4 core</span></h3>
+  <ul class="lessons">
+    <li>
+      <span class="code">B1</span>
+      <a href="lessons/0005-appetite-not-estimate.html">Appetite, not estimate</a>
+      <span class="pill core">core</span>
+      <span class="desc">Fix the time, vary the scope, because a fixed-scope
+      overrun has no limit. Includes the sentence to say when you accept an
+      appetite, so it does not become a deadline.</span>
+    </li>
+    <li>
+      <span class="code">B2</span>
+      <a href="lessons/0006-cutting-to-the-mvp.html">Cutting to the MVP</a>
+      <span class="pill core">core</span>
+      <span class="desc">Two tests — removal and answer — then say out loud what is
+      missing on purpose. A human doing it by hand is a valid
+      implementation.</span>
+    </li>
+    <li>
+      <span class="code">B3</span>
+      <a href="lessons/0007-boring-stack-innovation-tokens.html">Boring stack and innovation tokens</a>
+      <span class="pill core">core</span>
+      <span class="desc">You get about three novel choices. The real argument is
+      failure modes you already understand — so ask "have I run this in
+      production?"</span>
+    </li>
+    <li>
+      <span class="code">B4</span>
+      <a href="lessons/0008-walking-skeleton-quality-boundary.html">The walking skeleton and the quality boundary</a>
+      <span class="pill core">core</span>
+      <span class="desc">Deploy end to end on day one, then go fast on anything
+      you could fix in an afternoon. The axis is reversibility, not how bad it
+      feels.</span>
+    </li>
+  </ul>
+</div>
+
+<div class="chapter">
+  <h3>Track 3 — Live <span class="pill">4 core</span></h3>
+  <ul class="lessons">
+    <li>
+      <span class="code">L1</span>
+      <a href="lessons/0009-first-ten-users-by-hand.html">The first ten users, by hand</a>
+      <span class="pill core">core</span>
+      <span class="desc">Every channel multiplies a stock you do not have yet, so
+      at zero they all return zero. Fetch users one at a time, and log the
+      refusals — they name the real problem.</span>
+    </li>
+    <li>
+      <span class="code">L2</span>
+      <a href="lessons/0010-the-first-price.html">The first price</a>
+      <span class="pill core">core</span>
+      <span class="desc">Charging is a test, not a reward. Never ask "would you
+      pay?" — say "it is $X, shall I send the link?" and then be quiet.</span>
+    </li>
+    <li>
+      <span class="code">L3</span>
+      <a href="lessons/0011-one-metric-that-matters.html">The one metric that matters</a>
+      <span class="pill core">core</span>
+      <span class="desc">One number per stage: empathy, stickiness, virality,
+      revenue, scale. Growth before stickiness fills a leaking bucket at full
+      price.</span>
+    </li>
+    <li>
+      <span class="code">L4</span>
+      <a href="lessons/0012-keeping-it-alive-alone.html">Keeping it alive alone</a>
+      <span class="pill core">core</span>
+      <span class="desc">Three things only: a backup you have <b>restored</b>,
+      errors that reach your phone, a deploy you are not scared of. Plus the list
+      you skip on purpose.</span>
+    </li>
+  </ul>
+</div>
+
+<h2 id="depth">The depth queue — the other 80%</h2>
+
+<p>None of this is deleted. All of it waits. If you want one of these early, say
+so and we will do it — but the Lesson will name which core item it is jumping
+over.</p>
+
+<div class="chapter">
+  <ul class="lessons">
+    <li class="stub-row">
+      The founding-engineer offer: equity, vesting, cliff, dilution
+      <span class="pill depth">depth</span>
+      <span class="desc">Read this one before you sign anything, even though it is
+      not about making a product. Typical range is 0.1% to 1%, which is a
+      convention, not a law.</span>
+    </li>
+    <li class="stub-row">
+      Fundraising: what a seed deck has to prove
+      <span class="pill depth">depth</span>
+      <span class="desc">Out of scope as a goal, useful as a skill.</span>
+    </li>
+    <li class="stub-row">
+      Hiring engineers 2 to 5, and what breaks
+      <span class="pill depth">depth</span>
+      <span class="desc">The moment your habits become the company's habits.</span>
+    </li>
+    <li class="stub-row">
+      Multi-tenant data models and per-customer isolation
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Scaling past one box: queues, caching, read replicas
+      <span class="pill depth">depth</span>
+      <span class="desc">A problem you have to earn.</span>
+    </li>
+    <li class="stub-row">
+      The first enterprise security review: SOC 2, GDPR, questionnaires
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Growth channels after hand-recruiting
+      <span class="pill depth">depth</span>
+      <span class="desc">Picking one channel and testing it properly.</span>
+    </li>
+    <li class="stub-row">
+      A/B testing once you finally have traffic
+      <span class="pill depth">depth</span>
+      <span class="desc">Below a few thousand users a week, it mostly measures
+      noise.</span>
+    </li>
+    <li class="stub-row">
+      Pricing v2: tiers, packaging, expansion revenue
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Support that does not eat your week
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Migrations with no downtime
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      AI features: when the model is the product, and when it is a button
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Design and brand with no designer
+      <span class="pill depth">depth</span>
+    </li>
+    <li class="stub-row">
+      Investor and board reporting
+      <span class="pill depth">depth</span>
+    </li>
+  </ul>
+</div>
+
+<h2>Reference</h2>
+
+<p>Lessons are read once. Reference pages are read again and again. They print
+well on purpose.</p>
+
+<div class="chapter">
+  <ul class="lessons">
+    <li>
+      <a href="reference/glossary.html">Glossary</a>
+      <span class="pill core">core</span>
+      <span class="desc">Every term this course uses, in plain words, with the
+      source. If a Lesson and the Glossary disagree, the Glossary wins.</span>
+    </li>
+  </ul>
+</div>
+
+<h2>The workspace</h2>
+
+<div class="chapter">
+  <ul class="lessons">
+    <li>
+      <a href="MISSION.md">MISSION.md</a>
+      <span class="desc">Why this course exists, what success looks like, the
+      twelve core items with their sources, and what is out of scope.</span>
+    </li>
+    <li>
+      <a href="RESOURCES.md">RESOURCES.md</a>
+      <span class="desc">The trusted sources every Lesson cites, the communities
+      worth joining, and an honest list of gaps where no good source was
+      found.</span>
+    </li>
+    <li>
+      <a href="NOTES.md">NOTES.md</a>
+      <span class="desc">The fixed Lesson shape, the components in
+      <code>assets/</code>, and the rules learned from the review pass.</span>
+    </li>
+  </ul>
+</div>
+
+<div class="ask">
+  I am your teacher for this course. Ask me anything that is unclear — a Lesson, a
+  word, a decision you are facing at work. <b>The best question is the one you
+  think is too basic to ask.</b>
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← All courses</a></span>
+  <span><a href="lessons/0001-the-founding-engineer-job.html">Start here: F1 — The job is not writing code →</a></span>
+</div>
+
+</div>
+</body>
+</html>

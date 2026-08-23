@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F3 — Choosing which problem to build</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 1 · Find · Lesson F3</p>
+<h1>Choosing which problem to build</h1>
+<p class="subtitle">Four cheap filters that kill most ideas in ten minutes, so
+you spend your runway on the one that survives.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>judge someone else's work and say
+what is wrong and why</i>. After this you can look at any startup and name the
+guess it never tested. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 3 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> Given five candidate problems, you can rank them
+  in ten minutes and say out loud why the loser lost. No spreadsheet, no market
+  research report.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why a filter is needed at all</h2>
+
+<p>You have one runway and it can only test one problem properly. So the choice
+has to be made <b>before</b> the expensive part. That means the filters must be
+cheap: things you can check with the interview notes from
+<a href="0002-the-mom-test.html">F2</a> and nothing else.</p>
+
+<h3>Step 1 — What has to be true for anyone to buy anything</h3>
+
+<p>Someone only buys when they <b>change their behaviour</b>. They stop doing it
+the old way and start doing it your way. That is the whole event you are betting
+on.</p>
+
+<h3>Step 2 — Changing behaviour is not free</h3>
+
+<p>Switching costs them something: learning time, risk of it going wrong,
+explaining it to a colleague, admitting the old way was bad. Call that the
+<b>switching cost</b>.</p>
+
+<p>So the condition is simple, and it is the whole Lesson in one line:</p>
+
+<pre><code>pain of the problem  &gt;  cost of switching</code></pre>
+
+<p>Both sides are real. Most failed products had real pain on the left and never
+measured the right.</p>
+
+<p>Keep that in mind as you read the four filters. Three of them measure the left
+side. The right side needs its own estimate: ask what the person would have to
+stop doing, learn, or explain to a colleague.</p>
+
+<h3>Step 3 — Therefore: frequency matters</h3>
+
+<p>A problem that happens once a year cannot build a habit. Even if it hurts a lot,
+the person forgets you between events. Each time, they start again from nothing.</p>
+
+<p>A problem that happens weekly gives you many chances to be useful. And the
+switching cost is paid only once.</p>
+
+<h3>Step 4 — Therefore: the size of the pain matters</h3>
+
+<p>Measure pain in the only two units that are checkable: <b>hours</b> and
+<b>money</b>. "It is annoying" is not a unit. "It takes her four hours every
+Monday" is.</p>
+
+<p>The best sign here is a <b>workaround</b>. If someone built a spreadsheet, hired
+a person, or wrote a script to cope, they already paid for a solution. That is
+proof of pain, not a report of it.</p>
+
+<h3>Step 5 — Therefore: someone must hold money</h3>
+
+<p>Pain with no budget produces no sale. Ask two separate questions and do not
+confuse them. Who <b>feels</b> the problem? Who <b>signs</b> for the fix? When those are
+two different people, your product has two customers and you must satisfy both.</p>
+
+<h3>Step 6 — The filter everyone forgets: can you reach them?</h3>
+
+<p>A group you cannot find is the same as no group. Before you commit, name the
+actual place: this subreddit, this conference, this trade body's member list,
+these forty companies on this page.</p>
+
+<p>If you cannot name a place, the problem is not selectable yet, however real it
+is.</p>
+
+<h3>Step 7 — Multiply, do not add</h3>
+
+<p>Here is the important bit of arithmetic. Score each filter <b>0 to 5</b>, where
+<b>0 means it fails outright</b>. Then multiply the four scores.</p>
+
+<p>A zero anywhere makes the whole score zero. Adding cannot do that. That is the
+only reason to multiply.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 260" role="img" aria-labelledby="f3title f3desc">
+  <title id="f3title">The four filters, as a funnel</title>
+  <desc id="f3desc">Four filters. Every problem is scored 0 to 5 on frequency,
+  pain, budget and reach, then the scores are multiplied. The narrowing shape
+  shows the effect: most problems score badly on at least one filter.</desc>
+
+  <rect x="40"  y="30" width="560" height="34" rx="5" class="dg-box"/>
+  <text x="320" y="52" class="dg-label" text-anchor="middle">every problem you noticed in your F2 interviews</text>
+
+  <rect x="105" y="80" width="430" height="30" rx="5" class="dg-box"/>
+  <rect x="105" y="80" width="430" height="30" rx="5" class="dg-fill-accent" opacity="0.12"/>
+  <text x="320" y="100" class="dg-label" text-anchor="middle">1 &middot; FREQUENCY &mdash; does it happen weekly, not yearly?</text>
+
+  <rect x="150" y="126" width="340" height="30" rx="5" class="dg-box"/>
+  <rect x="150" y="126" width="340" height="30" rx="5" class="dg-fill-accent" opacity="0.18"/>
+  <text x="320" y="146" class="dg-label" text-anchor="middle">2 &middot; PAIN &mdash; measured in hours or money, not adjectives</text>
+
+  <rect x="195" y="172" width="250" height="30" rx="5" class="dg-box"/>
+  <rect x="195" y="172" width="250" height="30" rx="5" class="dg-fill-accent" opacity="0.24"/>
+  <text x="320" y="192" class="dg-label" text-anchor="middle">3 &middot; BUDGET &mdash; who signs for the fix?</text>
+
+  <rect x="235" y="218" width="170" height="30" rx="5" class="dg-box"/>
+  <rect x="235" y="218" width="170" height="30" rx="5" class="dg-fill-good" opacity="0.30"/>
+  <text x="320" y="238" class="dg-label" text-anchor="middle">4 &middot; REACH &mdash; name the place</text>
+
+  <text x="612" y="100" class="dg-small" text-anchor="end">score 0&ndash;5</text>
+  <text x="612" y="146" class="dg-small" text-anchor="end">score 0&ndash;5</text>
+  <text x="612" y="192" class="dg-small" text-anchor="end">score 0&ndash;5</text>
+  <text x="612" y="238" class="dg-small" text-anchor="end">score 0&ndash;5</text>
+</svg>
+<figcaption>Four filters. Every problem is scored 0 to 5 on each one, then the
+four scores are multiplied. The narrowing shape shows the effect: most problems
+score badly on at least one filter, and a single <b>0</b> takes the whole score to
+zero.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Name the four filters in order. Then say which of them measure the pain, and
+  which measure whether the sale can happen at all. If you cannot say
+  <b>pain &gt; switching cost</b> without looking, read Step 2 again.
+</div>
+
+<h3>Step 8 — Three signs that look bad and are good</h3>
+
+<p>These three come from YC's talk on evaluating ideas. They look wrong at first,
+which is exactly why they are worth memorising.<sup>1</sup></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Looks bad</th><th>Actually good, because</th></tr>
+  <tr>
+    <td>It looks like a lot of boring set-up work</td>
+    <td>The boring work is what keeps competitors away. Most people see the work
+    and stop, so nobody has done it properly.</td>
+  </tr>
+  <tr>
+    <td>The whole space is boring</td>
+    <td>Boring spaces get less attention from founders. So the easy wins are still
+    there, unlike in the exciting spaces.</td>
+  </tr>
+  <tr>
+    <td>Competitors already exist</td>
+    <td>Somebody proved people pay for this. An empty market usually means no
+    market, not an untapped one.</td>
+  </tr>
+</table>
+</div>
+
+<p>One more question from the same talk, which is not on that list but belongs
+here: <b>do you have the problem yourself?</b> If yes, you get free access to a
+real user. Be careful anyway — your own pain still has to pass all four
+filters.<sup>1</sup></p>
+
+<h3>Step 9 — Where this reasoning stops</h3>
+
+<p>These filters rank problems. They cannot tell you whether <i>you</i> are the
+right person to solve one. That question is about unfair advantage — what you
+know, who you know, what you can build faster than others — and it is a separate
+judgement the filters do not make.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://www.youtube.com/watch?v=Th8JoIan4dg">Jared Friedman, "How to Get
+and Evaluate Startup Ideas", YC Startup School</a>, and the wider
+<a href="https://www.ycombinator.com/library">YC Startup Library</a>.
+The four filters are this course's arrangement of that material — the names are
+ours, the underlying advice is theirs. Checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar">
+  <span class="who">Real pain, once a year</span>
+  Tax filing, annual audits, moving house. The pain is genuine and large, so it
+  passes the pain filter easily. Then you discover you get one shot per customer
+  per year, so learning is twelve months slow and habit never forms.
+  <p><b>The tell:</b> you can only describe the problem using the word
+  "annual".</p>
+</div>
+
+<div class="scar">
+  <span class="who">The market is "everyone"</span>
+  Small businesses. Developers. Teams. None of these is a place. You cannot name
+  where to find them, so every user costs a new invention to reach.
+  <p><b>The tell:</b> you cannot finish the sentence "I will find the next ten of
+  them at ______".</p>
+</div>
+
+<div class="scar money">
+  <span class="who">The passionate user with no budget</span>
+  A junior employee suffers most and cares most, so your interviews are warm and
+  useful. They have no purchasing power. The person who signs has a different
+  problem, and you never asked them.
+  <p><b>The tell:</b> your best three interviews are all with the same job
+  title, and it is not a manager.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">The engineer's trap — fails quietly</span>
+  You chose the problem you know how to build rather than the problem that hurts
+  most. It feels responsible, because you are being realistic about your skills.
+  It is backwards, and it stays hidden because the build goes well.
+  <p><b>The tell:</b> you decided the technology before you finished the
+  interviews.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Watch this next — the primary source</span>
+  <a href="https://www.youtube.com/watch?v=Th8JoIan4dg">"How to Get and Evaluate
+  Startup Ideas" — Jared Friedman, YC Startup School</a>. It covers common founder
+  mistakes, ten evaluation questions, and the counterintuitive signs above. One
+  hour, and it is the densest free thing on this subject.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>People only buy when they change how they work. Changing is uncomfortable, so
+the problem has to hurt more than the change does. That means you want problems
+that happen often, cost real hours or real money, belong to someone who can pay,
+and involve people you can actually find. Four cheap questions. Most ideas fail
+one of them, and one failure is enough.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>You are choosing where to dig a well. You do not dig where the ground is
+softest. You dig where the water is.</p>
+
+<p><b>Where the analogy breaks.</b> With ground water you can survey the land
+before you dig. With a market you cannot. The only survey available is watching
+who is already carrying buckets by hand. That is why a workaround is the
+strongest signal in this Lesson: it is a person carrying a bucket.</p>
+
+<h3>The sticking point</h3>
+
+<p>Almost everyone treats the four filters as a checklist to add up. They are a
+product, not a sum.</p>
+
+<p>Here is why that matters. An idea scoring 5, 5, 5, 1 sums to 16 out of 20 and
+looks strong. Multiplied it is 125 against a maximum of 625, and the 1 is the
+reason. That 1 might be "I cannot find these people". No amount of pain fixes
+that.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>TAM</code>, <code>market opportunity</code>, <code>pain point</code>,
+  <code>underserved segment</code>, <code>white space</code>. Plain version:
+  "Six of the eight people I spoke to were doing this by hand every Monday, it
+  took about three hours, and their operations manager already pays for two other
+  tools."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why a problem that hurts a lot can
+  still be a bad problem to build for.</p>
+  <p>Say it, then send it. I am looking for whether you name a <b>specific</b>
+  filter as the failure, not just "it depends".</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"Pain is only half the condition. The other half is what it costs someone to
+change how they work, and how often they get the chance. A problem that hurts
+badly once a year gives me one shot per customer per year, so I learn slowly and
+they never build a habit. And if the person who feels it cannot sign for the fix,
+the pain never turns into money."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — score five problems <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>From your <a href="0002-the-mom-test.html">F2</a> notes, list up to five
+    problems you heard. Real ones people described, never ones you invented. Three
+    real problems beats five with two inventions in them.</li>
+    <li>Build a table: one row per problem, four score columns, one product
+    column.</li>
+    <li>Score each filter 0 to 5, where 0 means it fails outright. Beside every
+    score write the <b>evidence</b> from your notes. A score with no evidence is a
+    guess, so mark it as one.</li>
+    <li>Multiply. Write one sentence for the winner and one for the loser saying
+    which filter decided it.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the table, plus this sentence completed for the
+  winner: "I will find the next ten of these people at ______." If you cannot
+  finish that sentence, the winner has a 1 in the reach column and you scored it
+  wrong.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — hunt for the workaround <span class="needs">~90 min</span></span>
+  <ol>
+    <li>Take the winning problem.</li>
+    <li>Go to the place you named and find three examples of people doing it by
+    hand: a shared spreadsheet, a forum post asking how, a job advert for someone
+    to do exactly this, a freelancer selling it as a service.</li>
+    <li>Screenshot each one.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> three screenshots of people already paying in
+  time or money. If you cannot find any in ninety minutes, that is a real result:
+  go back to your second-place problem and say why.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Nobody buys unless they change behaviour, and changing costs them
+  something.</li>
+  <li>The condition is <code>pain &gt; switching cost</code>. Most failures never
+  measured the right side.</li>
+  <li>Four cheap filters: <b>frequency</b>, <b>pain in hours or money</b>,
+  <b>who signs</b>, <b>can you reach them</b>.</li>
+  <li><b>Multiply</b> the scores, 0 to 5. A single <b>0</b> is fatal, and adding
+  hides it.</li>
+  <li>A workaround someone built is the strongest signal available. It is proof of
+  pain, not a report of it.</li>
+  <li>Three signs that look bad and are good: boring set-up work, a boring space,
+  existing competitors.</li>
+  <li>These filters rank problems. They cannot tell you whether you are the right
+  person to solve one.</li>
+</ul>
+<p class="one-thing">If you remember one thing: you must be able to name the
+place. If you cannot, you have not chosen a problem yet.</p>
+</div>
+
+<div class="ask">
+  Send me your five-row table. I will tell you which scores are evidence and
+  which are hope — that split is usually the whole answer.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0002-the-mom-test.html">← F2 — The Mom Test</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0004-the-kill-rule.html">F4 — The kill rule →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "The condition that decides whether anyone will buy is:",
+    options: [
+      "pain beats the switching cost",
+      "pain beats the yearly budget",
+      "price beats the switching cost",
+      "value beats the yearly budget"
+    ],
+    answer: 0,
+    why: "Buying means changing how they work, and changing costs them time, risk and pride. Real pain with a high switching cost still produces no sale."
+  },
+  {
+    q: "Why multiply the four filter scores instead of adding them?",
+    options: [
+      "A weak filter cannot be hidden",
+      "Multiplying gives a wider range",
+      "Adding favours the newer ideas",
+      "Investor models also multiply this"
+    ],
+    answer: 0,
+    why: "Adding lets three strong scores hide one weak score. Multiplying cannot. Score 5,5,5,0 and adding gives a respectable 15, while multiplying gives zero."
+  },
+  {
+    q: "The strongest single signal that a problem is real is:",
+    options: [
+      "a workaround they already built",
+      "a long list of feature requests",
+      "a competitor raising a big round",
+      "a survey with positive responses"
+    ],
+    answer: 0,
+    why: "A spreadsheet, a script, or a hired person means they already paid for a solution in time or money. That is proof of pain rather than a report of it."
+  },
+  {
+    q: "Competitors already selling into your market is:",
+    options: [
+      "a good sign, someone proved payment",
+      "a bad sign, the space is crowded now",
+      "a neutral sign, it depends entirely",
+      "a good sign, they may acquire you"
+    ],
+    answer: 0,
+    why: "An empty market usually means no market. Existing competitors show that money moves here, which is the hardest thing to find out on your own."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder says \"our market is small businesses\". What do you ask?",
+    answer: "\"Where will we find the next ten of them?\" <b>\"Small businesses\"</b> is not a place. If we cannot name a subreddit, a trade body list, a conference or forty specific companies, then reach scores a 0. And a zero anywhere takes the whole score to zero."
+  },
+  {
+    prompt: "You are shown an idea with huge pain but once a year. How do you say no?",
+    answer: "\"The pain is real, I believe that. My worry is frequency. One event per customer per year means we learn once a year. And each time, they start again from nothing. Is there a weekly version of this same pain we could start with?\" Why: name the filter, then offer a door — never just refuse."
+  },
+  {
+    prompt: "How do you separate who feels the pain from who pays?",
+    answer: "I ask two questions, never one. \"Who does this work today?\" Then: \"If you wanted to buy a tool for it tomorrow, who else has to say yes?\" Why: when the answers name different people, we have two customers. The product then has to satisfy both."
+  },
+  {
+    prompt: "Someone says \"there is no competition, we would be first\". What do you say?",
+    answer: "\"That worries me more than it excites me.\" Why: an empty market usually means nobody pays for this. It rarely means nobody noticed. I would rather enter a market where money already moves, and win by being better for one specific group."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

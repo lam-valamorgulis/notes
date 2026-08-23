@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F2 — The Mom Test</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 1 · Find · Lesson F2</p>
+<h1>The Mom Test</h1>
+<p class="subtitle">How to ask questions that even your mother could not answer
+with a comfortable lie.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>debug a problem that has no ready
+answer online</i>. Every startup's first problem is "is this real?" No search
+engine has that answer. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 2 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> After this page you can run a real customer
+  conversation and come out with <b>facts</b> instead of encouragement. You will
+  also be able to look at your own notes and see, in ten seconds, whether you
+  gathered data or applause.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why the normal way of asking fails</h2>
+
+<p>Start with what you actually want to know.</p>
+
+<p>You want to know whether people <b>will</b> use your product, and <b>will</b>
+pay. That is a fact about the future. Now the problem: the future cannot be
+observed. So you have to get it some other way.</p>
+
+<h3>Step 1 — The only thing you can observe is the past</h3>
+
+<p>You can observe what someone <i>did</i>. What they bought. What they built by
+hand to work around the problem. How much time it took them last Tuesday. All of
+that is real and checkable.</p>
+
+<p>You cannot observe what they will do. Neither can they.</p>
+
+<h3>Step 2 — Asking about the future returns a guess</h3>
+
+<p>"Would you use this?" asks a person to predict their own behaviour. People are
+bad at that. Not lying — bad at it. Predicting your own future action is a hard
+task, and the answer comes out as a hopeful guess.</p>
+
+<h3>Step 3 — Politeness makes the guess worse</h3>
+
+<p>Now add the second force. The person in front of you can see that you care
+about the answer. Most people will not hurt you for no reason. So the hopeful
+guess bends further toward yes.</p>
+
+<p>This is where the name comes from. Ask your mother if your business idea is
+good and she says yes. Not because it is good. Because she loves you.<sup>1</sup></p>
+
+<h3>Step 4 — Therefore: never ask about the future</h3>
+
+<p>If future questions return bent guesses, stop asking them. Ask only about the
+past and the present. Those answers are facts, and facts do not bend to be
+polite.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Instead of this (a guess)</th><th>Ask this (a fact)</th></tr>
+  <tr>
+    <td>"Would you use a tool that did X?"</td>
+    <td>"When did you last have this problem? Walk me through that day."</td>
+  </tr>
+  <tr>
+    <td>"Would you pay $20 a month for it?"</td>
+    <td>"What do you spend on this today? Tools, hours, anyone's salary?"</td>
+  </tr>
+  <tr>
+    <td>"Do you think this is a big problem?"</td>
+    <td>"What have you already tried? Why did you stop using it?"</td>
+  </tr>
+  <tr>
+    <td>"Would this fit your workflow?"</td>
+    <td>"Show me how you do it now." Then stay quiet and watch.</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 5 — Therefore: do not mention your idea first</h3>
+
+<p>This one surprises people. The moment you describe your idea, the person stops
+being a witness to their own life. They become a critic of your idea. Those are
+two different jobs, and only the first one is useful.</p>
+
+<p>So the idea comes last, or not at all in the first conversation.</p>
+
+<h3>Step 6 — The three rules, now derived rather than memorised</h3>
+
+<p>Rob Fitzpatrick's three rules fall straight out of the steps above.<sup>1</sup></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>The rule</th><th>Which step it comes from</th></tr>
+  <tr><td>Talk about <b>their life</b>, not your idea</td><td>Step 5</td></tr>
+  <tr><td>Ask about <b>specifics in the past</b>, not the future</td><td>Steps 1 to 4</td></tr>
+  <tr><td><b>Talk less</b>, listen more</td><td>Steps 3 and 5</td></tr>
+</table>
+</div>
+
+<h3>Step 7 — So what counts as evidence?</h3>
+
+<p>Not all answers weigh the same. Rank them by one question: <b>what did it cost
+the person to give me this?</b> A compliment is free, so it is worth nothing. A
+credit card number is expensive, so it is worth a lot.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 250" role="img" aria-labelledby="f2title f2desc">
+  <title id="f2title">The evidence ladder</title>
+  <desc id="f2desc">Six kinds of answer, ordered by how much they cost the
+  person giving them. A compliment costs nothing and proves nothing. Money and a
+  referral cost something and prove a lot.</desc>
+
+  <line x1="150" y1="222" x2="620" y2="222" class="dg-rule"/>
+
+  <text x="138" y="211" class="dg-small dg-strong" text-anchor="end">1</text>
+  <text x="138" y="181" class="dg-small dg-strong" text-anchor="end">2</text>
+  <text x="138" y="151" class="dg-small dg-strong" text-anchor="end">3</text>
+  <text x="138" y="121" class="dg-small dg-strong" text-anchor="end">4</text>
+  <text x="138" y="91"  class="dg-small dg-strong" text-anchor="end">5</text>
+  <text x="138" y="61"  class="dg-small dg-strong" text-anchor="end">6</text>
+
+  <rect x="150" y="196" width="60"  height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="196" width="60"  height="22" rx="3" class="dg-fill-warn" opacity="0.20"/>
+  <text x="130" y="211" class="dg-small" text-anchor="end">"Great idea!"</text>
+  <text x="216" y="211" class="dg-small">costs them nothing &mdash; worthless</text>
+
+  <rect x="150" y="166" width="110" height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="166" width="110" height="22" rx="3" class="dg-fill-warn" opacity="0.20"/>
+  <text x="130" y="181" class="dg-small" text-anchor="end">"I would use that"</text>
+  <text x="266" y="181" class="dg-small">a guess about the future</text>
+
+  <rect x="150" y="136" width="170" height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="136" width="170" height="22" rx="3" class="dg-fill-accent" opacity="0.18"/>
+  <text x="130" y="151" class="dg-small" text-anchor="end">a feature request</text>
+  <text x="326" y="151" class="dg-small">real, but about their idea</text>
+
+  <rect x="150" y="106" width="260" height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="106" width="260" height="22" rx="3" class="dg-fill-accent" opacity="0.18"/>
+  <text x="130" y="121" class="dg-small" text-anchor="end">shows you the workaround</text>
+  <text x="416" y="121" class="dg-small">they already pay in time</text>
+
+  <rect x="150" y="76" width="285" height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="76" width="285" height="22" rx="3" class="dg-fill-good" opacity="0.22"/>
+  <text x="130" y="91" class="dg-small" text-anchor="end">introduces you to a colleague</text>
+  <text x="441" y="91" class="dg-small">spent their reputation</text>
+
+  <rect x="150" y="46" width="330" height="22" rx="3" class="dg-box"/>
+  <rect x="150" y="46" width="330" height="22" rx="3" class="dg-fill-good" opacity="0.30"/>
+  <text x="130" y="61" class="dg-small" text-anchor="end">pays you money</text>
+  <text x="486" y="61" class="dg-small">spent real money</text>
+
+  <text x="150" y="242" class="dg-small">how much it cost them to say it &nbsp;&rarr;</text>
+</svg>
+<figcaption>Rungs 1 to 6, cheapest at the bottom. Read your interview notes
+against this ladder. If everything you wrote down sits in the <b>bottom two
+rungs</b>, you ran a pitch, not an interview.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the chain: <b>I need a fact about the future → the future cannot be
+  observed → only the past can → future questions return polite guesses → so ask
+  only about the past.</b> Then say the three rules without looking.
+</div>
+
+<h3>Step 8 — Where this stops being true</h3>
+
+<p>Two honest limits.</p>
+
+<p>First, the Mom Test finds out whether a problem is real. It does not tell you
+whether your <i>solution</i> is good. That answer only comes from people using
+the thing, which is Track 3.</p>
+
+<p>Second, at some point you do have to show your idea and ask for money. The rule
+is not "never talk about it". The rule is "not first, and not instead of
+listening".</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://www.momtestbook.com/">Rob Fitzpatrick, <i>The Mom Test</i></a>;
+summary at <a href="https://mtlynch.io/book-reports/the-mom-test/">mtlynch.io</a>;
+interview method from
+<a href="https://www.ycombinator.com/library/Iq-how-to-talk-to-users">Gustaf
+Alströmer, "How to talk to users", YC Startup Library</a>. The six rungs are
+<b>this course's arrangement</b> &mdash; ranking evidence by what it cost the person
+is Fitzpatrick's idea, the ladder is ours. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar">
+  <span class="who">You pitched, and called it research</span>
+  You spoke for most of the conversation. You explained the idea, handled two
+  objections, and left feeling good. You now know their reaction to your idea. You
+  know nothing about their work.
+  <p><b>The tell:</b> your notes contain your own sentences.</p>
+</div>
+
+<div class="scar">
+  <span class="who">You collected compliments</span>
+  Six conversations, all positive, and you cannot name a single number, date, or
+  tool from any of them. Encouragement feels like progress. It is the cheapest
+  thing a person can give you.
+  <p><b>The tell:</b> no numbers, no dates, no product names anywhere in your
+  notes.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">You asked about the future — fails quietly</span>
+  "Would you pay for this?" Eleven people said yes. Two paid. Nobody lied to you.
+  You asked them all to guess, and their guesses were optimistic. This one is
+  dangerous because it produces confident, well-documented, wrong conclusions.
+  <p><b>The tell:</b> the word <b>would</b> appears in your evidence.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Right problem, wrong person</span>
+  Enthusiastic conversations with someone who feels the pain but controls no
+  money and no decision. Months later you learn the buyer is a different person
+  with different priorities, and you built for the wrong one.
+  <p><b>The tell:</b> they said "we" a lot, and you never asked who "we" is when
+  something gets bought.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://www.momtestbook.com/"><i>The Mom Test</i> by Rob
+  Fitzpatrick</a>. It is short, cheap and the single highest-value book for this
+  Track. If you only read one thing in this whole course, read this.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>People are kind. If they can see that you want a yes, most of them will give
+you one. So do not ask questions where kindness can change the answer. Ask about
+things that already happened. What they did, what it cost, what they tried
+before. Those answers are facts. Facts are not polite.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>You are a doctor. A doctor never asks "do you think you have the flu?" They
+ask when it started, what you ate, what you already took, whether it hurts when
+they press here. Then <i>they</i> decide what is wrong.</p>
+
+<p><b>Where the analogy breaks.</b> A doctor can order a blood test. You cannot.
+There is no test that shows a person's future buying behaviour. Their history is
+the only instrument you have. That is why the history-taking is not the warm-up —
+it is the whole examination.</p>
+
+<h3>The sticking point</h3>
+
+<p>Two wrong readings, both common.</p>
+
+<p>The first is thinking this is about being polite or being sneaky. It is
+neither. It is about not changing the answers you came to collect. You are the
+biggest source of bias in the room, so you keep yourself out of them.</p>
+
+<p>The second is thinking it means you can never talk about your product. You
+can. Later, and to ask for money, not to ask for approval.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>customer discovery</code>, <code>problem interview</code>,
+  <code>validate the problem</code>, <code>signal</code>, <code>ICP</code>. The
+  plain version: "I asked eight people to walk me through the last time it
+  happened. Six of them had built a spreadsheet to cope. Two were paying someone
+  to do it by hand."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in two or three sentences why "would you use this?" is
+  a bad question — without using the words "bias" or "validate".</p>
+  <p>Say it out loud, then send it to me. I am checking for one thing: whether
+  you explain <b>why</b> the answer bends, not just that it does.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"It asks the person to predict their own future, and people are bad at that
+even when they are trying hard. Then, because they can see I want a yes, the
+guess moves further toward yes to be kind. So the answer tells me about their
+manners, not about their behaviour. If I ask what they did the last time the
+problem happened, kindness cannot change that answer."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<p>These are the sentences you will need in a real call. Say each one out loud
+before you flip the card.</p>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — three real conversations <span class="needs">~4 hrs</span></span>
+  <ol>
+    <li>Pick any group of people whose work you find interesting. You do not need
+    a product idea yet. That is the point of doing this now.</li>
+    <li>Find three of them. Use
+    <a href="https://www.indiehackers.com/">Indie Hackers</a>, a subreddit for
+    their job, LinkedIn, or people you already know through work.</li>
+    <li>Ask for fifteen minutes to learn about how they work. Do not mention any
+    idea. You do not have one.</li>
+    <li>In each call, use only past-tense questions. Take notes in three columns:
+    <b>what they did</b> · <b>what it cost them</b> (hours or money) ·
+    <b>what they already pay for</b> · <b>the problem they named</b>. The last
+    column feeds <a href="0003-choosing-which-problem.html">F3</a>.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> three pages of notes in which the word
+  <b>would</b> appears zero times. Every page must contain at least one number and
+  one real tool name. Send them to me and I will mark each line as a fact or as
+  applause &mdash; applause meaning a compliment with no fact inside it.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — grade your own notes <span class="needs">~30 min</span></span>
+  <ol>
+    <li>Take the evidence ladder from Block 01.</li>
+    <li>Go through your three pages line by line. Write the ladder rung next to
+    every line.</li>
+    <li>Count how many lines sit in the <b>top three rungs</b>: a workaround, a
+    referral, money. That number is your interview quality score for this
+    week.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a count. If more than half your lines are
+  compliments and guesses about the future, do one more call before moving to
+  <a href="0003-choosing-which-problem.html">F3</a>. This is the one Lesson worth
+  repeating until the number is good.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>You need a fact about the future. The future cannot be observed. Only the
+  past can.</li>
+  <li>Future questions return a <b>guess</b>, and politeness bends the guess
+  toward yes.</li>
+  <li>Three rules: their life not your idea · specifics in the past not the
+  future · talk less.</li>
+  <li>Do not describe your idea first. It turns a witness into a critic.</li>
+  <li>Rank evidence by what it cost them to say. Compliments are free, so they
+  prove nothing.</li>
+  <li>Find out who holds the money before you build for the person who feels the
+  pain.</li>
+  <li>This finds out if the <b>problem</b> is real. It cannot tell you if your
+  solution is good.</li>
+</ul>
+<p class="one-thing">If you remember one thing: if the word "would" is in your
+evidence, you do not have evidence.</p>
+</div>
+
+<div class="ask">
+  Send me your three pages of notes. I will mark every line as fact or applause,
+  and show you the questions you nearly asked well. <b>The best question is the
+  one you think is too basic to ask.</b>
+</div>
+
+<div class="footer-nav">
+  <span><a href="0001-the-founding-engineer-job.html">← F1 — The job is not writing code</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0003-choosing-which-problem.html">F3 — Choosing which problem →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "Why is \"would you pay for this?\" a weak question?",
+    options: [
+      "It asks them to predict themselves",
+      "It sounds too direct for strangers",
+      "It reveals your own idea too early",
+      "It skips the price of competitors"
+    ],
+    answer: 0,
+    why: "Predicting your own future behaviour is hard, and kindness then bends the guess toward yes. Ask what they spend today instead — that already happened."
+  },
+  {
+    q: "Which answer is the strongest evidence you can get?",
+    options: [
+      "They introduce you to a peer",
+      "They say the idea sounds great",
+      "They ask for one more feature",
+      "They say that they would use it"
+    ],
+    answer: 0,
+    why: "Rank evidence by what it cost the person. A referral spends their reputation. A compliment costs nothing, so it proves nothing."
+  },
+  {
+    q: "Why should you not describe your idea at the start?",
+    options: [
+      "It turns a witness into a critic",
+      "It gives your competitors an advantage",
+      "It makes the meeting run much longer",
+      "It stops them asking for features"
+    ],
+    answer: 0,
+    why: "Once they know the idea, they talk about your idea instead of their own life. Their life is the only part you cannot get anywhere else."
+  },
+  {
+    q: "The Mom Test tells you whether:",
+    options: [
+      "the problem is real",
+      "your solution is good",
+      "the price is correct",
+      "the market is large"
+    ],
+    answer: 0,
+    why: "It is a problem instrument, not a solution instrument. Whether your solution works only shows up when people use it, which is Track 3."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "Opening a call with a stranger. What is your first sentence?",
+    answer: "\"Thanks for the fifteen minutes. I am not selling anything and I do not have a product. I am trying to understand how people in your job handle [the area]. Can you walk me through the last time you had to do it?\" Why: saying you are not selling relaxes them. The last-time question starts you in the past."
+  },
+  {
+    prompt: "They say \"that sounds like a great idea\". What do you say next?",
+    answer: "\"Thank you — can I ask about the last time it came up for you? What did you do that day?\" You accept the compliment in three words and move straight back to the past. Never argue with a compliment and never write it down as evidence."
+  },
+  {
+    prompt: "How do you find out who really holds the budget?",
+    answer: "\"If you decided tomorrow that you wanted a tool for this, who else would have to say yes?\" It is still a question about their world, not about my idea, and it names the decision path without sounding like a sales question."
+  },
+  {
+    prompt: "A founder says \"we talked to twenty users and they all loved it\". What is your reply?",
+    answer: "\"What did any of them do after the call?\" Loving it is free. I want to know who changed something: sent a colleague, sent money, sent their spreadsheet. If nobody did anything, twenty conversations produced no evidence."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

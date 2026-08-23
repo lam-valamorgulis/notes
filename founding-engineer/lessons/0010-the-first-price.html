@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L2 — The first price</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 3 · Live · Lesson L2</p>
+<h1>The first price</h1>
+<p class="subtitle">Charging is a test, not a reward for finishing. Free usage
+proves less than you think.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>explain it from first principles</i>.
+Why money is evidence and usage is not, derived rather than asserted.
+&nbsp;·&nbsp; <b>Tag:</b> <span class="pill core">core</span> item 10 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can set a first price with a written reason,
+  and ask a real person for money out loud without apologising for it.
+</div>
+
+<div class="note">
+  <span class="label">Weaker evidence than the rest of this course</span>
+  Be warned: this is the thinnest-sourced Lesson here. Almost everything published
+  on first pricing is experience and opinion, not measurement. The reasoning below
+  is derived from first principles where it can be, and where it rests on
+  practitioner advice it says so. Treat the numbers as starting points, never as
+  findings.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why money is evidence and usage is not</h2>
+
+<p>Start with the problem. You built something. Fifty people signed up and use it
+for free. Do you have a business?</p>
+
+<p>You cannot tell. This Lesson is about why, and what to do instead.</p>
+
+<h3>Step 1 — What makes a signal strong</h3>
+
+<p>Same rule as <a href="0002-the-mom-test.html">F2</a>, applied to a product
+instead of a conversation. A signal is strong in proportion to <b>what it cost the
+person to send it</b>.</p>
+
+<h3>Step 2 — Therefore free usage is a weak signal</h3>
+
+<p>Signing up for something free costs a minute of curiosity. It measures
+interest, and interest is abundant. It does not measure whether the problem is
+worth solving, because the person risked nothing by finding out.</p>
+
+<h3>Step 3 — Money is the cheapest strong signal available</h3>
+
+<p>There is one thing stronger than money: coming back for months. But that takes
+months. Money takes an afternoon and it costs the sender something real.</p>
+
+<p>So charging is not the final step after everything works. It is the fastest
+available test of whether anything works at all.</p>
+
+<div class="soundbite">
+  <span class="label">The reframe</span>
+  <p>Charging is not a reward for having finished. It is the cheapest strong test
+  you can run this week.</p>
+</div>
+
+<h3>Step 4 — Therefore a low price is not the safe choice</h3>
+
+<p>This step feels backwards, and it has two parts.</p>
+
+<p>First, a very low price hides the answer. If someone pays $3 a month, you have
+not learned whether the problem matters — only that it is not worth arguing about.
+The test loses its power exactly because it is cheap.</p>
+
+<p>Second, cheap customers cost more, not less. One practitioner counted his own
+support load by tier: his $9 customers filed about seven times as many requests as
+his $199 customers.<sup>1</sup></p>
+
+<p>That is one product, not a study. Treat it as a warning, not a law. The related
+finding is better attested: paying customers ask for far less support than free
+users.<sup>1</sup></p>
+
+<h3>Step 5 — What to price <i>on</i>: the value metric</h3>
+
+<p>Pick the thing that grows as the customer gets more value. That is the <b>value
+metric</b>, and getting it right matters more than getting the number
+right.<sup>1</sup></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You charge per…</th><th>Good when</th><th>Bad when</th></tr>
+  <tr>
+    <td>Seat / user</td>
+    <td>Value grows with team size</td>
+    <td>Teams share one login to avoid the cost — you taught them to cheat</td>
+  </tr>
+  <tr>
+    <td>Usage (rows, orders, jobs)</td>
+    <td>Value grows with volume</td>
+    <td>The bill is unpredictable and finance blocks it</td>
+  </tr>
+  <tr>
+    <td>Flat fee</td>
+    <td>You want a decision with no arithmetic</td>
+    <td>Your biggest customers pay the same as your smallest</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 6 — Therefore: derive the first number from what they already pay</h3>
+
+<p>You do not need a pricing model. You need one number, and you already collected
+the input for it in <a href="0002-the-mom-test.html">F2</a>: what does this problem
+cost them today?</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 274" role="img" aria-labelledby="l2title l2desc">
+  <title id="l2title">Deriving a first price from the existing workaround</title>
+  <desc id="l2desc">Start from what the problem costs them today. Three branches:
+  a person's time, another tool, or nothing at all. Each branch gives a different
+  starting price and a different warning.</desc>
+
+  <rect x="170" y="20" width="300" height="34" rx="5" class="dg-box"/>
+  <rect x="170" y="20" width="300" height="34" rx="5" class="dg-fill-accent" opacity="0.14"/>
+  <text x="320" y="41" class="dg-label dg-strong" text-anchor="middle">what does it cost them TODAY?</text>
+
+  <line x1="240" y1="54" x2="105" y2="96" class="dg-rule"/>
+  <line x1="320" y1="54" x2="320" y2="96" class="dg-rule"/>
+  <line x1="400" y1="54" x2="535" y2="96" class="dg-rule"/>
+
+  <rect x="20"  y="100" width="176" height="42" rx="5" class="dg-box"/>
+  <text x="108" y="118" class="dg-label dg-strong" text-anchor="middle">a person&rsquo;s hours</text>
+  <text x="108" y="134" class="dg-small" text-anchor="middle">4 hrs/week &times; their rate</text>
+
+  <rect x="232" y="100" width="176" height="42" rx="5" class="dg-box"/>
+  <text x="320" y="118" class="dg-label dg-strong" text-anchor="middle">another tool</text>
+  <text x="320" y="134" class="dg-small" text-anchor="middle">they already pay $X</text>
+
+  <rect x="444" y="100" width="176" height="42" rx="5" class="dg-box"/>
+  <text x="532" y="118" class="dg-label dg-strong" text-anchor="middle">nothing at all</text>
+  <text x="532" y="134" class="dg-small" text-anchor="middle">no budget exists yet</text>
+
+  <rect x="20"  y="160" width="176" height="56" rx="5" class="dg-box"/>
+  <rect x="20"  y="160" width="176" height="56" rx="5" class="dg-fill-good" opacity="0.16"/>
+  <text x="108" y="178" class="dg-small dg-strong" text-anchor="middle">price at a clear</text>
+  <text x="108" y="192" class="dg-small dg-strong" text-anchor="middle">fraction of that cost</text>
+  <text x="108" y="208" class="dg-small" text-anchor="middle">strongest starting point</text>
+
+  <rect x="232" y="160" width="176" height="56" rx="5" class="dg-box"/>
+  <rect x="232" y="160" width="176" height="56" rx="5" class="dg-fill-good" opacity="0.16"/>
+  <text x="320" y="178" class="dg-small dg-strong" text-anchor="middle">price near theirs</text>
+  <text x="320" y="192" class="dg-small" text-anchor="middle">a little under is fine while</text>
+  <text x="320" y="208" class="dg-small" text-anchor="middle">you are feature-poor</text>
+
+  <rect x="444" y="160" width="176" height="56" rx="5" class="dg-box"/>
+  <rect x="444" y="160" width="176" height="56" rx="5" class="dg-fill-warn" opacity="0.16"/>
+  <text x="532" y="178" class="dg-small dg-strong" text-anchor="middle">warning sign</text>
+  <text x="532" y="192" class="dg-small" text-anchor="middle">you may be creating a</text>
+  <text x="532" y="208" class="dg-small" text-anchor="middle">budget, not filling one</text>
+
+  <text x="20" y="240" class="dg-small">The right-hand branch is not fatal, but it is a much longer sale.</text>
+  <text x="20" y="256" class="dg-small">Know which branch you are on before you name a number.</text>
+</svg>
+<figcaption>You do not need a pricing model for the first price. You need to know
+what the problem costs them today — which you already asked about in F2.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say why free usage is weak evidence, and why a very low price is not the safe
+  option. Then say where the first number comes from.
+</div>
+
+<h3>Step 7 — Ask for the money, do not ask about it</h3>
+
+<p>"Would you pay for this?" is an F2 violation — a question about the future,
+answered by politeness. There is only one version of this question that returns a
+fact:</p>
+
+<div class="soundbite">
+  <span class="label">The only pricing question that returns data</span>
+  <p>"It is $40 a month. Shall I send you the link?"</p>
+</div>
+
+<p>Then be quiet. What happens next is your data: they pay, they negotiate, they
+ask a question, or they go quiet. All four are informative. A "yes, sounds
+reasonable" with no payment is not.</p>
+
+<h3>Step 8 — The first price is a hypothesis with a date on it</h3>
+
+<p>Write it down the same way you wrote your kill rule in
+<a href="0004-the-kill-rule.html">F4</a>: "$40/month, reviewed on 1 November 2026." A
+price you never revisit becomes permanent by accident, and the first price is
+almost always wrong.</p>
+
+<h3>Step 9 — Where this reasoning stops</h3>
+
+<p>Three limits, stated plainly.</p>
+
+<p><b>Not every product can charge on day one.</b> Products whose value depends on
+other people being there — marketplaces, social products — genuinely need free users
+first. Then usage really is your only early signal, and it is weak, and you have to
+live with that.</p>
+
+<p><b>Discounts to the first customer set your reference price.</b> Common advice
+is to price fairly so price is not the blocker for the reference
+account.<sup>1</sup></p>
+
+<p>SaaStr says the opposite about the cost: it thinks a first discount stops
+mattering once you have hundreds of customers, so give it and raise the price for
+the next ones. We think it sets the reference price. <b>That disagreement is our
+opinion, not a finding.</b></p>
+
+<p><b>The evidence here is practitioner experience.</b> Nobody has run a controlled
+trial on your first price. Hold these rules more loosely than the ones in Track 2.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b> support load of paying versus free
+users, and the value-metric-first argument:
+<a href="https://www.kalzumeus.com/2012/09/21/ramit-sethi-and-patrick-mckenzie-on-why-your-customers-would-be-happier-if-you-charged-more/">Patrick
+McKenzie, Kalzumeus — "why your customers would be happier if you charged more"</a>
+and <a href="https://saas.transistor.fm/episodes/saas-pricing-experts">Patrick Campbell
+on the value metric, <i>Build Your SaaS</i> episode 15</a> — hosted by Jon Buda and
+Justin Jackson; the value-metric line is Campbell's, not Walling's.
+First-customer pricing:
+<a href="https://www.saastr.com/is-it-a-good-idea-to-give-the-first-customers-of-a-new-saas-startup-a-discount-to-get-them-on-board">SaaStr</a>.
+All three are practitioner sources, not studies. Checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar slow">
+  <span class="who">Free forever, to "get traction" — fails quietly</span>
+  Four hundred sign-ups, no revenue, and a founder who believes the product is
+  working. Then charging starts and 396 of them leave. The number was never
+  evidence; it was curiosity, counted.
+  <p><b>The tell:</b> your best metric is a number of free accounts.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Priced on your cost, not their value</span>
+  Server bills plus a margin. That number has nothing to do with what the problem
+  is worth to the customer, and it is usually far too low — software costs almost
+  nothing to run and can save someone a day a week.
+  <p><b>The tell:</b> you can explain your price using your own expenses.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Asked instead of charged</span>
+  "Would you pay $50 for this?" Eleven yeses, one payment. You ran a politeness
+  survey. The fix is one sentence: name the price and offer the link.
+  <p><b>The tell:</b> your pricing evidence contains the word "would" — again.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">The friendly discount became the price</span>
+  You gave your first customer 70% off because they took a chance on you. Fair.
+  Then they recommended you to two others and quoted the discounted number, and
+  now that is what the market expects.
+  <p><b>The tell:</b> nobody has ever paid your list price.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://www.kalzumeus.com/2012/09/21/ramit-sethi-and-patrick-mckenzie-on-why-your-customers-would-be-happier-if-you-charged-more/">Patrick
+  McKenzie on charging more</a>. Old, and still the clearest writing on why
+  engineers underprice their own work. Read it for the argument, not the specific
+  numbers.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>People will happily use something free, because it costs them nothing to try.
+That tells you they were curious. It does not tell you the problem matters. Money
+costs them something, so it is the first honest answer you can get. Ask for it
+early, and ask by naming a price — not by asking whether they would pay one.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>You are busking. A crowd stops and claps. That feels great and means little. The
+coins in the hat are the measurement, because a coin costs the giver something and
+a clap does not.</p>
+
+<p><b>Where the analogy breaks.</b> A busker cannot ask the person who walked past
+why they did not pay. You can, and you must. Your refusals are half your data — the
+exact words of a "no thanks" usually name the reason, which is something no busker
+ever gets to hear.</p>
+
+<h3>The sticking point</h3>
+
+<p>Engineers feel that charging before the product is good is dishonest. That
+instinct is decent and it is aimed at the wrong thing.</p>
+
+<p>Charging for something that does not work is dishonest. Charging for something
+small that does work is normal. A small shop can sell one product and still be a
+real business.</p>
+
+<p>The honest version has three parts. Say plainly what it does and does not do.
+Name a price. Refund anyone unhappy without arguing. That is not a trick.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>monetise</code>, <code>willingness to pay</code>,
+  <code>value-based pricing</code>, <code>freemium</code>,
+  <code>conversion rate</code>. Plain version: "it does the Monday report and
+  nothing else yet. It is $40 a month. Their operations person spends about four
+  hours on it now, so it pays for itself in the first week."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why a very low first price can be
+  worse than a higher one.</p>
+  <p>Say it, then send it. I want both halves: what it does to the <b>signal</b>,
+  and what it does to <b>who shows up</b>. Most people only get the second.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"The whole reason to charge is that paying costs the person something, so their
+yes means something. At $3 a month it costs them almost nothing, so the yes goes
+back to being nearly free and I have not learned whether the problem matters. And
+the cheapest price attracts the people who want the most help for the least
+commitment, so I get a weaker signal and a heavier support load at the same time."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — derive the number <span class="needs">~90 min</span></span>
+  <ol>
+    <li>Open your <a href="0002-the-mom-test.html">F2</a> notes. For each person,
+    write what the problem costs them today, in money or in hours times a
+    plausible rate.</li>
+    <li>Decide which branch of the diagram you are on: their hours, another tool,
+    or nothing.</li>
+    <li>Write one price, one value metric, and one sentence of justification.</li>
+    <li>Add the review date: "reviewed on ____".</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> four lines — price, value metric, justification,
+  review date. Send them to me. If your justification mentions your server bill,
+  I will send it straight back.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — ask three people for money <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>Take three of the people from
+    <a href="0009-first-ten-users-by-hand.html">L1</a> who are actually using it.</li>
+    <li>Say the sentence: "It is $X a month. Shall I send you the link?" Then stop
+    talking.</li>
+    <li>Write down what happened, word for word. Especially the refusals and the
+    negotiations.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> three verbatim responses. This is the hardest
+  task in the course so far and it is the one with the highest information per
+  minute. A refusal here is worth ten compliments.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>A signal is strong in proportion to what it <b>cost the sender</b>. Free
+  usage costs a minute.</li>
+  <li>Money is the <b>cheapest strong signal</b>. Only long-term return is
+  stronger, and that takes months.</li>
+  <li>Charging is a <b>test</b>, not a reward for finishing.</li>
+  <li>A very low price weakens the signal <b>and</b> attracts the heaviest support
+  load.</li>
+  <li>The <b>value metric</b> — what grows as their value grows — matters more than
+  the number.</li>
+  <li>Derive the first number from what the problem <b>costs them today</b>.</li>
+  <li>Never ask "would you pay?". Say "it is $X, shall I send the link?" and then
+  be quiet.</li>
+  <li><b>All seven of these are practitioner experience, not measurement.</b> Hold
+  them loosely.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a yes with no payment attached is
+not a yes.</p>
+</div>
+
+<div class="ask">
+  Send me your four lines and your three verbatim answers. The negotiation attempts
+  are the most useful thing in that file — they tell you what people think it is
+  worth, which is different from what they said.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0009-first-ten-users-by-hand.html">← L1 — The first ten users</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0011-one-metric-that-matters.html">L3 — The one metric that matters →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "Free usage is weak evidence because signing up costs the person:",
+    options: [
+      "almost nothing at all",
+      "more time than expected",
+      "a small amount of trust",
+      "nothing until much later"
+    ],
+    answer: 0,
+    why: "Signal strength tracks what it cost the sender. A free sign-up measures curiosity, which is abundant, and curiosity is not the same as the problem mattering."
+  },
+  {
+    q: "Charging early is best understood as:",
+    options: [
+      "the cheapest strong test available",
+      "the reward for finishing the build",
+      "the start of the growth phase",
+      "the proof the product is ready"
+    ],
+    answer: 0,
+    why: "Only long-term return is stronger evidence, and that takes months to collect. Money takes an afternoon and it costs the sender something real."
+  },
+  {
+    q: "A very low first price is risky because it:",
+    options: [
+      "weakens the signal you wanted",
+      "reduces the revenue you need",
+      "raises the cost of support",
+      "makes raises harder to justify"
+    ],
+    answer: 0,
+    why: "At three dollars the yes is nearly free again, so you learn nothing. Support cost goes the other way — cheap tiers file more requests, not fewer."
+  },
+  {
+    q: "The only pricing question that returns real data is:",
+    options: [
+      "\"It is $40. Shall I send the link?\"",
+      "\"Would you pay $40 a month for this?\"",
+      "\"Does $40 a month feel about right?\"",
+      "\"What would you pay for this tool?\""
+    ],
+    answer: 0,
+    why: "The other three ask about the future and get answered by politeness. Naming the price and stopping produces a payment, a negotiation, a question, or silence."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "Ask a user for money. Say the exact words.",
+    answer: "\"It is $40 a month. Shall I send you the link?\" Then I stop talking and let the silence sit. Whatever comes next is my data — payment, a negotiation, a question, or nothing. What I must not do is fill the silence by discounting it myself."
+  },
+  {
+    prompt: "A founder wants to stay free until the product is better. What do you say?",
+    answer: "\"Then we will not know if it is better.\" Free sign-ups measure curiosity, and curiosity is cheap. I would rather charge four people something real now and learn the truth, than have four hundred free accounts that tell us nothing about whether this matters."
+  },
+  {
+    prompt: "A user says \"that is too expensive\". What is your reply?",
+    answer: "\"That is useful, thank you — what were you expecting?\" I do not discount in the moment. I want the number in their head, because that tells me what they think the problem is worth. Then I can decide whether my price is wrong or my positioning is."
+  },
+  {
+    prompt: "Someone says charging for an unfinished product is dishonest.",
+    answer: "\"Charging for something that does not work is dishonest. Charging for something small that works is normal.\" I say plainly what it does and does not do, I name the price, and I refund anyone unhappy without arguing. A stall sells one dish, not a menu."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

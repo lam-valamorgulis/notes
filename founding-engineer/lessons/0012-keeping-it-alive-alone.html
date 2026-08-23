@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L4 — Keeping it alive alone</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 3 · Live · Lesson L4</p>
+<h1>Keeping it alive alone</h1>
+<p class="subtitle">Three things, in order. Everything else written about
+reliability assumes a team you do not have.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>say why it was built this way, and
+what that choice gives up</i>. This Lesson is mostly about what you deliberately do
+not do. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 12 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can name the three pieces of operations work
+  worth doing when you are one person, in priority order, and say exactly what you
+  are skipping and why.
+</div>
+
+<div class="note">
+  <span class="label">A real gap in the literature</span>
+  Almost everything written about reliability assumes a team: on-call rotations,
+  error budgets, service level objectives, incident commanders. That writing is
+  good and it is not for you. The three-item list below is derived from the
+  quality boundary in <a href="0008-walking-skeleton-quality-boundary.html">B4</a>
+  and assembled from practitioner sources. It is weaker evidence than Track 2's
+  material, and it is said honestly rather than hidden.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Deriving the shortest honest list</h2>
+
+<h3>Step 1 — Every hour on operations is an hour not buying answers</h3>
+
+<p>You are one person. There is no separate infrastructure budget and no separate
+week. So the goal is not reliability. Reliability is a means.</p>
+
+<h3>Step 2 — The goal is: prevent the losses you cannot undo</h3>
+
+<p>Straight from the quality boundary in
+<a href="0008-walking-skeleton-quality-boundary.html">B4</a>. Reversible failures
+cost you an afternoon. Irreversible ones can remove the customer who was going to
+give you the answer.</p>
+
+<h3>Step 3 — So list the failures you cannot undo. There are three</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Irreversible loss</th><th>What it actually looks like</th></tr>
+  <tr>
+    <td><b>You lose the data</b></td>
+    <td>A bad migration, a wrong <code>DELETE</code>, a dropped table, a deleted
+    account. The customer's work is gone and no code fixes that.</td>
+  </tr>
+  <tr>
+    <td><b>You lose money, quietly</b></td>
+    <td>Charges that ran twice. Payments that never ran. Both fixable in code,
+    neither undoable in someone's bank account or in their opinion of you.</td>
+  </tr>
+  <tr>
+    <td><b>You lose trust, silently</b></td>
+    <td>It has been broken for nine days and nobody told you. You kept selling.
+    That is the one that ends relationships.</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 4 — Each of those maps to exactly one piece of work</h3>
+
+<figure class="figure">
+<svg viewBox="0 0 640 300" role="img" aria-labelledby="l4title l4desc">
+  <title id="l4title">Three layers of operations work, and what is skipped</title>
+  <desc id="l4desc">Three stacked layers: a restored backup at the bottom, errors
+  reaching a human in the middle, a deploy without fear at the top. A side column
+  lists all seven things that are deliberately skipped: on-call rotation, error
+  budgets and SLOs, multi-region failover, 99.99% uptime targets, incident
+  commanders, load testing, and a status page.</desc>
+
+  <!-- layers -->
+  <rect x="30" y="212" width="400" height="58" rx="6" class="dg-box"/>
+  <rect x="30" y="212" width="400" height="58" rx="6" class="dg-fill-good" opacity="0.24"/>
+  <text x="44" y="234" class="dg-label dg-strong">1 &middot; A BACKUP YOU HAVE RESTORED</text>
+  <text x="44" y="250" class="dg-small">not a backup that exists &mdash; one you put back, on purpose,</text>
+  <text x="44" y="263" class="dg-small">and timed. Stops: you lose the data.</text>
+
+  <rect x="30" y="140" width="400" height="58" rx="6" class="dg-box"/>
+  <rect x="30" y="140" width="400" height="58" rx="6" class="dg-fill-good" opacity="0.17"/>
+  <text x="44" y="162" class="dg-label dg-strong">2 &middot; ERRORS THAT REACH A HUMAN</text>
+  <text x="44" y="178" class="dg-small">to your phone, not to an inbox. Money paths and sign-up</text>
+  <text x="44" y="191" class="dg-small">first. Stops: you lose trust silently.</text>
+
+  <rect x="30" y="68" width="400" height="58" rx="6" class="dg-box"/>
+  <rect x="30" y="68" width="400" height="58" rx="6" class="dg-fill-good" opacity="0.10"/>
+  <text x="44" y="90"  class="dg-label dg-strong">3 &middot; A DEPLOY YOU ARE NOT AFRAID OF</text>
+  <text x="44" y="106" class="dg-small">one command, any day. Fear makes you batch, and big</text>
+  <text x="44" y="119" class="dg-small">batches are what cause the incidents.</text>
+
+  <text x="30" y="46" class="dg-label dg-strong">Do these three. In this order.</text>
+
+  <!-- skipped column -->
+  <line x1="452" y1="40" x2="452" y2="278" class="dg-rule" stroke-dasharray="4 4"/>
+  <text x="468" y="60" class="dg-label dg-strong">Skipped on purpose</text>
+  <text x="468" y="82"  class="dg-small">on-call rotation</text>
+  <text x="468" y="100" class="dg-small">error budgets, SLOs</text>
+  <text x="468" y="118" class="dg-small">multi-region failover</text>
+  <text x="468" y="136" class="dg-small">99.99% uptime targets</text>
+  <text x="468" y="154" class="dg-small">incident commanders</text>
+  <text x="468" y="172" class="dg-small">load testing</text>
+  <text x="468" y="190" class="dg-small">a status page</text>
+  <text x="468" y="216" class="dg-small dg-strong">These are team</text>
+  <text x="468" y="230" class="dg-small dg-strong">problems. You get</text>
+  <text x="468" y="244" class="dg-small dg-strong">to earn them.</text>
+</svg>
+<figcaption>Three layers, bottom up. The right-hand column is the part you have to
+be able to defend.</figcaption>
+</figure>
+
+<h3>Step 5 — Why the word is "restored", not "backed up"</h3>
+
+<p>An untested backup is a belief, not a backup. This failure is common, and it is
+usually found at the worst moment. The file exists, and it cannot be put back:
+wrong version, missing encryption key, missing extension, a schema that no longer
+matches.</p>
+
+<p>The standard practice is a <b>restore drill</b>: actually recover into a scratch
+environment and confirm the data is complete and usable. Guidance recommends doing
+it on a schedule.<sup>1</sup></p>
+
+<p>Writing down the failed attempts too is <b>our own addition</b>, and it is the
+part that pays. A failed restore found during a drill is a task. The same failure
+found during an incident is a crisis.</p>
+
+<p>Two numbers name what "restored" has to mean, and they are worth knowing by
+their real names:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Name</th><th>The question it answers</th><th>A sane first answer</th></tr>
+  <tr>
+    <td><b>RPO</b><br><span class="small">recovery point objective</span></td>
+    <td>How much recent work may we lose?</td>
+    <td>"Up to 24 hours" — so a nightly backup is enough.</td>
+  </tr>
+  <tr>
+    <td><b>RTO</b><br><span class="small">recovery time objective</span></td>
+    <td>How long may we be down while restoring?</td>
+    <td>"Up to 4 hours" — so a manual restore is enough.</td>
+  </tr>
+</table>
+</div>
+
+<p>The wider rule of thumb is <b>3-2-1</b>: three copies, on two kinds of storage,
+with one off-site. A modern version adds one immutable copy and zero errors on
+verified restores.<sup>1</sup> For a one-person product, your managed database's
+automatic backup plus one copy you can download is usually enough — <i>if</i> you
+have restored it.</p>
+
+<h3>Step 6 — Why errors must reach a <i>person</i></h3>
+
+<p>A silent failure is worse than an outage. During an outage nobody can use it and
+everybody knows. During a silent failure you keep selling something broken, and
+your customer finds out before you do.</p>
+
+<p>The first action, and the one with the biggest effect, is <b>error
+tracking</b>.<sup>2</sup> Install the SDK, deploy, and you have it.</p>
+
+<p>Then send the alerts somewhere that interrupts you. <b>The phone rule is ours,
+not the source's</b> — that post suggests email or Slack. We think an inbox is where
+alerts go to die.</p>
+
+<p>Then add uptime checks on the production URL and the one or two endpoints that
+matter.<sup>2</sup> Then structured logs on the paths where silence hurts most:
+payments, sign-up, third-party integrations.<sup>2</sup></p>
+
+<h3>Step 7 — Why a fearless deploy is operations work</h3>
+
+<p>This one looks like developer comfort and is not.</p>
+
+<p>If deploying is scary, you deploy less. If you deploy less, each deploy contains
+more changes. Smaller changes have a lower failure rate, which is the
+best-established finding in this whole Lesson.<sup>3</sup></p>
+
+<p>So fear of deploying <i>causes</i> outages, by a mechanism, one step
+removed.</p>
+
+<p>The bar is low: one command or one push, works on a Friday, and you can get
+back to the previous version. That is enough.</p>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Name the three irreversible losses and the one piece of work that stops each.
+  Then say why "restored" is the word that does the work in item one.
+</div>
+
+<h3>Step 8 — Write the panic note</h3>
+
+<p>One paragraph, saved somewhere you can find on your phone: how to check if it is
+up, where the logs are, how to roll back, how to restore. Its purpose is not
+completeness. Its purpose is to slow you down for thirty seconds so you think
+before typing under pressure.<sup>2</sup></p>
+
+<h3>Step 9 — Where this reasoning stops</h3>
+
+<p>The moment there is a second engineer, or customers who lose money when you are
+down, the skipped column starts to apply. Not all at once — but the boundary moves,
+exactly as it did in <a href="0008-walking-skeleton-quality-boundary.html">B4</a>.
+The list here is correct for one person with early users, and it is wrong for a
+company with a contract.</p>
+
+<p class="verified"><sup>1</sup> Restore drills, 3-2-1 and its modern variant, and
+recording failed attempts:
+<a href="https://www.uschamber.com/co/run/technology/3-2-1-backup-rule">the 3-2-1
+rule explained</a>,
+<a href="https://www.druva.com/learning-center/glossary/3-2-1-backup-rule">Druva's
+overview</a>, and
+<a href="https://www.momentslog.com/development/database-backup-restore-drill-checklist-how-to-prove-recovery-works-before-an-outage">an
+anonymous restore-drill checklist</a> — useful, but not an authority. RPO and RTO
+are standard industry terms.
+&nbsp;<sup>2</sup> Error tracking as the first step and the one with the biggest
+effect, plus uptime
+checks, structured logging on money and sign-up paths, and the one-paragraph
+incident note:
+<a href="https://dev.to/alexcloudstar/what-happens-after-you-vibe-code-production-observability-for-solo-developers-2iba">production
+observability for solo developers</a> — error tracking as the first step, and the
+one with the biggest effect. These are practitioner sources, not studies. Note that
+we <b>disagree with its day five</b>: we skip the status page until a customer has
+a contract. &nbsp;<sup>3</sup> On smaller changes failing less often:
+<a href="https://dora.dev/guides/dora-metrics/">DORA metrics</a> — deploy frequency
+and change failure rate. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar money">
+  <span class="who">The backup that exists and cannot be restored</span>
+  Nightly backups ran for eight months. On the day it mattered, the restore failed:
+  the dump was made with a newer version of the database than the one available, and
+  one extension was missing. The file was real. The recovery was not.
+  <p><b>The tell:</b> you cannot say how many minutes a restore takes, because you
+  have never done one.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">Alerts to an inbox nobody reads — fails quietly</span>
+  Error emails go to a shared address. There are two hundred of them. The one that
+  said payments had been failing since Tuesday is between two hundred that do not
+  matter.
+  <p><b>The tell:</b> your error emails are in a folder with a filter on it.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Alert fatigue, then silence</span>
+  You alerted on everything, got woken up for nothing three times, and muted the
+  channel. Now you have the cost of monitoring and none of the benefit. Two loud
+  alerts beat forty quiet ones.
+  <p><b>The tell:</b> you have muted a channel that was meant to wake you.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Friday fear, then the big release</span>
+  Nobody deploys on Friday, so Friday's work waits. Then Monday's release carries
+  four days of changes, and when it breaks you cannot tell which change did it. The
+  caution caused the incident.
+  <p><b>The tell:</b> your average release contains more than a day of work.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Do this next — the primary source</span>
+  There is no single great source for one-person operations, which is why this
+  Lesson says so at the top. The most useful thing is not reading:
+  <b>run a restore drill this week</b> and write down the number of minutes. That
+  number is worth more than any article on this subject, including this one.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>You are one person, so you cannot look after everything. Look after the things
+that cannot be fixed later. Data that is gone is gone. Money taken wrongly is
+already in someone's account. A product broken for a week without you knowing is
+already remembered. So: a backup you have actually put back, errors that reach your
+phone, and a deploy you are not scared of. Everything else can wait until there
+are more of you.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>A house needs a smoke alarm and a way out. It does not need a fire brigade
+living in the spare room. You need to know quickly, and you need to get out.</p>
+
+<p><b>Where the analogy breaks.</b> A smoke alarm has a test button, and pressing
+it proves it works. Your backup has no test button. Nothing tells you it is broken
+until you need it. So you have to schedule the test yourself, and that is the whole
+reason "restored" is in the name of item one.</p>
+
+<h3>The sticking point</h3>
+
+<p>People treat the skipped list as a backlog they are behind on. It is not a
+backlog. It is a set of decisions.</p>
+
+<p>An on-call rotation with one person is not a rotation. An error budget over
+eleven users is a number worked out from too few users to mean anything.
+Multi-region failover for a product that might be dead in six months spends the
+runway on a future you have not earned.</p>
+
+<p>Being able to say that out loud, calmly, in an interview, is a stronger signal
+than having built any of it.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>observability</code>, <code>SLO</code>, <code>error budget</code>,
+  <code>five nines</code>, <code>blameless post-mortem</code>,
+  <code>toil</code>. Plain version, with your own numbers: "I restored the
+  database into a scratch copy last Tuesday and timed it. Errors go to my phone. I
+  can deploy with one command and roll back with another."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why a backup you have never
+  restored does not count — and why being scared to deploy actually causes
+  outages.</p>
+  <p>Say it, then send it. The second half is the one people miss. I want the
+  mechanism: fear, batching, then blame.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"A backup file existing is not the same as being able to put it back — the
+version can be wrong, a key can be missing, the schema can have moved — and you
+find all of that out on the worst day unless you try it on a calm one. Being scared
+to deploy works the same way, one step removed: if deploying is frightening I do it
+less often, so each release carries more changes, and when something breaks I
+cannot tell which change did it. So the caution is what produced the outage."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — the restore drill <span class="needs">~2 hrs</span></span>
+  <ol>
+    <li>Take your production database backup and restore it into a scratch
+    database. A local one is fine.</li>
+    <li><b>Time it.</b> Start a timer when you begin and stop it when you can read
+    real data.</li>
+    <li>Write down everything you needed that you did not have to hand: the
+    version, the extensions, the key, the connection string, the roles.</li>
+    <li>Write your <b>RPO</b> and <b>RTO</b> in one line each, as sentences a
+    customer could read.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a number of minutes, and the list of things you
+  were missing. Send me both. Almost nobody's first drill is clean, and the missing
+  list is the actual output of this task.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — make an error reach your phone <span class="needs">~1 hr</span></span>
+  <ol>
+    <li>Add error tracking to the deployed product from
+    <a href="0008-walking-skeleton-quality-boundary.html">B4</a>. A free tier is
+    enough.</li>
+    <li>Route alerts to something that interrupts you, not to email.</li>
+    <li>Throw a real error on purpose, in production, and confirm the alert
+    arrives.</li>
+    <li>Then write the panic note: one paragraph — how to check it is up, where the
+    logs are, how to roll back, how to restore.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a screenshot of the test alert on your phone, and
+  the panic note. If the alert took more than five minutes to arrive, say so — that
+  delay is a real property of your setup and you should know it.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>The goal is not reliability. It is preventing the losses you <b>cannot
+  undo</b>.</li>
+  <li>Three irreversible losses: the <b>data</b>, <b>money</b> quietly, and
+  <b>trust</b> silently.</li>
+  <li>Three answers, in order: a <b>restored</b> backup · errors that reach a
+  <b>person</b> · a deploy you are not afraid of.</li>
+  <li>An untested backup is a belief. Run a drill, time it, write down what was
+  missing.</li>
+  <li><b>RPO</b> = how much work may be lost. <b>RTO</b> = how long you may be
+  down. Write both.</li>
+  <li>Fear of deploying <b>causes</b> outages: fear → bigger batches → you cannot
+  tell what broke it.</li>
+  <li>On-call, error budgets, multi-region and uptime targets are <b>skipped on
+  purpose</b>. Say why.</li>
+</ul>
+<p class="one-thing">If you remember one thing: you do not have a backup until you
+have put one back.</p>
+</div>
+
+<div class="ask">
+  Send me your restore time and your list of missing pieces. The missing list is
+  the interesting part — it is the outage you did not have.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0011-one-metric-that-matters.html">← L3 — The one metric that matters</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="../index.html">The Map — all 12 core Lessons →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "A backup does not count until you have:",
+    options: [
+      "restored it and timed it",
+      "copied it to two places",
+      "encrypted it at rest",
+      "scheduled it every night"
+    ],
+    answer: 0,
+    why: "The file existing is not the same as recovery working — wrong version, missing key, moved schema. You find that out on the worst day unless you try it on a calm one."
+  },
+  {
+    q: "Being scared to deploy causes outages because fear leads to:",
+    options: [
+      "bigger batches of changes",
+      "slower code review cycles",
+      "fewer tests being written",
+      "worse documentation habits"
+    ],
+    answer: 0,
+    why: "Deploy less often and each release carries more changes, so when it breaks you cannot tell which change did it. The caution produced the incident."
+  },
+  {
+    q: "A silent failure is worse than an outage because you:",
+    options: [
+      "keep selling something broken",
+      "lose more data every hour",
+      "cannot roll the release back",
+      "breach the uptime agreement"
+    ],
+    answer: 0,
+    why: "In an outage everyone knows. In a silent failure your customer finds out before you do, and that is what ends the relationship rather than the downtime."
+  },
+  {
+    q: "On-call rotations and error budgets are skipped because they are:",
+    options: [
+      "problems that need a team",
+      "features of larger platforms",
+      "expensive to buy correctly",
+      "hard to configure properly"
+    ],
+    answer: 0,
+    why: "A rotation of one is not a rotation, and an error budget over eleven users is arithmetic on noise. Skipping them is a decision you should be able to defend out loud."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "An interviewer asks how you run reliability with no team.",
+    answer: "\"Three things, in this order. A backup I have actually restored — and I know how long it takes, because I timed it. Errors that reach my phone, starting with payments and sign-up. And a deploy I can run any day, with a rollback.\" Why: then say what you skip on purpose. That is the part that shows judgement. Put your own restore time in place of mine."
+  },
+  {
+    prompt: "Someone asks why you have no status page or uptime target.",
+    answer: "\"Not yet — and on purpose. With this few users an uptime percentage is too small a sample to mean anything, and a status page is something I would add for a customer with a contract.\" Why: these are not things I am behind on. I will revisit both when there is a second engineer, or a customer who loses money when we are down."
+  },
+  {
+    prompt: "Explain RPO and RTO to a non-technical founder.",
+    answer: "\"Two questions. If the worst happens, how much recent work can we afford to lose? That is RPO. And how long can we be down while we put it back? That is RTO.\" Why: both numbers are choices, and they decide what we pay for. Fill in your own two numbers, not mine."
+  },
+  {
+    prompt: "You muted the alert channel because it was too noisy. What now?",
+    answer: "\"Then I have the cost of monitoring and none of the benefit.\" Why: I cut it to the two alerts that mean real money or real data is at risk. Those get unmuted. Everything else goes to a log I read when I choose to. Two loud alerts beat forty quiet ones."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

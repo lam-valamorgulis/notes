@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F1 — The job is not writing code</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 1 · Find · Lesson F1</p>
+<h1>The job is not writing code</h1>
+<p class="subtitle">Why a startup needs a founding engineer. Derived from one
+fact: the money runs out.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>explain it from first principles</i>.
+Also <i>say why it was built this way, and what that choice gives up</i>.
+&nbsp;·&nbsp; <b>Tag:</b> <span class="pill core">core</span> item 1 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> By the end of this page you can answer "what does
+  a founding engineer actually do?" in three sentences. Built from first
+  principles, not copied from a job advert.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Where this role comes from</h2>
+
+<p>Start with the problem, not the job title.</p>
+
+<p>A founder has an idea. Nobody knows if the idea is true. Talking about it does
+not settle anything. Somebody has to make it real enough for a stranger to use
+it, or refuse it. That is the problem this role was invented for. Now let us
+derive the rest.</p>
+
+<h3>Step 1 — What a startup is (accept this)</h3>
+
+<p>Steve Blank's definition does most of the work. A <b>startup</b> is a
+temporary organisation that <b>searches</b> for a repeatable, scalable business
+model. A <b>company</b> is a permanent organisation that <b>executes</b> a model
+it already has.<sup>1</sup></p>
+
+<p>Search and execute are opposite jobs. Remember that. Most mistakes in this
+course come from doing the second one while still in the first.</p>
+
+<h3>Step 2 — The money is a timer (accept this)</h3>
+
+<p>Searching costs money. The money is finite. Two numbers give you the timer:</p>
+
+<pre><code>runway (months) = cash in the bank / money burned per month</code></pre>
+
+<p>That is arithmetic, not strategy. A startup with $600k and $50k a month has
+twelve months. Not "about a year". Twelve.</p>
+
+<h3>Step 3 — So what does a month produce?</h3>
+
+<p>Here is the first real step. If the business model is unknown, then the useful
+output of a month is not features. It is <b>answers</b>.</p>
+
+<p>The company spends money and gets answers back. Did anyone want it? Will they
+pay? Do they come back? Every month you either bought an answer, or you did
+not.</p>
+
+<h3>Step 4 — Therefore the measure changes</h3>
+
+<p>If answers are the output, then the number that matters is <b>answers per
+month</b>. Not features per month. Not lines of code.</p>
+
+<p>Two engineers can ship at exactly the same speed and buy a very different
+number of answers. One builds four small things that each settle a question. The
+other builds one large thing that settles nothing until month fourteen.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 250" role="img" aria-labelledby="fig1title fig1desc">
+  <title id="fig1title">The same runway, two plans</title>
+  <desc id="fig1desc">Plan A is one long build whose single answer arrives after
+  the money runs out. Plan B is four short builds, each producing an answer
+  inside the runway.</desc>
+
+  <!-- money-runs-out line -->
+  <line x1="528" y1="34" x2="528" y2="212" class="dg-warn" stroke-dasharray="5 4"/>
+
+  <!-- Plan A -->
+  <text x="60" y="48" class="dg-label dg-strong">Plan A &mdash; one big build</text>
+  <rect x="60" y="56" width="546" height="22" rx="4" class="dg-box"/>
+  <rect x="60" y="56" width="546" height="22" rx="4" class="dg-fill-warn" opacity="0.18"/>
+  <circle cx="606" cy="67" r="5.5" class="dg-fill-warn"/>
+  <text x="60" y="97" class="dg-small">One answer. It lands after the money is gone.</text>
+
+  <!-- Plan B -->
+  <text x="60" y="127" class="dg-label dg-strong">Plan B &mdash; four small builds</text>
+  <rect x="60"  y="135" width="112" height="22" rx="4" class="dg-box"/>
+  <rect x="177" y="135" width="112" height="22" rx="4" class="dg-box"/>
+  <rect x="294" y="135" width="112" height="22" rx="4" class="dg-box"/>
+  <rect x="411" y="135" width="112" height="22" rx="4" class="dg-box"/>
+  <rect x="60"  y="135" width="112" height="22" rx="4" class="dg-fill-good" opacity="0.18"/>
+  <rect x="177" y="135" width="112" height="22" rx="4" class="dg-fill-good" opacity="0.18"/>
+  <rect x="294" y="135" width="112" height="22" rx="4" class="dg-fill-good" opacity="0.18"/>
+  <rect x="411" y="135" width="112" height="22" rx="4" class="dg-fill-good" opacity="0.18"/>
+  <circle cx="172" cy="146" r="5.5" class="dg-fill-good"/>
+  <circle cx="289" cy="146" r="5.5" class="dg-fill-good"/>
+  <circle cx="406" cy="146" r="5.5" class="dg-fill-good"/>
+  <circle cx="523" cy="146" r="5.5" class="dg-fill-good"/>
+  <text x="60" y="176" class="dg-small">Four answers. Every one lands before the timer stops.</text>
+
+  <!-- axis -->
+  <line x1="60" y1="200" x2="618" y2="200" class="dg-rule"/>
+  <line x1="60"  y1="200" x2="60"  y2="206" class="dg-rule"/>
+  <line x1="177" y1="200" x2="177" y2="206" class="dg-rule"/>
+  <line x1="294" y1="200" x2="294" y2="206" class="dg-rule"/>
+  <line x1="411" y1="200" x2="411" y2="206" class="dg-rule"/>
+  <line x1="528" y1="200" x2="528" y2="206" class="dg-rule"/>
+  <text x="60"  y="218" class="dg-small" text-anchor="middle">0</text>
+  <text x="177" y="218" class="dg-small" text-anchor="middle">3</text>
+  <text x="294" y="218" class="dg-small" text-anchor="middle">6</text>
+  <text x="411" y="218" class="dg-small" text-anchor="middle">9</text>
+  <text x="528" y="218" class="dg-small" text-anchor="middle">12</text>
+  <text x="60"  y="240" class="dg-small">months of runway</text>
+  <text x="528" y="240" class="dg-label-strong" text-anchor="middle">money runs out</text>
+</svg>
+<figcaption>Same team. Same speed. Same twelve months. The dot is the moment an
+answer arrives. Plan A bought one answer and it came too late to use.</figcaption>
+</figure>
+
+<h3>Step 5 — Therefore somebody has to make things real</h3>
+
+<p>An answer about your <b>solution</b> cannot come from a meeting. A stranger has
+to touch the thing and react. So the search needs a person who turns a vague idea
+into a real, usable thing, fast.</p>
+
+<p>Answers about the <b>problem</b> can come from conversations. That is Lesson
+<a href="0002-the-mom-test.html">F2</a>, and it needs no product at all.</p>
+
+<p>The person who makes things real is the <b>founding engineer</b>. This course's
+one-line version: the first person accountable for the company being able to
+<b>act</b>.<sup>2</sup></p>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the chain out loud, from the start: <b>startup is search → search costs
+  money → money is a timer → so a month must produce an answer → so someone must
+  make things real.</b> If a link is missing, read Step 1 to Step 5 again before
+  you go on.
+</div>
+
+<h3>Step 6 — Five consequences that follow, not opinions</h3>
+
+<p>Each of these follows from "the output is answers per month". None of them is a
+taste preference.</p>
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Because…</th>
+    <th>Therefore</th>
+  </tr>
+  <tr>
+    <td>Nobody has written the requirements yet</td>
+    <td>You sit in the customer calls yourself. Second-hand requests lose the
+    <i>why</i>, and the why is the part you build from.</td>
+  </tr>
+  <tr>
+    <td>Time spent learning a tool buys no answers</td>
+    <td>You pick tools you can already operate. Choosing a boring tool is a speed
+    decision. Lesson B3.</td>
+  </tr>
+  <tr>
+    <td>Software nobody can reach teaches nothing</td>
+    <td>You deploy something end to end on day one, however thin. Lesson B4.</td>
+  </tr>
+  <tr>
+    <td>Every line of code is written before you know the guess is true</td>
+    <td>You write less than you want. Cutting scope is the main skill. Lesson B2.</td>
+  </tr>
+  <tr>
+    <td>Some failures cannot be undone</td>
+    <td>You stay careful in a few places. Losing a customer's data removes the
+    person who was going to give you the answer.</td>
+  </tr>
+</table>
+</div>
+
+<p>Read that last row again. It is the line between fast and reckless. Lesson
+<a href="0008-walking-skeleton-quality-boundary.html">B4</a> calls it the
+<b>quality boundary</b>.</p>
+
+<h3>Step 7 — Where this reasoning stops being true</h3>
+
+<p>Name the limit, or the rule becomes a habit nobody can explain.</p>
+
+<p>All of the above holds <b>while the business model is unknown</b>. The day the
+model is found, the job flips from search to execute. Then the same habits turn
+into debt. Thin code becomes an outage. "Deploy anything" becomes an incident
+review.</p>
+
+<p>This is why some founding engineers struggle two years in. The job changed
+under them, and nobody announced it. Knowing that in advance is most of the
+value of this Lesson.</p>
+
+<div class="note">
+  <span class="label">Bare facts, not derivations</span>
+  Two things here are <b>convention</b>, not logic. First, the title. "Founding
+  engineer" is not a legal or standard role. It means different things at
+  different companies.
+  <p>Second, the equity. The two sources do not agree, and neither gives a single
+  range. Underdog.io reports 0.1% to 2%, with a median near 0.33%. FCTO quotes
+  1%&ndash;3% pre-seed, 0.5%&ndash;1.5% at seed, and 0.25%&ndash;0.75% at Series A.
+  The <b>stage</b> moves the number more than your negotiation does.</p>
+  <p class="verified"><b>Sourced:</b>
+  <a href="https://fcto.ai/guides/founding-engineer/">FCTO, "What Is a Founding
+  Engineer?"</a> and
+  <a href="https://underdog.io/blog/founding-engineer">Underdog.io, "Founding
+  Engineer: 2026 Guide"</a>. Both are vendor blogs, so treat the hiring advice as
+  marketing. Links checked 2026-08-23 &mdash; re-check before quoting a number.</p>
+</div>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://steveblank.com/2010/01/25/whats-a-startup-first-principles/">Steve
+Blank, "What's A Startup? First Principles."</a> and
+<a href="https://steveblank.com/2012/03/05/search-versus-execute/">"Search versus
+Execute"</a>. &nbsp;<sup>2</sup> The one-line
+version is <b>this course's wording</b>, not a quote. Role description drawn from
+<a href="https://fcto.ai/guides/founding-engineer/">the FCTO guide</a> ("takes full
+technical ownership of building the product") and
+<a href="https://newsletter.pragmaticengineer.com/p/thriving-as-a-founding-engineer">The
+Pragmatic Engineer, "Thriving as a Founding Engineer"</a> ("the first priority is to
+build something people want"). Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<p>Four ways this goes wrong in real life. Each one has a tell you can spot in
+your first week.</p>
+
+<div class="scar">
+  <span class="who">Execute-mode process in a search-mode company</span>
+  The team runs quarterly roadmaps, ticket estimates and velocity charts. Output
+  looks excellent. Answers per month: zero. Everyone is busy delivering a plan
+  that was written before anyone knew anything.
+  <p><b>The tell:</b> ask "what did we learn last month?" and get a list of
+  shipped features as the answer.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">Second-hand requirements — fails quietly</span>
+  The engineer never joins a customer call. The founder relays what was said.
+  Each relay drops the <i>why</i>, so the engineer builds the literal request.
+  This one is dangerous because nobody is unhappy until launch day.
+  <p><b>The tell:</b> you can describe <i>what</i> to build but not <i>who</i>
+  asked for it or what they do today instead.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Innovation tokens spent on plumbing</span>
+  Week one: a database nobody on the team has run, a framework released this
+  year, and a deploy tool with three blog posts about it. Three weeks of runway
+  went into learning tools. Zero answers bought. Lesson B3 covers this.
+  <p><b>The tell:</b> your last three days of work show up in your terminal
+  history, not in the product.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Careful in the reversible half</span>
+  Ninety-five percent test coverage on the interface. No database backup. Care
+  was spent where mistakes are cheap, and skipped where they are permanent. This
+  is the most common misread of "move fast".
+  <p><b>The tell:</b> you can name your test coverage number but not the last
+  time a backup was restored.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://newsletter.pragmaticengineer.com/p/thriving-as-a-founding-engineer">"Thriving
+  as a Founding Engineer: Lessons from the Trenches"</a> — The Pragmatic
+  Engineer. I have not found a better single account of this job. Read it after this page,
+  not before. You will recognise the reasoning instead of memorising the advice.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>A startup is a guess about what people want. The money in the bank is a timer.
+Your job is to turn the guess into something real, fast, so the answer arrives
+before the timer stops. Writing code is how you do the job. It is not the job.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>You are the first cook in a new restaurant that has no menu yet. You do not
+plan forty dishes. You cook one small dish, put it in front of a customer, and
+watch their face. Their face is the answer. Then you cook the next one.</p>
+
+<p><b>Where the analogy breaks.</b> A cook can throw the dish in the bin and the
+kitchen is unchanged. Software you ship stays. It keeps running, keeps costing
+money, keeps needing care. So "just try it" is cheaper for a cook than for you.
+That is why <b>small</b> matters more than <b>fast</b>.</p>
+
+<h3>The sticking point</h3>
+
+<p>Almost everyone hears "move fast" and thinks "be sloppy". That is the wrong
+reading, and it is the one that gets people fired.</p>
+
+<p>Speed comes from <b>cutting scope</b>. It does not come from cutting care.
+Cutting scope is reversible — you can add the feature next month. Losing a
+customer's data is not reversible. Same word, "fast", two very different
+decisions.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  If you use these in an interview without the plain version behind them, you
+  sound like you read about the job. <code>lean</code>, <code>iterate</code>,
+  <code>MVP</code>, <code>product-market fit</code>, <code>validate</code>,
+  <code>de-risk</code>. Say the plain thing instead: "we built the smallest
+  version to find out if anyone would use it."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in two or three sentences. Why does a startup need a
+  founding engineer at all? And why is that different from a normal engineering
+  job?</p>
+  <p>Say it out loud first, then write it, then send it to me. I am looking for
+  one specific thing: whether the <b>timer</b> appears in your answer. If it does
+  not, the reasoning has not landed yet.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"A startup does not know yet whether anyone wants its product. And it has a
+fixed amount of money to find out."</p>
+<p>"So what a month has to produce is an answer, not a feature. A founding engineer
+makes the idea real enough for a stranger to use it &mdash; fast enough that the
+answer arrives while there is still money left."</p>
+<p>"A normal engineering job optimises for correctness over years. This one
+optimises for learning speed. That is why the same person can be right in one job
+and wrong in the other."</p>
+<p>Three sentences. No jargon. The timer is in it.</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<p>These are the questions you will be asked, in an interview and on the job. Say
+each answer out loud before you reveal it. Reading a good answer feels like
+knowing it, which is the exact illusion to avoid.</p>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — find the guess <span class="needs">~90 min</span></span>
+  <ol>
+    <li>Find three startups that are hiring a founding engineer or a first
+    engineer right now. Use
+    <a href="https://www.workatastartup.com/">Work at a Startup</a>,
+    <a href="https://news.ycombinator.com/submitted?id=whoishiring">Hacker News
+    "Who is hiring"</a>, or
+    <a href="https://www.indiehackers.com/">Indie Hackers</a>.</li>
+    <li>For each one, write <b>the guess the whole company depends on</b>. Not
+    the product. The guess. Use this shape: <i>"We believe [who] will change
+    [what they do today] to get [what benefit]."</i></li>
+    <li>For each one, write the smallest thing that would test that guess, and
+    how many weeks it would take.</li>
+    <li>For each one, write the single question you would ask the founder in an
+    interview, aimed straight at the guess.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> one page. Three startups, twelve lines. Send it
+  to me. I will tell you which guesses you wrote as <i>products</i> instead of
+  guesses — that is the most common miss, and seeing it once fixes it.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — sixty seconds, out loud <span class="needs">~30 min</span></span>
+  <ol>
+    <li>Record a voice memo on your phone. Sixty seconds, one take.</li>
+    <li>Answer: "What does a founding engineer do, and why does the role exist?"</li>
+    <li>Listen back. Mark every jargon word you used from the list above.</li>
+    <li>Record it again with those words removed. Keep the second take.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> two recordings, and the second one is shorter
+  than the first. If it got longer, the jargon was hiding a gap in the
+  reasoning.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>A startup <b>searches</b> for a business model. A company <b>executes</b>
+  one it already has. Opposite jobs.</li>
+  <li><code>runway = cash / monthly burn</code>. The money is a timer, and the
+  timer sets every decision.</li>
+  <li>While the model is unknown, a month's real output is an <b>answer</b>, not
+  a feature.</li>
+  <li>So the measure is <b>answers per month</b>. Four small builds beat one big
+  build at identical speed.</li>
+  <li>A founding engineer is the first person accountable for the company being
+  able to <b>act</b>.</li>
+  <li>Fast means <b>small scope</b>, never less care. Cut features, not backups.</li>
+  <li>When the model is found, the job flips to execute, and these habits become
+  debt. Nobody will tell you the day it happens.</li>
+</ul>
+<p class="one-thing">If you remember one thing: the money is a timer, so your job
+is to buy answers with it — not features.</p>
+</div>
+
+<div class="ask">
+  Something unclear? Ask me. Send me your Task 1 page and your two recordings,
+  and I will tell you what is missing. <b>The best question is the one you think
+  is too basic to ask.</b>
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0002-the-mom-test.html">F2 — The Mom Test →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "While the business model is still unknown, a month's real output is:",
+    options: [
+      "answers about the guess",
+      "features shipped that month",
+      "code written that month",
+      "meetings held that month"
+    ],
+    answer: 0,
+    why: "The company spends money and gets answers back. Features are the means, not the output. Two teams shipping at the same speed can buy four answers or none."
+  },
+  {
+    q: "Why must the founding engineer sit in the customer calls?",
+    options: [
+      "Nobody has written requirements yet",
+      "Founders do not write things down",
+      "Customers describe features clearly",
+      "Sales needs technical help here"
+    ],
+    answer: 0,
+    why: "Nobody has written the requirements, because nobody knows them yet. A relayed request keeps the what and drops the why, and the why is what you build from."
+  },
+  {
+    q: "In a startup, moving fast means cutting:",
+    options: [
+      "the scope, not the care",
+      "the tests, not the scope",
+      "the meetings, not the tests",
+      "the price, not the scope"
+    ],
+    answer: 0,
+    why: "Cutting scope is reversible; you add the feature next month. Losing a customer's data is not reversible. Same word, two very different decisions."
+  },
+  {
+    q: "Once the business model is finally found, these habits become:",
+    options: [
+      "debt, because the job changed",
+      "policy, because they clearly worked",
+      "culture, because the team grew",
+      "process, because the tools matured"
+    ],
+    answer: 0,
+    why: "The job flips from search to execute. Thin code becomes an outage and 'deploy anything' becomes an incident review. Nobody announces the day it changes."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "What does a founding engineer actually do?",
+    answer: "A startup does not know yet if anyone wants its product, and it has a fixed amount of money to find out. So a month has to produce an <b>answer</b>, not a feature. My job is to make the idea real enough for a stranger to use it, fast enough that the answer arrives while there is money left."
+  },
+  {
+    prompt: "A founder hands you a twelve-month roadmap in week one. What do you say?",
+    answer: "\"Which part of this are we least sure about?\" Then: \"Can we test that part in three weeks instead of twelve months?\" Why: you are not refusing the roadmap. A plan written before we knew anything cannot be the plan we execute. Keep the tone curious, not clever."
+  },
+  {
+    prompt: "Someone proposes a brand new database in week one. What do you say?",
+    answer: "\"What does it give us that the database we already run does not, this month?\" Why: if the answer is about the future, it is not worth it now. Learning a tool buys no answers, and a tool we know fails in ways we already understand."
+  },
+  {
+    prompt: "Your team ships every week and learns nothing. How do you name the problem?",
+    answer: "\"We are executing, but we are still searching.\" We run a process built for a known business model while our model is still a guess. The fix is to make each piece of work end in a question it answers, and to say out loud what we learned last month."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

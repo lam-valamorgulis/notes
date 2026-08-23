@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Founding Engineer</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Reference · read again and again</p>
+<h1>Glossary</h1>
+<p class="subtitle">Every term this course uses, in plain words, with its source.
+If a Lesson and this page disagree, this page wins.</p>
+
+<div class="win">
+  <strong>How to use it.</strong> Two columns: the term, and what it means in plain
+  words. The third column says where it comes from. A term marked
+  <span class="pill alt">ours</span> is this course's own name for something real
+  that has no agreed name. Do not use those in an interview without explaining
+  them.
+</div>
+
+<h2>The shape of a startup</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>Startup</b></td>
+    <td>A temporary organisation that is <b>searching</b> for a business model it
+    can repeat and grow. It does not have one yet.</td>
+    <td><a href="https://steveblank.com/2010/01/25/whats-a-startup-first-principles/">Steve Blank</a></td>
+  </tr>
+  <tr>
+    <td><b>Company</b></td>
+    <td>A permanent organisation that <b>executes</b> a business model it already
+    has. The opposite job to a startup.</td>
+    <td><a href="https://steveblank.com/2012/03/05/search-versus-execute/">Steve Blank</a></td>
+  </tr>
+  <tr>
+    <td><b>Search mode / execute mode</b></td>
+    <td>The two states. In search you buy answers. In execute you deliver a plan.
+    Running execute-mode process while still searching is the classic failure.</td>
+    <td><a href="https://steveblank.com/2012/03/05/search-versus-execute/">Steve Blank</a></td>
+  </tr>
+  <tr>
+    <td><b>Burn rate</b></td>
+    <td>How much money the company spends in a month, after any income.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>Runway</b></td>
+    <td>How many months of life are left. <code>cash / burn rate</code>. This is
+    the timer that sets every decision.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>The guess</b> <span class="pill alt">ours</span></td>
+    <td>The one belief the whole company depends on. Written as: "we believe
+    [who] will change [what they do today] to get [what benefit]". Elsewhere it
+    is called the riskiest assumption.</td>
+    <td>This course</td>
+  </tr>
+  <tr>
+    <td><b>An answer</b> <span class="pill alt">ours</span></td>
+    <td>A fact about the guess that you did not have last month. The real output
+    of a month in search mode. Features are how you buy one.</td>
+    <td>This course</td>
+  </tr>
+  <tr>
+    <td><b>Product-market fit</b></td>
+    <td>Being in a good market with a product that market wants. Named by
+    <b>Andy Rachleff</b>, not by Marc Andreessen — Andreessen made it famous and
+    credited Rachleff.</td>
+    <td><a href="https://a16z.com/12-things-about-product-market-fit/">a16z</a>,
+    <a href="https://en.wikipedia.org/wiki/Product-market_fit">Wikipedia</a></td>
+  </tr>
+  <tr>
+    <td><b>Pivot</b></td>
+    <td>Changing the guess on purpose while keeping what you learned. Not the same
+    as giving up, and not the same as drifting.</td>
+    <td>Standard usage</td>
+  </tr>
+</table>
+</div>
+
+<h2>The role</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>Founding engineer</b></td>
+    <td>The first person accountable for the company being able to <b>act</b>:
+    turning a vague idea into a real thing a stranger can use. <b>That one-line
+    version is ours</b> — the sources say "takes full technical ownership of building
+    the product". Not a legal or standard title either; it means different things at
+    different companies.</td>
+    <td><a href="https://fcto.ai/guides/founding-engineer/">FCTO</a>,
+    <a href="https://newsletter.pragmaticengineer.com/p/thriving-as-a-founding-engineer">Pragmatic Engineer</a></td>
+  </tr>
+  <tr>
+    <td><b>Equity</b></td>
+    <td>A share of the company, given instead of cash. The sources disagree.
+    Underdog.io reports 0.1%&ndash;2%, median near 0.33%. FCTO quotes 1%&ndash;3%
+    pre-seed, 0.5%&ndash;1.5% seed, 0.25%&ndash;0.75% Series A. The <b>stage</b>
+    moves it more than your negotiation does.</td>
+    <td><a href="https://underdog.io/blog/founding-engineer">Underdog.io</a></td>
+  </tr>
+  <tr>
+    <td><b>Vesting</b></td>
+    <td>You earn your equity slowly over time, usually four years, instead of
+    getting it all on day one.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>Cliff</b></td>
+    <td>The date before which you earn nothing at all. Usually twelve months.
+    Leave at month eleven and you leave with zero.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>Dilution</b></td>
+    <td>Your percentage gets smaller each time the company sells new shares to
+    raise money. Normal, and worth understanding before you sign.</td>
+    <td>Standard usage</td>
+  </tr>
+</table>
+</div>
+
+<h2>Finding the problem</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>The Mom Test</b></td>
+    <td>A way to ask questions so that even your mother could not give you a
+    false yes. Three rules: talk about their life not your idea; ask about
+    specific past events not the future; talk less and listen more.</td>
+    <td><a href="https://www.momtestbook.com/">Rob Fitzpatrick</a></td>
+  </tr>
+  <tr>
+    <td><b>Customer interview</b></td>
+    <td>A conversation whose purpose is to learn, not to sell. If you described
+    your product, it was a pitch, not an interview.</td>
+    <td><a href="https://www.ycombinator.com/library/Iq-how-to-talk-to-users">YC</a></td>
+  </tr>
+  <tr>
+    <td><b>Compliment</b> (as a warning)</td>
+    <td>"That sounds great" is not data. It is politeness. Only past behaviour,
+    money, and time are data.</td>
+    <td><a href="https://mtlynch.io/book-reports/the-mom-test/">The Mom Test</a></td>
+  </tr>
+  <tr>
+    <td><b>Switching cost</b></td>
+    <td>What it costs someone to change how they work: learning time, risk,
+    explaining it to a colleague, admitting the old way was bad. A sale needs
+    <code>pain &gt; switching cost</code>.</td>
+    <td>Standard usage; the one-line condition is ours</td>
+  </tr>
+  <tr>
+    <td><b>Evidence ladder</b> <span class="pill alt">ours</span></td>
+    <td>Six rungs, ranked by what an answer cost the person to give: a compliment,
+    a guess about the future, a feature request, showing you their workaround, a
+    referral, money.</td>
+    <td>Rungs ours; ranking-by-cost is
+    <a href="https://www.momtestbook.com/">Fitzpatrick's</a></td>
+  </tr>
+  <tr>
+    <td><b>The kill rule</b> <span class="pill alt">ours</span></td>
+    <td>Written down before you start: the exact evidence that would make you
+    stop. Without it, the runway decides for you. Elsewhere this is called
+    <b>kill criteria</b>.</td>
+    <td>Name ours; the idea is Annie Duke, <i>Quit</i> (2022) &mdash;
+    <a href="https://x.com/AnnieDuke/status/1579891488221061120">"states and
+    dates"</a></td>
+  </tr>
+</table>
+</div>
+
+<h2>Building the smallest real thing</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>MVP</b><br><span class="small">minimum viable product</span></td>
+    <td>The smallest version that is still worth using once, by someone who is
+    not your friend. Not a demo, not a prototype. <span class="pill alt">ours</span>
+    &mdash; Lesson B2 says the usual definition is wrong before giving this one.</td>
+    <td>This course, built on
+    <a href="https://www.ycombinator.com/library/6f-how-to-plan-an-mvp">YC, Michael
+    Seibel</a></td>
+  </tr>
+  <tr>
+    <td><b>Appetite</b></td>
+    <td>How much time this work is <b>worth</b>, decided before you design it.
+    The opposite of an estimate: you fix the time and vary the scope.</td>
+    <td><a href="https://basecamp.com/shapeup">Shape Up</a></td>
+  </tr>
+  <tr>
+    <td><b>Shaping</b></td>
+    <td>Roughing out a solution before anyone commits to it — enough detail to
+    judge the risk, not enough to be a spec.</td>
+    <td><a href="https://basecamp.com/shapeup">Shape Up</a></td>
+  </tr>
+  <tr>
+    <td><b>Pitch</b></td>
+    <td>The one-page document you bet on. It names the problem, the appetite, the
+    solution, the <b>rabbit holes</b>, and what is deliberately not included.</td>
+    <td><a href="https://basecamp.com/shapeup">Shape Up</a></td>
+  </tr>
+  <tr>
+    <td><b>Rabbit hole</b></td>
+    <td>A part of the work that could quietly eat all the time. You name these in
+    the pitch so nobody discovers one in week five.</td>
+    <td><a href="https://basecamp.com/shapeup">Shape Up</a></td>
+  </tr>
+  <tr>
+    <td><b>Betting table</b></td>
+    <td>The meeting where pitches are chosen for the next cycle. There is no
+    backlog: what is not chosen is simply not done.</td>
+    <td><a href="https://basecamp.com/shapeup">Shape Up</a></td>
+  </tr>
+  <tr>
+    <td><b>Boring technology</b></td>
+    <td>Tools whose <b>failure modes</b> you already understand. That is the real
+    argument, not age or fashion.</td>
+    <td><a href="https://mcfunley.com/choose-boring-technology">Dan McKinley</a></td>
+  </tr>
+  <tr>
+    <td><b>Innovation token</b></td>
+    <td>You get about three novel choices in total. Every unfamiliar tool spends
+    one. Spend them where they win the company something.</td>
+    <td><a href="https://mcfunley.com/choose-boring-technology">Dan McKinley</a></td>
+  </tr>
+  <tr>
+    <td><b>Walking skeleton</b></td>
+    <td>A tiny version of the system that does one small job end to end, through
+    all the real pieces. Thin, ugly, deployed. The architecture and the features
+    then grow together.</td>
+    <td><a href="https://www.oreilly.com/library/view/97-things-every/9780596800611/ch60.html">Alistair Cockburn</a></td>
+  </tr>
+  <tr>
+    <td><b>Quality boundary</b> <span class="pill alt">ours</span></td>
+    <td>The line between "go fast here" and "be careful here". Fast wherever a
+    mistake can be undone. Careful wherever it cannot: lost data, lost money,
+    lost trust.</td>
+    <td>This course</td>
+  </tr>
+</table>
+</div>
+
+<h2>Users, money, staying alive</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>Do things that don't scale</b></td>
+    <td>Recruit your first users by hand, one at a time. It cannot last, and that
+    is fine. The unscalable work is research, not waste.</td>
+    <td><a href="https://paulgraham.com/ds.html">Paul Graham</a></td>
+  </tr>
+  <tr>
+    <td><b>One Metric That Matters</b><br><span class="small">OMTM</span></td>
+    <td>The single number worth watching at your current stage. Everything else
+    waits. Watching thirty numbers is the same as watching none.</td>
+    <td><a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>The five stages</b></td>
+    <td>Empathy, stickiness, virality, revenue, scale. Each stage has its own
+    OMTM. Chasing a later stage's metric early is a common trap.</td>
+    <td><a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>Retention</b></td>
+    <td>Do they come back without being asked? The hardest number to fake, and
+    the one that decides whether anything else is worth doing.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>Churn</b></td>
+    <td>The share of customers who leave in a period. The mirror of retention.</td>
+    <td>Standard usage</td>
+  </tr>
+  <tr>
+    <td><b>Cohort</b></td>
+    <td>A group of users who joined in the same period, measured over time. Stops
+    new sign-ups hiding the fact that older users left.</td>
+    <td><a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>Value metric</b></td>
+    <td>The thing you charge <i>per</i>, chosen so it grows as the customer's value
+    grows: a seat, a row, an order. Getting this right matters more than the
+    number.</td>
+    <td><a href="https://saas.transistor.fm/episodes/saas-pricing-experts">Patrick
+    Campbell</a></td>
+  </tr>
+  <tr>
+    <td><b>Stickiness</b></td>
+    <td>The stage name for "do people come back?". The number underneath it is
+    <b>retention</b>. Two words, one idea.</td>
+    <td><a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>Vanity metric</b></td>
+    <td>A number chosen because it always rises. Total sign-ups, total downloads.
+    It hides a fall, because the news is only in its slope.</td>
+    <td><a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>Squeeze-toy effect</b></td>
+    <td>Push hard on one metric and another gets worse. That is not failure &mdash;
+    the one that got worse tells you the next thing to work on.</td>
+    <td>Short name ours; idea from
+    <a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Lean Analytics</a></td>
+  </tr>
+  <tr>
+    <td><b>Show HN</b></td>
+    <td>A post on Hacker News showing something you made. Free, harsh, and the
+    fastest real test of whether your one-sentence pitch makes sense.</td>
+    <td><a href="https://news.ycombinator.com/show">Hacker News</a></td>
+  </tr>
+</table>
+</div>
+
+<h2>Running it alone</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Source</th></tr>
+  <tr>
+    <td><b>Restore drill</b></td>
+    <td>Actually putting a backup back, into a scratch database, on purpose, on a
+    calm day &mdash; and timing it. Until you have done this you do not have a
+    backup.</td>
+    <td><a href="https://www.uschamber.com/co/run/technology/3-2-1-backup-rule">standard practice</a></td>
+  </tr>
+  <tr>
+    <td><b>RPO</b><br><span class="small">recovery point objective</span></td>
+    <td>How much recent work you can afford to lose. "Up to 24 hours" means a
+    nightly backup is enough.</td>
+    <td>Standard industry term</td>
+  </tr>
+  <tr>
+    <td><b>RTO</b><br><span class="small">recovery time objective</span></td>
+    <td>How long you can be down while putting it back. "Up to 4 hours" means a
+    manual restore is enough.</td>
+    <td>Standard industry term</td>
+  </tr>
+  <tr>
+    <td><b>3-2-1</b></td>
+    <td>Three copies, on two kinds of storage, one of them off-site. The newer
+    3-2-1-1-0 adds one copy nothing can change, and zero errors on a verified
+    restore.</td>
+    <td><a href="https://www.druva.com/learning-center/glossary/3-2-1-backup-rule">standard rule</a></td>
+  </tr>
+  <tr>
+    <td><b>Panic note</b> <span class="pill alt">ours</span></td>
+    <td>One paragraph on your phone: how to check it is up, where the logs are, how
+    to roll back, how to restore. Its job is to slow you down for thirty seconds
+    before you type under pressure.</td>
+    <td>This course</td>
+  </tr>
+</table>
+</div>
+
+<h2>Words to avoid saying without the plain version</h2>
+
+<div class="jargon-check">
+  <span class="label">Jargon check</span>
+  These are all real terms. Used alone, they signal that you read about the job
+  instead of doing it. Always follow them with the plain sentence.
+  <code>lean</code>, <code>iterate</code>, <code>MVP</code>,
+  <code>product-market fit</code>, <code>validate</code>, <code>de-risk</code>,
+  <code>north star metric</code>, <code>growth hacking</code>,
+  <code>disruptive</code>.
+  <p>Plain version, for example: instead of "we validated the MVP", say "we built
+  the smallest version and eleven of the fifteen people we gave it to used it
+  again the next week."</p>
+</div>
+
+<p class="verified"><b>All links checked:</b> 2026-08-23. Terms marked
+<span class="pill alt">ours</span> are this course's own names, invented because
+the real thing had no agreed name. Everything else is sourced.</p>
+
+<div class="ask">
+  A term here that still does not make sense in plain words? Tell me which one.
+  A definition you cannot say out loud is a definition you do not have yet.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="../lessons/0001-the-founding-engineer-job.html">F1 — The job is not writing code</a></span>
+</div>
+
+</div>
+</body>
+</html>

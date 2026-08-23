@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F4 — The kill rule</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 1 · Find · Lesson F4</p>
+<h1>The kill rule</h1>
+<p class="subtitle">Decide how you will stop, before you start. Written while you
+are still calm about the idea.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>predict how it behaves in a case
+you have never seen</i>. A kill rule is a prediction you write down, then check.
+&nbsp;·&nbsp; <b>Tag:</b> <span class="pill core">core</span> item 4 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can write a stopping condition in one
+  sentence that a stranger could check without asking you anything. And you can
+  say why writing it early is not pessimism.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why the decision must be made in advance</h2>
+
+<p>Start with the failure this prevents. A team spends nine months on a product
+that six people use. Everyone can see it is not working. Nobody stops. The money
+runs out, and the money makes the decision.</p>
+
+<p>That is not a courage problem. It is a timing problem, and it has a mechanism.</p>
+
+<h3>Step 1 — Building creates attachment</h3>
+
+<p>When you have spent four months on something, your judgement about it changes.
+The effort already spent starts to feel like a reason to continue. This is the
+<b>sunk cost fallacy</b>. It is standard behavioural economics, with a long
+research record.<sup>1</sup></p>
+
+<p>Knowing about it helps less than you hope. Training can reduce the effect. It
+does not remove it, and it is weakest on your own project.<sup>1</sup></p>
+
+<h3>Step 2 — Therefore a decision made after building is a biased decision</h3>
+
+<p>A decision made <i>before</i> building is free of that one bias. It has other
+biases. It does not have this one.</p>
+
+<p>Same person, same brain, different amount of sunk cost in the room. So move the
+decision earlier in time.</p>
+
+<h3>Step 3 — Therefore write the stopping condition first</h3>
+
+<p>Before the build starts, you write what result would make you stop. That
+written sentence is your <b>kill rule</b>. Your calm self is making a decision on
+behalf of your attached future self.</p>
+
+<h3>Step 4 — A rule that cannot be checked is not a rule</h3>
+
+<p>"If it is not working, we stop" is a wish. To be a rule it needs three parts:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Part</th><th>Why it is required</th><th>Bad</th><th>Good</th></tr>
+  <tr>
+    <td>A <b>number</b></td>
+    <td>So two people cannot disagree about whether it happened</td>
+    <td>"decent usage"</td>
+    <td>"8 of 15 come back in week two"</td>
+  </tr>
+  <tr>
+    <td>A <b>date</b></td>
+    <td>So the decision happens instead of drifting</td>
+    <td>"once we have data"</td>
+    <td>"on 14 October"</td>
+  </tr>
+  <tr>
+    <td>An <b>action</b></td>
+    <td>So the outcome is not just a feeling</td>
+    <td>"reconsider"</td>
+    <td>"pivot to the second problem on the list"</td>
+  </tr>
+</table>
+</div>
+
+<p>Annie Duke calls this idea <b>kill criteria</b>, and her pattern is "states and
+dates": if by this date I have not reached this state, I quit.<sup>3</sup> Fill this
+template and you have one:</p>
+
+<pre><code>By &lt;date&gt;, if &lt;measurable thing&gt; is not at least &lt;number&gt;,
+we &lt;pivot to X | kill it&gt;.</code></pre>
+
+<h3>Step 5 — The date is not optional, and it is the part people skip</h3>
+
+<p>Without a scheduled decision date, the decision never gets made on purpose.
+It gets made by exhaustion or by an empty bank account. Eric Ries's version of
+this is a recurring <b>pivot-or-persevere meeting</b>, held on a fixed schedule,
+where the team looks at the numbers and picks one of the paths.<sup>2</sup></p>
+
+<h3>Step 6 — There are three outcomes, not two</h3>
+
+<p>This is where most people get it wrong. They think a kill rule means
+"continue or quit". There is a third path, and it is the one people leave out.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 250" role="img" aria-labelledby="f4title f4desc">
+  <title id="f4title">The scheduled decision, and its three paths</title>
+  <desc id="f4desc">A build period runs to a scheduled decision date. From that
+  date three paths lead out: persevere, pivot keeping what was learned, or kill.</desc>
+
+  <!-- timeline -->
+  <rect x="40" y="112" width="260" height="26" rx="4" class="dg-box"/>
+  <rect x="40" y="112" width="260" height="26" rx="4" class="dg-fill-accent" opacity="0.15"/>
+  <text x="170" y="130" class="dg-label" text-anchor="middle">build and measure</text>
+  <text x="40" y="102" class="dg-small">rule written HERE, before any code</text>
+
+  <!-- decision node -->
+  <circle cx="320" cy="125" r="13" class="dg-good" fill="none" stroke-width="2.5"/>
+  <text x="320" y="130" class="dg-small dg-strong" text-anchor="middle">?</text>
+  <text x="320" y="164" class="dg-small dg-strong" text-anchor="middle">the dated</text>
+  <text x="320" y="176" class="dg-small dg-strong" text-anchor="middle">decision</text>
+
+  <!-- three branches -->
+  <line x1="336" y1="118" x2="400" y2="60"  class="dg-good"/>
+  <line x1="336" y1="125" x2="400" y2="125" class="dg-good"/>
+  <line x1="336" y1="132" x2="400" y2="196" class="dg-warn"/>
+
+  <rect x="404" y="44"  width="200" height="32" rx="5" class="dg-box"/>
+  <text x="414" y="58"  class="dg-label dg-strong">PERSEVERE</text>
+  <text x="414" y="70"  class="dg-small">the number was met &mdash; keep going</text>
+
+  <rect x="404" y="109" width="200" height="32" rx="5" class="dg-box"/>
+  <text x="414" y="123" class="dg-label dg-strong">PIVOT</text>
+  <text x="414" y="135" class="dg-small">keep the learning, change the guess</text>
+
+  <rect x="404" y="180" width="200" height="32" rx="5" class="dg-box"/>
+  <text x="414" y="194" class="dg-label dg-strong">KILL</text>
+  <text x="414" y="206" class="dg-small">nothing here was worth keeping</text>
+
+  <text x="40" y="228" class="dg-small">The middle path is the one people forget to write down. A pivot is not a failure &mdash;</text>
+  <text x="40" y="240" class="dg-small">it is a cheaper way to reach the next guess, using what the first one taught you.</text>
+</svg>
+<figcaption>The rule is written before the build. The decision happens on a date
+you set in advance. Three paths lead out of it, and the middle one is the one
+people forget.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the three parts a kill rule must have, and the three paths out of the
+  decision. Then say why the decision has to be scheduled rather than triggered.
+</div>
+
+<h3>Step 7 — What to measure: the trap of the growing number</h3>
+
+<p>Choose the measured thing carefully, or the rule is decoration.</p>
+
+<p>Any cumulative total — total sign-ups, total downloads, total visits — only ever
+goes up. It hides a fall: the useful part is its slope, and reading a slope by eye
+is slow and easy to fool yourself about.</p>
+
+<p>So measure the slope directly. That is a rate.</p>
+
+<p>Use a <b>rate</b> or a <b>cohort</b> instead. Of the fifteen people who started
+in week one, how many were still there in week two? That number can fall, so it
+can speak. Lesson <a href="0011-one-metric-that-matters.html">L3</a> goes deep on
+this.</p>
+
+<h3>Step 8 — Where this reasoning stops being true</h3>
+
+<p>Two honest limits.</p>
+
+<p>First, a kill rule protects you from continuing too long. It does not protect
+you from quitting too early. If you set the bar at a level nothing new could
+reach in the time given, you set the rule so it will always fire. The number has to be
+the smallest result that would still be encouraging.</p>
+
+<p>Second, the evidence base here is thinner than elsewhere in this course. Most
+published writing on quitting versus pivoting is opinion and hindsight, not data.
+Ries's pivot-or-persevere meeting is the strongest named practice, and it is
+still a practice, not a finding.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b> the sunk cost fallacy is standard
+behavioural economics; see <a href="https://en.wikipedia.org/wiki/Sunk_cost">Sunk
+cost</a> for the overview and its literature. On whether training reduces it:
+Larrick, Morgan &amp; Nisbett (1990), "Teaching the Use of Cost-Benefit Reasoning
+in Everyday Life" &mdash; training <i>reduces</i> the effect, it does not remove it.
+&nbsp;<sup>2</sup> The pivot-or-persevere meeting and innovation accounting are
+from <a href="https://theleanstartup.com/book">Eric Ries, <i>The Lean
+Startup</i></a>. &nbsp;<sup>3</sup> <b>Kill criteria</b> and the "states and dates"
+pattern are Annie Duke's, from <i>Quit</i> (2022) — see
+<a href="https://x.com/AnnieDuke/status/1579891488221061120">her own summary</a>.
+"Kill rule" is this course's shorter name for the same idea. Links checked
+2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar">
+  <span class="who">No date, so it drifts</span>
+  The rule says "if usage does not pick up we will rethink". There is no day on
+  which anyone is required to look. Six months pass. Everyone privately knows and
+  nobody has to say it.
+  <p><b>The tell:</b> the rule contains no calendar date.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">A number that can only go up — fails quietly</span>
+  The gate is "500 sign-ups". You reach it, so you persevere. Nobody notices that
+  of the 500, eleven came back a second time. The rule passed and told you
+  nothing, which is worse than having no rule, because now you have false comfort.
+  <p><b>The tell:</b> the measured thing is a cumulative total.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">The gate moved after the fact</span>
+  You needed 8 of 15 returning. You got 4. So the story becomes "the 4 are really
+  engaged, and the onboarding was broken, so it does not count". Every part of
+  that may be true. It is also exactly what the bias predicted you would say.
+  <p><b>The tell:</b> the reason for continuing was invented after seeing the
+  result.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Killed the company when only the guess was wrong</span>
+  The rule fired, and the team shut everything down. But they had a group of
+  users who trusted them and a real understanding of an industry. Both were
+  thrown away with the product. That is the pivot path, missed.
+  <p><b>The tell:</b> your rule had two outcomes written in it instead of
+  three.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://theleanstartup.com/book"><i>The
+  Lean Startup</i> by Eric Ries</a>, the chapters on innovation accounting and on
+  pivoting. Read it for the mechanism: baseline, tune, then a scheduled decision.
+  Skip the parts that read as motivation.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>Once you have worked on something for months, you cannot judge it fairly. The
+time you already spent starts to feel like a reason to keep going. So make the
+decision early, while you can still think clearly: write down the result that
+would make you stop, put a date on it, and say what you will do instead.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>It is a stop-loss order. A trader decides the exit price <i>before</i> buying,
+because nobody thinks clearly while watching their own money fall.</p>
+
+<p><b>Where the analogy breaks.</b> A share price is one clean public number that
+updates every second. A startup's signal is messy, slow and partly your own
+choice of what to measure. So a kill rule needs something a stop-loss does not:
+you must also name <b>which number</b> and <b>how it is measured</b>, or you will
+argue about that instead of about the decision.</p>
+
+<h3>The sticking point</h3>
+
+<p>People think writing a kill rule shows you do not believe in the idea. It is
+the exact opposite, and this is worth saying out loud in an interview.</p>
+
+<p>A kill rule is what lets you commit completely. You can work at full speed for
+twelve weeks without hedging. You already know what happens at the end of them.</p>
+
+<p>Without a rule you would be checking your own doubt every week. With one, you
+are not.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>fail fast</code>, <code>de-risk</code>, <code>validated learning</code>,
+  <code>stage gate</code>, <code>north star</code>. Plain version: "we agreed on
+  1 August that if fewer than eight of the first fifteen users came back in
+  their second week, we would switch to the warehouse problem instead."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in two or three sentences why a kill rule has to be
+  written before the work starts, and why that is a sign of commitment rather
+  than doubt.</p>
+  <p>Say it out loud, then send it. I am checking whether you explain the
+  <b>mechanism</b> — why your judgement changes — not just that it does.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"After a few months of work, the effort I already spent starts to feel like a
+reason to continue, and knowing about that does not stop it happening. So the
+version of me that can judge this fairly is the one who has not started yet — I
+write the stopping condition then, and my later self just checks it. It is
+commitment, not doubt: I can push hard for twelve weeks without hedging, because
+the date and the number are already agreed."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — write your kill rule <span class="needs">~1 hr</span></span>
+  <ol>
+    <li>Take the winning problem from
+    <a href="0003-choosing-which-problem.html">F3</a>.</li>
+    <li>Fill the template: <i>"By [date], if [measurable thing] is not at least
+    [number], we [pivot to X | kill it]."</i></li>
+    <li>Check the measured thing is a rate or a cohort, never a cumulative
+    total.</li>
+    <li>Name the pivot destination now, by name. "We would think again" is not a
+    destination.</li>
+    <li>Sanity-check the number both ways. Is it low enough that a real early
+    product could reach it? Is it high enough that reaching it means
+    something?</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> one sentence a stranger could check without
+  asking you a single question. Send it to me. The most common fault is a number
+  that can only go up — I will catch that immediately.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — grade someone else's <span class="needs">~45 min</span></span>
+  <ol>
+    <li>Take one of the three startups you researched in
+    <a href="0001-the-founding-engineer-job.html">F1</a>.</li>
+    <li>Write the kill rule you think they <i>should</i> have, from the outside.</li>
+    <li>Then write what you think they are actually using instead, and which of
+    the four scars in Block 02 it matches.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> two written rules and a named scar. This is
+  interview practice as much as anything — "what would make you stop?" is a
+  question a good founder will ask you back.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Effort already spent starts to feel like a reason to continue. Knowing that
+  does not stop it.</li>
+  <li>So the fair decision is the one made <b>before</b> the build. Write the
+  rule then.</li>
+  <li>A rule needs three parts: a <b>number</b>, a <b>date</b>, an
+  <b>action</b>.</li>
+  <li>Schedule the decision. Without a date it never gets made on purpose — the
+  bank account makes it.</li>
+  <li>Three paths out, not two: persevere, <b>pivot</b>, kill. The middle one is
+  the one people forget.</li>
+  <li>Never gate on a cumulative total. A number that only rises can never say
+  stop.</li>
+  <li>A kill rule is what lets you commit hard, because you already know how it
+  ends.</li>
+</ul>
+<p class="one-thing">If you remember one thing: pick the number and the date while
+you still do not care very much.</p>
+</div>
+
+<div class="ask">
+  Send me your kill rule. I will try to break it — if I can argue my way past it
+  in one sentence, it is not a rule yet.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0003-choosing-which-problem.html">← F3 — Choosing which problem</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0005-appetite-not-estimate.html">B1 — Appetite, not estimate →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "Why write the stopping condition before the work starts?",
+    options: [
+      "Sunk cost has not accumulated yet",
+      "The team has more time available",
+      "The numbers are easier to predict",
+      "Investors prefer to see it early"
+    ],
+    answer: 0,
+    why: "After months of work, effort already spent feels like a reason to continue, and knowing about the bias does not remove it. The calm version of you decides for the attached version."
+  },
+  {
+    q: "A kill rule must contain a number, an action, and:",
+    options: [
+      "a date on the calendar",
+      "a note about the market",
+      "a list of the features",
+      "a budget for the quarter"
+    ],
+    answer: 0,
+    why: "Without a scheduled date the decision drifts and is eventually made by an empty bank account instead of by a person."
+  },
+  {
+    q: "Why is \"500 total sign-ups\" a broken gate?",
+    options: [
+      "It can only ever move upward",
+      "It is far too small a target",
+      "It ignores the marketing spend",
+      "It counts the wrong user type"
+    ],
+    answer: 0,
+    why: "A cumulative total hides a fall, because the news is in its slope. Measure the slope directly: of the first fifteen, how many returned in week two."
+  },
+  {
+    q: "The outcome most people leave out of their rule is:",
+    options: [
+      "pivot, keeping what you learned",
+      "kill, and start something new",
+      "persevere, with a longer runway",
+      "delay, and gather more data"
+    ],
+    answer: 0,
+    why: "Often the guess was wrong while the users, the domain knowledge and the relationships are still worth keeping. Shutting all of that down is the mistake the third path prevents."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder asks: \"what would make you stop working on this?\"",
+    answer: "\"Here is what I would want us to agree. If fewer than eight of our first fifteen users come back in week two, then on 14 October we switch to the second problem on the list.\" Why: I want that agreed now, while I still do not care very much. After four months my judgement about my own work is not reliable."
+  },
+  {
+    prompt: "The rule fired and the team wants to explain the number away. What do you say?",
+    answer: "\"Everything you are saying might be true. It is also exactly what we predicted we would say.\" Then: \"We agreed this number in March. If we change it now, let us write down that we changed it, why, and the next date.\" Why: you are not blocking. You are keeping the record honest."
+  },
+  {
+    prompt: "Someone says a kill rule shows you do not believe in the idea.",
+    answer: "\"It is the opposite. I can work at full speed for twelve weeks without hedging, because I already know what happens at the end of them.\" Why: without a rule I would be checking my own doubt every week. With one, I am not."
+  },
+  {
+    prompt: "How do you avoid setting a bar that guarantees you quit?",
+    answer: "I pick the smallest result that would still be encouraging, not the result that would be impressive. Then I check it from both sides. Could a rough first version really reach this in the time we gave it? And if it does reach it, does that mean anything?"
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

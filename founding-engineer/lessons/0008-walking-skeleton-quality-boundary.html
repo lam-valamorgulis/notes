@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B4 — The walking skeleton and the quality boundary</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 2 · Build · Lesson B4</p>
+<h1>The walking skeleton and the quality boundary</h1>
+<p class="subtitle">Deploy something thin on day one. Then go fast everywhere
+except where a mistake cannot be undone.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>predict how it behaves in a case you
+have never seen</i>. The quality boundary is a rule you can apply to a decision
+nobody wrote about. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 8 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can answer "should I write a test for this?"
+  in five seconds, with a reason, for any piece of code in an early startup.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>What a first build has to prove, and where care belongs</h2>
+
+<h3>Part one — why the first build is thin and end to end</h3>
+
+<h3>Step 1 — Software nobody can reach teaches nothing</h3>
+
+<p>From <a href="0001-the-founding-engineer-job.html">F1</a>: the output is
+answers, and answers come from strangers touching the thing. Code on your laptop
+is worth zero answers. So being deployed is not a milestone at the end — it is a
+precondition for learning anything.</p>
+
+<h3>Step 2 — The riskiest part of a new system is the joins</h3>
+
+<p>Think about where new projects actually get stuck. Rarely in the business logic.
+Almost always in the seams: the deploy pipeline, environment variables, the
+database connection from the real host, the auth callback URL, the email provider
+refusing to send from a new domain.</p>
+
+<p>Each piece works alone. The system fails between the pieces.</p>
+
+<h3>Step 3 — Therefore build the thinnest complete path first</h3>
+
+<p>Alistair Cockburn's name for this is a <b>walking skeleton</b>: a tiny
+implementation of the system that performs one small end-to-end function, linking
+together the real main components.<sup>1</sup> Then the architecture and the
+features grow together, along a path that already works.</p>
+
+<p>For a web product, the first day looks like this:</p>
+
+<div class="diagram">a browser  →  one real route  →  one real write  →  the real database
+                                                    ↓
+              a visible result on a real URL  ←  one real read
+
+  deployed. on a domain. by a script you ran, not by hand.</div>
+
+<p>It does nothing useful. That is fine. Every seam in the system has now been
+crossed once, while the cost of fixing a seam is at its lowest.</p>
+
+<h3>Step 4 — A skeleton is not a prototype</h3>
+
+<p>Important distinction, and people get it wrong constantly. A <b>prototype</b> is
+built to be thrown away. A <b>skeleton</b> is the first version of the real thing:
+real components, real deploy, real database. Thin, not fake.</p>
+
+<h3>Part two — so where does care belong?</h3>
+
+<p>Now the harder half. "Go fast" cannot mean "never be careful", or you lose
+customer data in month two. So we need a rule that says <b>where</b>. Let us derive
+one instead of using taste.</p>
+
+<h3>Step 5 — Two questions decide it</h3>
+
+<p>For any possible mistake, ask two things:</p>
+
+<ol>
+  <li><b>How bad is it if this goes wrong?</b></li>
+  <li><b>Can it be undone?</b></li>
+</ol>
+
+<p>The second question is the one that does the work, and it is the one people
+forget. A bad-but-reversible mistake costs you time. A small-but-permanent one can
+cost you the customer who was going to give you the answer.</p>
+
+<h3>Step 6 — Therefore reversibility decides first, and cost decides second</h3>
+
+<figure class="figure">
+<svg viewBox="0 0 640 320" role="img" aria-labelledby="b4title b4desc">
+  <title id="b4title">The quality boundary</title>
+  <desc id="b4desc">A grid. The horizontal axis is whether a mistake can be
+  undone, with no on the left. The vertical axis is how bad it is, with worse at
+  the top. The whole left half — anything that cannot be undone, bad or small —
+  earns careful work. The bottom right, small and undoable, ships as it is.</desc>
+
+  <!-- axes -->
+  <line x1="70" y1="270" x2="610" y2="270" class="dg-rule"/>
+  <line x1="70" y1="30"  x2="70"  y2="270" class="dg-rule"/>
+  <text x="340" y="298" class="dg-small" text-anchor="middle">can it be undone?&nbsp;&nbsp;&larr; no &nbsp;&middot;&nbsp; yes &rarr;</text>
+  <text x="20" y="150" class="dg-small" text-anchor="middle" transform="rotate(-90 20 150)">how bad?&nbsp;&nbsp;&uarr; worse</text>
+
+  <!-- careful quadrant -->
+  <rect x="70" y="30" width="270" height="120" class="dg-fill-warn" opacity="0.13"/>
+  <text x="82" y="50" class="dg-label dg-strong">BE CAREFUL &mdash; the only place it is worth it</text>
+  <text x="82" y="70"  class="dg-small">customer data deleted or corrupted</text>
+  <text x="82" y="86"  class="dg-small">money charged twice, or not at all</text>
+  <text x="82" y="102" class="dg-small">personal data leaked</text>
+  <text x="82" y="118" class="dg-small">your first ten users lose trust</text>
+  <text x="82" y="138" class="dg-small dg-strong">tests &middot; backups &middot; idempotency &middot; review live HERE</text>
+
+  <!-- ship it quadrant -->
+  <rect x="345" y="155" width="265" height="112" class="dg-fill-good" opacity="0.15"/>
+  <text x="357" y="175" class="dg-label dg-strong">SHIP IT</text>
+  <text x="357" y="195" class="dg-small">ugly layout, bad naming</text>
+  <text x="357" y="211" class="dg-small">a missing feature</text>
+  <text x="357" y="227" class="dg-small">a slow page</text>
+  <text x="357" y="243" class="dg-small">a wrong guess about the flow</text>
+  <text x="357" y="261" class="dg-small dg-strong">none of these is permanent</text>
+
+  <!-- the other two, lightly -->
+  <text x="357" y="60" class="dg-small">bad but undoable &mdash; ship, then fix fast</text>
+  <text x="82" y="200" class="dg-small">small but permanent &mdash; still be careful</text>
+  <text x="82" y="216" class="dg-small">(a lost signup email is gone forever)</text>
+</svg>
+<figcaption>Speed and care are not opposites — they apply in different places. The
+axis that decides first is reversibility, not how bad it is. Note the bottom-left
+corner: small and permanent still earns care.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the two questions that place a mistake on the grid, and which one people
+  forget. Then name three things that live on the careful side for a product with
+  ten users.
+</div>
+
+<h3>Step 6b — Two things this rule does not cover</h3>
+
+<p>Be honest about the limits, or the rule turns into a slogan.</p>
+
+<p>It does not cover <b>how likely</b> the mistake is. A cheap, reversible bug that
+hits every user every day still deserves a test.</p>
+
+<p>It does not cover <b>how expensive the undo is</b>. Reversible in an afternoon
+and reversible in a week are not the same thing. A bad migration with a good backup
+is reversible and still costs you a day of downtime.</p>
+
+<p>So reversibility gets you the first answer, not the whole answer. Ask "can it be
+undone?" first, then "what would undoing it cost?"</p>
+
+<h3>Step 7 — What this rule actually decides for you</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Decision</th><th>The rule's answer</th></tr>
+  <tr>
+    <td>Should I write tests for the payment code?</td>
+    <td><b>Yes.</b> Wrong money movement is not undoable. This is the clearest
+    yes in the whole product.</td>
+  </tr>
+  <tr>
+    <td>Should I write tests for the settings page layout?</td>
+    <td><b>No.</b> Wrong layout is an afternoon. Ship it and look at it.</td>
+  </tr>
+  <tr>
+    <td>Should I add a backup before launch?</td>
+    <td><b>Yes,</b> and restore it once. Lost data is the definition of
+    irreversible. See <a href="0012-keeping-it-alive-alone.html">L4</a>.</td>
+  </tr>
+  <tr>
+    <td>Should the import be idempotent — safe to run twice?</td>
+    <td><b>Yes,</b> if running it twice would double or corrupt data. That is the
+    same question in different clothes.</td>
+  </tr>
+  <tr>
+    <td>Should I refactor this ugly module?</td>
+    <td><b>Not yet.</b> Ugly is reversible and cheap. Do it when it starts
+    causing the irreversible kind of bug.</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 8 — What "go fast" gives up, honestly</h3>
+
+<p>The reversible side really does get worse. Your code will be ugly, your naming
+will be inconsistent, and you will have three slightly different ways of doing the
+same thing. That is a genuine cost, paid later, in slower development.</p>
+
+<p>You accept it because the alternative — being careful everywhere — costs you the
+runway, and runway is the thing you cannot buy back. Say this out loud rather than
+pretending the trade is free.</p>
+
+<h3>Step 9 — Where this reasoning stops</h3>
+
+<p>The boundary moves as the company changes. When the business model is found and
+customers depend on you daily, more things become irreversible: an outage is now a
+lost contract, a bad release now reaches ten thousand people. The rule is the
+same; the answers change. That is the flip from search to execute in
+<a href="0001-the-founding-engineer-job.html">F1</a>, and this is exactly where
+founding engineers get caught out.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b> walking skeleton is
+<a href="https://www.oreilly.com/library/view/97-things-every/9780596800611/ch60.html">Alistair
+Cockburn's term</a> (needs an O'Reilly subscription; the definition first appeared
+in his <i>Crystal Clear</i>, 2004). His full sentence: "a tiny implementation of the
+system that performs a small end-to-end function. <b>It need not use the final
+architecture</b>, but it should link together the main architectural components."
+The stronger reading used here — real deploy, real database, no fakes — is
+<b>this course's own</b>; Cockburn allows the architecture to change later.</p>
+
+<p class="verified">The <b>quality boundary</b> is also this course's own rule. The
+nearest published framing is Apurva Chitnis in
+<a href="https://newsletter.pragmaticengineer.com/p/thriving-as-a-founding-engineer">The
+Pragmatic Engineer</a>: pick two of scope, quality and speed. He recommends cutting
+<i>scope</i> and keeping quality high. We cut quality instead, but only where a
+mistake can be undone. That difference is ours, and we are disagreeing with him on
+purpose. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar money">
+  <span class="who">Careful in the reversible half</span>
+  Ninety-five percent test coverage on the interface. No database backup. The care
+  went where mistakes are cheap and skipped where they are permanent. This is the
+  single most common misread of "move fast", and it looks like discipline from the
+  outside.
+  <p><b>The tell:</b> you can quote your coverage number but not the last time a
+  backup was restored.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">A skeleton that never left the laptop — fails quietly</span>
+  It works end to end locally, so it feels done. The real deploy is scheduled for
+  "when there is something to show". Then week six discovers the auth callback,
+  the environment variables and the email domain all at once, under pressure.
+  <p><b>The tell:</b> your skeleton has no public URL.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Careful everywhere, so nothing shipped</span>
+  Full test suite, clean architecture, three abstraction layers, and no users. The
+  work is genuinely good. It bought zero answers, and the runway does not care how
+  clean it was.
+  <p><b>The tell:</b> month two, and no stranger has used it.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Money code written at product speed</span>
+  The charge runs twice on a retry. A refund lands on the wrong customer. Both
+  fixable in code, neither undoable in the customer's bank account or in their
+  opinion of you.
+  <p><b>The tell:</b> nothing that touches money is safe to run twice.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://www.oreilly.com/library/view/97-things-every/9780596800611/ch60.html">"Start
+  with a Walking Skeleton" — Alistair Cockburn</a>, two pages (needs an O'Reilly
+  subscription). Then re-read the "Approaches for success" section of
+  <a href="https://newsletter.pragmaticengineer.com/p/thriving-as-a-founding-engineer">the
+  Pragmatic Engineer piece</a> with the grid in your head. Its "Tech debt" section
+  needs a paid subscription.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>On day one, build the thinnest thing that goes all the way through — a real page,
+a real save, a real address on the internet. It does not have to be useful. It has
+to be real, because that is where the hidden problems live. After that, work fast
+on anything you could fix in an afternoon, and be careful only where a mistake
+cannot be taken back.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>Before you build the bridge, you string a single rope across the river and walk
+it. Now you know how wide the river is, where the far bank is soft, and that the
+rope holds.</p>
+
+<p><b>Where the analogy breaks.</b> A rope and a real bridge have nothing in
+common structurally — the rope teaches you about the river, not about the bridge. A
+walking skeleton is the opposite: it uses the <b>real</b> components. That is the
+entire point. It teaches you about the bridge, because it is the first inch of the
+bridge.</p>
+
+<h3>The sticking point</h3>
+
+<p>People place mistakes on the grid by <b>how bad it feels</b> instead of
+<b>whether it can be undone</b>.</p>
+
+<p>That is why a slow page gets a week of work. A missing backup gets none. The
+slow page is visible and embarrassing every day. The missing backup is invisible
+until it is fatal.</p>
+
+<p>Read the two low-drama corners of the grid again. A lost sign-up email is small
+and permanent. That person is gone and you will never know their name. It belongs
+on the careful side.</p>
+
+<p>A crashing dashboard is loud and reversible, so it does not — unless it crashes
+in front of the person deciding whether to trust you. Then it has moved to the
+other side.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>technical debt</code>, <code>tech debt is fine</code>,
+  <code>move fast and break things</code>, <code>MVP quality</code>,
+  <code>good enough</code>. Plain version: "the layout is bad and I will fix it
+  next week. The import cannot run twice, and I wrote a test for that, because
+  running it twice would double every customer's data."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences how you decide whether a piece of
+  code in an early startup deserves a test — without using the words "important"
+  or "critical".</p>
+  <p>Say it, then send it. I am looking for <b>undone</b> or <b>reversible</b> in
+  your answer. If the answer is about how central the feature is, the rule has not
+  landed.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"I ask what happens if this is wrong, and then whether I could take it back. If
+the worst case is an ugly screen or a missing feature, I can fix that in an
+afternoon, so a test costs more than the mistake would. If the worst case is
+deleted data, double-charged money, or a leaked email address, then no amount of
+fixing afterwards undoes it — so that is where the test goes. The size of the
+feature does not come into it; only whether the damage is permanent."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — deploy a walking skeleton today <span class="needs">~3 hrs</span></span>
+  <ol>
+    <li>Using the stack you settled in
+    <a href="0007-boring-stack-innovation-tokens.html">B3</a>, build one route
+    that accepts one input.</li>
+    <li>Write it to a <b>real</b> database — not a file, not memory.</li>
+    <li>Read it back and show it on the page.</li>
+    <li>Deploy it to a real URL, using a command or a push. Not by dragging
+    files.</li>
+    <li>Open it on your phone, on mobile data, and add one row.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the URL, and a screenshot from your phone showing
+  the row you added. Send me the link. If any step took more than an hour, that
+  step was a seam — write down what it was, because that is what this task exists
+  to find.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — write your quality boundary <span class="needs">~1 hr</span></span>
+  <ol>
+    <li>Two lists for your product. <b>Fast</b>: at least five things you will do
+    quickly and fix later. <b>Careful</b>: exactly three things you will not.</li>
+    <li>Beside every item on the Careful list, write the sentence "if this goes
+    wrong, ______ cannot be undone".</li>
+    <li>Pin it where you will see it. This list is the thing you will be tempted
+    to break at 11pm.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the two lists. If your Careful list has seven
+  items, you have written a wish, not a boundary — three is the number that
+  survives contact with a real week.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Undeployed software buys zero answers. Being live is a precondition, not a
+  milestone.</li>
+  <li>New systems fail <b>between</b> the pieces. So cross every seam once, on day
+  one.</li>
+  <li>A <b>walking skeleton</b> is thin but real: real components, real database,
+  real URL.</li>
+  <li>A skeleton is not a prototype. A prototype is thrown away; a skeleton is
+  version one.</li>
+  <li>The <b>quality boundary</b> is set first by <b>reversibility</b>, then by
+  what the undo costs.</li>
+  <li>Careful side: lost data, wrong money, leaked personal data, the trust of
+  your first ten users.</li>
+  <li>The boundary moves as the company grows. More things become irreversible,
+  and nobody announces it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: go fast on anything you could fix
+in an afternoon, and only there.</p>
+</div>
+
+<div class="ask">
+  Send me the URL of your skeleton and your two lists. I will argue with your
+  Careful list — if I can move an item off it, it did not belong there.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0007-boring-stack-innovation-tokens.html">← B3 — Boring stack</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0009-first-ten-users-by-hand.html">L1 — The first ten users →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "A walking skeleton is thin but must be:",
+    options: [
+      "real, through every actual component",
+      "fast, through the important components",
+      "clean, through the tested components",
+      "small, through the finished components"
+    ],
+    answer: 0,
+    why: "New systems fail between the pieces, not inside them. Using real components and a real deploy is what makes the seams show up while they are cheap to fix."
+  },
+  {
+    q: "The line between fast and careful is drawn by:",
+    options: [
+      "whether the mistake can be undone",
+      "whether the feature is very central",
+      "whether the customer will notice it",
+      "whether the code is hard to write"
+    ],
+    answer: 0,
+    why: "A loud reversible bug costs an afternoon. A quiet permanent one can remove the customer who was going to give you the answer. Reversibility is the axis."
+  },
+  {
+    q: "A lost sign-up email belongs on the careful side because it is:",
+    options: [
+      "small but fully permanent",
+      "large but easily undone",
+      "small and quickly undone",
+      "large but highly visible"
+    ],
+    answer: 0,
+    why: "That person is gone and you will never learn their name. Low drama, zero recovery — which is exactly the corner of the grid people misread."
+  },
+  {
+    q: "A prototype differs from a walking skeleton because a prototype is:",
+    options: [
+      "built to be discarded",
+      "built with better tools",
+      "built for internal use",
+      "built without a database"
+    ],
+    answer: 0,
+    why: "A skeleton is the first version of the real thing and it keeps growing. Confusing the two leads to fake work that has to be rebuilt before anyone can use it."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder asks why you spent day one deploying something useless.",
+    answer: "\"It is empty on purpose — here is what it bought us today.\" Every hidden problem in a new system lives between the parts: the deploy, the environment variables, the database connection, the auth callback. I crossed all of those today, when they cost an hour each. In week six, under pressure, they cost a day each."
+  },
+  {
+    prompt: "\"Should we write tests?\" — answer it in two sentences.",
+    answer: "\"Where a mistake cannot be undone, yes. Everywhere else, not yet.\" Why: money, deletions, imports that could run twice, and personal data all get tests. Layout, naming and slow pages do not — I can fix those in an afternoon."
+  },
+  {
+    prompt: "It is 11pm and you want to skip the backup check before launch.",
+    answer: "\"No, this one is on the short list.\" I have three things I do not go fast on, and losing customer data is the first of them. Skipping it saves twenty minutes tonight and risks the only thing I genuinely cannot get back."
+  },
+  {
+    prompt: "The company grew and your old habits are now causing incidents. What do you say?",
+    answer: "\"The boundary moved and I did not move with it.\" More things are irreversible now — an outage is a lost contract, a bad release reaches ten thousand people. Same rule, different answers. I would rather say that out loud than defend habits that were correct last year."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

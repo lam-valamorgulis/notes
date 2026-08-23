@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B3 — Boring stack and innovation tokens</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 2 · Build · Lesson B3</p>
+<h1>Boring stack and innovation tokens</h1>
+<p class="subtitle">You get about three novel choices. A database is a terrible
+place to spend one.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>say why it was built this way, and
+what that choice gives up</i>. This is the clearest trade in the course: you buy
+one thing by giving up another. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 7 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can defend a boring stack to an excited team
+  without sounding old or lazy, using one question that ends the argument.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why "boring" is a speed argument</h2>
+
+<p>Here is the problem. This week you have to pick a language, a database, a host,
+a deploy method and five other things. You have no product, no users, and money
+running out.</p>
+
+<p>Every one of those choices is made with the least information you will ever
+have. And you will live with them for years.</p>
+
+<p>People think the answer is about taste, or about being cautious. It is not. It
+is an argument about time.</p>
+
+<h3>Step 1 — Every tool has two costs, not one</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Cost</th><th>When you pay it</th><th>Can you see it when choosing?</th></tr>
+  <tr>
+    <td>Learning it</td>
+    <td>The first week</td>
+    <td><b>Yes.</b> You can feel this one, so you plan for it.</td>
+  </tr>
+  <tr>
+    <td>Debugging it when it breaks strangely</td>
+    <td>A random Tuesday, later</td>
+    <td><b>No.</b> Invisible at choosing time, and much larger.</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 2 — The second cost is the one that matters</h3>
+
+<p>Learning a tool has a floor and a ceiling. You can guess it: days for a
+library, weeks for a database or a deploy system.</p>
+
+<p>Debugging an unfamiliar tool at the worst moment has no ceiling. You do not know
+how long it will take, because you do not know what is wrong. And you have no
+instinct to guide you.</p>
+
+<h3>Step 3 — What "boring" actually means</h3>
+
+<p>Dan McKinley's argument, and the clearest statement of this I have found: the point
+of boring technology is that its <b>failure modes are well understood</b>.<sup>1</sup>
+Not that it is old. Not that it is dull. When it breaks, the shape of the breakage
+is already known &mdash; and reading about a failure is not the same as having fixed
+one.</p>
+
+<h3>Step 4 — Therefore novelty is a risk budget</h3>
+
+<p>McKinley's name for it: <b>innovation tokens</b>. You get about three. Every
+unfamiliar tool spends one.<sup>1</sup> Spend them and you have no capacity left
+for surprises — and the product itself is going to be one big surprise.</p>
+
+<h3>Step 5 — Before you have a product, the budget is one, not three</h3>
+
+<p>McKinley's three is for a company that already has a business model. Before you
+have one, this course sets the budget at <b>one</b>. That number is ours, not his.</p>
+
+<p>The reason: a pre-product startup has no spare capacity at all, and the product
+itself is guaranteed to be a surprise.</p>
+
+<h3>Step 6 — The number that matters is per team, not per tool</h3>
+
+<p><b>This step is ours, not McKinley's.</b> He defines boring by maturity and wide
+use, and he lists Postgres as boring with no qualification. Here is the extension.</p>
+
+<p>"Boring" is not only a property of the tool. It is also a property of <b>the
+tool plus you</b>.</p>
+
+<p>Postgres is boring to most of the industry. If you have never run Postgres in
+production, it is not boring to <i>you</i> — it costs you a token. Meanwhile a
+framework the internet calls risky might be free for you, because you have shipped
+four products with it.</p>
+
+<p>So the honest question is not "is this boring?" It is "<b>have I run this in
+production before?</b>"</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 250" role="img" aria-labelledby="b3title b3desc">
+  <title id="b3title">Three tokens, two ways to spend them</title>
+  <desc id="b3desc">Plan A spends all three innovation tokens on infrastructure —
+  database, framework and deploy tool — leaving nothing for the product. Plan B
+  spends one on the hard part of the product and keeps two in reserve. A box at the
+  bottom gives the question to ask: what does this give us this month that the
+  boring option does not?</desc>
+
+  <text x="40" y="34" class="dg-label dg-strong">Plan A &mdash; tokens spent on plumbing</text>
+  <circle cx="60"  cy="62" r="13" class="dg-warn" fill="none" stroke-width="2"/>
+  <text x="60" y="66" class="dg-small" text-anchor="middle">1</text>
+  <circle cx="96"  cy="62" r="13" class="dg-warn" fill="none" stroke-width="2"/>
+  <text x="96" y="66" class="dg-small" text-anchor="middle">2</text>
+  <circle cx="132" cy="62" r="13" class="dg-warn" fill="none" stroke-width="2"/>
+  <text x="132" y="66" class="dg-small" text-anchor="middle">3</text>
+  <text x="158" y="58" class="dg-small">new database &middot; new framework &middot; new deploy tool</text>
+  <text x="158" y="72" class="dg-small dg-strong">left for the product: nothing</text>
+
+  <line x1="40" y1="100" x2="600" y2="100" class="dg-rule"/>
+
+  <text x="40" y="132" class="dg-label dg-strong">Plan B &mdash; one token, on the hard part</text>
+  <circle cx="60"  cy="160" r="13" class="dg-good" fill="none" stroke-width="2"/>
+  <text x="60" y="164" class="dg-small" text-anchor="middle">1</text>
+  <circle cx="96"  cy="160" r="13" class="dg-rule" fill="none" stroke-dasharray="3 3"/>
+  <text x="96" y="164" class="dg-small" text-anchor="middle">&mdash;</text>
+  <circle cx="132" cy="160" r="13" class="dg-rule" fill="none" stroke-dasharray="3 3"/>
+  <text x="132" y="164" class="dg-small" text-anchor="middle">&mdash;</text>
+  <text x="158" y="156" class="dg-small">the one thing customers actually pay for</text>
+  <text x="158" y="170" class="dg-small dg-strong">two tokens still in reserve for surprises</text>
+
+  <rect x="40" y="196" width="560" height="36" rx="5" class="dg-box"/>
+  <text x="52" y="212" class="dg-small dg-strong">The question that ends the argument:</text>
+  <text x="52" y="226" class="dg-small">"What does this give us THIS MONTH that the boring option does not?"</text>
+</svg>
+<figcaption>The tokens are a risk budget, not a fun budget. Spend them where a
+customer can feel the difference, and keep some back — the product itself is going
+to surprise you.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Say the two costs of any tool, and which one is invisible when you choose. Then
+  say what "boring" really means, in five words or fewer.
+</div>
+
+<h3>Step 7 — The question to ask out loud</h3>
+
+<div class="soundbite">
+  <span class="label">Say this in the meeting</span>
+  <p>"What does this give us <b>this month</b> that the boring option does not?"</p>
+</div>
+
+<p>The words "this month" do the work. Almost every argument for an exciting tool
+is about a future state: when we have scale, when we have a team, when the data
+model grows. Those are real arguments for a company that has found its business
+model. You have not found yours yet.</p>
+
+<h3>Step 8 — What the boring choice gives up</h3>
+
+<p>Be honest about the cost, or you are just being conservative and calling it
+reasoning. Boring choices give up three things:</p>
+
+<ul>
+  <li><b>Some real capability.</b> Sometimes the new tool genuinely does something
+  the old one cannot. When a customer can feel that difference, spend the token.</li>
+  <li><b>Some hiring appeal.</b> A few engineers only want to work on new
+  technology. You will not attract those people. Decide if you mind.</li>
+  <li><b>Some future rework.</b> The boring choice may need replacing at a scale
+  you may never reach. That is a good trade: a problem you have to earn is better
+  than one you invented.</li>
+</ul>
+
+<h3>Step 9 — Where this reasoning stops</h3>
+
+<p>Two limits.</p>
+
+<p>First, if the novel thing <b>is</b> the product — you are building a company
+around a new model, a new protocol, a new device — then it is not a token, it is
+the business. The rule applies to everything around it, not to it.</p>
+
+<p>Second, "boring" can be an excuse for a tool that genuinely cannot do the job.
+If you are fighting your database every week to make it do something normal, the
+cost has moved to the other side, and you should move with it.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://mcfunley.com/choose-boring-technology">Dan McKinley, "Choose
+Boring Technology" (2015)</a> — innovation tokens, and the failure-modes argument.
+<b>Two things here are ours, not his.</b> McKinley defines boring by maturity and
+wide use, not by your own experience — he lists Postgres as boring with no
+qualification. So the "have I run this in production?" test is this course's
+extension. So is dropping the budget from three tokens to one before you have a
+product. Links checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar money">
+  <span class="who">All three tokens on plumbing, week one</span>
+  A database nobody has run, a framework released this year, a deploy tool with
+  three blog posts about it. Three weeks of runway went into learning tools and
+  zero answers were bought. When the real surprise arrives, there is no capacity
+  left for it.
+  <p><b>The tell:</b> your last three days show up in your terminal history, not
+  in the product.</p>
+</div>
+
+<div class="scar slow">
+  <span class="who">"We will need it at scale" — fails quietly</span>
+  A choice justified by a load you do not have and may never have. It looks
+  responsible, so nobody challenges it. The cost lands months later as slow
+  development on every ordinary feature.
+  <p><b>The tell:</b> the justification is a sentence about the future with no
+  date in it.</p>
+</div>
+
+<div class="scar">
+  <span class="who">Boring by reputation, new to you</span>
+  You picked Postgres and Kubernetes because everyone calls them standard. You
+  have never operated either. Postgres is on McKinley's boring list; Kubernetes is
+  not, and being widely used is not the same thing. Either way, a tool you have
+  never run costs you a token.
+  <p><b>The tell:</b> you cannot say what you would check first if it went down
+  tonight.</p>
+</div>
+
+<div class="scar">
+  <span class="who">The choice was about you, not the product</span>
+  It is the tool you want on your CV, or the one you have been curious about.
+  That is a real and normal motivation, and it is not the company's money's
+  motivation.
+  <p><b>The tell:</b> you cannot finish the sentence "the customer gets ___ from
+  this choice".</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://mcfunley.com/choose-boring-technology">"Choose Boring
+  Technology" — Dan McKinley</a>. Fifteen minutes, and it is the core of the argument.
+  Pay attention to the section on failure modes: that is the part most summaries
+  drop, and it is the actual point.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>Every tool costs you twice: once to learn it, and once when it breaks in a
+strange way at a bad moment. The second cost is the big one and you cannot see it
+when you choose. So use tools you have used before, where you already know what
+breaking looks like. Keep your risk for the product, because the product is the
+thing that is really going to surprise you.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>You are driving in a foreign city at night, in the rain. You want the boring
+rental car — the one with the pedals where you expect them. The city is already
+the hard part; you do not need the car to be interesting too.</p>
+
+<p><b>Where the analogy breaks.</b> A rental car is a one-day commitment and you
+can swap it in an hour. A database is a multi-year commitment and swapping it is
+a project. So the real decision is heavier than the analogy suggests: choosing a
+boring car is cheap to undo, and choosing a boring database is a choice you are
+mostly stuck with.</p>
+
+<h3>The sticking point</h3>
+
+<p>Everyone hears "boring" as "old" or "worse". Both are wrong, and mixing them up
+loses the argument in the meeting.</p>
+
+<p>Boring means <b>the failure modes are known</b>. Hearing it as "old" loses the
+argument in the meeting, because "old" is easy to argue against and "known" is
+not.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>innovation tokens</code>, <code>battle-tested</code>,
+  <code>bleeding edge</code>, <code>future-proof</code>,
+  <code>best-in-class</code>. Plain version: "I have run Postgres in production
+  three times and I know what to look at when it slows down. I have never run the
+  other one, so if it breaks on a Sunday I will be reading documentation instead of
+  fixing it."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why the same tool can be a boring
+  choice for one team and a risky choice for another.</p>
+  <p>Say it, then send it. I want to see the words <b>failure modes</b> or your own
+  plain version of them. Without that, the explanation collapses into "use old
+  things", which is not the argument.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"Boring is not about the age of the tool, it is about whether you already know
+what it looks like when it breaks. A team that has run this database for years has
+instincts — they know which three things to check first — so an outage costs them
+an hour. A team that has never run it has no instincts, so the same outage costs
+them a day of reading. Same tool, different risk, because the knowledge is in the
+team and not in the tool."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — count your tokens <span class="needs">~1 hr</span></span>
+  <ol>
+    <li>Write the stack for the product from
+    <a href="0006-cutting-to-the-mvp.html">B2</a>. Every real choice: language,
+    framework, database, hosting, deploy, auth, payments, background jobs, email,
+    error tracking.</li>
+    <li>Three columns: <b>choice</b> · <b>have I run this in production?</b> ·
+    <b>token spent (Y/N)</b>.</li>
+    <li>Add the tokens up.</li>
+    <li>If the total is more than <b>one</b>, replace choices until it is one or
+    zero. Write what you replaced and why.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the table, with a total of 0 or 1. Then one
+  sentence about the token you kept. That sentence must say what the
+  <b>customer</b> gets from it. Send it to me — most people undercount by two,
+  because "industry standard" got counted as free.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — the 3am test <span class="needs">~45 min</span></span>
+  <ol>
+    <li>For each row in your table, write the first thing you would check if it
+    broke tonight and you were alone.</li>
+    <li>Any row where you cannot write a real answer is a hidden token. Mark it
+    and re-total.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> one line per row. Blank lines are the finding —
+  they are the tools you think you know and do not.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>Every tool costs twice: learning it, and debugging it later. The second cost
+  is invisible and bigger.</li>
+  <li><b>Boring</b> means the <b>failure modes are known</b>. Not old, not dull,
+  not worse.</li>
+  <li>Novelty is a risk budget. About <b>three tokens</b>, and every unfamiliar
+  tool spends one.</li>
+  <li>Boringness is a property of <b>tool plus you</b>. Ask "have I run this in
+  production?"</li>
+  <li>The question that ends the argument: "what does this give us <b>this
+  month</b>?"</li>
+  <li>Boring gives up some capability, some hiring appeal, and some future rework.
+  Say so.</li>
+  <li>If the novel thing <b>is</b> the product, it is not a token — it is the
+  business.</li>
+</ul>
+<p class="one-thing">If you remember one thing: keep your risk for the product,
+because the product is the surprise you cannot avoid.</p>
+</div>
+
+<div class="ask">
+  Send me your stack table. I will tell you which rows you counted as free and
+  should not have — that is the usual finding, and it is usually two rows.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0006-cutting-to-the-mvp.html">← B2 — Cutting to the MVP</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0008-walking-skeleton-quality-boundary.html">B4 — The walking skeleton →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "\"Boring technology\" means a tool whose:",
+    options: [
+      "failure modes are already known",
+      "release date is several years old",
+      "feature set is fairly limited",
+      "licence terms are widely accepted"
+    ],
+    answer: 0,
+    why: "The argument is about what happens when it breaks, not about age. Known breakage costs an hour; unknown breakage costs a day of reading documentation."
+  },
+  {
+    q: "In this course, whether a tool is boring depends on:",
+    options: [
+      "whether your team ran it before",
+      "whether the industry calls it standard",
+      "whether the vendor is well funded",
+      "whether the community is quite large"
+    ],
+    answer: 0,
+    why: "McKinley defines boring by maturity. This course adds one test on top: the knowledge lives in the team, not in the tool. Never-run Postgres still costs you a token."
+  },
+  {
+    q: "The question that ends a stack argument is what it gives us:",
+    options: [
+      "this month, versus the boring option",
+      "at scale, versus the boring option",
+      "in hiring, versus the boring option",
+      "on paper, versus the boring option"
+    ],
+    answer: 0,
+    why: "Almost every argument for an exciting tool describes a future state. Future states are real arguments for a company that has found its business model."
+  },
+  {
+    q: "Spending all three tokens on infrastructure is bad because:",
+    options: [
+      "no risk budget is left for surprises",
+      "infrastructure rarely needs innovation",
+      "customers cannot see the difference",
+      "the team resists learning three tools"
+    ],
+    answer: 0,
+    why: "The product itself is guaranteed to surprise you. If your capacity for unknowns went into plumbing, the real unknown arrives with nowhere to go."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A teammate proposes a brand new database. What do you ask?",
+    answer: "\"What does it give us this month that the database we already run does not?\" Why: if the answer is about a future scale we have not reached, that is a reason to revisit later. I would also ask who has run it in production, because that decides what it really costs us."
+  },
+  {
+    prompt: "Someone says a boring stack will stop you hiring good engineers.",
+    answer: "\"Some engineers only want new technology, and we will not attract those. I think that is an acceptable trade at our size.\" Then I name what we buy: when something breaks on a Sunday, whoever is on it already knows where to look. I would rather have that than a more exciting job advert."
+  },
+  {
+    prompt: "How do you justify keeping exactly one token?",
+    answer: "\"There is one place where the new thing genuinely changes what the customer gets, and that is where I am spending our risk.\" One sentence, naming the customer-visible difference. Everything else on the list is something I have shipped before."
+  },
+  {
+    prompt: "You inherit a stack with four unfamiliar tools. What do you do first?",
+    answer: "I do not rewrite anything. I write down, for each one, the first thing I would check if it broke tonight — and where the blanks are, I go and learn just that. Turning unknown failure modes into known ones is cheaper than replacing working software."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>

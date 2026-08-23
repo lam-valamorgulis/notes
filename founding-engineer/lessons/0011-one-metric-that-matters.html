@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L3 — The one metric that matters</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 3 · Live · Lesson L3</p>
+<h1>The one metric that matters</h1>
+<p class="subtitle">One number per stage. Watching thirty numbers is the same as
+watching none.</p>
+
+<p class="expertise"><b>Moves forward:</b> <i>judge someone else's work and say
+what is wrong and why</i>. Naming the wrong headline metric is the fastest
+diagnosis you can make. &nbsp;·&nbsp; <b>Tag:</b>
+<span class="pill core">core</span> item 11 of 12.</p>
+
+<div class="win">
+  <strong>The one win.</strong> You can look at any startup's dashboard and say,
+  in one sentence, which number should be the headline and which one they are
+  fooling themselves with.
+</div>
+
+<!-- ======================= BLOCK 01 ======================= -->
+<section class="block why">
+<h2>Why one number, and not a dashboard</h2>
+
+<p>Start with the problem. You have a dashboard with thirty charts on it. It is
+Monday morning. Which one do you work on?</p>
+
+<p>Nothing on the screen answers that. That is the problem this Lesson solves.</p>
+
+<h3>Step 1 — A metric is only useful if it changes a decision</h3>
+
+<p>Start here, because it eliminates most metrics immediately. If the number goes
+up and you do nothing differently, and it goes down and you do nothing
+differently, then measuring it was a hobby.</p>
+
+<h3>Step 2 — Attention is the scarce resource in a small team</h3>
+
+<p>With three people, the limit is not data. It is how many things can genuinely be
+worked on at once. That number is about one.</p>
+
+<p><b>That last number is a judgement, not a measurement.</b> If you think your team
+can hold two, the rest of this Lesson still works. It just gets weaker as the number
+grows.</p>
+
+<h3>Step 3 — Therefore thirty numbers means zero numbers</h3>
+
+<p>A dashboard with thirty charts cannot tell you what to do, because it never says
+"this one, now". Every chart is a request for attention, and you have one unit of
+it. So the choosing is the work. Croll and Yoskovitz's name for the result is the
+<b>One Metric That Matters</b>: pick the single number that matters most right now,
+rally around it, and ignore the rest until it is solved.<sup>1</sup></p>
+
+<h3>Step 4 — Which number depends on the open question</h3>
+
+<p>And the open question changes as the company grows. That is why the OMTM is not
+one number forever. <i>Lean Analytics</i> gives five stages, each with its own
+question.<sup>1</sup></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Stage</th><th>The open question</th><th>What the number looks like</th></tr>
+  <tr>
+    <td><b>Empathy</b></td>
+    <td>Is this problem real?</td>
+    <td>Interviews per week, against ten by Friday. Not a product metric at all.</td>
+  </tr>
+  <tr>
+    <td><b>Stickiness</b></td>
+    <td>Do people come back? Stickiness is the stage name; the number under it is <b>retention</b>.</td>
+    <td>Of the 15 who started in week one, how many used it in week two?</td>
+  </tr>
+  <tr>
+    <td><b>Virality</b></td>
+    <td>Do users bring users?</td>
+    <td>Invites sent per active user, and how many are accepted.</td>
+  </tr>
+  <tr>
+    <td><b>Revenue</b></td>
+    <td>Does the money work?</td>
+    <td>Revenue per customer against what it costs to get one.</td>
+  </tr>
+  <tr>
+    <td><b>Scale</b></td>
+    <td>Can we grow this repeatably?</td>
+    <td>Growth rate from one channel you can spend into.</td>
+  </tr>
+</table>
+</div>
+
+<h3>Step 5 — Therefore a later-stage metric is a trap when used early</h3>
+
+<p>This is the mistake worth learning properly. Chasing growth before stickiness means
+pouring users into a container that leaks. You spend money to bring people in and
+they leave through the holes you have not fixed. The growth number even goes up
+for a while, which is what makes it a trap.</p>
+
+<figure class="figure">
+<svg viewBox="0 0 640 280" role="img" aria-labelledby="l3title l3desc">
+  <title id="l3title">Growth before retention is a leaking bucket</title>
+  <desc id="l3desc">Users pour into a bucket from the top while leaking out of
+  several holes at the bottom. The level does not rise. Fixing the holes is the
+  earlier job.</desc>
+
+  <!-- pour -->
+  <path d="M300 18 q10 24 0 44" class="dg-good" fill="none" stroke-width="7" opacity="0.5"/>
+  <text x="316" y="34" class="dg-small">new users, bought with money and effort</text>
+
+  <!-- bucket -->
+  <path d="M232 70 L268 236 L372 236 L408 70" class="dg-box" stroke-width="2"/>
+  <line x1="232" y1="70" x2="408" y2="70" class="dg-rule" stroke-width="2"/>
+
+  <!-- water level: low -->
+  <path d="M262 196 L268 236 L372 236 L378 196 Z" class="dg-fill-accent" opacity="0.22"/>
+  <text x="320" y="220" class="dg-small" text-anchor="middle">level barely moves</text>
+
+  <!-- leaks -->
+  <path d="M266 226 q-22 8 -34 26" class="dg-warn" fill="none" stroke-width="4" opacity="0.7"/>
+  <path d="M374 226 q22 8 34 26" class="dg-warn" fill="none" stroke-width="4" opacity="0.7"/>
+  <path d="M300 238 q-6 16 -10 26" class="dg-warn" fill="none" stroke-width="4" opacity="0.7"/>
+  <path d="M340 238 q6 16 10 26" class="dg-warn" fill="none" stroke-width="4" opacity="0.7"/>
+
+  <text x="20"  y="268" class="dg-small">they never came back</text>
+  <text x="430" y="268" class="dg-small">nobody found the point</text>
+
+  <text x="430" y="120" class="dg-small dg-strong">Fix the holes first.</text>
+  <text x="430" y="136" class="dg-small">Stickiness comes before</text>
+  <text x="430" y="150" class="dg-small">virality and revenue,</text>
+  <text x="430" y="164" class="dg-small">because those two both</text>
+  <text x="430" y="178" class="dg-small">multiply whatever is left</text>
+  <text x="430" y="192" class="dg-small">in the bucket.</text>
+
+  <text x="20" y="120" class="dg-small dg-strong">The trap:</text>
+  <text x="20" y="136" class="dg-small">the intake number</text>
+  <text x="20" y="150" class="dg-small">goes up, so it looks</text>
+  <text x="20" y="164" class="dg-small">like it is working.</text>
+</svg>
+<figcaption>Virality and revenue both multiply what stays in the bucket. So
+stickiness comes first, even though growth is the number that feels like progress.
+<b>Where the bucket breaks:</b> a real hole stays the same size. Your reasons for
+losing users change every month, so this is not one repair — it is a
+habit.</figcaption>
+</figure>
+
+<div class="recall-inline">
+  <span class="label">Cover the screen</span>
+  Name the five stages in order. Then say why a growing intake number can hide a
+  failing product.
+</div>
+
+<h3>Step 6 — Why cumulative totals cannot be your metric</h3>
+
+<p>Same point as the kill rule in <a href="0004-the-kill-rule.html">F4</a>, and it
+is worth repeating because it catches everyone.</p>
+
+<p>A cumulative total — total sign-ups, total downloads, total revenue ever — only
+goes up. It <b>hides a fall</b>: the useful part is its slope, and reading a slope
+by eye is slow and easy to fool yourself about.</p>
+
+<p>So measure the slope directly. That is a rate. A number chosen because it always
+rises is a <b>vanity metric</b>: pleasant, and decoration.</p>
+
+<p>Use a <b>rate</b> (per week, per user) or a <b>cohort</b> (this group, tracked
+over time). A cohort is the strongest early tool you have. It stops a flood of new
+sign-ups hiding the fact that everyone who joined in March has gone.</p>
+
+<p>A count with a target and a date behaves like a rate, because it can fall
+behind. "Ten interviews by Friday" is usable. "Interviews done" is not.</p>
+
+<h3>Step 7 — The squeeze-toy effect</h3>
+
+<p>A useful consequence from the same source. When you push hard on one metric, you
+usually stress another one — improve sign-up conversion and support load rises,
+improve retention and growth slows. That is not failure. The metric that got worse
+is telling you what the next OMTM is.<sup>1</sup></p>
+
+<h3>Step 8 — Where this reasoning stops</h3>
+
+<p>One limit, and it is a real one.</p>
+
+<p>Small numbers are noisy. With eleven users, a change from four to six is
+not a trend, and treating it as one will make you act on noise. Below about a few
+hundred users, the honest instrument is still conversations — the metric confirms
+what the conversations told you, rather than replacing them.</p>
+
+<p class="verified"><sup>1</sup> <b>Sourced:</b>
+<a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/">Alistair
+Croll &amp; Benjamin Yoskovitz, <i>Lean Analytics</i> (O'Reilly, 2013)</a> — the One
+Metric That Matters, the five stages, and the squeeze-toy effect. See also
+<a href="https://medium.com/lean-stack/lean-analytics-the-one-metric-that-matters-and-other-provocations-fd3006aab17">Ash
+Maurya's write-up of the same ideas</a>. Checked 2026-08-23.</p>
+</section>
+
+<!-- ======================= BLOCK 02 ======================= -->
+<section class="block hurts">
+<h2>Where it goes wrong</h2>
+
+<div class="scar slow">
+  <span class="who">The dashboard of thirty — fails quietly</span>
+  Everything is measured. Nothing is decided. The dashboard becomes a thing people
+  look at on Monday and feel informed by. It never says "this one, now", so it
+  never changes any behaviour.
+  <p><b>The tell:</b> nobody can say what the team would do differently if any
+  single chart moved.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Cumulative sign-ups as the headline</span>
+  "We are at 4,000 users." Of those, 60 opened it twice. The number went up every
+  week, so it never triggered a decision, and it was quoted in every investor
+  update as evidence.
+  <p><b>The tell:</b> your headline number has never gone down.</p>
+</div>
+
+<div class="scar money">
+  <span class="who">Chasing revenue at the empathy stage</span>
+  Sales targets set before anyone knows whether the product works. The team
+  optimises closing, gets a few customers who then leave, and the churn is blamed
+  on onboarding rather than on the stage being wrong.
+  <p><b>The tell:</b> you have a sales target and no retention number.</p>
+</div>
+
+<div class="scar">
+  <span class="who">A metric nobody can move</span>
+  "Brand awareness." "Market share." Real business ideas, but no one on a
+  three-person team can change either of them this week. A metric you cannot act
+  on is a mood.
+  <p><b>The tell:</b> you cannot name one thing you would build to move it.</p>
+</div>
+</section>
+
+<div class="tip">
+  <span class="label">Read this next — the primary source</span>
+  <a href="https://www.oreilly.com/library/view/lean-analytics/9781449335687/"><i>Lean
+  Analytics</i> — Croll &amp; Yoskovitz</a>. Read the chapter on the One Metric
+  That Matters and the stage chapter that matches where you are. Skip the
+  benchmark tables from 2013 — the reasoning survived, the numbers did not.
+</div>
+
+<!-- ======================= BLOCK 03 ======================= -->
+<section class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>In plain words</h3>
+
+<p>A small team can only really work on one thing at a time. So watching thirty
+numbers is the same as watching none of them — nothing ever says "do this next".
+Pick the one number that answers the question you are actually stuck on right now,
+put it on the wall, and ignore the others until it moves. When the company changes,
+the question changes, so pick again.</p>
+
+<h3>One analogy, and where it breaks</h3>
+
+<p>A doctor in an emergency watches one thing. If the patient is bleeding, they
+watch blood pressure, not cholesterol. Cholesterol matters — later, and not
+tonight.</p>
+
+<p><b>Where the analogy breaks.</b> A human body has a fixed set of vital signs
+that never changes. A product's key number changes every time the company enters a
+new stage, and nothing tells you it has changed. So you have to re-pick on purpose,
+which is a step the doctor never has to take.</p>
+
+<h3>The sticking point</h3>
+
+<p>People think "one metric" means being under-informed, so they compromise: they
+pick one headline and keep the other twenty-nine on the same screen. That defeats
+it, because the twenty-nine still compete for the one unit of attention.</p>
+
+<p>The rule is about <b>action</b>, not about data collection. Record everything.
+Act on one. If your headline metric shares a screen with twelve others, you have a
+dashboard with a bigger font.</p>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited a book</span>
+  <code>north star metric</code>, <code>KPI</code>, <code>OKR</code>,
+  <code>data-driven</code>, <code>actionable insights</code>,
+  <code>engagement</code>. Plain version: "of the fifteen people who started in
+  week one, six used it again in week two. That six is the number I am trying to
+  make ten, and nothing else is on the wall."
+</div>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">Explain in three sentences why spending money on growth before
+  fixing retention is a mistake — without using the words "funnel" or "churn".</p>
+  <p>Say it, then send it. I am looking for the multiplication idea: growth
+  multiplies whatever stays. If your answer is just "retention is important", the
+  mechanism is missing.</p>
+</div>
+
+<details class="model">
+<summary>Reveal a model answer — only after you have tried</summary>
+<p>"Growth brings people in, and how many are still there next month decides how
+many of them are worth anything. So growth multiplies whatever stays — and if
+almost nobody stays, I am multiplying by nearly zero and paying full price for it.
+The dangerous part is that the incoming number still goes up, so it looks like it is
+working while I am spending money to fill a container with holes in it."</p>
+</details>
+
+<h3>Drill the spoken version</h3>
+
+<div id="recall"></div>
+
+<h3>Check yourself</h3>
+
+<div id="quiz"></div>
+</section>
+
+<!-- ======================= BLOCK 04 ======================= -->
+<section class="block do">
+<h2>Do it this week</h2>
+
+<div class="task">
+  <span class="label">Task 1 — pick your stage, then your number <span class="needs">~1 hr</span></span>
+  <ol>
+    <li>Name your stage honestly from the table in Block 01. Most people building
+    a first product are at <b>empathy</b> or <b>stickiness</b>, not revenue.</li>
+    <li>Write four lines: the <b>OMTM</b>, its value <b>today</b>, the
+    <b>target</b>, and the <b>date</b>.</li>
+    <li>Check it can go <b>down</b>. If it cannot, it is a vanity metric — pick
+    again.</li>
+    <li>Write the five numbers you are choosing <b>not</b> to watch, by name. This
+    part matters as much as the first.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> the four lines, on the wall or at the top of your
+  README, plus the ignore list. Send it to me. The two common faults are a
+  cumulative number and a stage that flatters you — I will say which one you
+  did.</p>
+</div>
+
+<div class="task">
+  <span class="label">Task 2 — build one cohort table <span class="needs">~90 min</span></span>
+  <ol>
+    <li>Take everyone who first used your product in a given week.</li>
+    <li>Count how many of that same group used it in week two, week three, week
+    four. Rows are the starting week, columns are the weeks after.</li>
+    <li>Ten users is enough. A spreadsheet is enough. Counting by hand is
+    enough.</li>
+  </ol>
+  <p class="proof"><b>Proof:</b> a small table with real names or IDs in it. If
+  the second column is mostly empty, you have found the most important fact about
+  your product, and you found it before spending money on growth.</p>
+</div>
+</section>
+
+<!-- ======================= REMEMBER ======================= -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>A metric is only useful if it <b>changes a decision</b>. Most metrics fail
+  this immediately.</li>
+  <li>Attention is the scarce resource. Thirty numbers means zero numbers.</li>
+  <li>The right number depends on the <b>open question</b>: empathy, stickiness,
+  virality, revenue, scale.</li>
+  <li>Growth before stickiness is a <b>leaking bucket</b> — and the intake number
+  still goes up.</li>
+  <li>A cumulative total hides a fall. The news is in its slope, so measure the
+  slope.</li>
+  <li>Use a <b>rate</b> or a <b>cohort</b>. A cohort stops new sign-ups hiding old
+  users leaving.</li>
+  <li>Record everything, act on one. And below a few hundred users, conversations
+  are still the real instrument.</li>
+</ul>
+<p class="one-thing">If you remember one thing: if your headline number can never
+go down, it can never ask you to change anything.</p>
+</div>
+
+<div class="ask">
+  Send me your four lines and your cohort table. If your chosen number can only go
+  up, I will say so immediately — it is the most common mistake in this Lesson.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0010-the-first-price.html">← L2 — The first price</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="0012-keeping-it-alive-alone.html">L4 — Keeping it alive alone →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: "A metric earns a place on the wall only if it:",
+    options: [
+      "changes a decision you make",
+      "improves steadily over time",
+      "matches what investors ask",
+      "measures the whole product"
+    ],
+    answer: 0,
+    why: "If it moves and you do nothing differently either way, measuring it was a hobby. That single test eliminates most of a typical dashboard."
+  },
+  {
+    q: "Spending on growth before fixing retention fails because growth:",
+    options: [
+      "multiplies whatever actually stays",
+      "costs more than it returns early",
+      "attracts the wrong kind of user",
+      "hides the real support workload"
+    ],
+    answer: 0,
+    why: "If almost nobody stays, you are multiplying by nearly zero at full price. The trap is that the incoming number rises, so it looks like it is working."
+  },
+  {
+    q: "Total sign-ups is a poor headline metric because it:",
+    options: [
+      "can never go down at all",
+      "counts inactive accounts",
+      "ignores paying customers",
+      "changes far too slowly"
+    ],
+    answer: 0,
+    why: "A total hides a fall, because the news is only in its slope. Measure the slope directly — a rate, or a cohort tracked over time."
+  },
+  {
+    q: "Most people building a first product are actually at the stage of:",
+    options: [
+      "empathy or stickiness",
+      "revenue or stickiness",
+      "virality or revenue",
+      "scale or virality"
+    ],
+    answer: 0,
+    why: "Is the problem real, and do people come back. Setting revenue or growth targets before those are answered optimises the wrong question and hides the churn."
+  }
+]);
+
+renderRecall('#recall', [
+  {
+    prompt: "A founder is proud of 4,000 sign-ups. What do you ask?",
+    answer: "\"How many of them opened it twice?\" Total sign-ups only goes up, so it can never tell us to change anything. I would rather know that of the fifteen people who started last week, six came back — because that number can fall, and when it falls we know what to do."
+  },
+  {
+    prompt: "The team wants to spend on ads. You are at eleven users. What do you say?",
+    answer: "\"Ads multiply whatever stays. Right now we do not know what stays.\" I would spend the same two weeks finding out whether the eleven come back, then decide. If they do not come back, the ad spend buys us a bigger number and the same problem."
+  },
+  {
+    prompt: "You fixed retention and growth slowed. How do you report that?",
+    answer: "\"That is the expected shape.\" Why: pushing hard on one number usually stresses another, and the one that got worse tells us what to work on next. I would say it that way rather than apologise, because the alternative was paying to add users who leave."
+  },
+  {
+    prompt: "Someone asks why you only track one number.",
+    answer: "\"We record everything. We only act on one.\" With three people we can genuinely work on about one thing at a time, so the choosing is the work. If the headline shares a screen with twelve other charts, we have a dashboard in a bigger font."
+  }
+]);
+</script>
+
+</div>
+</body>
+</html>
