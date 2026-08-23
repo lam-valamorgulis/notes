@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Track 2 — Apps &amp; Integrations</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+<p class="kicker">Track 2 of 3 · the heart of the Course</p>
+<h1>Apps &amp; Integrations</h1>
+<p class="subtitle">You integrate Shopify by building an app. The app is the vehicle. The sync is the job.</p>
+
+<div class="win">
+  <strong>The one win of this Track.</strong> By the end you will have a service you wrote,
+  running against a real Shopify Dev store, that survives a duplicate webhook, a 429, a
+  clock that runs backwards, and an ERP that goes down mid-batch — and a report that proves
+  it survived.
+</div>
+
+<h2>The story of this Track</h2>
+
+<p>Chapter A1 builds the app itself: how Shopify identifies it, how the session token
+becomes an access token, and how a webhook proves it really came from Shopify. Chapter A2
+adds only the backend the app actually needs — a NestJS module, a Postgres schema, one
+queue, and a way to run it locally. Nothing more; depth beyond the Project belongs in the
+Node course.</p>
+
+<p>Chapter A3 is the discipline, and it is the most valuable material here. It starts from
+one question — <b>who owns this field?</b> — and follows every consequence: why a write must
+be absolute so replay is safe, why a webhook is a hint and not a guarantee, what a delete
+means when neither side agrees it happened, and how you prove the two systems match without
+trusting either of them.</p>
+
+<p>Chapter A4 is the connectors you meet in real work: an ERP, a CSV dropped on an SFTP
+server, a vendor who will not give you an API at all. Chapter A5 is the Project, where you
+build the thing.</p>
+
+<p>Read A1 and A2 while you build Steps 0 and 1. Do not wait until the reading is finished —
+hands-on time is the scarce resource, not reading time.</p>
+
+<div class="note">
+  <span class="label">A note on where this material came from</span>
+  Several traps in this Track were learned from a real integration read against a live
+  system. Every company, client, tenant and traceable number has been removed. The pattern
+  survives; the source does not. That is deliberate and permanent.
+</div>
+
+<h2 id="project">A5 · The Project <span class="pill core">core</span></h2>
+
+<p>Five steps. Each one is built from a blank file while you say out loud what you are
+doing. Code lives in <code>shopify-tech-lead/project/</code>, inside the private
+<code>learn</code> repo. <code>deploy-site.sh</code> excludes that folder from the published
+site and aborts if anything secret-shaped is ever staged, so an <code>.env</code> holding a
+Shopify access token cannot reach the public copy. Lessons show code as text — they never
+link into <code>project/</code>, because the folder does not exist on the live site.</p>
+
+<div class="step"><span class="n">0</span><div>
+  <b><a href="lessons/0022-step-0-the-dev-store-and-the-generator.html">The Dev store, the Shape sample, and the generator</a></b>
+  <span class="desc">Create a free Plus Dev store. Read the Client store for structure and
+  scale only — counts, metafield namespaces, tag conventions, locations. Then write a
+  generator that produces a synthetic catalogue of the same shape.
+  <a href="../docs/adr/0001-synthetic-catalogue-from-shape-samples.md">ADR 0001</a> is the rule.</span>
+</div></div>
+
+<div class="step"><span class="n">1</span><div>
+  <b><a href="lessons/0023-step-1-the-fake-erp.html">The Fake ERP</a></b>
+  <span class="desc">Products, prices, stock per location, an order inbox — and switches to
+  break it on purpose: return stale data, duplicate a webhook, go down for ten minutes,
+  change a price mid-sync. You need to <em>cause</em> the failures, which is why you write
+  this side yourself instead of using someone's sandbox.</span>
+</div></div>
+
+<div class="step"><span class="n">2</span><div>
+  <b><a href="lessons/0024-step-2-catalogue-out.html">Catalogue out — the bulk load, then keeping it fresh</a></b>
+  <span class="desc">Get ~46,000 synthetic variants in without being throttled, then keep
+  them current when only a few percent change per day. This is where the rate-limit model
+  stops being theory.</span>
+</div></div>
+
+<div class="step"><span class="n">3</span><div>
+  <b><a href="lessons/0025-step-3-webhooks-in-inventory-back.html">Webhooks in, inventory back</a></b>
+  <span class="desc">HMAC on the raw body. Answer 200 inside the timeout. Dedupe on
+  <code>X-Shopify-Webhook-Id</code>. Then send inventory the other way and meet the trap:
+  Shopify owns inventory while your ERP owns the catalogue, so ownership is <em>split</em>
+  on the same product.</span>
+</div></div>
+
+<div class="step"><span class="n">4</span><div>
+  <b><a href="lessons/0026-step-4-the-queue-the-dead-letter-and-the-proof.html">The queue, the dead-letter, and the proof</a></b>
+  <span class="desc">Retries with backoff, a dead-letter queue you actually read, and a
+  reconciliation report. Then break the ERP and prove the report catches it. A sync without
+  a report is a sync you are only guessing about.</span>
+</div></div>
+
+<p class="small">All ten katas from the old course became these steps. A drill you never run
+is not practice.</p>
+
+<div class="note">
+  <span class="label">Reserved file numbers — do not renumber</span>
+  Lesson files in <code>apps/lessons/</code> are numbered by <em>Map order</em>, not by the
+  order they get written, and each Chapter owns a fixed block. A1 <code>0001–0004</code> ·
+  A2 <code>0005–0008</code> · A3 <code>0009–0015</code> · A4 <code>0016–0021</code> ·
+  A5 <code>0022–0026</code>. Step 0 is therefore <code>0022</code> even though it is the
+  first file written. Renumbering later would break every cross-link, so the ranges are
+  claimed up front.
+</div>
+
+<h2>The Chapters</h2>
+
+<div class="chapter">
+<h3>A1 · What an app is</h3>
+<ul class="lessons">
+  <li><a href="lessons/0001-anatomy-of-a-shopify-app.html">Anatomy of a Shopify app</a> <span class="pill core">core</span>
+      <span class="desc">Public, custom, and the app config. What Shopify sees when it looks at your app.</span></li>
+  <li><a href="lessons/0002-app-auth-session-tokens-and-token-exchange.html">App auth: session tokens and token exchange</a> <span class="pill core">core</span>
+      <span class="desc">How an embedded app turns a browser session into a server-side access token.</span></li>
+  <li><a href="lessons/0003-webhooks-done-right.html">Webhooks done right</a> <span class="pill core">core</span>
+      <span class="desc">HMAC on the raw body, the response deadline, retries, and dedupe.</span></li>
+  <li><a href="lessons/0004-scopes-protected-customer-data-and-compliance.html">Scopes, protected customer data, and the mandatory webhooks</a> <span class="pill core">core</span>
+      <span class="desc">What you are allowed to ask for, and what you must promise in return.</span></li>
+</ul>
+</div>
+
+<div class="chapter">
+<h3>A2 · The backend the app needs</h3>
+<p class="small">Hard-scoped to the Project. Deeper Node work links out to
+<code>../../nodejs-mastery-in-1-year/</code>.</p>
+<ul class="lessons">
+  <li><a href="lessons/0005-the-nestjs-module-shape-for-a-sync-service.html">The NestJS module shape for a sync service</a> <span class="pill core">core</span>
+      <span class="desc">Modules, providers, and the API surface your own service exposes.</span></li>
+  <li><a href="lessons/0006-a-postgres-schema-for-a-sync-store.html">A Postgres schema for a sync store</a> <span class="pill core">core</span>
+      <span class="desc">Mapping tables, last-seen watermarks, and why you store the remote id twice.</span></li>
+  <li><a href="lessons/0007-one-queue-with-retries-and-a-dead-letter.html">One queue, with retries and a dead-letter</a> <span class="pill core">core</span>
+      <span class="desc">Backoff, poison messages, and the queue you can actually inspect.</span></li>
+  <li><a href="lessons/0008-run-it-docker-compose-ci-and-what-to-log.html">Run it: docker-compose, CI, and what to log</a> <span class="pill core">core</span>
+      <span class="desc">One command to start everything, and the three log lines that save you at 2am.</span></li>
+</ul>
+</div>
+
+<div class="chapter">
+<h3>A3 · The sync discipline</h3>
+<p class="small">The strongest material in the Course. Start here if you only read one Chapter.</p>
+<ul class="lessons">
+  <li><a href="lessons/0009-shopify-alone-and-what-a-second-system-adds.html">Shopify alone, and what a second system adds</a> <span class="pill core">core</span>
+      <span class="desc">Why one system is easy and two is a design problem.</span></li>
+  <li><a href="lessons/0010-ownership-per-field-not-per-record.html">Ownership, per field not per record</a> <span class="pill core">core</span>
+      <span class="desc">The spine of the Track. Title from the ERP, inventory from Shopify, on the same product.</span></li>
+  <li><a href="lessons/0011-absolute-writes-safe-replay-and-tombstones.html">Absolute writes, safe replay, and tombstones</a> <span class="pill core">core</span>
+      <span class="desc">Send the value, never the change. Then deletes, archives, and the record that says "gone".</span></li>
+  <li><a href="lessons/0012-webhooks-are-a-hint-clocks-order-and-staleness.html">Webhooks are a hint — clocks, order and staleness</a> <span class="pill core">core</span>
+      <span class="desc">Out-of-order delivery, a clock that disagrees, and the update that overwrites a newer one.</span></li>
+  <li><a href="lessons/0013-the-backlog.html">The backlog</a> <span class="pill core">core</span>
+      <span class="desc">What happens after four hours down, and why "catch up fast" is the wrong instinct.</span></li>
+  <li><a href="lessons/0014-reconciliation-and-numbers-that-do-not-lie.html">Reconciliation, and numbers that do not lie</a> <span class="pill core">core</span>
+      <span class="desc">Counting rows proves nothing. What to compare so a money bug cannot hide.</span></li>
+  <li><a href="lessons/0015-store-17-of-four-hundred.html">Store 17 of four hundred</a> <span class="pill core">core</span>
+      <span class="desc">One tenant is a script. Four hundred tenants is a different job.</span></li>
+</ul>
+</div>
+
+<div class="chapter">
+<h3>A4 · Real connectors</h3>
+<ul class="lessons">
+  <li><a href="lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">Integration patterns: ERP, CRM, payments, fulfillment</a> <span class="pill core">core</span>
+      <span class="desc">The four shapes almost every brief turns out to be.</span></li>
+  <li><a href="lessons/0017-set-piece-design-a-shopify-erp-sync-at-scale.html">Set piece: design a Shopify ↔ ERP sync at scale</a> <span class="pill core">core</span>
+      <span class="desc">The whiteboard answer, start to finish, out loud.</span></li>
+  <li><a href="lessons/0018-the-vendor-stock-feed-connector-csv-and-sftp.html">The vendor stock-feed connector: CSV and SFTP</a> <span class="pill core">core</span>
+      <span class="desc">What half of real clients actually hand you. Boring, and it breaks in interesting ways.</span></li>
+  <li><a href="lessons/0019-identifier-mapping-and-the-mapping-registry.html">Identifier mapping and the mapping registry</a> <span class="pill core">core</span>
+      <span class="desc">Their id, your id, Shopify's id. Where syncs die.</span></li>
+  <li><a href="lessons/0020-when-the-vendor-will-not-give-you-an-api.html">When the vendor will not give you an API</a> <span class="pill core">core</span>
+      <span class="desc">A real refusal, and the four routes left. Genericised — no company, no tenant.</span></li>
+  <li><a href="lessons/0021-worked-example-integrating-a-stock-availability-saas.html">Worked example: integrating a stock-availability SaaS</a> <span class="pill depth">depth</span>
+      <span class="desc">One integration end to end, using stockinstore as the concrete case.</span></li>
+</ul>
+</div>
+
+<h2>References for this Track</h2>
+<ul class="lessons">
+  <li><a href="../reference/scars-apps.html">Scars — Apps &amp; Integrations</a>
+      <span class="desc">Every "Where it hurts" block in this Track, on one page. Read it before a client call.</span></li>
+  <li><a href="../reference/ownership-matrix.html">Ownership matrix</a>
+      <span class="desc">A blank grid you fill in per project: field, owner, direction, conflict rule.</span></li>
+  <li><a href="../reference/conflict-cases.html">Conflict cases</a>
+      <span class="desc">Named failure cases with the resolution for each.</span></li>
+  <li><a href="../reference/rate-limits-card.html">Rate limits and throttles card</a>
+      <span class="desc">The cost model, the bulk limits, and every number dated with the day it was
+      checked — including the throttle that changed 10&times; in three weeks.</span></li>
+</ul>
+
+<div class="ask">
+  <b>Ask questions.</b> Say <b>"start step 0"</b> to begin the Project, or
+  <b>"teach A3.2"</b> to jump straight to field ownership.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../platform/index.html">← Track 1 · Platform</a></span>
+  <span><a href="../index.html">The Map</a></span>
+  <span><a href="../room/index.html">Track 3 · The Room →</a></span>
+</div>
+
+</div>
+</body>
+</html>

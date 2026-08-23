@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R3.4 — Disagreeing Upward, and the Senior Narrative</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R3 · Lesson 4 · <span class="pill depth">depth</span></p>
+<h1>Disagreeing upward, and the senior narrative</h1>
+<p class="subtitle">How to push back on someone above you — and how to tell your own six years in a way that lands.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A shape for disagreeing that leaves the other person's authority intact,
+  and a way to describe your own experience that is specific instead of a list of technologies.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Part 1 · Disagreeing upward</h3>
+
+<p>Derive it from what the other person needs. A PM or a senior who is wrong does not need to be corrected
+— they need <b>the information they were missing</b>, delivered in a way that lets them change their mind
+without losing face. Those are different goals, and only the second one works.</p>
+
+<div class="diagram">
+  1. AGREE with the goal        "I want that too"
+  2. ONE specific concern       not three. one, and concrete
+  3. HAND BACK the decision     "your call — here's what I'd do"
+
+  ── you have not corrected anyone. you have added information.
+</div>
+
+<div class="script">
+  <span class="who">Drill this shape</span>
+  <q>I want that too. The one thing I'd check first is [specific concern], because [specific consequence].
+  Your call — I'd [recommendation].</q>
+  <span class="why-said">Three clauses. The first removes the conflict, the second is the actual content,
+  the third returns the authority. Almost nobody digs in against this.</span>
+</div>
+
+<h3>Why one concern, not three</h3>
+
+<p>Three concerns reads as resistance and invites a defence of the whole idea. One specific concern reads as
+diligence and invites a fix. So <b>pick your strongest single point</b> — usually the one with money or an
+irreversible consequence attached — and hold the rest.</p>
+
+<p>If the one concern is answered well, you were wrong about that one and you should say so. That is what
+makes the technique credible the next time.</p>
+
+<h3>When you are overruled</h3>
+
+<div class="script">
+  <span class="who">Drill this — it matters more than the disagreement</span>
+  <q>Understood — I'll build it that way. I've noted the concern about overselling so we know where to look
+  if it comes up.</q>
+  <span class="why-said">Accepts the decision, records the position once, and stops. Repeating an objection
+  after a decision turns a reasonable engineer into an obstruction.</span>
+</div>
+
+<p>The rule: <b>say it once, record it once, then commit fully.</b> Half-hearted execution of a decision you
+lost is the worst available outcome — it damages the work and your credibility at the same time.</p>
+
+<h3>The one exception</h3>
+
+<p>If the decision is genuinely unsafe — money, customer data, something irreversible — you escalate rather
+than accept. And you say exactly that:</p>
+
+<div class="script">
+  <span class="who">Rare, and it needs to be automatic</span>
+  <q>I'm not comfortable making this call at my level. It affects customer data and it can't be undone, so
+  I'd like it confirmed by whoever owns that risk. I'll keep working on everything else meanwhile.</q>
+  <span class="why-said">Not a refusal and not insubordination — a request for the decision to be made at
+  the right level. And it keeps you working, which is what stops it looking like a protest.</span>
+</div>
+
+<h3>Part 2 · The senior narrative</h3>
+
+<p>Now the other half. Asked "tell me about your experience", most people list technologies. That answers
+nothing, because everyone lists the same technologies.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Weak</th><th>Strong</th></tr>
+  <tr><td>"Six years, mostly Shopify. Liquid, React, some Node."</td><td>"Six years on Shopify. Three of those deep in themes — I know where the storefront hurts. Then front end, then increasingly the integration side, which is what I'm doing now."</td></tr>
+</table>
+</div>
+
+<p>The strong version has a <b>direction</b>. It is a story with a trajectory, and it makes the next role the
+obvious next step rather than a jump.</p>
+
+<h3>The three-sentence shape</h3>
+
+<div class="script">
+  <span class="who">Build yours, then drill it</span>
+  <q>[Where I started, and what it taught me.] [What I moved toward, and why.] [What I'm doing now, and the
+  gap I'm closing.]</q>
+  <span class="why-said">Three sentences, thirty seconds, and it ends on growth rather than on a claim.
+  Ending on what you are still learning is stronger than ending on mastery.</span>
+</div>
+
+<h3>Talking about a gap honestly</h3>
+
+<p>This is the part that matters most, and it has its own Lesson in R5. The short version: <b>a named gap
+with a plan attached is a strength; a hidden gap is a risk.</b></p>
+
+<div class="script">
+  <span class="who">Drill this</span>
+  <q>What I haven't done is run a live sync in production. So I've been building one — a real service against
+  a real store, with the failure handling and a reconciliation report — because I'd rather have hit those
+  problems on my own time than on yours.</q>
+  <span class="why-said">Names the gap without flinching, then shows the response. That sentence is only
+  available to someone who actually did the work, which is why it lands.</span>
+</div>
+
+<div class="recall">
+  <span class="label">Do this now, out loud</span>
+  A PM says "let's skip the reconciliation report for now, we're tight on time." <b>Disagree upward in three
+  clauses.</b>
+</div>
+
+<p>Something close to: <b>"I want to hit the date too. The one thing I'd worry about is that without the
+report we'd have no way to know if the sync is quietly wrong — a sync doing nothing looks exactly like a sync
+working. Your call, but I'd keep a cut-down version, maybe half a day, that just compares prices and
+stock."</b>
+<br><br>
+Check it against the three clauses. Did you agree with the goal first? Was there exactly <em>one</em> concern?
+Did you hand the decision back with a recommendation?
+<br><br>
+And notice the recommendation is not "keep it as scoped" — it is a smaller version. <b>Offering a cheaper
+form of your own position is what makes disagreeing upward work</b>, because it gives the other person a way
+to agree with you that also respects their constraint.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar">
+  <span class="who">Three concerns instead of one</span>
+  Reads as resistance to the whole idea and triggers a defence. One specific concern, with money or
+  irreversibility attached, invites a fix.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — repeating the objection after a decision</span>
+  A reasonable position becomes obstruction, and people stop bringing you into decisions. Say it once,
+  record it once, commit fully.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — half-hearted execution of a decision you lost</span>
+  The work suffers and it is visibly your work. You lose twice. Commit properly or escalate; there is no
+  third option.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — silent disagreement</span>
+  You thought it was wrong, said nothing, and it went wrong. Nobody knows you knew, so you get none of the
+  credit for the judgement and all of the delivery. This is the most common failure here.
+</div>
+
+<div class="scar">
+  <span class="who">A narrative that is a technology list</span>
+  Everyone lists the same technologies. Without a direction it says nothing about you, and it makes your next
+  step look like a jump rather than a progression.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — do not stockpile "I told you so"</span>
+  If your recorded concern turns out to be right, the useful move is to fix it without mentioning that you
+  called it. The record exists so the fix is fast, not so you can be vindicated. People remember which one you
+  used it for.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Disagreeing with a PM under time pressure</span>
+  <q>I want to hit that date too. The one thing I'd worry about is that without the checking report we can't
+  tell a working sync from a stopped one — they look identical. Your call, but I'd keep a half-day version that
+  just compares prices and stock, and drop the rest.</q>
+  <span class="why-said">Agrees, one concern, and a cheaper version of your own position so they can say
+  yes without losing their constraint.</span>
+</div>
+
+<div class="script">
+  <span class="who">Overruled, and moving on</span>
+  <q>Understood, we'll go without it. I've written the concern down so if stock numbers look odd later we know
+  where to check first. On to the inventory piece.</q>
+  <span class="why-said">Accepts cleanly, records once, and changes subject in the same breath. The last
+  three words are what stop it sounding grudging.</span>
+</div>
+
+<div class="script">
+  <span class="who">The thirty-second narrative</span>
+  <q>Six years on Shopify. The first three were deep in themes and storefronts, so I know where that platform
+  hurts and what breaks in a real shop. Then more front end, and increasingly the integration side — how
+  Shopify talks to the systems behind it. That's what I'm focused on now, and it's where I want to keep
+  going.</q>
+  <span class="why-said">Direction, specificity, and it ends on where they are heading. Thirty seconds and
+  no technology list.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Three clauses: agree with the goal · one specific concern · hand back the decision.</b></li>
+  <li><b>One concern, not three.</b> Pick the one with money or irreversibility attached.</li>
+  <li><b>Offer a cheaper version of your own position.</b> It gives them a way to agree.</li>
+  <li><b>Overruled: say it once, record it once, commit fully.</b> Never half-execute.</li>
+  <li><b>Escalate only for unsafe and irreversible</b> — and keep working while you do.</li>
+  <li><b>A narrative needs a direction</b>, not a technology list. Three sentences, ending on growth.</li>
+  <li><b>A named gap with a plan is a strength.</b> A hidden one is a risk.</li>
+</ul>
+<p class="one-thing">If you remember one thing: agree with the goal before you disagree with the plan — and
+offer a smaller version of what you wanted.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter R3 done — these are the sentences to drill out loud, not read.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0013-a-range-not-a-number.html">← R3.3</a></span>
+  <span><a href="../index.html">Track 3 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

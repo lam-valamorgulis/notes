@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R5.1 — The Experience Gap: Talking About What You Have Not Built</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R5 · Lesson 1</p>
+<h1>The experience gap: talking about what you have not built</h1>
+<p class="subtitle">A named gap with work attached is a strength. A hidden one is a risk they can smell.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A way to answer "have you done this before?" honestly, when the answer is
+  no, that leaves you stronger than a vague yes would.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is the question actually asking?</h3>
+
+<p>"Have you run a live sync in production?" sounds like a check on your history. It is not — nobody cares
+about your past for its own sake. They are asking <b>"will this go wrong on my watch, and will I find out
+from you or from a customer?"</b></p>
+
+<p>That reframing changes everything. A vague yes answers the surface question and fails the real one, because
+a vague answer is exactly what someone hiding a gap sounds like. And they hear it, even if they cannot name
+what they heard.</p>
+
+<div class="diagram">
+  what they ASK          "have you done this?"
+  what they MEAN         "will this go wrong, and will you tell me?"
+
+  vague yes    → answers the first, fails the second
+  bare no      → answers neither
+  named gap
+  + the work   → answers the second, which is the one that matters
+</div>
+
+<h3>The three-part answer</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Part</th><th>Content</th></tr>
+  <tr><td><b>1 · Name it plainly</b></td><td>"I haven't run one in production." No hedging, no softening</td></tr>
+  <tr><td><b>2 · Say what you did about it</b></td><td>The specific thing you built or learned, with detail only a doer would have</td></tr>
+  <tr><td><b>3 · Say what you know is still missing</b></td><td>The honest remainder. This is the part that makes parts 1 and 2 believable</td></tr>
+</table>
+</div>
+
+<p>Part 3 is counter-intuitive and it is the whole technique. <b>Volunteering what your own work does not
+cover is what proves you are not overselling.</b> Anyone can claim to have built something; only someone who
+actually did it knows precisely where its edges are.</p>
+
+<h3>Why part 2 has to be specific</h3>
+
+<p>"I've been learning about it" is worthless — it is what someone says who has read about it. The details are
+the evidence:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Weak</th><th>Strong</th></tr>
+  <tr><td>"I've studied sync patterns."</td><td>"I built one — a service that syncs a fake ERP with a Shopify dev store. It has switches to make the ERP go stale, duplicate a record, or fail mid-batch, because I wanted to cause those failures rather than wait for them."</td></tr>
+  <tr><td>"I understand rate limiting."</td><td>"I found out the hard way that a throttled GraphQL call returns HTTP 200 — the failure is inside the response body. So checking the status code silently misses it."</td></tr>
+  <tr><td>"I know about data quality issues."</td><td>"I sampled a real store and found the same option axis spelled both 'Color' and 'Colour', and a tag in two casings. So my test data reproduces those on purpose."</td></tr>
+</table>
+</div>
+
+<p>Each strong version contains something you could only know by doing it. That is the point — <b>a specific
+detail is not showing off, it is the proof.</b></p>
+
+<h3>What not to do</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do not</th><th>Because</th></tr>
+  <tr><td>Claim experience you do not have</td><td>One follow-up question exposes it, and then everything else you said is in doubt</td></tr>
+  <tr><td>Say "no" and stop</td><td>You have confirmed their concern and given them nothing</td></tr>
+  <tr><td>Blame circumstances — "I never got the chance"</td><td>Shifts it to something outside your control, which is the opposite of what they want to hear</td></tr>
+  <tr><td>Overclaim the side project as production</td><td>A dev store is not production and they know it. Say what it is</td></tr>
+  <tr><td>Apologise</td><td>The gap is a fact, not a failing. Treat it as one</td></tr>
+</table>
+</div>
+
+<h3>The honest framing for a self-built project</h3>
+
+<p>Be precise about what it is and is not. "A real service against a real Shopify dev store, with real rate
+limits and real webhooks — but no real customers and no real money." That sentence costs you nothing and buys
+all your other claims credibility, because you have shown you know the difference.</p>
+
+<div class="recall">
+  <span class="label">Do this now, out loud</span>
+  "Have you handled a production sync between Shopify and an ERP?" <b>Answer in three parts, from memory.</b>
+</div>
+
+<p>Something close to: <b>"Not in production, no. What I've done is build one — a NestJS service syncing a
+fake ERP with a Shopify dev store, deliberately with failure switches so I could cause stale reads, duplicate
+webhooks and mid-batch failures rather than wait for them. It has a reconciliation report, because I wanted to
+know when it was quietly wrong. What I haven't dealt with is a real merchant's data being wrong at nine in the
+morning with someone on the phone — that pressure is the part I can't manufacture."</b>
+<br><br>
+Check yours against the three parts. Did you name it in the first sentence without hedging? Was part 2
+specific enough that only someone who built it could say it? And did you volunteer the remainder?
+<br><br>
+That last sentence is the strongest thing in the answer. It shows you know exactly what your own work does not
+prove — and that is the quality they were actually testing for.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — the vague yes</span>
+  It survives one question and fails the second. And once one answer is doubted, every other answer is
+  re-examined. A hedge costs more than the gap it was hiding.
+</div>
+
+<div class="scar">
+  <span class="who">"No" with nothing after it</span>
+  You have confirmed the concern and offered nothing to weigh against it. The gap becomes the whole answer.
+</div>
+
+<div class="scar">
+  <span class="who">Blaming circumstances</span>
+  "I never got the opportunity" moves it outside your control, which is precisely the opposite of the signal
+  you want. What you did about it is the answer.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a generic part 2</span>
+  "I've been reading about it" produces no evidence and quietly confirms the gap. The specificity <em>is</em>
+  the evidence — no detail, no proof.
+</div>
+
+<div class="scar">
+  <span class="who">Overclaiming a dev-store project</span>
+  Calling it production experience is a small lie that discredits a genuinely strong story. Say what it is; the
+  work is impressive enough described accurately.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the gap closes by working, not by rehearsing</span>
+  No sentence makes an unbuilt thing built. This Lesson makes the honest answer as strong as it can be — the
+  Project in Track 2 is what changes the answer itself. Do the work; the words are the smaller half.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The direct question</span>
+  <q>Not in production, no. What I have done is build one end to end — a service syncing a fake ERP with a
+  Shopify dev store, with switches to make the other side fail on purpose so I could handle it rather than hope.
+  What I haven't had is a real merchant's data wrong on a Monday morning with someone on the phone. That's the
+  part I can't practise.</q>
+  <span class="why-said">Three parts, no hedging, and it ends on the honest remainder. The last sentence is what
+  makes the first two credible.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they push on the difference</span>
+  <q>Fair — a dev store isn't production. The rate limits and webhooks are real, so I've hit real throttling and
+  real duplicate deliveries. What's missing is scale, real money, and the pressure. I'd want to be paired with
+  someone who's done a live cutover before I ran one alone.</q>
+  <span class="why-said">Concedes the point precisely, states exactly what does transfer, and asks for the
+  support you would actually need. That request is a strength, not a weakness.</span>
+</div>
+
+<div class="script">
+  <span class="who">Turning the gap into a question for them</span>
+  <q>Can I ask how you'd want that handled? If something's quietly wrong at nine in the morning, do you want me
+  to pause the sync and investigate, or fix forward? I'd default to pausing — but I'd rather know your preference
+  now than guess on the day.</q>
+  <span class="why-said">Converts the topic from your history into how you would work together. It also shows
+  you have thought about the failure they were worried about, which is the underlying question.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>"Have you done this?" means "will it go wrong, and will you tell me?"</b> Answer the second.</li>
+  <li><b>Three parts: name it plainly · what you did about it · what is still missing.</b></li>
+  <li><b>Part 3 is what makes parts 1 and 2 believable.</b> Volunteer the remainder.</li>
+  <li><b>Part 2 must be specific.</b> A detail only a doer would know is the evidence.</li>
+  <li><b>Never claim it, never blame circumstances, never apologise.</b></li>
+  <li><b>Say what a dev store is and is not.</b> Precision buys credibility everywhere else.</li>
+  <li><b>The gap closes by working.</b> The words are the smaller half.</li>
+</ul>
+<p class="one-thing">If you remember one thing: name the gap in the first sentence and end on what is still
+missing — that combination is only available to someone who actually did the work.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for what these conversations actually probe.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0016-confident-problem-solving-under-pressure.html">← R4.2</a></span>
+  <span><a href="0018-what-a-shopify-tech-lead-interview-actually-probes.html">R5.2 · What they probe →</a></span>
+</div>
+
+</div>
+</body>
+</html>

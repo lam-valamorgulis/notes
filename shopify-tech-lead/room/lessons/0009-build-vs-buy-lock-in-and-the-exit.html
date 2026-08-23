@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2.5 — Build vs Buy, Lock-In, and the Exit</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R2 · Lesson 5 · <span class="pill depth">depth</span></p>
+<h1>Build vs buy, lock-in, and the exit</h1>
+<p class="subtitle">The question a client should ask you and usually does not: how do we get out?</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A three-question test for build versus buy, and the habit of designing
+  the exit at the same time as the entrance.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what are you actually buying?</h3>
+
+<p>Not features. You are buying <b>someone else's ongoing maintenance</b> — their handling of API version
+changes, their edge cases, their on-call. And you are paying for it with money and with a dependency.</p>
+
+<p>So the question is never "could we build this?" — you almost always could. It is <b>"do we want to own
+this forever?"</b></p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Ask</th><th>If yes</th></tr>
+  <tr><td><b>1.</b> Is this a source of competitive advantage — something customers choose you for?</td><td><b>Build.</b> Do not outsource your differentiator</td></tr>
+  <tr><td><b>2.</b> Will we have someone maintaining it in two years?</td><td>Building is sustainable. If no, <b>buy</b></td></tr>
+  <tr><td><b>3.</b> Is the vendor's version genuinely close to what we need?</td><td><b>Buy.</b> If it is 60% right, buying costs more than building</td></tr>
+</table>
+</div>
+
+<p>Question 1 is the strategic one and question 2 is the honest one. Question 2 kills most build
+decisions, and it is the one nobody asks aloud — because the answer is usually "no, we'd build it and
+then nobody would own it".</p>
+
+<h3>The three kinds of lock-in, in order of severity</h3>
+
+<div class="diagram">
+  1. DATA lock-in        they hold data you cannot export
+                         ── worst. you cannot leave at any price.
+
+  2. PROCESS lock-in     your team's workflows are shaped around them
+                         ── expensive. retraining and rebuilding.
+
+  3. INTEGRATION lock-in you wrote code against their API
+                         ── cheapest. it is just work.
+</div>
+
+<p>Everyone worries about the third and it is the least important. <b>Data lock-in is the one to
+negotiate away before signing</b>, because no amount of engineering fixes it later. And this Course has
+seen the concrete version: a vendor platform holding a <b>customer credit ledger</b> — a balance that is
+real money, living in a system you cannot export from.</p>
+
+<h3>Design the exit at the same time as the entrance</h3>
+
+<p>Three questions to answer before you commit, in writing:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Question</th><th>Acceptable answer</th></tr>
+  <tr><td>Can we get all our data out, in a usable format, on demand?</td><td>Yes, self-serve, without asking them</td></tr>
+  <tr><td>How much of our code touches them directly?</td><td><b>One module.</b> Never sprinkled through</td></tr>
+  <tr><td>What would replacing them cost, in weeks?</td><td>A number you have actually thought about</td></tr>
+</table>
+</div>
+
+<p>The middle row is entirely within your control, and it is the cheapest insurance in software. <b>Put
+the vendor behind one module — a façade with your own vocabulary.</b> Then swapping them is rewriting one
+module rather than auditing the whole codebase. It costs almost nothing to do up front and is expensive to
+retrofit.</p>
+
+<p>This is the same boundary as the <code>shopify</code> module in
+<a href="../../apps/lessons/0005-the-nestjs-module-shape-for-a-sync-service.html">A2.1</a>. Same reason,
+different vendor.</p>
+
+<h3>The honest recommendation is usually "buy, and stay portable"</h3>
+
+<p>Not a compromise — a genuinely better position. You get the vendor's maintenance today and keep the
+ability to leave. State it as one recommendation rather than as hedging: <b>"buy it, put it behind one
+module, and make sure we can export our data."</b></p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client asks whether to build their own click-and-collect system instead of buying one. <b>Run the
+  three questions.</b>
+</div>
+
+<p><b>1 · Competitive advantage?</b> No. Customers do not choose a retailer because its collection flow is
+bespoke. They choose it for stock, price and convenience.
+<br><br>
+<b>2 · Maintained in two years?</b> Almost certainly not. It would be built by an agency and then owned by
+nobody — and it touches stock and customer promises, so unowned is dangerous rather than merely untidy.
+<br><br>
+<b>3 · Is the vendor's version close?</b> Usually yes; this is a mature category.
+<br><br>
+So: <b>buy</b>. And then the valuable part of your answer — the part the client did not ask for — is the
+exit: put it behind one module, confirm the data is exportable, and know roughly what replacing it would
+cost. That turns "buy" from a surrender into a managed position.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — data lock-in discovered after signing</span>
+  A vendor holding a balance, a history or a customer relationship you cannot export. You cannot leave at
+  any price. Negotiate exportability before you sign, never after.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — building something nobody will own</span>
+  Question 2 answered optimistically. The build lands, the team disperses, and in eighteen months it is
+  unmaintained code touching stock and money.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — buying something 60% right</span>
+  The gap gets filled with custom work around the vendor, which is the worst of both: you pay the licence
+  and own the complexity. If it is not close, building is cheaper.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the vendor sprinkled through the codebase</span>
+  Their client library called from forty files. Nothing is wrong until you need to leave, and then the
+  migration is an audit of everything. One module, always.
+</div>
+
+<div class="scar">
+  <span class="who">Two systems holding the same money</span>
+  The concrete case from Track 2: a vendor with a credit ledger, plus store credit issued in Shopify. Both
+  real, neither aware of the other, and a customer can spend the same balance twice.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the vendor's plan gates are theirs, not Shopify's</span>
+  A vendor's own product tiers can require a particular Shopify plan for some features and not others. So
+  "does this need Plus?" can have a different answer per feature, set by the vendor rather than by Shopify.
+  Confirm per feature, in writing, before scoping.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The recommendation</span>
+  <q>I'd buy it. You could build it — the inventory part isn't the hard bit — but you'd be building the
+  collection flow, the store locator and the staff screens, then maintaining them forever, and customers
+  don't choose you because those are bespoke. Two conditions though: I want it behind one piece of our code
+  so we could swap it, and I want written confirmation you can export your own data whenever you like.</q>
+  <span class="why-said">A clear recommendation with two conditions that cost nothing and preserve every
+  option. This is what a lead sounds like on a commercial question.</span>
+</div>
+
+<div class="script">
+  <span class="who">The question they did not ask</span>
+  <q>One thing worth asking them before you sign: if you left in three years, could you take your data with
+  you, and in what format? It's a much easier conversation now than later. Vendors answer it happily
+  pre-sale and much less happily afterwards.</q>
+  <span class="why-said">Offers a piece of commercial advice a developer is not expected to give, which is
+  exactly why it lands.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants to build for the wrong reason</span>
+  <q>I'll build it if you want it. The question I'd want answered first is who maintains it in two years —
+  because this touches stock and customer promises, so it can't be left unowned. If there's a name, building
+  is fine. If there isn't, buying is genuinely the safer call even though it feels like less control.</q>
+  <span class="why-said">Does not refuse. Names the one condition and is honest that buying feels worse and
+  usually is not.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>You are buying someone's ongoing maintenance</b>, not features.</li>
+  <li><b>Three questions: competitive advantage · maintained in two years · is theirs close enough.</b></li>
+  <li><b>Question 2 kills most build decisions</b>, and nobody asks it aloud.</li>
+  <li><b>Data lock-in is the severe one.</b> Negotiate exportability before signing; engineering cannot fix it later.</li>
+  <li><b>Integration lock-in is the cheapest.</b> One module, a façade in your vocabulary.</li>
+  <li><b>60% right is the worst case</b> — you pay the licence and own the complexity.</li>
+  <li><b>The usual right answer is "buy, and stay portable".</b> State it as one recommendation.</li>
+</ul>
+<p class="one-thing">If you remember one thing: design the exit while you are choosing the entrance — ask
+how the data comes out before anyone signs.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for what a senior actually does in a sprint.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0008-the-integration-project-discovery-to-rollout.html">← R2.4</a></span>
+  <span><a href="0010-agile-delivery-as-a-senior.html">R2.6 · Agile as a senior →</a></span>
+</div>
+
+</div>
+</body>
+</html>

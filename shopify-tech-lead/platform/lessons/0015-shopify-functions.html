@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P5.3 — Shopify Functions</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P5 · Lesson 3 · <span class="pill depth">depth</span></p>
+<h1>Shopify Functions</h1>
+<p class="subtitle">Your logic, running inside Shopify's backend. No URL, no server, no network call.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can explain what a Function is by what it is <em>not</em> — not
+  a webhook, not an API call, not something you can reach — and why that difference decides where you
+  can use one.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why could a webhook never do this?</h3>
+
+<p>Shopify needs to decide a discount while a customer sits in a cart. Could it ask your server?
+Only by making the customer wait on your latency and your uptime, on the most important page in the
+funnel. For a decision that must happen every time, in the request path, that is unacceptable.</p>
+
+<p>So the model inverts. Instead of Shopify calling out to you, <b>you ship code into Shopify and
+Shopify runs it</b>. No network hop, no uptime dependency, no timeout.</p>
+
+<div class="diagram">
+  WEBHOOK                          FUNCTION
+  Shopify ──HTTP──▶ your server    your code lives INSIDE Shopify
+  after the fact                   during the customer journey
+  you can retry                    there is no retry — it runs or it doesn't
+  your uptime matters              your uptime is irrelevant
+  you can log to your system       you cannot attach a debugger
+</div>
+
+<p>Shopify's own wording is worth remembering: <b>"Shopify Functions are never invoked directly by
+URL or otherwise. Shopify invokes them as needed within the customer journey."</b> There is no
+endpoint. That single sentence explains every constraint below.</p>
+
+<h3>Anatomy: an input query, then logic</h3>
+
+<div class="diagram">
+  1. run.graphql      you declare what data you need
+        │
+        ▼
+  2. Shopify runs that query and hands you input.json
+        │             (shape matches your query exactly)
+        ▼
+  3. your logic       pure transformation, no I/O
+        │
+        ▼
+  4. output           shape defined by the Function API schema
+</div>
+
+<p>Both the input and output shapes come from the schema of a <b>Function API</b> — one per
+capability. Each target your extension implements can have its <b>own</b> input query, so you request
+only what that target needs.</p>
+
+<p>Language: <b>anything that compiles to WebAssembly</b>. Rust is <b>recommended and strongly
+preferred</b> — which in practice means the tooling, examples and performance guidance assume it.
+JavaScript compiles too, and you should expect a rougher path.</p>
+
+<h3>The lifecycle, and who configures what</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Step</th><th>Who</th></tr>
+  <tr><td>Write and deploy an app containing the function</td><td>You</td></tr>
+  <tr><td>Install the app and <b>configure</b> the function — create a discount from your new type</td><td>The merchant</td></tr>
+  <tr><td>Execute it during the customer journey</td><td>Shopify</td></tr>
+</table>
+</div>
+
+<p>The middle row matters for design. You are not shipping a discount; you are shipping a
+<em>discount type</em> the merchant then configures. So your function must read its configuration
+from somewhere — and that is what <b>metafields, app-owned metaobjects, and input variables</b> are
+for in an input query.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the lifecycle and the "never invoked directly by URL"
+statement —
+<a href="https://shopify.dev/docs/apps/build/functions">About Shopify Functions</a>. Function anatomy,
+the <code>run.graphql</code> input query, the input/output schema coming from a Function API, any
+language compiling to Wasm with Rust "recommended and strongly preferred", per-target input queries,
+and customising input with metafields, app-owned metaobjects and input variables —
+<a href="https://shopify.dev/docs/api/functions/2026-07">Function APIs</a>. Availability on all plans
+except Starter, some APIs feature-preview only, and the <code>checkout.liquid</code> prerequisite —
+<a href="https://shopify.dev/docs/apps/build/checkout/technologies">Technologies for customizing Shopify checkout</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client wants a discount that depends on the customer's loyalty tier, which lives in an external
+  loyalty system. <b>Can a Function do it?</b>
+</div>
+
+<p>Not by asking the loyalty system — a Function has no network access and cannot call out. So the
+design has to move the data <em>before</em> the moment of decision: your app syncs each customer's
+tier into a metafield, and the Function's input query reads that metafield. The tier is then slightly
+stale, and that is the trade-off you must name to the client. And watch the size limit: a Function
+input query <b>does not return metafield values larger than 10,000 bytes</b> — it receives
+<code>null</code> instead, while the Admin API still returns the value in full. So keep whatever the
+Function reads small and deliberate.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — designing a Function that needs external data live</span>
+  There is no network access. Discovering this after committing to a feature means redesigning it as
+  a sync-then-read, which changes the freshness guarantee you promised.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the 10,000-byte input cliff</span>
+  Metafield values above that limit arrive as <code>null</code> in a Function input query. Stored
+  fine, returned fine by the Admin API, invisible only to the Function, only for large values. Small
+  test products pass; real ones do not.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — no debugger, no logs of your own</span>
+  It does not run on your infrastructure, so the tools you reach for first are absent. Keep functions
+  small and pure, and put anything you need to observe on the configuration side where you can see
+  it.
+</div>
+
+<div class="scar">
+  <span class="who">Forgetting the merchant configures it</span>
+  You ship a type, not an instance. A function with its rules hardcoded is one no merchant can adjust,
+  and every change becomes a deploy. Read configuration from metafields or input variables.
+</div>
+
+<div class="scar">
+  <span class="who">A <code>checkout.liquid</code> store cannot use Function APIs</span>
+  Merchants with old checkout customisations must migrate to Extensions in Checkout first. That makes
+  the migration a prerequisite for a feature that looks unrelated.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — over-asking in the input query</span>
+  The input query runs before your logic every time, on every affected customer interaction.
+  Requesting data you do not use is work Shopify does on every cart. Trim <code>run.graphql</code> to
+  exactly what the logic reads, and keep the per-target queries genuinely separate.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Explaining what a Function is, without jargon</span>
+  <q>Normally when something happens in your store, Shopify tells our server and our server responds.
+  This is the opposite: we put a small piece of our logic inside Shopify, and Shopify runs it itself.
+  That means it's instant and it can't be affected by our server being slow or down — which matters,
+  because this runs while a customer is checking out.</q>
+  <span class="why-said">Explains it by contrast with the thing the client already understands, and
+  lands on the benefit they care about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the rule needs data from another system</span>
+  <q>One constraint worth knowing: that logic runs inside Shopify and can't reach out to your loyalty
+  system while the customer is there. So we copy each customer's tier into Shopify ahead of time and
+  the rule reads it from there. Practically that means a tier change takes a few minutes to affect
+  discounts rather than being instant. Is that acceptable?</q>
+  <span class="why-said">States the constraint, gives the workaround, names the exact cost in the
+  client's terms, and asks. Four sentences and no jargon.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Your code runs inside Shopify.</b> Never invoked by URL — Shopify calls it during the customer journey.</li>
+  <li><b>No network access, no retry, no logs of your own.</b> Keep functions small and pure.</li>
+  <li><b>Anatomy: <code>run.graphql</code> input query → logic → output</b>, both shapes from a Function API schema.</li>
+  <li><b>Any language compiling to Wasm; Rust is strongly preferred.</b></li>
+  <li><b>You ship a <em>type</em>, the merchant configures an instance.</b> Read config from metafields, app-owned metaobjects or input variables.</li>
+  <li><b>Input queries drop metafield values over 10,000 bytes</b> — the Function gets <code>null</code>.</li>
+  <li><b>All plans except Starter</b>, but a <code>checkout.liquid</code> store must migrate first.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a Function cannot reach anything — so any external
+data it needs must already be inside Shopify before the customer arrives.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for knowing when not to write code at all.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0014-checkout-extensibility.html">← P5.2</a></span>
+  <span><a href="0016-flow-when-automation-replaces-your-code.html">P5.4 · Flow →</a></span>
+</div>
+
+</div>
+</body>
+</html>

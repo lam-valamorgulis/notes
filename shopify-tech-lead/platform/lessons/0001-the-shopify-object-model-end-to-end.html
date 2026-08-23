@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1.1 — The Shopify Object Model, End to End</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P1 · Lesson 1</p>
+<h1>The Shopify object model, end to end</h1>
+<p class="subtitle">One diagram you will reuse all year. Stock is not on the product, and that is the whole lesson.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can draw the chain from product to a stock number at a
+  named place, and explain why "how many do we have?" needs three objects to answer.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is actually being sold?</h3>
+
+<p>A shop sells "a t-shirt". But you cannot ship "a t-shirt" — you ship a medium in black. So the
+sellable thing is the <b>variant</b>, and the product is a grouping for presentation.</p>
+
+<p>Push once more. The variant is what a customer chooses. But the same physical item might sit in
+a warehouse and in two shops, with different quantities. So the quantity cannot live on the
+variant either — a single number cannot describe three places.</p>
+
+<div class="diagram">
+  Product              a group for display. NOT sellable.
+    └── ProductVariant  the sellable thing. price, SKU, options.
+          └── InventoryItem      the stockable thing (1:1 with the variant)
+                └── InventoryLevel   ONE PER LOCATION  ← the quantity lives here
+                      └── Location    a real place
+
+  "how many do we have?"  =  sum of InventoryLevels across Locations
+  "how many here?"        =  one InventoryLevel
+</div>
+
+<p>Feynman version: <b>the product is the poster, the variant is the thing, the inventory item is
+the thing-as-stock, and the level is that stock in one place.</b> Four objects because the
+question "how many" is meaningless without a place.</p>
+
+<h3>Quantities are plural</h3>
+
+<p>Even one inventory level has several numbers, and they are not interchangeable:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Name</th><th>Roughly means</th></tr>
+  <tr><td><code>available</code></td><td>Can be sold right now</td></tr>
+  <tr><td><code>on_hand</code></td><td>Physically there, including what is already promised</td></tr>
+  <tr><td><code>committed</code></td><td>Sold but not yet shipped</td></tr>
+  <tr><td><code>incoming</code></td><td>On its way to this location</td></tr>
+  <tr><td><code>reserved</code>, <code>damaged</code></td><td>Held back, not sellable</td></tr>
+</table>
+</div>
+
+<p>This is the source of the overselling mistake from Track 2: an ERP's "stock" is usually
+<code>on_hand</code>, and Shopify sells <code>available</code>. Writing one into the other is how
+you promise items that are already sold.</p>
+
+<h3>The order side</h3>
+
+<div class="diagram">
+  Order                      the customer's request to buy
+    ├── LineItem             what they chose
+    └── FulfillmentOrder     work to be done FROM ONE LOCATION
+          ├── FulfillmentOrderLineItem
+          └── Fulfillment    an actual shipment, with tracking
+
+  one Order can have SEVERAL FulfillmentOrders
+  ── because its items may ship from different places
+</div>
+
+<p>That last line is the part people miss. An order is not one shipment. Split it across a
+warehouse and a shop and you get two fulfillment orders, each with its own location and status.
+Anything that assumes one order equals one shipment breaks the first time a cart spans two
+locations.</p>
+
+<p>And a <b>FulfillmentService</b> — a third-party warehouse — <b>automatically gets its own
+Location</b> when it is created. So "locations" in a real store is not just shops and warehouses;
+some are apps.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> Order contains an array of FulfillmentOrders; a
+FulfillmentOrder is items fulfilled from the same location and there can be more than one per
+order per location; a FulfillmentService always has its own automatically created Location; active
+Locations can fulfil online orders when configured with shipping rates, local pickup or local
+delivery —
+<a href="https://shopify.dev/docs/apps/build/orders-fulfillment/order-management-apps">Apps in order management</a>
+and <a href="https://shopify.dev/docs/apps/build/orders-fulfillment/fulfillment-service-apps">About fulfillment services</a>.
+The product → variant → inventoryItem → inventoryLevel → location chain and the named quantities
+were <b>validated against the 2026-07 Admin schema</b> on the same date.</p>
+
+<h3>The query that proves it</h3>
+
+<pre><code>query ObjectModel {
+  products(first: 1) {
+    nodes {
+      id title
+      variants(first: 1) {
+        nodes {
+          id sku
+          inventoryItem {
+            id tracked requiresShipping
+            inventoryLevels(first: 10) {
+              nodes {
+                location { id name }
+                quantities(names: ["available","on_hand","committed",
+                                   "incoming","reserved","damaged"]) {
+                  name quantity
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<p>Read the nesting: to get from a product to a number you pass through variant, inventory item,
+inventory level and location. That nesting <em>is</em> the model.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "the product page says 5 in stock but we have 8 in the shop". <b>Name three
+  different explanations, using the right object names.</b>
+</div>
+
+<p>One: the shop's Location is not stocking that variant, so its InventoryLevel is absent — the 5
+is from another location. Two: <code>on_hand</code> is 8 but <code>available</code> is 5, because
+3 are <code>committed</code> to orders not yet shipped. Three: the shop is not a Location at all,
+so its stock is invisible to Shopify entirely. All three look identical to a client, and the object
+names are what let you tell them apart in one query instead of a day of guessing.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — writing <code>on_hand</code> into <code>available</code></span>
+  The two differ by exactly the amount already sold. Overwrite one with the other and you re-sell
+  items that are boxed and waiting to ship. This is the single most common cause of overselling in
+  an integration.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — assuming one order is one shipment</span>
+  Code that fulfils "the order" fails or double-ships when an order has two FulfillmentOrders from
+  two locations. Model the fulfillment order, not the order.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the missing InventoryLevel</span>
+  A variant not stocked at a location has no level there, rather than a level of zero. Code
+  expecting a row gets nothing and often treats it as zero — which is right by accident, until you
+  try to <em>write</em> to a level that does not exist.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — <code>tracked: false</code></span>
+  A variant with tracking off has no meaningful quantity, and writes to it do nothing useful.
+  Check <code>tracked</code> before trusting or setting a number.
+</div>
+
+<div class="scar">
+  <span class="who">Treating the product as the sellable unit</span>
+  Prices, SKUs, barcodes and stock are all on the variant. A design that maps an ERP item to a
+  Shopify <em>product</em> works only while every product has exactly one variant, and then breaks
+  permanently.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — locations are not all shops</span>
+  Fulfillment services create their own locations, so a "location count" mixes real places with
+  apps. Never assume the list of locations equals the list of shops; check what each one is before
+  building a store locator on it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client says "just sync our stock number"</span>
+  <q>I need to be precise about which number. Shopify keeps stock per location, and it separates
+  "physically here" from "available to sell" — the difference being items already sold but not yet
+  shipped. If your system's number includes those, sending it straight across would re-sell them.
+  Which number is it?</q>
+  <span class="why-said">One question that prevents the most expensive failure in the project.
+  Ask it before agreeing to anything.</span>
+</div>
+
+<div class="script">
+  <span class="who">Explaining why "one product" is not one thing</span>
+  <q>In Shopify a product is really a folder. The things customers buy are the variants inside it —
+  each size and colour has its own price, its own code and its own stock. So when we say "10,000
+  products", the number that actually matters for how long anything takes is the variant count,
+  which is usually four or five times bigger.</q>
+  <span class="why-said">Corrects the unit before it appears in an estimate. Clients count
+  products; the work scales with variants.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>The variant is the sellable thing.</b> The product is a grouping for display.</li>
+  <li><b>Product → Variant → InventoryItem → InventoryLevel → Location.</b> The quantity lives at the level.</li>
+  <li><b>"How many" is meaningless without a place.</b> Total stock is a sum across locations.</li>
+  <li><b><code>available</code> ≠ <code>on_hand</code>.</b> They differ by what is committed. Confusing them oversells.</li>
+  <li><b>One order can have several FulfillmentOrders</b>, one per location. Model that, not the order.</li>
+  <li><b>A missing InventoryLevel is absence, not zero</b>, and you cannot write to a level that does not exist.</li>
+  <li><b>Fulfillment services create their own Locations.</b> Not every location is a shop.</li>
+</ul>
+<p class="one-thing">If you remember one thing: stock is not a property of a product — it is a
+number attached to a variant at a place.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the two APIs and how the rate limit really works.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← Track 1 Map</a></span>
+  <span><a href="0002-the-two-apis-and-the-rate-limit-model.html">P1.2 · The two APIs →</a></span>
+</div>
+
+</div>
+</body>
+</html>

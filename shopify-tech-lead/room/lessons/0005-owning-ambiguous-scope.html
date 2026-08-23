@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2.1 — Owning Ambiguous Scope</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R2 · Lesson 1</p>
+<h1>Owning ambiguous scope</h1>
+<p class="subtitle">The brief is three sentences. What you ask, and what you decide without asking.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A rule for sorting unknowns into "ask" and "decide" — so you stop
+  either blocking on questions or guessing on things that mattered.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what makes an unknown worth a question?</h3>
+
+<p>Every ambiguity has two properties: how <b>expensive it is to get wrong</b>, and how <b>cheap it is
+to change later</b>. That gives four situations, and only one of them deserves a question.</p>
+
+<div class="diagram">
+                    cheap to change          expensive to change
+                 ┌────────────────────────┬────────────────────────┐
+  low cost       │  DECIDE                │  DECIDE, and say so    │
+  if wrong       │  do not mention it     │  one line in a note    │
+                 ├────────────────────────┼────────────────────────┤
+  high cost      │  DECIDE, flag it       │  ★ ASK ★               │
+  if wrong       │  "assumed X, easy to   │  this is the only      │
+                 │   change if wrong"     │  blocking question     │
+                 └────────────────────────┴────────────────────────┘
+</div>
+
+<p>So the discipline is: <b>find the top-right and bottom-right, ask about the bottom-right, state
+assumptions for everything else, and get on with it.</b></p>
+
+<p>Feynman version: <b>only stop and ask when being wrong would be both costly and hard to undo.</b>
+Everything else is a decision you are being paid to make.</p>
+
+<h3>The two failure modes, and both are common</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Failure</th><th>Looks like</th><th>Why it happens</th></tr>
+  <tr><td><b>Blocking</b></td><td>Twelve questions before starting. Nothing moves for a week</td><td>Treating every unknown as equal, and fear of being wrong</td></tr>
+  <tr><td><b>Guessing</b></td><td>Two weeks of work in the wrong direction, discovered at review</td><td>Not wanting to look uncertain, or not noticing the unknown was load-bearing</td></tr>
+</table>
+</div>
+
+<p>Blocking feels responsible and reads as helpless. Guessing feels decisive and reads as careless. The
+middle — <b>decide, state the assumption, keep moving</b> — is what a lead does, and it is a habit rather
+than a talent.</p>
+
+<h3>The three questions that resolve most Shopify ambiguity</h3>
+
+<p>For integration work specifically, these are almost always in the bottom-right box:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Question</th><th>Why it is load-bearing</th></tr>
+  <tr><td><b>Who decides this field when both systems disagree?</b></td><td>Wrong answer means overwriting real data. Expensive and hard to undo</td></tr>
+  <tr><td><b>Is this number sellable stock or everything on the shelf?</b></td><td>Wrong answer means overselling. Directly costs money</td></tr>
+  <tr><td><b>What happens when the other system is down?</b></td><td>Undecided means the code decides by accident, usually by failing</td></tr>
+</table>
+</div>
+
+<p>Three questions, all answerable by a non-engineer, all cheap to ask. If you only ever ask these on a
+new integration, you will be right more often than someone who asks twenty.</p>
+
+<h3>How to state an assumption so it actually gets read</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Weak</th><th>Strong</th></tr>
+  <tr><td>"Assumed the ERP owns pricing."</td><td>"I've assumed your ERP decides prices and Shopify follows. If your team ever edits a price directly in Shopify, tell me — it'd be overwritten overnight."</td></tr>
+  <tr><td>"Assumed daily sync."</td><td>"I've assumed once a day is fine for product details. Stock will be within minutes. Say if either needs to be different."</td></tr>
+</table>
+</div>
+
+<p>The difference is that the strong version names <b>the consequence if the assumption is wrong</b>.
+Nobody reads a list of assumptions. Everybody reads "it'd be overwritten overnight".</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A ticket says: "Sync products from the ERP to Shopify." <b>Name one thing you would ask and two you
+  would decide.</b>
+</div>
+
+<p><b>Ask:</b> which fields does each side own — specifically, does anyone edit product details directly
+in Shopify? That is expensive if wrong (you overwrite their work) and hard to undo (the old values are
+gone). It is the one genuinely blocking question.
+<br><br>
+<b>Decide:</b> the sync interval — start with something sensible and say so, because it is trivial to
+change. And the identifier — use their product code, note it, move on. Both are cheap to revise, so
+asking would slow the work down for no benefit.
+<br><br>
+The thing to notice: "sync products" is four words that contains one real question and about fifteen
+decisions. Finding <em>which</em> is the skill.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — guessing on ownership</span>
+  You assume the ERP owns everything, build it, and the first run overwrites the marketing team's
+  hand-written descriptions. Their work is gone and there is no undo. This is the classic instance of a
+  bottom-right question treated as a decision.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — blocking for a week</span>
+  Twelve questions sent, nothing built, and the client concludes you cannot work independently. Every
+  question you did not need to ask spent trust you will want later.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — an assumption stated with no consequence</span>
+  Buried in a list, nobody reads it, and it was wrong. You did technically flag it, which will not help
+  anyone. Name what happens if it is wrong, or you did not really flag it.
+</div>
+
+<div class="scar">
+  <span class="who">Asking in a channel nobody reads</span>
+  A blocking question in a group chat at 5pm on Friday is not a question, it is a hope. If it genuinely
+  blocks you, it needs a named person and a stated deadline.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — some ambiguity is a business disagreement</span>
+  Sometimes nobody has decided who owns a field because two teams want different things, and your
+  question exposes that. Do not resolve it in code. Say plainly that it is a decision between two people
+  and that you will hold until they make it — that is escalating, not blocking.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Asking the one blocking question</span>
+  <q>One thing I need before I start, because it's expensive to get wrong. Does anyone on your team edit
+  product titles or descriptions directly in Shopify? If they do, and I set this up with the ERP as the
+  source, their edits would get overwritten every night. Everything else I can make a sensible call on
+  and tell you what I chose.</q>
+  <span class="why-said">One question, the consequence spelled out, and an explicit promise to decide the
+  rest yourself. That last clause is what makes the question welcome rather than annoying.</span>
+</div>
+
+<div class="script">
+  <span class="who">Stating decisions, at the start</span>
+  <q>Three calls I've made so I could get moving. Product details sync once a day, stock every few
+  minutes. I'm matching products on your ERP product code. And if your ERP is unreachable we hold the
+  last known values rather than blanking anything. All three are easy to change — flag any that don't
+  match how you work.</q>
+  <span class="why-said">Shows initiative and stays correctable. Three specific decisions with an open
+  door reads as ownership; asking about all three reads as needing supervision.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the ambiguity is really a disagreement between two people</span>
+  <q>I've hit something I shouldn't decide. Your buying team wants prices controlled in the ERP; the
+  marketing team is currently setting promotional prices in Shopify. Both are reasonable, and whichever
+  we pick means the other loses something. I'll keep working on the parts that don't depend on it — can
+  the two of them agree by Thursday?</q>
+  <span class="why-said">Refuses to arbitrate a business decision in code, keeps working, and asks for a
+  dated resolution. This is the highest-value sentence in the Lesson.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Sort unknowns by cost-if-wrong and cost-to-change.</b> Only expensive-and-irreversible earns a question.</li>
+  <li><b>Blocking reads as helpless; guessing reads as careless.</b> Decide, state, move.</li>
+  <li><b>Three load-bearing questions:</b> who owns each field · sellable or shelf stock · what happens when they are down.</li>
+  <li><b>State assumptions with their consequence.</b> Nobody reads a list; everybody reads "overwritten overnight".</li>
+  <li><b>A blocking question needs a named person and a date.</b> A group chat is not a question.</li>
+  <li><b>Do not arbitrate a business disagreement in code.</b> Name it and hold that part.</li>
+  <li><b>Announce the decisions you made</b>, briefly, so ownership is visible and still correctable.</li>
+</ul>
+<p class="one-thing">If you remember one thing: ask only when being wrong is both costly and permanent —
+everything else is what you are paid to decide.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for estimates.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0004-allocation-data-model-consistency-and-failure-at-scale.html">← R1.4</a></span>
+  <span><a href="0006-estimating-pacing-and-holding-two-projects.html">R2.2 · Estimating →</a></span>
+</div>
+
+</div>
+</body>
+</html>

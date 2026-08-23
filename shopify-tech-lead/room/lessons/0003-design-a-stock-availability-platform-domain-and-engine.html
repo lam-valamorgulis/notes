@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R1.3 — Design a Stock-Availability Platform: Domain and Engine</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R1 · Lesson 3 · <span class="pill depth">depth</span></p>
+<h1>Design a stock-availability platform: domain and engine</h1>
+<p class="subtitle">A full worked design, so you have one you have actually thought through.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> One system you can design from scratch out loud — the domain, then the
+  engine that answers the only question that matters.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>The problem, in one sentence</h3>
+
+<p>A retailer with shops and a website wants to answer: <b>"can I get this item, here, soon?"</b> —
+for every item, every shop, and every customer, continuously.</p>
+
+<p>Notice how much that one sentence contains. Not "how many do we have" — that is a number Shopify
+already holds. It is <em>can I get it</em>, which folds in place, time, and a promise.</p>
+
+<h3>The domain: five nouns, and no more</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Noun</th><th>Is</th><th>Is not</th></tr>
+  <tr><td><b>Item</b></td><td>The thing a customer chooses. A variant</td><td>A product. Nobody buys "a t-shirt"</td></tr>
+  <tr><td><b>Place</b></td><td>Somewhere stock physically is</td><td>Always a shop — warehouses and third parties count</td></tr>
+  <tr><td><b>Count</b></td><td>Item + Place + a number + <b>a timestamp</b></td><td>A property of the item</td></tr>
+  <tr><td><b>Promise</b></td><td>A reservation. Someone is coming for it</td><td>A sale. It can expire</td></tr>
+  <tr><td><b>Rule</b></td><td>What turns counts into an answer</td><td>Configuration. It is the product</td></tr>
+</table>
+</div>
+
+<p>The <b>timestamp on Count</b> is the load-bearing decision. A stock number without an age is
+unusable, because you cannot tell a fresh zero from a stale five. Make freshness part of the data, not
+a property of the pipeline that carried it.</p>
+
+<p>And <b>Promise</b> as a separate noun is what most designs get wrong. A reservation is not a sale and
+not a stock adjustment — it is a claim with an expiry. Model it separately and you can expire it,
+report on it, and explain it. Fold it into the count and you can do none of those.</p>
+
+<h3>The engine: turning counts into an answer</h3>
+
+<p>The naive engine returns the number. The real engine returns <b>an answer to a question a customer
+asked</b>, which is a different thing.</p>
+
+<div class="diagram">
+   counts per place (each with an age)
+        │
+        ├── subtract PROMISES that have not expired
+        │
+        ├── apply a SAFETY BUFFER per place
+        │    a shop floor is not accurate to the unit
+        │
+        ├── apply FRESHNESS rules
+        │    older than N minutes → downgrade the confidence
+        │
+        └── apply RULES
+             per place: is it sellable from here at all?
+             per item: minimum before we say "available"
+        ▼
+   an ANSWER, not a number:
+     available · low · unavailable · unknown
+</div>
+
+<p><b>Four outcomes, not three.</b> "Unknown" is the one people leave out, and it is the one that keeps
+you honest — a place whose count is two days old should say unknown, not zero and not five.</p>
+
+<h3>Why bands rather than counts</h3>
+
+<p>Derive it rather than accepting it. A shop floor miscounts: items are held, damaged, in a fitting
+room, or mis-scanned. So the true count has an error margin of a few units. Publishing an exact number
+implies an accuracy the physical world does not provide, and the customer's decision — <em>is it worth
+the trip?</em> — does not need it. A band absorbs the error and answers the real question.</p>
+
+<p>Exception worth naming: <b>"one left" is the most dangerous number to display</b>, because it is both
+the most likely to be wrong and the most likely to make someone travel. Many retailers deliberately
+show nothing below a threshold.</p>
+
+<h3>The safety buffer, and who owns it</h3>
+
+<p>A buffer of two units per shop means you show "unavailable" while two remain. You lose a few sales
+and avoid a few wasted journeys. <b>That is a business trade-off, not a technical one</b> — so it is
+configuration per place, set by the business, not a constant in your code. Making it configurable is
+part of the design, not a nicety.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A shop's count says 3. There is one unexpired promise against it, the buffer for that shop is 2, and
+  the count is 40 minutes old. <b>What do you tell the customer?</b>
+</div>
+
+<p>3 − 1 promise = 2, minus a buffer of 2 = <b>0</b>, so the honest answer is <b>unavailable</b> — even
+though a shop staff member looking at the shelf would see three.
+<br><br>
+That gap is the whole point of the design, and it is the thing you must be able to explain to the
+client, because they <em>will</em> ask why their website says no while the shelf says yes. The answer:
+one is promised to someone who is on their way, and two are held back because a shop floor is not
+accurate to the unit. You are not reporting stock; you are answering "can this customer get it".
+<br><br>
+The 40-minute age is a separate judgement. If the freshness threshold is 30 minutes, the correct answer
+becomes <b>unknown</b> rather than unavailable — and "we can't confirm right now" is a better thing to
+show a customer than a confident wrong no.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a count with no age</span>
+  You cannot distinguish a fresh zero from a stale five, so you either trust old data or discard good
+  data. Both cost sales, and neither is visible. Put the timestamp in the data model.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — promises folded into counts</span>
+  A reservation modelled as a stock decrement cannot expire, cannot be reported on, and cannot be
+  explained to a merchant asking where the item went. Then abandoned reservations quietly consume real
+  stock forever.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — no "unknown" state</span>
+  Stale data reported as a confident number. Everything looks fine and some answers are simply invented.
+  Four outcomes, not three.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a buffer hardcoded in the engine</span>
+  The business wants it different per shop, and per season. Hardcoded, it becomes a deploy every time
+  they change their mind, and nobody remembers what the number is or why.
+</div>
+
+<div class="scar">
+  <span class="who">Modelling Place as "shop"</span>
+  Warehouses, third-party fulfilment and popups all hold stock. Naming the concept "shop" bakes in an
+  assumption you will fight later, in every query and every screen.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the exact-number request will come back</span>
+  A client who accepted bands will ask again for exact counts in six months, usually because one customer
+  complained. Write the reasoning down when you agree it, so the second conversation is a reference
+  rather than a re-litigation.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Explaining the design in one pass</span>
+  <q>We keep a count per item per location, and crucially we keep <em>when</em> we last heard it. Then
+  before we show anything, we take off whatever's promised to customers coming to collect, hold back a
+  small buffer because shop floors are never exact, and check the number isn't too old. What comes out
+  is "available", "low", "not available", or "we can't confirm right now" — rather than a count we can't
+  stand behind.</q>
+  <span class="why-said">Describes the whole engine in four sentences with no jargon, and the fourth
+  outcome makes the honesty visible.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client asks why the site says no and the shelf says yes</span>
+  <q>Two reasons, both deliberate. One of those three is promised to someone who's on their way to
+  collect it. And we hold back two per shop, because a shop floor is never accurate to the item — things
+  get held, damaged, or left in a fitting room. So we're not reporting your stock, we're answering
+  whether a customer can actually get it. The buffer is yours to set if two feels too cautious.</q>
+  <span class="why-said">Explains a confusing behaviour as two intentional decisions, and hands them the
+  dial. The last sentence turns a complaint into a setting.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>The question is "can I get this, here, soon?"</b> — not "how many are there".</li>
+  <li><b>Five nouns: Item, Place, Count, Promise, Rule.</b></li>
+  <li><b>A Count carries a timestamp.</b> Freshness is data, not a pipeline property.</li>
+  <li><b>A Promise is a claim with an expiry</b>, not a sale and not a stock adjustment.</li>
+  <li><b>The engine subtracts promises, applies a buffer, checks freshness, applies rules.</b></li>
+  <li><b>Four outcomes: available · low · unavailable · unknown.</b> "Unknown" keeps you honest.</li>
+  <li><b>The buffer is a business setting per place</b>, never a constant in code.</li>
+</ul>
+<p class="one-thing">If you remember one thing: put the timestamp in the count — without it you cannot
+tell a fresh zero from a stale five, and every other decision gets worse.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for allocation, consistency and what breaks at scale.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0002-the-design-conversation-whiteboard-for-a-client.html">← R1.2</a></span>
+  <span><a href="0004-allocation-data-model-consistency-and-failure-at-scale.html">R1.4 · Allocation &amp; scale →</a></span>
+</div>
+
+</div>
+</body>
+</html>

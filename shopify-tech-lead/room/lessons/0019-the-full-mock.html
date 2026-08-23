@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R5.3 — The Full Mock</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R5 · Lesson 3 · <span class="pill depth">depth</span></p>
+<h1>The full mock</h1>
+<p class="subtitle">Answer before you reveal. Printable score sheet. No marks for reading ahead.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> An honest measurement of where you are — which is only honest if you answer
+  out loud before looking at what follows each question.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<div class="trap">
+  <span class="label">The rule that makes this worth doing</span>
+  <b>Say your answer out loud, in full, before reading the "looking for" line.</b> Reading first feels
+  productive and teaches nothing — recognising an answer is not producing one. If you read ahead, the score is
+  meaningless and so is the exercise.
+</div>
+
+<h3>How to score</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Score</th><th>Means</th></tr>
+  <tr><td><b>2</b></td><td>Said it fluently, and volunteered at least one thing the prompt did not ask for</td></tr>
+  <tr><td><b>1</b></td><td>Got the substance, but hesitated or missed part of it</td></tr>
+  <tr><td><b>0</b></td><td>Could not produce it out loud</td></tr>
+</table>
+</div>
+
+<p>Total out of 30. Below 20, re-read the Lesson named next to the question rather than repeating the mock —
+repeating a test does not teach the material.</p>
+
+<h2>Part 1 · Platform (10 marks)</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Question</th><th>Looking for</th><th>Lesson</th></tr>
+  <tr><td>1</td><td>Where does a stock number live in Shopify's model?</td><td>Variant → inventory item → inventory level at a location. "How many" needs a place</td><td><a href="../../platform/lessons/0001-the-shopify-object-model-end-to-end.html">P1.1</a></td></tr>
+  <tr><td>2</td><td>How does the GraphQL rate limit work?</td><td>A cost budget, not a request count. Scalars free, mutations 10, connections sized by <code>first</code>. 1,000-point ceiling per query</td><td><a href="../../platform/lessons/0002-the-two-apis-and-the-rate-limit-model.html">P1.2</a></td></tr>
+  <tr><td>3</td><td>Why pin the API version?</td><td>Quarterly releases; a retired version <b>falls forward</b> silently. No error, changed behaviour</td><td><a href="../../platform/lessons/0003-api-versioning-and-the-quarterly-upgrade.html">P1.3</a></td></tr>
+  <tr><td>4</td><td>What happens if you write a metafield with no definition?</td><td>Stored, readable by API, but not editable in the admin, not validated, not filterable</td><td><a href="../../platform/lessons/0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a></td></tr>
+  <tr><td>5</td><td>When is it a metaobject rather than a metafield?</td><td>Several fields together, or shared by many resources. Adjective versus noun</td><td><a href="../../platform/lessons/0005-metaobjects-and-when-data-does-not-belong-on-the-product.html">P2.2</a></td></tr>
+</table>
+</div>
+
+<h2>Part 2 · Sync and integration (12 marks)</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Question</th><th>Looking for</th><th>Lesson</th></tr>
+  <tr><td>6</td><td>Who owns which field in an ERP sync?</td><td>Per field, not per record. Ownership splits inside one product — ERP owns title and price, Shopify owns quantity</td><td><a href="../../apps/lessons/0010-ownership-per-field-not-per-record.html">A3.2</a></td></tr>
+  <tr><td>7</td><td>Why absolute writes rather than deltas?</td><td>Replay becomes free. A retry of "stock is 12" is harmless; "add 3" is a bug</td><td><a href="../../apps/lessons/0011-absolute-writes-safe-replay-and-tombstones.html">A3.3</a></td></tr>
+  <tr><td>8</td><td>How do you detect a deletion in the source?</td><td>You cannot from an absence — it carries no information. Needs a tombstone. Archive in Shopify, never delete</td><td><a href="../../apps/lessons/0011-absolute-writes-safe-replay-and-tombstones.html">A3.3</a></td></tr>
+  <tr><td>9</td><td>Why is a webhook payload not data?</td><td>A photograph of the past, of unknown age. Trigger a read of the current value. Fixes out-of-order delivery for free</td><td><a href="../../apps/lessons/0012-webhooks-are-a-hint-clocks-order-and-staleness.html">A3.4</a></td></tr>
+  <tr><td>10</td><td>What is wrong with "newest wins"?</td><td>It compares clocks you do not own. Use ownership, which needs no clock</td><td><a href="../../apps/lessons/0012-webhooks-are-a-hint-clocks-order-and-staleness.html">A3.4</a></td></tr>
+  <tr><td>11</td><td>How do you know the sync is correct?</td><td>Three-way reconciliation with the denominator published. Counts prove almost nothing</td><td><a href="../../apps/lessons/0014-reconciliation-and-numbers-that-do-not-lie.html">A3.6</a></td></tr>
+</table>
+</div>
+
+<h2>Part 3 · The room (8 marks)</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Question</th><th>Looking for</th><th>Lesson</th></tr>
+  <tr><td>12</td><td>A client wants exact per-shop stock counts live on every product page. Respond.</td><td>Push back on "exact" and on "live on every page". Offer bands, deferred loading, product page only</td><td><a href="../../platform/lessons/0006-three-ways-in-store-stock-reaches-the-storefront.html">P3.1</a></td></tr>
+  <tr><td>13</td><td>How long will the ERP sync take?</td><td>A range, its single named cause, and when it collapses. Never a bare number</td><td><a href="../../room/lessons/0013-a-range-not-a-number.html">R3.3</a></td></tr>
+  <tr><td>14</td><td>A PM wants to drop the reconciliation report to save time.</td><td>Agree with the goal, one concern, hand back the decision, offer a cheaper version</td><td><a href="../../room/lessons/0014-disagreeing-upward-and-the-senior-narrative.html">R3.4</a></td></tr>
+  <tr><td>15</td><td>Have you run a production sync?</td><td>Name the gap plainly, the specific work you did, and what is still missing</td><td><a href="0017-the-experience-gap-talking-about-what-you-have-not-built.html">R5.1</a></td></tr>
+</table>
+</div>
+
+<h2>The score sheet</h2>
+
+<div class="diagram">
+   Part 1 · Platform          __ / 10
+   Part 2 · Sync              __ / 12
+   Part 3 · The Room          __ /  8
+                              ─────────
+   TOTAL                      __ / 30
+
+   Volunteered without being asked:  ______
+   Questions I could not say out loud at all:
+     ______________________________________
+</div>
+
+<p>That second box matters more than the total. <b>Anything you could not produce out loud is not yours yet</b>,
+regardless of whether you recognised the answer when you read it. Write those down and re-read those Lessons.</p>
+
+<h3>The bar</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Total</th><th>Read as</th></tr>
+  <tr><td><b>26–30</b></td><td>Ready. Keep the Project moving — the remaining gap is experience, not knowledge</td></tr>
+  <tr><td><b>20–25</b></td><td>Solid. Re-read the specific Lessons behind your 0s and 1s, then re-run only Part 2</td></tr>
+  <tr><td><b>Below 20</b></td><td>Do not repeat the mock. Re-read the Chapters, then come back in a week</td></tr>
+</table>
+</div>
+
+<div class="recall">
+  <span class="label">The one question that is not scored</span>
+  Which of the fifteen did you most want to skip? <b>That is your next re-read</b> — reluctance is a more
+  reliable signal than a score.
+</div>
+
+<p>Wanting to skip a question almost always means one of two things: you know you cannot produce it, or you can
+produce it but not confidently. Both are the same instruction — that Lesson, out loud, this week.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar">
+  <span class="who">Reading the "looking for" column first</span>
+  Recognition is not production. You will score well and learn nothing, and the false confidence is worse than
+  a low score.
+</div>
+
+<div class="scar">
+  <span class="who">Answering in your head</span>
+  Silent answers are always fluent. The failure mode this mock exists to find is the gap between knowing and
+  saying, and that gap is invisible unless you speak.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — repeating the mock instead of re-reading</span>
+  Your score rises because you remember the questions. Nothing was learned. Repeating a test measures recall of
+  the test.
+</div>
+
+<div class="scar">
+  <span class="who">Scoring 1 as 2</span>
+  Hesitating counts as 1. Under real pressure a hesitation becomes a 0, so be strict — a generous score here
+  costs you later.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the mock cannot test the thing that matters most</span>
+  It measures whether you can say the answers. It cannot measure whether you have built one. A 30 out of 30 with
+  no running Project is exactly the position that lost an interview once. <b>The Project is the part the mock
+  cannot score.</b>
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When you scored well but the gap is real</span>
+  <q>I can talk through all of that, and I want to be straight about the difference between talking and having
+  done it. I've built a sync end to end against a dev store — real rate limits, real webhooks, deliberate
+  failures. What I haven't done is a live cutover with real money moving. That's the piece I'd want support on
+  first time.</q>
+  <span class="why-said">Uses the honesty from R5.1 rather than letting fluency imply experience. Fluency
+  without that sentence is exactly what reads as overselling.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you are asked something you scored 0 on</span>
+  <q>I don't have that one at my fingertips. What I'd do is check Shopify's documentation and note the date,
+  because these limits move — I've seen one change by a factor of ten in three weeks. I'd rather look it up than
+  give you a number I half-remember.</q>
+  <span class="why-said">Turns a genuine gap into a demonstration of the right habit. Far stronger than a
+  half-remembered fact delivered confidently.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Answer out loud before reading the "looking for" line.</b> Recognition is not production.</li>
+  <li><b>2 = fluent and volunteered extra. 1 = hesitated. 0 = could not say it.</b></li>
+  <li><b>Below 20, re-read — do not repeat the mock.</b> Repeating measures recall of the test.</li>
+  <li><b>The list of questions you could not answer aloud matters more than the total.</b></li>
+  <li><b>The question you wanted to skip is your next re-read.</b></li>
+  <li><b>Score strictly.</b> A hesitation here is a zero under real pressure.</li>
+  <li><b>A perfect score with no running Project is the position that lost an interview.</b></li>
+</ul>
+<p class="one-thing">If you remember one thing: this mock scores what you can say — the Project is what changes
+what you can honestly claim.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Say <b>"mock me"</b> and I will run this live, interrupting and following up the way a
+  real interviewer does.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0018-what-a-shopify-tech-lead-interview-actually-probes.html">← R5.2</a></span>
+  <span><a href="../index.html">Track 3 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

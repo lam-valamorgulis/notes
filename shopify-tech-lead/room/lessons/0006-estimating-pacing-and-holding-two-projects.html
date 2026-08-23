@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2.2 — Estimating, Pacing, and Holding Two Projects</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R2 · Lesson 2</p>
+<h1>Estimating, pacing, and holding two projects</h1>
+<p class="subtitle">Why your estimate was wrong, and the shape of one that is not.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> An estimate format that is honest, useful, and does not collapse the
+  first time something surprises you.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is an estimate actually a statement about?</h3>
+
+<p>People treat an estimate as a prediction of duration. It is not — it is a statement about
+<b>uncertainty</b>. "Three days" claims you know the work to within a day. Usually you do not, and the
+number is a wish with a decimal point.</p>
+
+<p>So the correct output is not a number. It is <b>a range, plus the thing that decides where in the
+range you land.</b> That third part is what makes a range useful rather than evasive.</p>
+
+<div class="diagram">
+  BAD    "about three days"
+         ── no uncertainty stated. becomes a promise. breaks.
+
+  WEAK   "three to eight days"
+         ── honest, and useless. why the spread?
+
+  GOOD   "three days if their API can tell me what changed since a
+          timestamp. Eight if it can't and I have to compare full
+          lists. I'll know within an hour of seeing their docs."
+         ── a range, the reason, and when it collapses.
+</div>
+
+<p>The last version does three things at once: it gives a bound, it explains the spread, and it names
+<b>when the uncertainty ends</b>. Nobody argues with that estimate, because it is not asking to be
+believed — it is describing what is not yet known.</p>
+
+<h3>Why your estimates were wrong: the four usual causes</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Cause</th><th>Fix</th></tr>
+  <tr><td>You estimated the <b>happy path</b></td><td>Failure handling, retries and reconciliation are usually 30–50% of integration work. Estimate them as line items</td></tr>
+  <tr><td>You estimated <b>your part</b></td><td>Add the client's part: getting credentials, an API doc, a decision, a test account. This is often the longest wait in the project</td></tr>
+  <tr><td>You counted <b>products, not variants</b></td><td>The platform limits variants. A 4× unit error multiplies straight through</td></tr>
+  <tr><td>You forgot <b>verification</b></td><td>Reconciliation, a sample load, a hand-check. Real work with real duration</td></tr>
+</table>
+</div>
+
+<p>The second row is the one that surprises people most. On integration work, <b>waiting on the other
+side is frequently the critical path</b>, and it is entirely absent from a naive estimate. Name it, with
+a date, and it becomes visible instead of becoming your fault.</p>
+
+<h3>Estimate the shape before the number</h3>
+
+<p>When you genuinely cannot size something, size its <em>parts</em> and their confidence:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Piece</th><th>Confidence</th><th>Note</th></tr>
+  <tr><td>Catalogue in</td><td><b>High</b></td><td>Done this shape before</td></tr>
+  <tr><td>Inventory both ways</td><td>Medium</td><td>Depends on whose number is sellable stock</td></tr>
+  <tr><td>Initial load at volume</td><td><b>Low</b></td><td>Needs one sample load to know. Half a day to find out</td></tr>
+  <tr><td>Reconciliation and monitoring</td><td>High</td><td>Standard, and non-optional</td></tr>
+</table>
+</div>
+
+<p>Handing over that table instead of a single number is more useful to a client than any figure, because
+it tells them <b>which unknown to spend money resolving first</b>.</p>
+
+<h3>Pacing, and holding two projects</h3>
+
+<p>The instinct is to split days between projects. Do not. Context switching on integration work is
+expensive because the state you hold in your head is large — whose field is whose, what the last run did,
+which of six unknowns is still open.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Instead of</th></tr>
+  <tr><td>Whole days, or whole half-days, on one thing</td><td>Alternating hour by hour</td></tr>
+  <tr><td>Deliberately leave one thing <em>waiting on someone else</em></td><td>Both projects active at once</td></tr>
+  <tr><td>Write down where you stopped, before switching</td><td>Trusting you will remember</td></tr>
+  <tr><td>Tell both clients your rhythm</td><td>Letting both believe they are the only one</td></tr>
+</table>
+</div>
+
+<p>The second row is the real technique: <b>stagger the projects so one is always blocked on the client
+while you work the other.</b> Two integrations always have waiting in them — for credentials, for a
+decision, for a vendor to reply. Two projects that are both waiting are a scheduling accident; two where
+one is always waiting is a plan.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A PM asks for "a number, not a range" for an ERP sync you have not scoped. <b>What do you say?</b>
+</div>
+
+<p>Give a number and make it a commitment about something you control. <b>"I'll give you a number on
+Thursday. To get it I need their API documentation and half a day to load a sample at your real volume.
+What I can commit to today is that Thursday date."</b>
+<br><br>
+That is not evasion, and it is the strongest available answer: you have supplied a firm date, named
+exactly what you need to hit it, and moved the commitment onto ground you can hold. A PM asking for a
+number usually needs <em>something</em> to put in a plan — and a date for a number is something.
+<br><br>
+What you must not do is invent a figure to end the conversation. That figure becomes the plan, and you
+will spend the rest of the project explaining a number you knew was fiction when you said it.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a number invented to end a conversation</span>
+  It goes into a plan and becomes the baseline you are measured against. Every later conversation is now
+  about a variance from a figure you knew was fiction.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — omitting the client's part</span>
+  Credentials, decisions and vendor replies are often the longest waits in the project. Absent from the
+  estimate, every delay looks like yours.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — estimating the happy path</span>
+  Failure handling and verification are a third to a half of integration work. Left out, the project is
+  "nearly done" for a very long time.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a range with no reason</span>
+  "Three to eight days" reads as unwillingness to commit. The spread must have a named cause, or it
+  sounds like padding.
+</div>
+
+<div class="scar">
+  <span class="who">Splitting the day between two projects</span>
+  Integration state is large and switching costs are real. Two half-days produce less than one whole day,
+  and the loss is invisible on a timesheet.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — re-estimate out loud, early</span>
+  When you learn something that moves the estimate, say so the day you learn it. A number revised at week
+  two is information. The same number revised at week six is a broken promise, even though the work was
+  identical.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The estimate itself</span>
+  <q>Three days if their system can tell me what's changed since a given time. Eight if it can't, because
+  then I have to compare full lists every night, which is a different piece of work. I'll know which
+  within an hour of seeing their API docs — can you get me those?</q>
+  <span class="why-said">Range, reason, and the exact thing that collapses the uncertainty, framed as a
+  request. The client can now do something to shorten their own project.</span>
+</div>
+
+<div class="script">
+  <span class="who">Naming the client's part in the timeline</span>
+  <q>Two things on your side are on the critical path: the API credentials from your ERP vendor, and a
+  decision on who owns product descriptions. If both land this week we're on for the 14th. If the
+  credentials take three weeks — which happens — the date moves by that much, and I'd rather we both see
+  that now.</q>
+  <span class="why-said">Makes their dependencies visible before they cause a delay, without blaming
+  anyone for something that has not happened yet.</span>
+</div>
+
+<div class="script">
+  <span class="who">Re-estimating early</span>
+  <q>Something's changed and I want to tell you today rather than in three weeks. Their API can't tell me
+  what's changed since a timestamp, so we're on the eight-day path, not the three-day one. Nothing's gone
+  wrong — this was the unknown I flagged, and it resolved the expensive way.</q>
+  <span class="why-said">Ties the revision back to a risk you already named, which turns bad news into a
+  demonstration that your process works.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>An estimate is a statement about uncertainty</b>, not a prediction of duration.</li>
+  <li><b>Range + reason + when it collapses.</b> A range without a reason reads as padding.</li>
+  <li><b>Estimate failure handling and verification</b> — often a third to a half of integration work.</li>
+  <li><b>Include the client's part.</b> Waiting is frequently the critical path.</li>
+  <li><b>Variants, not products.</b> A 4× unit error multiplies through everything.</li>
+  <li><b>Stagger two projects so one is always blocked on someone else.</b> Whole days, never alternating hours.</li>
+  <li><b>Re-estimate the day you learn something.</b> Week two it is information; week six it is a broken promise.</li>
+</ul>
+<p class="one-thing">If you remember one thing: never invent a number to end a conversation — commit to a
+date for the number instead.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the client who does not reply.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0005-owning-ambiguous-scope.html">← R2.1</a></span>
+  <span><a href="0007-communicating-with-a-busy-client.html">R2.3 · The busy client →</a></span>
+</div>
+
+</div>
+</body>
+</html>

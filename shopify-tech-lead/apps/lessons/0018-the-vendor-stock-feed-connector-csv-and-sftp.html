@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A4.3 — The Vendor Stock-Feed Connector: CSV and SFTP</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A4 · Lesson 3</p>
+<h1>The vendor stock-feed connector: CSV and SFTP</h1>
+<p class="subtitle">What half of real clients actually hand you. Boring, and it breaks in interesting ways.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A connector that treats a file drop as a legitimate integration
+  rather than a workaround — and that refuses to import a truncated file instead of wiping a
+  catalogue with it.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: a file is a snapshot with no metadata</h3>
+
+<p>An API answers questions. A file does not. It arrives, it contains rows, and everything you
+would want to know is absent:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You want to know</th><th>An API tells you</th><th>A file tells you</th></tr>
+  <tr><td>What changed?</td><td><code>changed since X</code></td><td><b>Nothing. Diff it yourself</b></td></tr>
+  <tr><td>Is this complete?</td><td>Pagination, a cursor</td><td><b>Nothing. It may be half-written</b></td></tr>
+  <tr><td>What was deleted?</td><td>A tombstone or a flag</td><td><b>Absence — which carries no information</b></td></tr>
+  <tr><td>Is this newer than the last one?</td><td>A timestamp per record</td><td>A filename and an mtime, both editable</td></tr>
+</table>
+</div>
+
+<p>So the connector's job is to <b>manufacture the metadata a file does not carry</b>. That is the
+whole design, and it is why "it's just a CSV" is the most misleading sentence in this trade.</p>
+
+<h3>A file feed IS a full-state snapshot — use that</h3>
+
+<p>Here is the one genuine advantage. A full file every day answers the deletion question that
+APIs make hard. If a SKU was in yesterday's file and is not in today's, it is gone. An absence
+inside a <em>complete</em> snapshot is information — unlike an absence inside a page of changes.</p>
+
+<div class="diagram">
+  yesterday's file    today's file        conclusion
+  ────────────────    ────────────        ──────────
+  SKU-1               SKU-1               unchanged (or changed — diff the row)
+  SKU-2               —                   DELETED. this is reliable.
+  —                   SKU-3               new
+</div>
+
+<p>That inference is only valid if today's file is <b>complete</b>. Which is exactly why the next
+section is the most important part of the Lesson.</p>
+
+<h3>Never trust the file until it passes the gate</h3>
+
+<p>A truncated upload plus "absence means deleted" equals a wiped catalogue. So every file passes
+a gate before a single row is applied:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Gate</th><th>Rule</th><th>Prevents</th></tr>
+  <tr><td><b>Stability</b></td><td>Size unchanged for N seconds before you open it</td><td>Reading a file still being uploaded</td></tr>
+  <tr><td><b>Header</b></td><td>Exact expected columns, or reject</td><td>A silent column reorder mapping price into stock</td></tr>
+  <tr><td><b>Row count sanity</b></td><td>Within ±X% of the last good file</td><td>A truncated file deleting the catalogue</td></tr>
+  <tr><td><b>Freshness</b></td><td>Not older than the last file processed</td><td>An old file being re-dropped, undoing a day</td></tr>
+  <tr><td><b>Checksum</b></td><td>Identical to last time → skip</td><td>Re-processing an unchanged feed</td></tr>
+</table>
+</div>
+
+<p>The row-count gate is the one that saves you. A feed that normally has 40,000 rows arriving
+with 300 is not a business event — it is a failed upload. <b>Reject and alert. Never apply.</b>
+Half a catalogue deleted at 3am is one of the few genuinely unrecoverable integration
+incidents.</p>
+
+<h3>Vendors do not send well-formed files</h3>
+
+<p>Assume all of this, because you will meet all of it:</p>
+
+<ul>
+  <li><b>Encoding.</b> UTF-8 with a BOM, or Windows-1252 with a smart quote. Detect, do not assume.</li>
+  <li><b>A trailing summary row.</b> "TOTAL, 40000" at the bottom, which parses as a product.</li>
+  <li><b>Numbers as text.</b> <code>"1,234"</code> with a thousands separator, or <code>"12.00 "</code> with a trailing space.</li>
+  <li><b>Excel damage.</b> A SKU like <code>0012345</code> silently losing its leading zeros, or becoming a date.</li>
+  <li><b>Duplicate keys.</b> The same SKU twice, with different stock. Decide the rule — last wins, or reject the file — and write it down.</li>
+  <li><b>A changed column order</b> with no version marker. This is why the header gate is exact-match, not permissive.</li>
+</ul>
+
+<h3>Then convert it into the shape from A3</h3>
+
+<p>Once it passes the gate, the file becomes ordinary. Diff against the previous good snapshot,
+turn the diff into absolute writes, emit tombstones for disappearances, and everything from
+Chapter A3 applies unchanged. <b>Keep the previous good file</b> — it is your only diff baseline
+and your only evidence when a vendor says they never sent that.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Monday's feed has 40,000 rows. Tuesday's has 38,500. Your rule is "absence means deleted".
+  <b>Do you apply it?</b>
+</div>
+
+<p>Not automatically — 3.75% is exactly the ambiguous band. It could be a genuine seasonal
+delisting or a partial upload, and the file cannot tell you. So the honest design has three
+outcomes, not two: <b>apply</b> below a tight threshold, <b>reject</b> above a wide one, and
+<b>hold for a human</b> in between. Most connectors have only apply and reject, which forces you
+to set the threshold either dangerously loose or annoyingly tight. A hold state costs one
+notification and removes the dilemma.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — applying a truncated file</span>
+  The worst incident in this Lesson. Absence means deleted, the upload failed halfway, and half
+  the catalogue is archived overnight. Recovery means restoring from your previous snapshot, which
+  only exists if you kept it.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — reading a file mid-upload</span>
+  Your watcher fires on file creation, not completion. You read 60% of a feed and treat it as
+  complete. Identical damage to the above, from a race rather than a vendor error. Wait for a
+  stable size, or require the vendor to upload to a temp name and rename.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a reordered column</span>
+  Price and stock swap places. Every row parses. Every number is wrong. There is no error at any
+  layer, and the store sells at stock levels and stocks at prices. Exact header matching is the
+  only defence.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — Excel eating the SKU</span>
+  A vendor opens the file to check it and saves it. Leading zeros are gone, and long numeric SKUs
+  become scientific notation. Your matching silently fails for those rows, which then look like
+  new products. Validate the key format and reject rows that fail it.
+</div>
+
+<div class="scar">
+  <span class="who">The re-dropped old file</span>
+  A vendor re-uploads last week's file to "fix" something. Without a freshness gate you cheerfully
+  roll the catalogue back a week. Track the last processed file's identity and timestamp, and
+  refuse to go backwards.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — SFTP has no delivery notification</span>
+  There is no webhook. You poll a directory, which means your freshness is bounded by your poll
+  interval plus the vendor's schedule. And if the vendor's upload silently stops, you receive
+  nothing — which looks exactly like "no changes today". <b>Alert on the absence of a file</b>, not
+  only on bad files. This is the failure most connectors miss entirely.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client apologises that their supplier "only does CSV"</span>
+  <q>That's genuinely fine, and in one way it's better — a full file every day tells me clearly
+  when something has been discontinued, which APIs often don't. What I need from them is
+  consistency: same columns, same order, and ideally uploaded to a temporary name then renamed, so
+  I never read a half-finished file.</q>
+  <span class="why-said">Removes the apology, names the real advantage, and asks for the three
+  things that prevent most incidents. All in one reply.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a feed arrives short and you have held it</span>
+  <q>Today's file has 38,500 products; yesterday's had 40,000. That might be genuine, or it might
+  be a failed upload — I can't tell from the file. I've held it rather than applying it, because
+  if it's a bad upload, applying it would take 1,500 products off sale. Can someone confirm with
+  the supplier?</q>
+  <span class="why-said">Explains the hold as protection rather than as a blocker, with the
+  specific damage named. Nobody argues with this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When no file has arrived for two days</span>
+  <q>We've had no feed since Monday. Nothing has failed on our side — there's simply nothing to
+  process, which is why it wouldn't show up as an error. Your stock figures are two days stale
+  right now. Worth chasing them today.</q>
+  <span class="why-said">Reports silence as a finding. Most connectors never notice, and the
+  client discovers it from a customer instead.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A file carries no metadata.</b> The connector's job is to manufacture what the file does not say.</li>
+  <li><b>A complete snapshot answers the deletion question</b> that APIs make hard — but only if it is complete.</li>
+  <li><b>Five gates before any row is applied:</b> stability, exact header, row-count sanity, freshness, checksum.</li>
+  <li><b>Three outcomes, not two:</b> apply, hold for a human, reject. A hold state removes the threshold dilemma.</li>
+  <li><b>Keep the last good file.</b> It is your diff baseline and your evidence.</li>
+  <li><b>Assume encoding, summary rows, Excel damage and duplicate keys.</b> All of them, every time.</li>
+  <li><b>Alert on a missing file.</b> Silence looks exactly like "no changes today".</li>
+</ul>
+<p class="one-thing">If you remember one thing: never let a short file delete anything — hold it
+and ask a human.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the mapping registry, where syncs die.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0017-set-piece-design-a-shopify-erp-sync-at-scale.html">← A4.2</a></span>
+  <span><a href="0019-identifier-mapping-and-the-mapping-registry.html">A4.4 · Identifier mapping →</a></span>
+</div>
+
+</div>
+</body>
+</html>

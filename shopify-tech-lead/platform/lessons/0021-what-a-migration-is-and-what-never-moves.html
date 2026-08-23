@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.5 — What a Migration Is, and What Never Moves</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 5 · <span class="pill depth">depth</span></p>
+<h1>What a migration is, and what never moves</h1>
+<p class="subtitle">Passwords never move. Neither do several things clients assume will.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell a client, in the first meeting, which of their data
+  will not survive the move — before they promise their customers otherwise.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: three categories, not two</h3>
+
+<p>People plan migrations as "what we move" and implicitly assume everything else is small. The honest
+model has three categories, and the third is the one that causes trouble:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Category</th><th>Examples</th><th>Effort</th></tr>
+  <tr><td><b>Moves cleanly</b></td><td>Products, variants, prices, collections, customers (without credentials), inventory levels</td><td>Mechanical. This is the work everyone plans for</td></tr>
+  <tr><td><b>Moves with loss</b></td><td>Orders, discounts, content pages, redirects, gift cards</td><td>Moves, but not identically. The differences need decisions</td></tr>
+  <tr><td><b>Never moves</b></td><td><b>Passwords.</b> Platform-specific features. Third-party app data. SEO authority tied to old URLs</td><td>Not a task. A <b>change to how the business works</b></td></tr>
+</table>
+</div>
+
+<h3>Passwords: the one nobody expects</h3>
+
+<p>Customer password hashes do not transfer between platforms. They are hashed with the old
+platform's scheme and secret, so there is nothing meaningful to import — and importing them would be a
+security failure if it were possible.</p>
+
+<p>So every existing customer must set a new password, or sign in without one. This is not a technical
+inconvenience. <b>It is a communications project</b>: every customer needs to be told, before they hit
+a login form that no longer recognises them, or your support queue becomes the migration's most visible
+cost.</p>
+
+<p>Modern Shopify customer accounts can sign a customer in with a one-time code sent to their email,
+which removes the password problem entirely for many stores. That is worth raising early, because it
+changes the shape of the communications plan.</p>
+
+<h3>Order history: moves with loss, and the loss is specific</h3>
+
+<p>Historical orders can be created via the API — but a created order is not a replayed order. Things
+that will not be identical: the payment transaction as the gateway recorded it, the exact tax
+calculation from that day, discount applications from the old platform's engine, and anything the old
+system computed at the time.</p>
+
+<p>So decide what historical orders are <em>for</em>, because the answer changes the work:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Purpose</th><th>What you need</th></tr>
+  <tr><td>Customers seeing their own past orders</td><td>Line items, dates, totals. Approximate is fine</td></tr>
+  <tr><td>Support answering "what did I buy?"</td><td>Same. Approximate is fine</td></tr>
+  <tr><td><b>Accounting, tax or audit</b></td><td><b>Do not migrate for this.</b> Keep the old system readable, or export to a warehouse</td></tr>
+  <tr><td>Returns and exchanges on old orders</td><td>A decision: a cut-off date, or a manual process</td></tr>
+</table>
+</div>
+
+<p>That third row is the most useful thing in this Lesson. Trying to make migrated orders
+accounting-accurate is an enormous amount of work for a purpose a read-only archive serves better.
+Say so early.</p>
+
+<h3>The categories clients forget entirely</h3>
+
+<ul>
+  <li><b>Redirects.</b> Old URLs will be linked from Google, emails and other sites forever. Without
+      redirects you lose that traffic silently. This is usually the highest-value, lowest-glamour task
+      in the whole project.</li>
+  <li><b>Third-party app data.</b> Reviews, loyalty points, subscriptions, wishlists. Each lives in an
+      app, each has its own export, and some have none. <b>Enumerate the installed apps in week
+      one.</b></li>
+  <li><b>Content and SEO metadata.</b> Pages, blogs, meta titles and descriptions. Mechanical but
+      voluminous, and always underestimated.</li>
+  <li><b>Anything platform-specific.</b> A feature the old platform had that Shopify does not is not a
+      migration item — it is a scope decision, and it belongs in front of the client immediately.</li>
+</ul>
+
+<div class="note">
+  <span class="label">What I did not verify today</span>
+  The precise mechanics — the required import order between products, customers and orders; whether
+  orders can be imported by CSV at all; the exact scope and token type <code>orderCreate</code> needs;
+  order-per-minute caps on development and trial stores; how backdating is expressed; and how gift-card
+  and saved-payment-method migration works. Those were verified for an earlier version of this material
+  on <b>3 August 2026</b> but <b>not re-checked today</b>. Given that the variant throttle in
+  <a href="0019-the-huge-catalogue-load-and-the-throttle.html">P6.3</a> changed by 10× in three weeks,
+  treat all of them as needing a fresh check before you plan against them.
+</div>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says "and obviously all our customers' logins carry over." <b>What do you say, and what do
+  you ask for?</b>
+</div>
+
+<p>They do not — passwords cannot move between platforms, so every customer will need to set a new one
+or sign in with an emailed code. Then immediately ask for two things: <b>who owns the customer
+communication</b>, and <b>when it goes out relative to go-live</b>. Because the failure here is not
+technical, it is that thousands of people hit a login form that does not recognise them on the same
+morning, and nobody warned them. Raising it in the first meeting turns it into a planned email
+campaign. Raising it in week eight turns it into a support crisis.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — no redirects</span>
+  Every old URL indexed by search engines or linked from an email becomes a 404. Traffic drops and
+  nothing errors. It is invisible in your logs and extremely visible in the client's revenue.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — discovering app data late</span>
+  Reviews and loyalty points are the client's most emotionally valuable data, and they live in apps
+  with their own exports — or none. Found in week one it is a task. Found in week eight it is a
+  crisis.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — migrating orders for accounting</span>
+  A recreated order is not the original transaction. Building toward audit accuracy is enormous effort
+  for a purpose a read-only archive serves better and cheaper.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the login surprise</span>
+  Passwords cannot transfer, so on go-live morning every returning customer fails to sign in. Nothing
+  is broken. Everything is working as designed, and the support queue does not care.
+</div>
+
+<div class="scar">
+  <span class="who">A platform-specific feature treated as a migration task</span>
+  If Shopify does not do it, it is not a data problem — it is a scope decision. Escalate it rather than
+  quietly building a substitute nobody agreed to.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — customers will notice small differences</span>
+  Order numbers that do not match old receipts, dates shifted by a timezone, an address formatted
+  differently. Individually trivial, collectively they read as "they lost our data". Decide deliberately
+  what will visibly differ, and tell the client which ones customers will see.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">First meeting, unprompted</span>
+  <q>Three things I want to flag now rather than later. Customer passwords can't move between platforms
+  — everyone will need to set a new one, or sign in with a code we email them, so that needs a
+  communication plan. Second, anything living in your current apps — reviews, loyalty points — is a
+  separate export each, and I need the app list this week. And third, we need redirects from every old
+  URL, or you lose your search traffic on day one.</q>
+  <span class="why-said">Three items, all of which are cheap now and expensive later. Delivering them
+  unprompted is the difference between a supplier and a lead.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to migrate ten years of orders</span>
+  <q>Let me ask what they're for. If it's so customers can see what they bought, we can bring across the
+  items, dates and totals and that works well. If it's for accounting or tax, I'd keep the old system
+  readable instead — a recreated order isn't the original transaction, and making it accurate enough for
+  an audit is a project on its own. Which one matters?</q>
+  <span class="why-said">One question that can remove the largest and least valuable chunk of a
+  migration from the scope entirely.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Three categories:</b> moves cleanly · moves with loss · never moves.</li>
+  <li><b>Passwords never move.</b> That makes it a communications project, not a data task.</li>
+  <li><b>One-time email codes remove the password problem</b> for many stores. Raise it early.</li>
+  <li><b>A recreated order is not the original transaction.</b> Never migrate orders for accounting.</li>
+  <li><b>Redirects are the highest-value, least glamorous task.</b> Without them, traffic dies silently.</li>
+  <li><b>Enumerate installed apps in week one.</b> Reviews and loyalty are the client's most treasured data.</li>
+  <li><b>A missing platform feature is a scope decision</b>, not a migration item. Escalate it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: ask what the historical data is <em>for</em> — the
+answer usually removes most of the work.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for orders, money and Shopify-to-Shopify.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0020-the-cutover-and-the-proof.html">← P6.4</a></span>
+  <span><a href="0022-orders-money-and-the-shopify-to-shopify-replatform.html">P6.6 · Orders &amp; money →</a></span>
+</div>
+
+</div>
+</body>
+</html>

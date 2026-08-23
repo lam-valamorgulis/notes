@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A5 Step 3 — Webhooks In, Inventory Back</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A5 · Project Step 3</p>
+<h1>Webhooks in, inventory back</h1>
+<p class="subtitle">The first step where data comes <em>to</em> you. That inverts everything about the setup.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A receiver that proves a message came from Shopify, survives the same one
+  arriving twice, and writes inventory back to the Fake ERP — with ownership deliberately reversed on the same
+  product.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>What changed: direction</h3>
+
+<p>Steps 0 to 2 were all <b>outbound</b>. Your code called Shopify, so <code>localhost</code> was fine —
+nothing needed to reach you. Step 3 is the first <b>inbound</b> step, and that single change inverts the
+networking requirement.</p>
+
+<div class="diagram">
+  STEPS 0-2  (outbound)            STEP 3  (inbound)
+  your laptop ──▶ Shopify          Shopify ──▶ your laptop
+  localhost is fine                localhost is UNREACHABLE
+  you control the timing           Shopify controls the timing
+  you can retry                    you get 5 seconds, then 8 retries
+</div>
+
+<p>So you need a <b>public HTTPS URL</b> that forwards to your machine. Three ways, in order of
+convenience:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Tool</th><th>Notes</th></tr>
+  <tr><td><code>shopify app dev</code></td><td>Shopify CLI creates a tunnel for you. Easiest, and the URL changes on each restart</td></tr>
+  <tr><td><code>cloudflared tunnel --url http://localhost:3000</code></td><td>Free, no account for a quick tunnel</td></tr>
+  <tr><td><code>ngrok http 3000</code></td><td>Same idea. A free account gives you a stable subdomain</td></tr>
+</table>
+</div>
+
+<p>Whichever you pick, the URL <b>changes when the tunnel restarts</b>. So do not hardcode it: read
+<code>PUBLIC_BASE_URL</code> from <code>.env</code>, and <b>recreate the subscription on boot</b> if the
+registered URL does not match. That is ten lines and it removes a whole category of "why is nothing
+arriving".</p>
+
+<h3>1 · Register the subscription</h3>
+
+<pre><code>mutation CreateWebhook(
+  $topic: WebhookSubscriptionTopic!
+  $sub:   WebhookSubscriptionInput!
+) {
+  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
+    webhookSubscription { id topic apiVersion { handle } uri }
+    userErrors { field message }
+  }
+}</code></pre>
+
+<p>And to see what is already registered — run this <em>first</em>, or you will create duplicates:</p>
+
+<pre><code>query ListWebhooks {
+  webhookSubscriptions(first: 50) {
+    nodes { id topic apiVersion { handle } createdAt uri }
+  }
+}</code></pre>
+
+<p class="verified"><b>Validated against the 2026-07 Admin schema on 2026-08-23.</b> The first draft of both
+used <code>endpoint</code>, which the validator rejected as <b>deprecated in favour of <code>uri</code></b>.
+That is the <b>third</b> already-deprecated field this Course has caught by validating — after
+<code>ShopPlan.displayName</code> and <code>Market.enabled</code>. Validate every query.</p>
+
+<p>Subscribe to the topics this Project actually needs, and no more:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Topic</th><th>Why</th></tr>
+  <tr><td><code>INVENTORY_LEVELS_UPDATE</code></td><td>The core of this Step. Shopify owns quantity; you carry it back</td></tr>
+  <tr><td><code>PRODUCTS_UPDATE</code></td><td>To notice when someone edits in the admin — the <code>shadow</code> ≠ Shopify case</td></tr>
+  <tr><td><code>APP_UNINSTALLED</code></td><td>Stop trying. Not optional in anything real</td></tr>
+</table>
+</div>
+
+<h3>2 · The receiver, in the only order that works</h3>
+
+<div class="diagram">
+  POST /webhooks/shopify
+    1. capture the RAW body            ← before any JSON parsing
+    2. verify HMAC-SHA256(raw, secret) vs X-Shopify-Hmac-SHA256
+       mismatch → 401, and do not log the body
+    3. INSERT X-Shopify-Webhook-Id into inbox
+       duplicate key → 200, and stop. already handled.
+    4. enqueue the id + topic
+    5. return 200                      ← inside 5 seconds, always
+       ── total work here: microseconds. no API calls. no ERP calls.
+</div>
+
+<p>Step 1 is where most people fail. Your framework parses JSON before your handler runs, and a
+parsed-then-re-serialised body is a <em>different byte string</em> — so the HMAC never matches and the code
+looks correct. Capture raw bytes on this route specifically.</p>
+
+<p>Step 3 is idempotency as a database constraint rather than an <code>if</code>. Two workers racing cannot
+both insert; the loser's insert fails and it returns 200. An <code>if</code> can be passed by both.</p>
+
+<h3>3 · Then do the work, outside the request</h3>
+
+<p>The queued job does what A3.4 requires: <b>the webhook is a trigger, not data.</b></p>
+
+<div class="diagram">
+  job(webhookId, topic):
+    read the CURRENT value from Shopify   ← never trust the payload
+    map ids via the registry
+    write to the Fake ERP, ABSOLUTE
+    record in shadow, only after success
+    advance the watermark to the highest seen
+</div>
+
+<h3>4 · Inventory back — and read this mutation choice carefully</h3>
+
+<p>Shopify gives you two, and the names are dangerously similar:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Mutation</th><th>Semantics</th><th>Use</th></tr>
+  <tr><td><code>inventorySetQuantities</code></td><td><b>Absolute.</b> "This is now 12"</td><td><b>This one</b></td></tr>
+  <tr><td><code>inventoryAdjustQuantities</code></td><td><b>Delta.</b> "Change by −3"</td><td>Almost never. A retry applies it twice</td></tr>
+</table>
+</div>
+
+<pre><code>mutation SetInventoryAbsolute($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup {
+      createdAt
+      reason
+      changes { name delta quantityAfterChange }
+    }
+    userErrors { field message code }
+  }
+}</code></pre>
+
+<p>Note what comes back: <code>quantityAfterChange</code>. That is Shopify telling you the resulting value, so
+you can record exactly that in <code>shadow</code> rather than recording what you hoped for.</p>
+
+<h3>5 · The point of this Step: ownership reverses</h3>
+
+<p>On the same product, in the same run:</p>
+
+<div class="diagram">
+  title, description, price   Fake ERP ──▶ Shopify     (Step 2)
+  inventory quantity          Fake ERP ◀── Shopify     (Step 3)
+
+  ── ownership SPLITS INSIDE ONE PRODUCT. this is the whole lesson.
+</div>
+
+<p>Build it that way deliberately, because it is the arrangement most real integrations have and the one that
+catches people. And note which direction you are writing: pull Shopify's <code>available</code>, and write it
+to the ERP's <em>sellable</em> field — never to its warehouse total.</p>
+
+<h3>6 · Then break it on purpose</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do this</th><th>Prove</th></tr>
+  <tr><td>Change stock in the Shopify admin</td><td>The ERP follows within seconds</td></tr>
+  <tr><td>Replay the same webhook body twice</td><td>Second one returns 200 and does nothing. Check the inbox row</td></tr>
+  <tr><td>Return a <b>301</b> from the route for a minute</td><td>Shopify counts failures. Watch the retries arrive</td></tr>
+  <tr><td>Take the receiver down for 20 minutes</td><td>Retries arrive with growing gaps. Count them</td></tr>
+  <tr><td>Set <code>ERP_FAIL_MODE=down</code></td><td>The job fails, retries, and lands in the dead-letter — not lost</td></tr>
+  <tr><td>Sleep 6 seconds before returning 200</td><td>It times out at 5. <b>Confirm the deadline is real</b></td></tr>
+</table>
+</div>
+
+<div class="recall">
+  <span class="label">Answer before you build</span>
+  Your handler verifies the HMAC, then does the ERP write, then returns 200. The ERP takes 4 seconds today.
+  <b>What breaks, and when?</b>
+</div>
+
+<p>Nothing — today. You are at 4 seconds against a 5-second budget, so it works, and it will keep working
+until the ERP has a slow afternoon. Then you cross 5 seconds, Shopify records a failure, and it retries — so
+you do the slow write <em>again</em>, still too slowly, eight times. After 8 consecutive failures your
+<b>subscription is deleted</b>, and from then on your app looks healthy and receives nothing.
+<br><br>
+That is the whole reason for enqueue-then-200. The 5 seconds is for <em>acknowledging</em>, never for working.
+And notice the failure is invisible: no error in your logs, because your handler completed fine — just slowly.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — doing the work inside the request</span>
+  The scenario above. It works until it does not, then it deletes your own subscription and the app goes quiet
+  while looking healthy. Enqueue, return 200, work behind it.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — HMAC on a parsed body</span>
+  Every delivery is rejected as unauthentic and the code reads as correct. Capture raw bytes on this route
+  only.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a stale tunnel URL</span>
+  The tunnel restarted, the subscription still points at the old URL, and nothing arrives. Shopify is failing
+  deliveries you never see. <b>Recreate the subscription on boot if the URL does not match.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — <code>inventoryAdjustQuantities</code></span>
+  A delta. Retry it and the stock drifts permanently, in a direction nobody notices until a count is wrong.
+  Use <code>inventorySetQuantities</code>.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — writing <code>available</code> into a warehouse total</span>
+  You are writing back now, so the oversell risk points the other way: the ERP's picking decisions get made on
+  a sellable number that excludes reserved stock.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — duplicate subscriptions</span>
+  Register on every boot without listing first and you accumulate subscriptions on one topic. Each produces a
+  <em>separate</em> delivery with its own <code>Webhook-Id</code> and the same <code>Event-Id</code> — so your
+  inbox lets both through and you do the work twice.
+</div>
+
+<div class="scar">
+  <span class="who">Logging the payload to debug</span>
+  Order and customer payloads carry names, emails and addresses. Log the <code>Webhook-Id</code>, the topic and
+  your decision — never the body.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — pin the webhook's API version too</span>
+  A subscription carries its own version. Pin your calls and forget the subscription and you will one day parse
+  a new payload shape with old code. Read it back from <code>apiVersion { handle }</code> and assert it matches
+  your constant on boot.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked why inventory goes the opposite way to everything else</span>
+  <q>Because that's where it actually changes. Your ERP decides what a product is and what it costs, but a sale
+  happens in Shopify — so Shopify knows the quantity first, and we carry that back to you. It means one product
+  has information flowing both ways at once, which sounds odd but is the arrangement that stops the two systems
+  fighting.</q>
+  <span class="why-said">Explains a design that looks inconsistent by grounding it in where the event happens.
+  Clients accept it immediately once "a sale happens there" is said aloud.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked how fast the update is</span>
+  <q>Usually a few seconds. I won't say instant, because Shopify's own guidance is that a notification can
+  arrive up to a day late — so alongside reacting to notifications we also re-check on a schedule. What I can
+  promise is that a late or repeated message can't do any damage, which matters more than the speed.</q>
+  <span class="why-said">Refuses the wrong promise and replaces it with a better guarantee.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Step 3 is the first inbound step.</b> You need a public tunnel; <code>localhost</code> cannot receive.</li>
+  <li><b>Read the tunnel URL from config and recreate the subscription on boot</b> if it changed.</li>
+  <li><b>List subscriptions before creating one</b>, or you get duplicate deliveries you will process twice.</li>
+  <li><b>Order: raw body → HMAC → inbox insert → enqueue → 200.</b> No API or ERP calls in the request.</li>
+  <li><b><code>inventorySetQuantities</code>, never <code>inventoryAdjustQuantities</code>.</b> Absolute, not delta.</li>
+  <li><b>Record <code>quantityAfterChange</code> in <code>shadow</code></b> — what happened, not what you hoped.</li>
+  <li><b>Ownership splits inside one product.</b> Price flows out; quantity flows in. That is the Step.</li>
+</ul>
+<p class="one-thing">If you remember one thing: the five seconds is for saying yes, never for doing the work —
+break that and Shopify eventually deletes your subscription and your app goes quiet while looking healthy.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Say <b>"write the receiver"</b> once the tunnel is up and I will build it with you
+  against real deliveries.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0024-step-2-catalogue-out.html">← Step 2</a></span>
+  <span><a href="0026-step-4-the-queue-the-dead-letter-and-the-proof.html">Step 4 · The proof →</a></span>
+</div>
+
+</div>
+</body>
+</html>

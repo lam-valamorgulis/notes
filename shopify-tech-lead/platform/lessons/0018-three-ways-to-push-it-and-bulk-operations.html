@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.2 — Three Ways to Push It, and Bulk Operations</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 2</p>
+<h1>Three ways to push it, and bulk operations</h1>
+<p class="subtitle">One at a time, a spreadsheet, or a job. The third one is the only one that scales.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can pick the right import route from the record count alone, and
+  you know the five limits that decide whether a bulk job will finish.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does volume change?</h3>
+
+<p>Writing one record is a request. Writing 40,000 is a <em>schedule</em>, because the rate limit is a
+budget over time. So the routes are not three styles — they are three different answers to "how do I
+spend a budget?"</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th></th><th>One at a time</th><th>CSV</th><th><b>Bulk operation</b></th></tr>
+  <tr><td>Good for</td><td>Tens</td><td>A merchant doing it by hand</td><td><b>Thousands upward</b></td></tr>
+  <tr><td>You control it</td><td>Fully</td><td>Barely</td><td>Fully</td></tr>
+  <tr><td>Per-record errors</td><td>Immediate</td><td>Hard to see</td><td>In a results file you download</td></tr>
+  <tr><td>Rate limit</td><td>You pace it yourself</td><td>n/a</td><td><b>Shopify paces it</b></td></tr>
+  <tr><td>Right for an integration</td><td>For small deltas</td><td><b>No</b></td><td><b>Yes</b></td></tr>
+</table>
+</div>
+
+<p>CSV is a <em>merchant</em> tool. It exists so a shop owner can update prices in a spreadsheet. It is
+not an integration route, and treating it as one means giving up error visibility and control.</p>
+
+<div class="note">
+  <span class="label">What I did not verify today</span>
+  The specific CSV import rules — the file size cap, that Handle is the match column, whether blank
+  columns overwrite while omitted ones do not, and whether an import can be cancelled — live in
+  Shopify's <em>merchant</em> help documentation rather than on shopify.dev, and I did not re-check
+  them for this Lesson. <b>Verify them there before relying on any of it</b>, and prefer a bulk
+  operation regardless.
+</div>
+
+<h3>The bulk flow, and where people stop too early</h3>
+
+<div class="diagram">
+  1. stagedUploadsCreate      reserve a slot → URL + form parameters
+  2. POST the JSONL           the `file` field goes LAST in the form
+  3. bulkOperationRunMutation mutation passed as a STRING + stagedUploadPath
+  4. wait                     poll bulkOperation(id:)  [2026-01+]
+                              or subscribe to bulk_operations/finish
+  5. DOWNLOAD THE RESULTS  ←  most people stop at step 4
+</div>
+
+<p>Step 5 is not optional. <code>COMPLETED</code> means the job ran to the end, not that the rows
+worked. <b>Per-line <code>userErrors</code> exist only in the results file at <code>url</code>.</b> An
+import that "completed" with 4,000 silent row failures is indistinguishable from a success unless you
+download and count.</p>
+
+<h3>The five limits</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Limit</th><th>Value</th></tr>
+  <tr><td>JSONL file size</td><td><b>100 MB</b></td></tr>
+  <tr><td>Time to complete</td><td><b>24 hours</b>, then stopped and marked failed</td></tr>
+  <tr><td>Connection fields in the mutation</td><td><b>One</b></td></tr>
+  <tr><td>Concurrent bulk mutations per app per shop</td><td><b>5</b> on 2026-01+ · one of each type before that</td></tr>
+  <tr><td>Input array size, any mutation</td><td>250 items</td></tr>
+</table>
+</div>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the staged-upload flow, the 100 MB JSONL cap, the
+24-hour limit, the single-connection-field restriction, five concurrent bulk mutations on 2026-01 and
+higher against one of each type before, <code>bulkOperation(id:)</code> versus
+<code>currentBulkOperation</code>, the <code>bulk_operations/finish</code> webhook option, and
+<code>bulkOperationCancel</code> —
+<a href="https://shopify.dev/docs/api/usage/bulk-operations/imports">Bulk import data with the GraphQL Admin API</a>.
+The 250-item input array limit — <a href="https://shopify.dev/docs/api/usage/limits">Shopify API limits</a>.</p>
+
+<div class="scar undocumented">
+  <span class="who">The docs contradict themselves — test it yourself</span>
+  The bulk-import guide's argument table lists <em>"Valid values: productCreate, collectionCreate,
+  productUpdate, productUpdateMedia"</em> for the <code>mutation</code> argument. The Limitations
+  section on the <b>same page</b> says you can supply <em>any</em> Admin API mutation except the two
+  bulk ones. Both cannot be true, and <code>productSet</code> — the upsert you actually want — is not
+  in the four-value list.
+  <br><br>
+  <b>Settle this by running one product through a bulk operation on your own Dev store</b>, not by
+  reasoning about it. If <code>productSet</code> is refused, fall back to <code>productCreate</code>
+  for the first load and <code>productUpdate</code> afterwards, keeping your own mapping so you know
+  which is which.
+</div>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your bulk import reports <code>status: COMPLETED</code>, <code>objectCount: 40000</code>, and no
+  errors anywhere in your logs. <b>How many products are in the store?</b>
+</div>
+
+<p>Unknown. <code>objectCount</code> counts objects processed, not objects succeeded, and every row
+can fail on its own with a <code>userError</code> that appears only in the results file. So the honest
+answer is that you cannot tell from any of those three signals — you have to download the results and
+count successes. This is the same lesson as the reconciliation Chapter in Track 2: <b>every "green"
+indicator here measures effort, not outcome.</b></p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — treating <code>COMPLETED</code> as success</span>
+  Thousands of silently failed rows, and a client told the import worked. The gap is discovered by a
+  customer or by a reconciliation weeks later, when the cause is much harder to trace.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — a CSV import for an integration</span>
+  No per-record error visibility, no control over pacing, and rules that differ from the API's. A
+  route designed for a human doing it once, used for a machine doing it nightly.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the <code>file</code> form field out of order</span>
+  It must be <b>last</b> in the multipart form. Earlier and the upload is rejected or wrong, with an
+  error that points nowhere near the cause.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a JSONL that grew past 100 MB</span>
+  <code>productSet</code> variables with every variant, option and metafield are far bigger than the
+  source records. Count bytes while writing and chunk, rather than discovering the cap at 99%.
+  Chunking is cheap now that five operations can run at once.
+</div>
+
+<div class="scar">
+  <span class="who">Two connection fields in the mutation</span>
+  Only one is allowed. A selection set asking for both <code>variants</code> and <code>media</code>
+  is rejected. Keep the selection to the id and the errors.
+</div>
+
+<div class="scar">
+  <span class="who">A job that could take more than 24 hours</span>
+  It is stopped and marked failed, with no warning at hour 23. If that is even conceivable, the job is
+  too big. Split it.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — reuse the results file</span>
+  The results JSONL contains the created ids next to your input. That is your mapping table for free,
+  and the cheapest moment to record it. Discard the file and you will pay for those ids again with a
+  lookup pass.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked how long an import takes</span>
+  <q>The upload is quick; the queue on Shopify's side is what takes time, and I won't have a real
+  number until I've run it once at your volume. What I can tell you is that it's restartable and that
+  I'll give you a count of what succeeded and what didn't — because a job finishing isn't the same as
+  every row working.</q>
+  <span class="why-said">Refuses a made-up number, offers restartability, and sets the expectation
+  that there will be a failure list.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone suggests just using a CSV</span>
+  <q>That's the right tool if you're doing it by hand occasionally. For something we run repeatedly I'd
+  rather use the API route, because it tells me exactly which rows failed and why. With a spreadsheet
+  import, a bad row tends to disappear quietly, and we find out from a missing product.</q>
+  <span class="why-said">Respects the suggestion, then distinguishes it by error visibility rather
+  than by sounding more technical.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Three routes: one at a time, CSV, bulk.</b> CSV is a merchant tool, not an integration route.</li>
+  <li><b>Five steps, and step 5 is downloading the results.</b> Per-line errors live only there.</li>
+  <li><b><code>COMPLETED</code> and <code>objectCount</code> both measure effort, not success.</b></li>
+  <li><b>100 MB · 24 hours · one connection field · 5 concurrent on 2026-01+ · 250-item arrays.</b></li>
+  <li><b>The <code>file</code> form field goes last.</b> Out of order fails misleadingly.</li>
+  <li><b>The docs disagree about which mutations bulk accepts.</b> Test one product; do not reason.</li>
+  <li><b>Keep the results file — it is your mapping table for free.</b></li>
+</ul>
+<p class="one-thing">If you remember one thing: the import is not finished until you have downloaded
+the results and counted them.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the throttle that only starts at half a million.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0017-the-matching-key-and-custom-ids.html">← P6.1</a></span>
+  <span><a href="0019-the-huge-catalogue-load-and-the-throttle.html">P6.3 · The huge load →</a></span>
+</div>
+
+</div>
+</body>
+</html>

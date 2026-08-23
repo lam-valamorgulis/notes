@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A3.6 — Reconciliation, and Numbers That Do Not Lie</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A3 · Lesson 6</p>
+<h1>Reconciliation, and numbers that do not lie</h1>
+<p class="subtitle">Counting rows proves almost nothing. Here is what to compare instead.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> One number you can put in front of a client that actually
+  means "the sync is correct" — and the knowledge of why the obvious number does not.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what would a proof of correctness have to do?</h3>
+
+<p>Every technique so far reduces the chance of drift. None of them detects it. From first
+principles, detecting drift requires comparing the two copies — there is no way to infer it from
+your own logs, because a silent failure leaves no log.</p>
+
+<p>So the question is what to compare. The obvious answer is counts.</p>
+
+<div class="diagram">
+  ERP: 10,000 products        Shopify: 10,000 products
+                     ✓ match — done?
+
+  now consider:
+    · 50 products missing, 50 extra duplicates      → count matches
+    · every price off by one cent                    → count matches
+    · every stock level from last Tuesday            → count matches
+    · one product's variants deleted, another's added→ count matches
+
+  ── a count is one number summarising thousands.
+     almost every real bug survives it.
+</div>
+
+<p>Feynman version: <b>a count tells you how many things there are, and every bug you care about
+is about what the things say.</b></p>
+
+<h3>Compare what you sent against what is there</h3>
+
+<p>This is what the <code>shadow</code> table from A2.2 exists for. It holds exactly what you
+last successfully sent. So reconciliation becomes a three-way comparison:</p>
+
+<div class="diagram">
+   source          shadow            Shopify
+   (truth)      (what we sent)     (what's there)
+      │                │                 │
+      ├── A ───────────┤                 │   source ≠ shadow → we are BEHIND
+      │                ├──── B ──────────┤   shadow ≠ Shopify → someone ELSE wrote
+      └──────── C ─────────────────────  ┘   source ≠ Shopify → drift, cause unknown
+</div>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Difference</th><th>Means</th><th>Fix</th></tr>
+  <tr><td><b>A</b> source ≠ shadow</td><td>We have not sent the latest yet. A missed change or a stuck watermark</td><td>Re-read and send</td></tr>
+  <tr><td><b>B</b> shadow ≠ Shopify</td><td><b>Something else edited the field.</b> A person in the admin, or another app</td><td>Ownership question, not a bug. Decide, then enforce</td></tr>
+  <tr><td><b>C</b> source ≠ Shopify, shadow agrees with neither</td><td>Both moved. Genuine conflict</td><td>Apply the ownership rule from A3.2</td></tr>
+</table>
+</div>
+
+<p>That B row is the reason this is worth building. Without <code>shadow</code>, "the price is
+wrong" is unattributable — you cannot tell your own bug from a colleague editing the admin. With
+it, you can say which, and that changes the conversation from blame to a decision.</p>
+
+<h3>Compare the fields that cost money, not all of them</h3>
+
+<p>Comparing everything nightly is expensive against the rate limit. So pick by consequence, the
+same principle as the backlog:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Compare</th><th>How often</th><th>Because</th></tr>
+  <tr><td>Inventory quantity per location</td><td>Every night</td><td>Wrong = overselling</td></tr>
+  <tr><td>Price and compare-at price</td><td>Every night</td><td>Wrong = selling at the wrong price</td></tr>
+  <tr><td>Existence: in source but not Shopify, or the reverse</td><td>Every night</td><td>Catches tombstones you missed</td></tr>
+  <tr><td>Title, description, tags, images</td><td>Weekly</td><td>Wrong = untidy</td></tr>
+</table>
+</div>
+
+<h3>Read it with a bulk operation, not a loop</h3>
+
+<p>A nightly full comparison is exactly what bulk query operations are for. Fetch the fields you
+compare in one asynchronous job rather than paging synchronously — which would spend your budget
+and take hours. And when you read counts, remember what A5 Step 0 found on a real store:
+<code>productsCount</code> returned <code>10000</code> with precision <b><code>AT_LEAST</code></b>,
+meaning a limit was reached. Counts are capped as well as uninformative.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> <code>CountPrecision</code> has two values —
+<code>AT_LEAST</code> ("a limit was imposed and reached") and <code>EXACT</code>, and even
+<code>EXACT</code> carries the caveat that "a write may not be reflected instantaneously" —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-07/enums/CountPrecision">CountPrecision</a>.
+So a count read one second after a write can legitimately disagree with the write.</p>
+
+<h3>Then output a work list, not a percentage</h3>
+
+<p>"99.7% in sync" is not actionable. The output of reconciliation is a list of records with the
+field, both values, and the diagnosis. Drift becomes a queue of fixable items — and the count of
+unresolved items is the one number worth alerting on.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Reconciliation reports zero differences, every night, for two weeks. <b>Name two ways that
+  could be a false clean report.</b>
+</div>
+
+<p>First: you are comparing <code>shadow</code> against Shopify only, and both are stale. They
+agree with each other and neither matches the source. You proved you sent what you sent. Second:
+the comparison set is empty — a filter matches no rows, or the watermark is in the future, so you
+compare nothing and find nothing. Both report zero. The defence is to <b>always publish the
+number of records compared</b> alongside the number of differences. Zero differences out of zero
+records is not a pass, and it looks identical to one unless you print both.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — count-only reconciliation</span>
+  Every price off by one cent, or every stock level a week old, passes a count check
+  perfectly. Teams ship this, believe they have a correctness check, and find the real drift
+  from a customer.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — zero out of zero</span>
+  An empty comparison set reports zero differences. Publish the denominator or you cannot tell a
+  pass from a no-op.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — comparing shadow to Shopify only</span>
+  That proves you sent what you sent. It cannot detect a missed change, because a change you
+  never saw is in neither table. The source must be in the comparison.
+</div>
+
+<div class="scar">
+  <span class="who">Counts are capped and can be stale</span>
+  <code>AT_LEAST</code> means the number is a floor, not a value. And <code>EXACT</code> is not a
+  freshness promise — a recent write may not be reflected. Never build a correctness check on a
+  count alone, even a precise-looking one.
+</div>
+
+<div class="scar">
+  <span class="who">Auto-fixing every difference</span>
+  Tempting and wrong. A type-B difference means a human or another app wrote that field. Silently
+  overwriting it starts a fight where your sync and a person take turns. Auto-fix only where
+  ownership is unambiguous; queue the rest for a decision.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — floating point on money</span>
+  Compare money as integer minor units, never as floats. <code>10.10</code> from one system and
+  <code>10.1</code> from another are equal, and a naive string or float comparison may report
+  drift every single night. A reconciliation that cries wolf gets ignored, which is worse than
+  not having one.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked for one number that proves it works</span>
+  <q>Every night we compare what we sent against what's actually in Shopify, field by field, for
+  prices and stock. The report is "we checked 46,000 values and found 3 differences, here they
+  are". If I only told you the product count matched, that would look reassuring and prove almost
+  nothing.</q>
+  <span class="why-said">Gives the number, gives the denominator, and pre-emptively dismisses the
+  weaker metric someone will otherwise ask for.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a price is wrong and it is not your fault</span>
+  <q>We sent 14.99 on Tuesday and I can show you that. It's 12.99 now, and we didn't change it —
+  so someone edited it in the admin, or another app did. That's worth a decision: if staff need to
+  override prices there, I'll stop overwriting that field. If not, I should be putting it back.</q>
+  <span class="why-said">Turns "who broke it" into "what should the rule be". Only possible
+  because the shadow table exists.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to make the sync fix everything automatically</span>
+  <q>For prices and stock, yes — your ERP owns those, so I'll correct them. For anything your
+  team edits in Shopify, I'd rather show you the difference than silently overwrite their work.
+  Otherwise we get a tug-of-war where a person changes something and it reverts overnight.</q>
+  <span class="why-said">Says yes to most of it, and gives a vivid reason for the exception.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Counts prove almost nothing.</b> Missing-plus-duplicate, wrong prices, and stale stock all pass.</li>
+  <li><b>Three-way compare: source, <code>shadow</code>, Shopify.</b> Each pair of differences has a distinct meaning.</li>
+  <li><b><code>shadow</code> ≠ Shopify means someone else wrote it</b> — an ownership decision, not a bug.</li>
+  <li><b>Compare by consequence.</b> Stock and price nightly; text weekly.</li>
+  <li><b>Always publish the denominator.</b> Zero out of zero looks exactly like a pass.</li>
+  <li><b>Counts are capped and can be stale.</b> <code>AT_LEAST</code> is a floor; <code>EXACT</code> is not a freshness promise.</li>
+  <li><b>Compare money as integer minor units.</b> A check that cries wolf gets ignored.</li>
+</ul>
+<p class="one-thing">If you remember one thing: reconciliation is the only thing that measures
+correctness — everything else measures effort.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for what changes when it is not one store but four
+  hundred.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0013-the-backlog.html">← A3.5</a></span>
+  <span><a href="0015-store-17-of-four-hundred.html">A3.7 · Store 17 of 400 →</a></span>
+</div>
+
+</div>
+</body>
+</html>

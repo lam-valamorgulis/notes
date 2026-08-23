@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A1.4 — Scopes, Protected Customer Data &amp; Compliance</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A1 · Lesson 4</p>
+<h1>Scopes, protected customer data &amp; compliance</h1>
+<p class="subtitle">What you are allowed to ask for, and what you must promise in return.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell a client exactly which data the integration
+  will touch, why you are asking for less than they offered, and what obligations arrive the
+  moment a customer's name enters your database.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Scopes: ask for the minimum, and be able to defend it</h3>
+
+<p>Scopes are the permissions your app requests. They live in your app configuration, in your
+repo, so a scope change is a reviewable diff. The rule is not "ask for what you might need" —
+it is <b>ask for the minimum that makes the feature work</b>. Shopify approves protected data
+access only when the request is the minimum required to deliver the functionality.</p>
+
+<p>For the Project in this Course, that is genuinely short:</p>
+
+<pre><code>read_products
+write_products
+read_inventory
+write_inventory
+read_locations</code></pre>
+
+<p>Notice what is absent. No customer scopes, no order scopes. A catalogue-and-stock sync does
+not need to know who bought anything — and staying at that line keeps the whole next section
+from applying to you.</p>
+
+<h3>Protected customer data: three levels</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Level</th><th>What you touch</th><th>What you owe</th></tr>
+  <tr><td><b>0</b></td><td>No customer data</td><td><b>Nothing.</b> No action required</td></tr>
+  <tr><td><b>1</b></td><td>Customer data <em>excluding</em> name, address, phone and email</td>
+      <td>Request access in the Partner Dashboard · implement the level 1 requirements</td></tr>
+  <tr><td><b>2</b></td><td>Customer data <em>including</em> name, address, phone or email</td>
+      <td>Request access <em>and the specific fields</em> · implement level 1 <b>and</b> 2 · <b>participate in data protection reviews</b></td></tr>
+</table>
+</div>
+
+<p>The jump from 1 to 2 is the expensive one, and the trigger is small: a single name field.
+This applies to the review process for a <b>public, published</b> app.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the three levels, the exact field list that
+separates 1 from 2, the data-protection-review obligation at level 2, and the
+minimum-necessary approval rule —
+<a href="https://shopify.dev/docs/apps/launch/protected-customer-data">Work with protected customer data</a>.</p>
+
+<h3>Mandatory compliance webhooks</h3>
+
+<p>Any app distributed through the Shopify App Store must respond to data subject requests
+<b>whether or not it collects personal data</b>. Three topics:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Topic</th><th>Means</th></tr>
+  <tr><td><code>customers/data_request</code></td>
+      <td>A customer asked the store owner for their data. You supply it <b>to the store owner</b>, not to the customer</td></tr>
+  <tr><td><code>customers/redact</code></td>
+      <td>Delete or redact that customer's data</td></tr>
+  <tr><td><code>shop/redact</code></td>
+      <td>The store is gone. Delete its data</td></tr>
+</table>
+</div>
+
+<p>The obligations: acknowledge with a <b>200-series</b> status code, and <b>complete the
+action within 30 days</b>. There is one carve-out worth knowing precisely — if you are
+<b>legally required to retain</b> the data, you should <em>not</em> complete the redaction.</p>
+
+<p>And a timing rule that surprises everyone. For <code>customers/redact</code>: if the
+customer has <b>not placed an order in the past six months</b>, Shopify sends the payload
+<b>10 days</b> after the deletion request. Otherwise the request is <b>withheld until six
+months have passed</b>.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the three topics, the App-Store requirement
+regardless of data collection, the 200-series acknowledgement, the 30-day completion window,
+the legal-retention exception, and the 10-day / six-month redaction timing —
+<a href="https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance">Privacy law compliance</a>.
+Shopify applies the same privacy rights to all personal data regardless of where the
+individual is located, rather than only in GDPR or CPRA territories.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A customer asks to be deleted today. They ordered last week. <b>When does your app receive
+  the <code>customers/redact</code> webhook?</b>
+</div>
+
+<p>In about six months. Because they ordered within the past six months, the request is
+<b>withheld until six months have passed</b>. Only for a customer with no order in that
+window does it arrive after 10 days. If you promised a client "deletions flow through within
+a day", you promised something the platform does not do — and the reason is sound, because a
+merchant still needs order records for returns, tax and chargebacks.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — one name field moves you to level 2</span>
+  Level 1 excludes name, address, phone and email. Include any one of them and you are at
+  level 2: request the specific fields, implement both levels' requirements, and take part in
+  data protection reviews. Teams walk into this by adding a customer name to a dashboard
+  "just for support".
+</div>
+
+<div class="scar">
+  <span class="who">Required even when you collect nothing</span>
+  Mandatory compliance webhooks apply to every App Store app <b>regardless of whether it
+  collects personal data</b>. "We don't store customers" is not an exemption from having the
+  endpoints.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the 30-day clock nobody owns</span>
+  You return 200 and the request is acknowledged. Then a human has 30 days to actually delete
+  the data, and nothing chases them. An acknowledged request that was never completed looks
+  identical to a completed one from the outside. Track them in your own database with a due
+  date.
+</div>
+
+<div class="scar">
+  <span class="who">Data goes to the store owner, not the customer</span>
+  On <code>customers/data_request</code> you supply the data <b>to the store owner directly</b>.
+  Sending it to the customer would be sending personal data to whoever controls that email
+  address — which is not the same person you think it is.
+</div>
+
+<div class="scar">
+  <span class="who">Sometimes all you get is an email address</span>
+  Shopify's own note is that in some cases a customer record contains only the email address.
+  Code that assumes a customer id will always resolve to a full record will throw on exactly
+  the requests you least want to fail.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — scope creep is permanent</span>
+  Adding a scope is easy. Removing one means merchants re-approve. So every "we might want
+  orders later" costs you either an unused permission on a security review, or a re-consent
+  campaign. Ask for what today's feature needs.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client offers full admin access "to make it easier"</span>
+  <q>I'd rather take less. The sync only needs products, inventory and locations — no
+  customers, no orders. That means if our credentials ever leaked, nobody's personal data is
+  exposed, and it keeps us out of a whole category of privacy obligations. It's not extra work
+  for you; it's a shorter list.</q>
+  <span class="why-said">Turns "least privilege" into two things a client cares about: their
+  customers' exposure, and less paperwork.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client asks for a customer name on the sync dashboard</span>
+  <q>I can, but I want you to know what it costs before you decide. Adding a name moves us
+  into a higher tier of Shopify's customer-data rules — extra approval and a data protection
+  review. If support just needs to find an order, an order number does the job with none of
+  that. Which do you want?</q>
+  <span class="why-said">Never refuse outright and never comply silently. Price it, offer the
+  cheaper option, hand back the decision.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone promises a client "deletions happen within 24 hours"</span>
+  <q>I need to correct that before it's in writing. If the customer has ordered in the last
+  six months, Shopify holds the deletion request for six months before it reaches us — the
+  merchant still needs those records for returns and tax. We have 30 days to act once it
+  arrives. Let's say that instead.</q>
+  <span class="why-said">Catching a wrong promise before it is written down is worth more than
+  anything you will build that week.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Ask for the minimum scope.</b> Approval depends on it, and removing a scope later means re-consent.</li>
+  <li><b>Level 0 costs nothing.</b> A catalogue-and-stock sync can stay there by never touching customers or orders.</li>
+  <li><b>Name, address, phone or email = level 2.</b> One field makes the jump, and level 2 adds data protection reviews.</li>
+  <li><b>Three compliance topics:</b> <code>customers/data_request</code>, <code>customers/redact</code>, <code>shop/redact</code>. Required for App Store apps even if you store nothing.</li>
+  <li><b>200-series to acknowledge, 30 days to complete.</b> Unless you are legally required to retain the data, in which case do not redact.</li>
+  <li><b>Redaction timing:</b> 10 days if no order in six months, otherwise withheld for six months.</li>
+  <li><b>Data requests go to the store owner</b>, never to the customer. Sometimes only an email address exists.</li>
+</ul>
+<p class="one-thing">If you remember one thing: the cheapest privacy programme is not
+collecting the data — decide your scopes so level 0 stays true.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter A1 is done. Say <b>"next"</b> for A2, the backend your app
+  actually needs.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0003-webhooks-done-right.html">← A1.3 · Webhooks</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

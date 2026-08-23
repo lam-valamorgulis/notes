@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2.2 — Metaobjects, and When Data Does Not Belong on the Product</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P2 · Lesson 2</p>
+<h1>Metaobjects, and when data does not belong on the product</h1>
+<p class="subtitle">The moment two products need the same size chart, it stops being a product field.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A rule for choosing between a metafield and a metaobject that
+  takes five seconds and is almost always right.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: when does a field stop being a field?</h3>
+
+<p>A metafield holds a value on one resource. Fine for "fabric: linen". Now the client wants a size
+chart — several sizes, each with several measurements — and forty products share the same chart.</p>
+
+<p>Store it as a metafield on each product and you have copied the chart forty times. Change one
+measurement and you must find forty copies. That is not a Shopify problem; it is the oldest problem
+in data modelling, and the answer is the same as it has always been: <b>give the thing its own
+identity and point at it.</b></p>
+
+<div class="diagram">
+  METAFIELD                        METAOBJECT
+  a value ON a thing               a THING of its own, referenced
+
+  product ── fabric: "linen"       product ─┐
+  product ── fabric: "linen"       product ─┼──▶ [ Size Chart: Womens Tops ]
+  product ── fabric: "cotton"      product ─┘         S · M · L rows
+
+  edit = one product               edit = one place, forty products update
+</div>
+
+<p>Feynman version: <b>a metafield is an adjective, a metaobject is a noun.</b> "Linen" describes a
+product. A size chart is a thing that exists whether or not any product points at it.</p>
+
+<h3>The five-second rule</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Ask</th><th>Then</th></tr>
+  <tr><td>Is it one value, belonging to exactly this one resource?</td><td><b>Metafield</b></td></tr>
+  <tr><td>Does it have several fields that belong together?</td><td><b>Metaobject</b></td></tr>
+  <tr><td>Will more than one resource point at the same instance?</td><td><b>Metaobject</b></td></tr>
+  <tr><td>Would a merchant want to manage a <em>list</em> of these?</td><td><b>Metaobject</b></td></tr>
+</table>
+</div>
+
+<p>Any yes after the first means metaobject. And the two combine: the product still carries a
+metafield, but its type is a <b>reference</b> to a metaobject rather than a raw value. That is what
+a <code>metaobject_reference</code> type is for, and lists of them allow up to <b>1,024</b>
+items.</p>
+
+<div class="note">
+  <span class="label">Found on a real store</span>
+  The live store this Course sampled used exactly this pattern. Product metafields included a
+  <code>measurement</code> field typed as a <b>metaobject reference</b>, and around 55 of its
+  definitions were Shopify's own standard taxonomy fields — almost all typed as
+  <code>list.metaobject_reference</code>. So Shopify itself models its product taxonomy this way.
+  Following the pattern is not exotic; it is the platform's own design.
+</div>
+
+<h3>Definition first, then entries</h3>
+
+<p>A metaobject definition is a schema: a type identifier, its fields with types and validation,
+access permissions, capabilities, and how entries display. One definition, many entries — one
+"size chart" definition holds every individual chart.</p>
+
+<h3>Ownership decides how you create it — and this trips people</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Ownership</th><th>Type prefix</th><th>Created how</th><th>Who edits</th></tr>
+  <tr><td><b>App-owned</b></td><td>Reserved <code>$app</code> / <code>app</code></td><td>TOML <em>or</em> GraphQL</td><td>Your app. Admin edit access is configurable</td></tr>
+  <tr><td><b>Merchant-owned</b></td><td>Any non-reserved, e.g. <code>size_chart</code></td><td><b>GraphQL only</b></td><td>The merchant and any installed app</td></tr>
+  <tr><td><b>Shopify-reserved</b></td><td>Shopify's</td><td>You enable, not create</td><td>Structure Shopify's, entries the merchant's</td></tr>
+</table>
+</div>
+
+<p>The trap is in that middle row. <b>TOML configuration only ever creates app-owned
+definitions.</b> If you want something the merchant manages in the admin and other apps can read,
+it must be created through GraphQL. Declaring it in TOML gets you a working definition that is the
+wrong kind, and the wrongness only shows up when the merchant cannot edit it or another app cannot
+see it.</p>
+
+<p>Scopes for this work: <code>read_metaobject_definitions</code> and
+<code>write_metaobject_definitions</code>.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> definitions as schemas with fields, access,
+capabilities and display config; one definition to many entries; the three ownership models and
+their prefixes; that <b>merchant-owned metaobjects must be created using GraphQL</b> because TOML
+only creates app-owned ones —
+<a href="https://shopify.dev/docs/apps/build/metaobjects">About metaobjects</a> and
+<a href="https://shopify.dev/docs/apps/build/metaobjects/manage-metaobject-definitions">Manage metaobject definitions</a>.
+The 1,024-item metaobject-reference list limit —
+<a href="https://shopify.dev/docs/apps/build/metafields/metafield-limits">Metafield limits</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your integration needs to store, per product, the three suppliers who can provide it — each with
+  a name, a lead time and a minimum order quantity. <b>Metafield or metaobject, and why?</b>
+</div>
+
+<p>Metaobject, on two of the four tests at once. A supplier has several fields that belong together
+(name, lead time, minimum), and many products share the same supplier — so storing it per product
+copies the supplier's details across the catalogue and makes a lead-time change a catalogue-wide
+edit. Model <code>supplier</code> as a metaobject definition, create one entry per real supplier,
+and put a <code>list.metaobject_reference</code> on the product. And because the merchant's buying
+team will want to manage that supplier list in the admin, it must be <b>merchant-owned</b> — which
+means creating it via GraphQL, not TOML.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — duplicating a shared thing across products</span>
+  A size chart or supplier copied onto 400 products. The first correction becomes a 400-record
+  migration, and until it finishes the store shows two different answers to the same question.
+</div>
+
+<div class="scar">
+  <span class="who">Merchant-owned declared in TOML</span>
+  TOML only creates <b>app-owned</b> definitions. The deploy succeeds and you get the wrong kind —
+  discovered when the merchant cannot edit the entries, or another app cannot read them. Use
+  GraphQL for anything merchant-owned.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a reference to a deleted entry</span>
+  A metaobject reference points at an entry someone deleted in the admin. The reference resolves to
+  nothing and the storefront renders a gap rather than an error. Anything reading a reference must
+  handle the empty case.
+</div>
+
+<div class="scar">
+  <span class="who">A metaobject for something that is really one value</span>
+  The overcorrection. "Fabric" as a metaobject means an extra lookup on every read and an extra
+  screen for the merchant, for no benefit. Apply the five-second rule honestly in both directions.
+</div>
+
+<div class="scar">
+  <span class="who">Storefront access not granted</span>
+  A definition's access settings decide whether the storefront can read it. A metaobject that works
+  perfectly in the admin and renders nothing on the storefront is almost always this. Set
+  storefront access when you create the definition.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — reference lists cap at 1,024</span>
+  Generous, and finite. A design that points a product at "every review" or "every related item"
+  will meet it eventually. Where a list could grow without bound, model the relationship from the
+  other side instead.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client describes data with parts</span>
+  <q>That sounds like a thing in its own right rather than a label on a product. So I'd set it up
+  once, as its own record, and have the products point at it. Then when a measurement changes you
+  edit it in one place and every product that uses it updates. If we put it on each product
+  instead, you'd be editing it forty times.</q>
+  <span class="why-said">Explains normalisation with no jargon and in terms of the client's future
+  editing effort, which is what they actually care about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked whether the team will be able to edit it themselves</span>
+  <q>Yes, as long as we set it up as yours rather than as our app's. That's a decision at build
+  time — the two look identical afterwards, but only one lets your team manage it in the admin. I'll
+  set it up as yours by default unless it's purely internal plumbing.</q>
+  <span class="why-said">Surfaces a build-time decision that is invisible later and expensive to
+  reverse. Clients rarely know to ask.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A metafield is an adjective; a metaobject is a noun.</b></li>
+  <li><b>Several fields together, or shared by many resources → metaobject.</b> One value on one thing → metafield.</li>
+  <li><b>They combine:</b> the product carries a metafield whose type is a reference to a metaobject.</li>
+  <li><b>Definition first, then entries.</b> One definition, many entries.</li>
+  <li><b>TOML only creates app-owned definitions.</b> Merchant-owned must be created via GraphQL.</li>
+  <li><b>Set storefront access at creation.</b> Works-in-admin-but-blank-on-storefront is almost always this.</li>
+  <li><b>Reference lists cap at 1,024.</b> Unbounded relationships should be modelled from the other side.</li>
+</ul>
+<p class="one-thing">If you remember one thing: the moment two products need the same piece of
+data, it is no longer a product field.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P2 done — the part missing from most people's Shopify knowledge.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0004-metafields-definitions-and-the-cost-of-skipping-them.html">← P2.1</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

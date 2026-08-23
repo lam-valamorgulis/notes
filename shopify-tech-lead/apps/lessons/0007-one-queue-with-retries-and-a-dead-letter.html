@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2.3 — One Queue, With Retries and a Dead-Letter</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A2 · Lesson 3</p>
+<h1>One queue, with retries and a dead-letter</h1>
+<p class="subtitle">The most dangerous response Shopify sends you is a 200 that means "no".</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A worker that reads its own rate-limit budget from every
+  response, slows down before it is told to, and separates "try again" from "this will never
+  work" instead of retrying both forever.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>The fact that changes your error handling</h3>
+
+<p>REST returns <code>429 Too Many Requests</code> when you are throttled. <b>GraphQL returns
+<code>200 OK</code></b> with the failure inside the response body:</p>
+
+<pre><code>{
+  "errors": [
+    { "message": "Throttled",
+      "extensions": { "code": "THROTTLED" } }
+  ],
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 202,
+      "actualQueryCost": null,
+      "throttleStatus": {
+        "maximumAvailable": 1000,
+        "currentlyAvailable": 186,
+        "restoreRate": 50
+      }
+    }
+  }
+}</code></pre>
+
+<p>So <code>if (response.ok)</code> is <b>not</b> an error check on the GraphQL Admin API. A
+throttled request is HTTP 200. A validation failure is HTTP 200. A partial success with
+<code>userErrors</code> is HTTP 200. You must read the body, every time, on three levels:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Level</th><th>Where</th><th>Means</th></tr>
+  <tr><td>Transport</td><td>HTTP status</td><td>Did the request arrive at all</td></tr>
+  <tr><td>Query</td><td><code>errors[]</code></td><td>Malformed, unauthorised, or <code>THROTTLED</code></td></tr>
+  <tr><td>Business</td><td><code>data.*.userErrors[]</code></td><td>Shopify understood you and refused</td></tr>
+</table>
+</div>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the <code>extensions.cost</code> shape,
+<code>throttleStatus</code> fields, the 1,000-point bucket with a 50/second restore in the
+documented example, and that a throttled GraphQL request returns <b>200 OK</b> with a
+<code>THROTTLED</code> error in the body while REST returns 429 —
+<a href="https://shopify.dev/docs/apps/build/graphql/migrate/learn-how">Migrate to GraphQL from REST</a>
+and the <a href="https://shopify.dev/docs/api/admin-graphql/2026-07">GraphQL Admin API reference</a>.</p>
+
+<h3>Every response tells you your remaining budget</h3>
+
+<p><code>throttleStatus</code> arrives on <b>successful</b> responses too. That is the
+important part: you never have to be throttled to know you are close. Read
+<code>currentlyAvailable</code> after each call and pause when it drops below the cost of your
+next query.</p>
+
+<div class="diagram">
+  a well-behaved worker
+
+  loop:
+    if (available < nextQueryCost + margin)
+        sleep( (nextQueryCost - available) / restoreRate )
+    send
+    read extensions.cost.throttleStatus     ← on success as well
+    available = currentlyAvailable
+
+  ── this is a SPEED LIMITER, not error handling.
+     Being throttled means the limiter failed.
+</div>
+
+<p>The point is worth stating plainly: retrying on 429 is <em>recovery</em>. Reading
+<code>throttleStatus</code> is <em>prevention</em>. Most integrations only do the first and
+spend their lives at the limit.</p>
+
+<h3>Classify before you retry</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Class</th><th>Examples</th><th>Do</th></tr>
+  <tr><td><b>Transient</b></td><td>5xx, timeout, connection reset</td><td>Retry with exponential backoff and jitter</td></tr>
+  <tr><td><b>Throttled</b></td><td><code>THROTTLED</code>, or REST 429</td><td>Wait for the budget. Honour <code>Retry-After</code> on REST. Not a failure — a queue</td></tr>
+  <tr><td><b>Terminal</b></td><td><code>userErrors</code>, bad scope, invalid field</td><td><b>Do not retry.</b> Dead-letter it immediately</td></tr>
+  <tr><td><b>Poison</b></td><td>Anything that fails the same way N times</td><td>Dead-letter with the full error body</td></tr>
+</table>
+</div>
+
+<p>Retrying a terminal error is the most common waste in a sync. A product rejected for a
+missing required field will be rejected identically eight times, burning rate-limit budget
+that the valid records needed.</p>
+
+<h3>Jitter, and why</h3>
+
+<p>Plain exponential backoff makes every failed job retry at the same moment, because they all
+failed at the same moment. The retry storm then reproduces the outage. Add randomness:
+<code>delay = base · 2^attempt · (0.5 + random·0.5)</code>. This costs one line and prevents
+a self-inflicted second incident.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your worker retries on any non-2XX. It processes 40,000 variant updates, 900 of which have a
+  missing required field. <b>What does the run look like, and what is the real cost?</b>
+</div>
+
+<p>It looks like a slow success. The 900 bad records each fail 8 times — 7,200 wasted calls —
+and every one of those consumed rate-limit budget the other 39,100 needed. So the run takes
+far longer, and if the budget runs out you also start failing <em>valid</em> records, which
+then look broken too. Meanwhile the 900 genuinely bad records are still not in a list anyone
+can read. Terminal errors must dead-letter on the first attempt.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — treating HTTP 200 as success</span>
+  The single most expensive habit on this API. A throttled call, a validation failure and a
+  partial success all return 200. Code that checks only the status silently drops real
+  failures and reports a clean run.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — retrying terminal errors</span>
+  Eight attempts at something that can never succeed, multiplied by every bad record, spent
+  out of the same budget your good records need. Classify first, retry second.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — no jitter</span>
+  Synchronised retries after an outage reproduce the outage. Your monitoring shows recovery,
+  then a second spike you caused. Nothing identifies you as the cause.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the unread dead-letter queue</span>
+  Failures go somewhere, so the main path looks healthy. Nobody looks. Alert on the count of
+  <em>unresolved</em> dead-letter rows, not on the existence of the table.
+</div>
+
+<div class="scar">
+  <span class="who">Concurrency multiplies against one bucket</span>
+  The rate limit is per app <em>and</em> store. Ten workers on one store share one bucket, so
+  scaling workers does not scale throughput — it just distributes the throttling. The budget
+  has to be shared state, not per-process.
+</div>
+
+<div class="scar">
+  <span class="who">A single query may not exceed 1,000 points</span>
+  That ceiling applies regardless of plan and is checked <b>before</b> execution, from the
+  requested cost. A query that asks for too much per page fails at every bucket level, so no
+  amount of waiting helps. Reduce the page size instead.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — one queue, not five</span>
+  Splitting into per-entity queues feels tidy and gives you five independent things competing
+  for one rate-limit bucket, with no shared view of priority. One queue with a priority field
+  is easier to reason about and easier to drain.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked why the sync is "slow" </span>
+  <q>It's not slow, it's paced. Shopify gives us a budget of API calls and we deliberately
+  stay under it — if we push through, they start rejecting us and everything takes longer.
+  Your plan sets the budget, so a higher plan genuinely makes this faster if that ever
+  matters.</q>
+  <span class="why-said">Reframes pacing as deliberate, and names the one lever the client
+  actually controls.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 900 products did not sync</span>
+  <q>They were rejected, not delayed — each has a specific reason and I've got the list. I
+  don't retry those, because they'd fail identically and eat the capacity the working records
+  need. Send me the list back with fixes and they'll go through on the next run.</q>
+  <span class="why-said">Separates "failed" from "not tried yet", which is the distinction
+  that makes a client trust the report.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM suggests "just run more workers to speed it up"</span>
+  <q>It won't help — the limit is per store, not per worker. Ten workers share the same
+  budget, so I'd get the same throughput and more throttling. If we need it faster, the levers
+  are fewer calls per product or a higher Shopify plan.</q>
+  <span class="why-said">Kills a plausible-sounding suggestion with a mechanism, then offers
+  the two real options. Never just say no.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>GraphQL returns 200 when throttled.</b> <code>if (response.ok)</code> is not an error check.</li>
+  <li><b>Check three levels:</b> HTTP status, <code>errors[]</code>, and <code>userErrors[]</code>.</li>
+  <li><b><code>throttleStatus</code> comes back on success too.</b> Use it to slow down before you are told to.</li>
+  <li><b>Classify: transient, throttled, terminal, poison.</b> Only the first two are worth retrying.</li>
+  <li><b>Never retry a <code>userError</code>.</b> It will fail identically and spend budget the good records need.</li>
+  <li><b>Add jitter.</b> Synchronised retries recreate the outage you just recovered from.</li>
+  <li><b>The bucket is per app and store.</b> More workers redistribute throttling; they do not add throughput.</li>
+</ul>
+<p class="one-thing">If you remember one thing: read the rate-limit budget on every response
+and stay under it — being throttled means your speed limiter already failed.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for running it all, and the three log lines that
+  matter at 2am.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0006-a-postgres-schema-for-a-sync-store.html">← A2.2</a></span>
+  <span><a href="0008-run-it-docker-compose-ci-and-what-to-log.html">A2.4 · Run it →</a></span>
+</div>
+
+</div>
+</body>
+</html>

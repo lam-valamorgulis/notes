@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.4 — The Cutover and the Proof</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 4</p>
+<h1>The cutover and the proof</h1>
+<p class="subtitle">The night it goes live. What you check, in what order, and what you refuse to do at 1am.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A cutover plan with a written stop condition — so the decision to
+  abort is made in advance by a calm person rather than at 2am by a tired one.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what makes a cutover different from a deploy?</h3>
+
+<p>A deploy is reversible. You ship, it is wrong, you roll back, and the world is as it was.</p>
+
+<p>A cutover is not, and the reason is that <b>reality moves during it</b>. Customers place orders.
+Staff edit prices. Stock changes. So you cannot simply undo — the state you would roll back to no
+longer exists. Any data written during the window has to be reconciled forward, not reverted.</p>
+
+<div class="diagram">
+  DEPLOY                    CUTOVER
+  code changes              code AND live data change
+  roll back = restore       roll back = reconcile forward
+  the world waited          the world did not wait
+</div>
+
+<p>Everything below follows from that one asymmetry. It is why you freeze what you can, why the order
+of checks matters, and why the stop condition must be written before you start.</p>
+
+<h3>The order, and why it is this order</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Step</th><th>Why here</th></tr>
+  <tr><td>1</td><td><b>Freeze edits on the source</b> and announce it</td><td>Reduces the moving target. This is the cheapest risk reduction available</td></tr>
+  <tr><td>2</td><td><b>Final delta load</b> — everything changed since the last full load</td><td>Small and fast, because the bulk already happened days ago</td></tr>
+  <tr><td>3</td><td><b>Reconcile: counts, then values</b></td><td>Counts catch gross failure fast. Values catch the expensive kind</td></tr>
+  <tr><td>4</td><td><b>Spot-check money by hand</b> — ten products, real prices</td><td>The only check that catches a wrong-but-plausible price</td></tr>
+  <tr><td>5</td><td><b>Enable the ongoing sync</b>, watch one cycle end to end</td><td>Prove the steady state before anyone depends on it</td></tr>
+  <tr><td>6</td><td><b>Unfreeze</b>, then watch reconciliation for a full day</td><td>Drift shows up in the first 24 hours or not at all</td></tr>
+</table>
+</div>
+
+<p>Step 4 is the one people skip because it feels unsophisticated. It is the only step that catches a
+price that is <em>wrong but believable</em> — the failure that automated comparison passes when both
+systems agree on the wrong number.</p>
+
+<h3>Do the big load days early</h3>
+
+<p>The bulk of the data should already be in Shopify, loaded and reconciled, days before the cutover.
+Then the cutover window contains only a small delta. A plan whose window includes a full catalogue load
+is a plan with no room for anything to go wrong, and something will.</p>
+
+<h3>Write the stop condition down, in advance</h3>
+
+<div class="trap">
+  <span class="label">The single most valuable paragraph in this Lesson</span>
+  Before the cutover starts, write down — and agree with the client — the conditions under which you
+  stop and roll back. For example: <em>"If reconciliation shows more than 1% of variants with a price
+  difference, or any difference in a top-50 seller, we stop and revert to the old system."</em>
+  <br><br>
+  Write it while calm. At 2am, tired, with a client on the phone, nobody makes this judgement well —
+  and the pressure runs entirely one way, toward continuing.
+</div>
+
+<h3>What you refuse to do at 1am</h3>
+
+<ul>
+  <li><b>No code changes.</b> Fix forward tomorrow or roll back tonight. A cutover is not the time to
+      write anything.</li>
+  <li><b>No "we'll fix that in the morning"</b> for anything touching money. Prices and stock are
+      either right or you stop.</li>
+  <li><b>No skipping the reconciliation</b> because it is late and the counts looked fine. Counts are
+      the check that passes when everything is subtly wrong.</li>
+  <li><b>No unfreezing before step 5 is proven.</b> Unfreezing is the irreversible moment, not the
+      load.</li>
+</ul>
+
+<h3>The proof you hand over</h3>
+
+<p>A cutover ends with a document, not with a feeling. Four numbers, each with its denominator:</p>
+
+<div class="diagram">
+  products expected / loaded / failed
+  variants expected / loaded / failed
+  prices compared  / matching / differing
+  stock  compared  / matching / differing
+
+  plus: the ten hand-checked products, listed by name
+  plus: the stop condition, and confirmation it was not met
+</div>
+
+<p>That document is what lets everyone agree the next morning that it worked — and it is what protects
+you if something surfaces in week two.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  It is 1:40am. Everything reconciles except 12 products whose prices differ by small amounts. The
+  client is on the call and wants to go live. <b>What do you do?</b>
+</div>
+
+<p>You read the stop condition you wrote down, and you follow it. That is the whole point of having
+written it — so this decision is not being made now.
+<br><br>
+If the condition says "any difference in a top-50 seller stops us", check whether those 12 are top
+sellers; if they are, you stop, and you have a pre-agreed reason rather than an opinion. If they are
+long-tail products and below your threshold, you go live and put the 12 on a list with a named owner
+and a deadline.
+<br><br>
+What you do <b>not</b> do is investigate the root cause at 1:40am. Twelve small price differences is
+tomorrow's work. And notice that "small amounts" is exactly what a wrong-but-plausible failure looks
+like — which is why the hand-check in step 4 matters more than it feels like it should.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a full load inside the cutover window</span>
+  No slack for anything to go wrong, and something will. Load days early, reconcile early, and keep the
+  window for a small delta.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — no stop condition</span>
+  The decision to continue gets made by whoever is most tired and most under pressure, and the pressure
+  is always toward going live. Written in advance, it is a policy. Decided at 2am, it is a hope.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — code changes during a cutover</span>
+  Untested code, shipped by a tired person, onto a live store, at the moment of maximum change. Roll
+  back or accept the issue; do not write.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — count-only reconciliation</span>
+  Every price wrong by a cent, or every stock level a week old, passes a count check perfectly. Compare
+  values, and hand-check ten products.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — unfreezing too early</span>
+  Once edits resume on both sides, you are in the two-copies world from Track 2 and can no longer
+  simply reload. Unfreeze is the irreversible step, not the import.
+</div>
+
+<div class="scar">
+  <span class="who">No named owner for the leftover list</span>
+  "We'll sort those twelve out" with nobody's name on it means they are still wrong in a month. Every
+  item that survives the cutover gets an owner and a date, in the handover document.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — pick the quietest hour, not the middle of the night</span>
+  Everyone assumes 2am. But the real requirement is low order volume and available people, and those
+  two rarely peak together at 2am. For many retailers an early weekday morning is quieter <em>and</em>
+  fully staffed. Look at the client's actual order-by-hour data rather than following convention.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Agreeing the plan, a week before</span>
+  <q>Two things I need from you before the date. First, a freeze on editing products for the window —
+  a few hours, announced to your team. Second, I want us to agree now what would make us stop and
+  revert. My suggestion: any price difference in your top fifty sellers, or more than one percent
+  overall. Deciding that today is much better than deciding it at two in the morning.</q>
+  <span class="why-said">Asks for the freeze and pre-agrees the abort criteria in the same
+  conversation, when everyone is calm and reasonable.</span>
+</div>
+
+<div class="script">
+  <span class="who">During the cutover, when asked to just push through</span>
+  <q>We agreed a stop line last week and this is inside it, so we're going ahead — but I'm putting
+  these twelve products on a list with a name and a date against them, and they'll be in the handover
+  note. What I'm not going to do tonight is change any code to fix them. Tired changes on a live store
+  is how a small problem becomes a big one.</q>
+  <span class="why-said">Uses the pre-agreed line as the authority, and refuses the one genuinely
+  dangerous action while still saying yes.</span>
+</div>
+
+<div class="script">
+  <span class="who">The morning after</span>
+  <q>Here's the record: 40,120 variants expected, 40,120 loaded, 0 failed. Prices compared on all of
+  them, 12 differences, all long-tail and on the list. Stock compared, no differences. I also checked
+  ten products by hand against your old system, including your three bestsellers. Reconciliation runs
+  again tonight and I'll send the result.</q>
+  <span class="why-said">Numbers with denominators, the hand-check named, and the next checkpoint
+  stated. This is what "it worked" sounds like when it is evidence rather than a feeling.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A cutover is not a deploy.</b> Reality moves during it, so rollback means reconciling forward.</li>
+  <li><b>Do the big load days early.</b> The window should hold only a small delta.</li>
+  <li><b>Order: freeze · delta load · reconcile counts then values · hand-check money · enable sync · unfreeze and watch a day.</b></li>
+  <li><b>Hand-check ten products.</b> The only check that catches wrong-but-plausible prices.</li>
+  <li><b>Write the stop condition down and agree it in advance.</b> At 2am the pressure runs one way.</li>
+  <li><b>No code changes during a cutover.</b> Roll back or accept; do not write.</li>
+  <li><b>Unfreeze is the irreversible step</b>, not the import. Prove the steady state first.</li>
+</ul>
+<p class="one-thing">If you remember one thing: agree the abort criteria while everyone is calm — that
+one paragraph is worth more than every other precaution combined.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> The last two Lessons of P6 are marked depth.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0019-the-huge-catalogue-load-and-the-throttle.html">← P6.3</a></span>
+  <span><a href="0021-what-a-migration-is-and-what-never-moves.html">P6.5 · What never moves →</a></span>
+</div>
+
+</div>
+</body>
+</html>

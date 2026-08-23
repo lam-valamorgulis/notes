@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2.3 — Communicating With a Busy Client</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R2 · Lesson 3</p>
+<h1>Communicating with a busy client</h1>
+<p class="subtitle">Five days of silence, then a decision needed today. How to write so you get an answer.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A message format that gets replies from people who do not read long
+  messages — and a rule for what to do when nobody answers at all.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why do your messages not get answered?</h3>
+
+<p>Not because the client is rude. Because answering costs them something and your message did not make
+that cost small. A busy client reading your message has to work out: what is this about, is it for me,
+what do you want, and by when. If any of those takes effort, the message moves to "later", and later
+does not arrive.</p>
+
+<p>So the format follows directly: <b>put the ask first, make it a single decision, and give it a
+date.</b></p>
+
+<div class="diagram">
+  BAD                              GOOD
+  context…                         ONE-LINE ASK, at the top
+  more context…                       │
+  what you tried…                  the two options
+  a question, buried                  │
+  another question                 what happens if no answer by <date>
+                                      │
+  ── requires reading to find       context, below, for whoever wants it
+     the ask. gets deferred.
+</div>
+
+<h3>The four-line message</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Line</th><th>Content</th></tr>
+  <tr><td><b>1 · The ask</b></td><td>One sentence, and it must be answerable with a choice, not an essay</td></tr>
+  <tr><td><b>2 · The options</b></td><td>Two, with the consequence of each. Never three or more</td></tr>
+  <tr><td><b>3 · Your recommendation</b></td><td>"I'd do the first one, because…" Always include this</td></tr>
+  <tr><td><b>4 · The default</b></td><td>"If I don't hear by Thursday I'll go with the first one and we can change it later"</td></tr>
+</table>
+</div>
+
+<p>Line 3 is the one people leave out to seem neutral. Do not — a recommendation converts a question
+into an approval, and approving is far cheaper than deciding. Most busy clients will simply say "yes, do
+that", which is exactly what you wanted.</p>
+
+<p>Line 4 is the one that unblocks you. <b>A stated default with a date turns silence into an answer.</b>
+It is not a threat and it is not passive-aggressive — it is how you keep moving without either guessing
+or stalling. Only use it where the default is genuinely reversible.</p>
+
+<h3>Two questions in one message is one question too many</h3>
+
+<p>A message with two decisions in it gets zero answers, because the reader cannot finish it in one pass.
+Send them separately, or bundle them into a single "here is what I'm going to do unless you object"
+list. One decision per message, always.</p>
+
+<h3>The weekly note nobody asked for</h3>
+
+<p>Send a short update every week even when nothing needs a decision. Three lines: done, next, blocked.
+It costs you five minutes and it buys two things — the client never wonders what is happening, and when
+you <em>do</em> need something urgently, you are not a stranger sending an emergency.</p>
+
+<div class="diagram">
+  Done this week:     the delta load and the reconciliation report
+  Next week:          inventory flowing back from Shopify
+  Blocked on you:     ERP credentials — chased Tuesday, still waiting
+</div>
+
+<p>That third line is the important one. <b>A blocker written down every week, dated, becomes a shared
+fact rather than a surprise.</b> The first time it appears it is information. By the fourth week it is
+evidence, and nobody can be surprised by the delay.</p>
+
+<h3>When nobody answers at all</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Attempt</th><th>Do</th></tr>
+  <tr><td>1</td><td>The four-line message, with a default and a date</td></tr>
+  <tr><td>2</td><td>After the date: "Going with option A as flagged. Easy to change — say if you'd rather not"</td></tr>
+  <tr><td>3</td><td>If it is genuinely irreversible: escalate to whoever owns the outcome, naming the cost of waiting</td></tr>
+</table>
+</div>
+
+<p>Never let an irreversible decision be made by silence. And never let a reversible one block you for a
+week.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You have not heard from the client in five days. You need to know whether their team edits product
+  descriptions in Shopify, because the answer decides whether tonight's run overwrites their work.
+  <b>Write the message.</b>
+</div>
+
+<p>Something close to: <b>"Quick decision needed before tonight's run. Does anyone on your team edit
+product descriptions directly in Shopify? If yes, I'll leave descriptions alone and only sync prices and
+stock. If no, I'll sync descriptions from the ERP too. I'd guess yes and leave them alone — safer, and
+easy to switch on later. If I don't hear by 4pm I'll go with leaving them alone."</b>
+<br><br>
+Note what that does. The ask is first and answerable with one word. Both options have a stated
+consequence. There is a recommendation. And the default is the <b>safe, reversible</b> one — leaving data
+alone can be undone; overwriting it cannot. When you pick a default, pick the direction that is
+recoverable.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — the destructive default</span>
+  If you must default, default to the reversible option. Defaulting to "overwrite" because it was the
+  faster path means silence caused permanent data loss and you chose it.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — waiting a week for a reversible decision</span>
+  A cheap decision, blocked on someone who is busy, costing you days. State a default and move. Blocking
+  on something you could have changed later is a self-inflicted delay.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the buried ask</span>
+  Four paragraphs of context with a question in the middle. It reads as an update, not a request, so it
+  gets no reply and you conclude the client is ignoring you. Ask first, context last.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — two decisions in one message</span>
+  You get an answer to one and assume the other was agreed. It was not read. One decision per message.
+</div>
+
+<div class="scar">
+  <span class="who">No weekly note</span>
+  The client has no idea what is happening, so your first urgent message in three weeks arrives cold and
+  reads as a problem. Regular contact is what makes an urgent request land.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — record blockers on the day, every time</span>
+  A blocker mentioned once in week one and then dropped becomes your fault by week six. The same blocker
+  in every weekly note, dated, is a shared fact nobody can be surprised by. Repetition is the mechanism.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The four-line decision message</span>
+  <q>Need a call from you before Thursday. Do we send historical orders across, or keep the old system
+  readable as an archive? Sending them is about two weeks and the money won't be exactly right; the
+  archive is a day and keeps the numbers accurate. I'd do the archive. If I don't hear by Thursday I'll
+  plan for the archive and we can revisit.</q>
+  <span class="why-said">Ask, two costed options, a recommendation, a dated default. Answerable in five
+  seconds with "agreed".</span>
+</div>
+
+<div class="script">
+  <span class="who">Following the default through</span>
+  <q>Didn't hear back, so as flagged I've gone with the archive. Nothing is lost — if you want the full
+  order history later, it's still possible, it's just the two-week version. Wanted to make sure you knew
+  the choice was made.</q>
+  <span class="why-said">No reproach, and it restates that the decision is reversible. This is the message
+  that makes a client comfortable with you using defaults again.</span>
+</div>
+
+<div class="script">
+  <span class="who">Escalating an irreversible one</span>
+  <q>I've asked twice about who owns product pricing and I don't want to guess, because whichever way I
+  build it, the other team's work gets overwritten and there's no undo. I've paused that piece and I'm
+  working on inventory instead, so nothing is idle — but the go-live date moves by however long this
+  takes. Who should I be asking?</q>
+  <span class="why-said">Names the irreversibility, shows you kept working, states the cost, and asks for a
+  person rather than an answer. That last part is often what actually unblocks it.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Ask first, context last.</b> A buried question reads as an update and gets no reply.</li>
+  <li><b>Four lines: ask · two costed options · your recommendation · a dated default.</b></li>
+  <li><b>Always recommend.</b> Approving is much cheaper for a busy person than deciding.</li>
+  <li><b>A stated default with a date turns silence into an answer</b> — but only for reversible things.</li>
+  <li><b>Default to the recoverable direction.</b> Leaving data alone can be undone; overwriting cannot.</li>
+  <li><b>One decision per message.</b> Two gets you zero answers.</li>
+  <li><b>Weekly note: done, next, blocked on you.</b> The blocker line, repeated and dated, is the whole value.</li>
+</ul>
+<p class="one-thing">If you remember one thing: give them something to approve, not something to decide —
+and say what you will do if they say nothing.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> The rest of R2 is marked depth.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0006-estimating-pacing-and-holding-two-projects.html">← R2.2</a></span>
+  <span><a href="0008-the-integration-project-discovery-to-rollout.html">R2.4 · The project →</a></span>
+</div>
+
+</div>
+</body>
+</html>

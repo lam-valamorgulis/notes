@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P4.4 — Discounts on the Storefront</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P4 · Lesson 4 · <span class="pill depth">depth</span></p>
+<h1>Discounts on the storefront</h1>
+<p class="subtitle">The theme displays discounts. It never decides them. And four fields are deprecated for the same reason.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can fix "the line prices don't add up to the total" in one
+  look, because you know exactly which fields lie and why.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: where can a discount be decided?</h3>
+
+<p>A price shown on a page could come from the theme's arithmetic or from Shopify. Only one of those
+can be right, because the theme does not know about every discount type, does not know the customer's
+eligibility, and is not the thing that takes the money.</p>
+
+<p>So the rule is absolute: <b>the theme displays what Shopify calculated. It never calculates.</b>
+Every discount bug on a storefront is a violation of that sentence — usually by reading a field that
+sounds like a total and is not.</p>
+
+<h3>The deprecated fields, and the one reason behind all of them</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Deprecated on <code>line_item</code></th><th>Shopify's stated reason</th><th>Use instead</th></tr>
+  <tr><td><code>price</code></td><td>Discounts from automatic discounts and discount codes are not included</td><td><code>final_price</code></td></tr>
+  <tr><td><code>line_price</code></td><td>Same</td><td><code>final_line_price</code></td></tr>
+  <tr><td><code>discounts</code></td><td>Not all discount types and details are available</td><td><code>discount_allocations</code></td></tr>
+</table>
+</div>
+
+<p>The pattern is one thing: those fields include <b>Shopify Scripts</b> discounts and not automatic
+discounts or discount codes. So they were correct in a world where Scripts were how discounts
+happened, and they are quietly incomplete now.</p>
+
+<p>That is the whole explanation for the classic bug: <b>the line prices do not add up to the
+total</b>. The theme is summing <code>line_price</code>, which excludes the code the customer
+entered, while the total comes from Shopify and includes it. Both numbers are "right"; one of them
+answers a question nobody asked any more.</p>
+
+<h3>The fields that actually work</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>You want</th><th>Use</th></tr>
+  <tr><td>Price before discount, per unit / per line</td><td><code>original_price</code> · <code>original_line_price</code></td></tr>
+  <tr><td>Price after discount, per unit / per line</td><td><code>final_price</code> · <code>final_line_price</code></td></tr>
+  <tr><td>Each discount on a line, with its amount</td><td><code>line_level_discount_allocations</code></td></tr>
+  <tr><td>Total discount on a line</td><td><code>line_level_total_discount</code></td></tr>
+  <tr><td>Discounts on the whole cart</td><td><code>cart_level_discount_applications</code></td></tr>
+</table>
+</div>
+
+<p>And the display convention: if a discount applies, show the original with a strikethrough
+alongside the discounted price. A cart-level discount displays <b>between the subtotal and the
+total</b>, because the subtotal is after line discounts and the total is after cart discounts.</p>
+
+<pre><code>{% for line_item in cart.items %}
+  {% if line_item.original_price > line_item.final_price %}
+    &lt;s&gt;{{ line_item.original_price | money }}&lt;/s&gt;
+  {% endif %}
+  {{ line_item.final_price | money }}
+
+  {% if line_item.line_level_discount_allocations.size > 0 %}
+    {% for allocation in line_item.line_level_discount_allocations %}
+      {{ allocation.discount_application.title }}
+      −{{ allocation.amount | money }}
+    {% endfor %}
+  {% endif %}
+{% endfor %}</code></pre>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the deprecation of <code>price</code>,
+<code>line_price</code> and <code>discounts</code> with Shopify's own stated reasons and their
+replacements —
+<a href="https://shopify.dev/docs/api/liquid/objects/line_item">Liquid objects: line_item</a>. The
+correct display fields, <code>line_level_discount_allocations</code>,
+<code>line_level_total_discount</code>, <code>cart_level_discount_applications</code>, and the
+subtotal-versus-total placement —
+<a href="https://shopify.dev/docs/storefronts/themes/pricing-payments/discounts">Discounts</a>.</p>
+
+<h3>One more trap in the same object</h3>
+
+<p>On an order, <code>line_item.title</code> returns the title <b>as it was at the time of the
+order</b>. But <code>line_item.product.title</code> and <code>line_item.variant.title</code> return
+the <b>current</b> values. So a renamed or deleted product makes those three disagree — and on an old
+order receipt, only the first one is historically correct.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client reports that their cart page shows £120 of line items but a £108 subtotal, and asks
+  whether the discount is being applied twice. <b>Diagnose it without looking at the code.</b>
+</div>
+
+<p>The discount is applied once and displayed wrongly. The theme is summing a deprecated field —
+almost certainly <code>line_price</code> — which excludes discount codes and automatic discounts,
+while the subtotal comes from Shopify and includes them. So the line numbers are pre-discount and
+the subtotal is post-discount, and the £12 gap is the discount itself. Nothing is double-counted and
+nothing is broken in the discount engine. Switch the line display to
+<code>final_line_price</code> and show <code>original_line_price</code> struck through. This is
+worth recognising on sight, because the client's own theory sends you looking in the wrong place.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — summing deprecated fields</span>
+  Line totals that exclude codes and automatic discounts, next to a total that includes them.
+  Customers see inconsistent numbers on the page where they decide to buy, and some of them stop.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — calculating a discount in the theme</span>
+  The theme cannot know eligibility, combination rules or every discount type. Any arithmetic it does
+  will eventually disagree with what is charged. Display Shopify's numbers only.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — deprecated but still returning data</span>
+  The deprecated fields still produce plausible money values, so nothing breaks visibly. They are
+  simply incomplete, in one direction, only when certain discount types are present. That is why this
+  survives code review.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — <code>title</code> versus <code>product.title</code></span>
+  On an order, one is historical and the other is current. A receipt built on the wrong one silently
+  rewrites history after a product is renamed.
+</div>
+
+<div class="scar">
+  <span class="who">A cart discount shown in the wrong place</span>
+  The subtotal is after line discounts; the total is after cart discounts. A cart-level discount
+  placed above the subtotal makes the arithmetic look wrong even when every number is right.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — an invalid code is not an error</span>
+  Applying a wrong discount code does not fail loudly at the cart level; the cart comes back looking
+  normal. You have to inspect the resulting cart to see whether the code was actually applied, rather
+  than assuming a successful response means a successful discount. Treat "did it apply?" as a
+  question you must ask, not something the status code answers.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When the numbers do not add up on the cart page</span>
+  <q>Nothing's charging twice — the discount is applied once and correctly. The line prices are being
+  read from an older field that doesn't include discount codes, while the total does. So the gap
+  you're seeing <em>is</em> the discount. It's a display fix, and I'd like to do it soon, because
+  customers seeing inconsistent numbers at the cart is the worst place for it.</q>
+  <span class="why-said">Kills the scary theory first, explains the real cause in one sentence, then
+  argues for urgency on the customer's behalf rather than the code's.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to show a "you saved X%" calculation</span>
+  <q>Happy to show it, and I'll take the numbers from Shopify rather than working them out in the
+  page. If the theme does its own maths, it'll eventually disagree with what's actually charged —
+  usually on a promotion, which is exactly when you'd least want it.</q>
+  <span class="why-said">Says yes, and defends "no arithmetic in the theme" with the moment it would
+  fail.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>The theme displays discounts, never decides them.</b> Every storefront discount bug breaks this rule.</li>
+  <li><b><code>price</code>, <code>line_price</code> and <code>discounts</code> are deprecated</b> — they include Scripts discounts only.</li>
+  <li><b>Use <code>final_price</code>, <code>final_line_price</code>, <code>discount_allocations</code></b> and their originals for strikethrough.</li>
+  <li><b>"Line prices don't add up to the total" is this bug</b>, every time. The gap is the discount.</li>
+  <li><b><code>line_level_total_discount</code> per line, <code>cart_level_discount_applications</code> for the cart.</b></li>
+  <li><b>A cart discount displays between subtotal and total.</b> Subtotal is after line discounts.</li>
+  <li><b>On an order, <code>title</code> is historical; <code>product.title</code> is current.</b></li>
+</ul>
+<p class="one-thing">If you remember one thing: if the line prices do not add up to the total,
+somebody read a deprecated field — the gap is the discount.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P4 done.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0011-the-cart-ajax-api.html">← P4.3</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

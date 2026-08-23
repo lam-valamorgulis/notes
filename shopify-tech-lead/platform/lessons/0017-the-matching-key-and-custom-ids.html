@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.1 — The Matching Key, and Custom IDs</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 1</p>
+<h1>The matching key, and custom IDs</h1>
+<p class="subtitle">Shopify's own documented answer to "how do I find this record again?" — and most integrations never use it.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can look up and upsert any product by <em>your own</em>
+  identifier, with no mapping table lookup and no round trip.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: whose id do you have?</h3>
+
+<p>You are importing 40,000 products from an ERP. You have <em>their</em> ids. Shopify wants
+<em>its</em> ids, which do not exist yet for the first import and which you must remember afterwards.
+So the naive loop is: look up my mapping table, find the Shopify id, then write. One extra step per
+record, and a mapping table you must never lose.</p>
+
+<p>Ask whether that step is necessary. It is only necessary because Shopify does not know your
+identifier. So <b>tell it your identifier</b> and the problem disappears.</p>
+
+<div class="diagram">
+  WITHOUT                              WITH A CUSTOM ID
+  their id                             their id
+     │                                    │
+     ▼ your mapping table lookup          ▼ productSet(identifier: { customId: ... })
+  Shopify id                              │
+     │                                    ▼
+     ▼ write                           created or updated. one call.
+</div>
+
+<h3>What a custom ID actually is</h3>
+
+<p>A metafield with a definition, whose value is unique, used as an identifier. Once a resource
+carries it, Shopify gives you dedicated lookup queries:</p>
+
+<pre><code>query findProduct {
+  productByIdentifier(identifier: {
+    customId: { namespace: "custom", key: "id", value: "1234" }
+  }) {
+    title
+    handle
+  }
+}</code></pre>
+
+<p>There are matching queries for other resource types —
+<code>customerByIdentifier</code>, <code>orderByIdentifier</code>, and similar
+<code>ByIdentifier</code> queries for collections and product variants.</p>
+
+<h3>Upsert in one call</h3>
+
+<pre><code>mutation UpsertProductByCustomId(
+  $input: ProductSetInput!
+  $identifier: ProductSetIdentifiers
+) {
+  productSet(input: $input, identifier: $identifier) {
+    product { id title }
+    userErrors { field message }
+  }
+}
+
+# variables
+{
+  "input":      { "title": "Summer sandals" },
+  "identifier": { "customId": { "namespace": "custom", "key": "id", "value": "12345" } }
+}</code></pre>
+
+<p><code>ProductSetIdentifiers</code> accepts exactly three things — <code>customId</code>,
+<code>handle</code>, or <code>id</code>. So identity is a first-class argument, not something you
+resolve beforehand.</p>
+
+<h3>The distinction that matters: which mutations create</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Mutation</th><th>With a custom ID</th></tr>
+  <tr><td><code>productSet</code></td><td>Looks up a match. Updates it if found, <b>creates it if not</b></td></tr>
+  <tr><td><code>productUpdate</code></td><td>Looks up a match and updates it. <b>Does not create</b> if no match</td></tr>
+  <tr><td><code>customerSet</code></td><td>Create-or-update, as with <code>productSet</code></td></tr>
+</table>
+</div>
+
+<p>So <b>lookup by custom ID is broad</b> — products, customers, orders, collections, variants — while
+<b>create-or-update is narrow</b>: products and customers. For anything else you can find a record by
+your own id but must still create it the ordinary way.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the custom-ID mechanism and the <code>ByIdentifier</code>
+queries for products, customers, orders, collections and variants; that <code>productSet</code> creates
+when no match exists while <code>productUpdate</code> does not; and <code>customerSet</code> for
+customers —
+<a href="https://shopify.dev/docs/apps/build/metafields/working-with-custom-ids">Working with custom IDs</a>.
+The three fields of <code>ProductSetIdentifiers</code> —
+<a href="https://shopify.dev/docs/api/admin-graphql/2026-04/input-objects/ProductSetIdentifiers">ProductSetIdentifiers</a>.
+The <code>productSet</code> upsert example —
+<a href="https://shopify.dev/docs/api/admin-graphql/2025-10/mutations/productSet">productSet</a>.
+Both mutations were run through the schema validator before appearing here.</p>
+
+<h3>This does not replace your mapping table</h3>
+
+<p>Be clear about what you have and have not solved. A custom ID removes the <em>lookup round
+trip</em> and gives you a mapping that survives losing your database. It does not remove the need for
+your own registry from
+<a href="../../apps/lessons/0019-identifier-mapping-and-the-mapping-registry.html">A4.4</a>, because
+you still need the hub for three or more systems, and you still need tombstones for retired keys.</p>
+
+<p>Use both: the custom ID is the identity written <em>into</em> Shopify; the registry is the identity
+you own.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You use <code>handle</code> as your identifier instead of a custom ID, because it is already there
+  and needs no setup. <b>What breaks, and when?</b>
+</div>
+
+<p>The first time a merchant edits a product title. A handle is derived from the title, so it changes —
+and your next run cannot find the product, creates a duplicate, and now two live products compete for
+the same sales. Nothing errors, because creating a product is a perfectly valid outcome. The whole
+point of a custom ID is that <b>it is a value nobody has a reason to edit</b>, whereas a handle is a
+side-effect of content someone edits for a living. <code>handle</code> is offered as an identifier
+because it is occasionally the right tool for a one-off import — never for an ongoing sync.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — matching on handle or title</span>
+  A title edit creates a duplicate product. Sales and inventory split across two records, and
+  reconciliation reports drift on both. This is the most common cause of duplicate products in an
+  integrated store.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — a custom ID with no uniqueness guarantee</span>
+  The definition must be set up so values are unique. Without it, two products can carry the same
+  identifier and your lookups return an arbitrary one. Verify the definition, not just the values.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — expecting <code>productUpdate</code> to create</span>
+  With a custom ID it looks up and updates, and does nothing useful when there is no match. A first
+  import written on it silently imports nothing. Use <code>productSet</code> when you need
+  create-or-update.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — an id stored at the wrong level</span>
+  Verified on a live store: a product-level external id that actually identified only one of that
+  product's variants. Every lookup matched that variant and silently mismatched the rest.
+</div>
+
+<div class="scar">
+  <span class="who">Assuming create-or-update everywhere</span>
+  Lookup covers many resource types; create-or-update covers products and customers. A design that
+  assumes upsert-by-custom-id for collections or orders will need rewriting.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — pick the namespace and key once, forever</span>
+  A metafield key cannot be renamed without a migration, and your identifier is the last thing you
+  want to migrate. Choose the namespace and key deliberately at the start, write it down, and never
+  let a second convention appear alongside it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Explaining why you need a stable code from them</span>
+  <q>I need one code per product that never changes for the life of that product. Not the name — your
+  team edits those, and if I match on a name, editing it creates a duplicate. Whatever your ERP uses
+  internally is usually perfect. I'll store it against each Shopify product so anyone can see which is
+  which.</q>
+  <span class="why-said">Explains the requirement through the failure it prevents, and offers the
+  answer they already have.</span>
+</div>
+
+<div class="script">
+  <span class="who">When duplicates have already appeared</span>
+  <q>These are duplicates from name changes — the previous integration matched products by name, so
+  editing a title made it look like a new product. I'm switching to your product codes, which don't
+  change. Then I'll merge the existing duplicates, and I'll need your team to tell me which of each
+  pair to keep, because both may have sales against them.</q>
+  <span class="why-said">Names the cause, states the fix, and is honest that cleanup needs the
+  client's decisions rather than pretending it is automatic.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A custom ID is a unique, defined metafield used as an identifier.</b> Tell Shopify your id.</li>
+  <li><b><code>productByIdentifier</code>, <code>customerByIdentifier</code>, <code>orderByIdentifier</code></b> and similar for collections and variants.</li>
+  <li><b><code>productSet</code> creates when there is no match. <code>productUpdate</code> does not.</b></li>
+  <li><b>Lookup is broad; create-or-update is products and customers only.</b></li>
+  <li><b><code>ProductSetIdentifiers</code> takes <code>customId</code>, <code>handle</code>, or <code>id</code>.</b></li>
+  <li><b>Never match on handle or title for an ongoing sync.</b> Both change when content is edited.</li>
+  <li><b>A custom ID complements your mapping registry</b>, it does not replace it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: write your own identifier into Shopify, and the
+question "which record is this?" stops needing a lookup.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the three ways to push data, and when each is right.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0016-flow-when-automation-replaces-your-code.html">← P5.4</a></span>
+  <span><a href="0018-three-ways-to-push-it-and-bulk-operations.html">P6.2 · Three ways to push →</a></span>
+</div>
+
+</div>
+</body>
+</html>

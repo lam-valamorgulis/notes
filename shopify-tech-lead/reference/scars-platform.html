@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scars — Platform</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a> · <a href="../platform/index.html">Track 1</a></p>
+<p class="kicker">Reference · Track 1</p>
+<h1>Scars — Platform</h1>
+<p class="subtitle">Every "Where it hurts" from Track 1, on one page. Read before a client call.</p>
+
+<div class="note">
+  <span class="label">How to read this</span>
+  <span class="scar" style="display:inline;border:none;padding:0;background:none">Red = costs money.</span>
+  <span class="scar silent" style="display:inline;border:none;padding:0;background:none">Purple = fails with no error.</span>
+  Dashed = not documented, engineering judgement. All facts verified against shopify.dev on 2026-08-23
+  unless noted.
+</div>
+
+<h2>The object model</h2>
+
+<div class="scar money">
+  <span class="who">Writing <code>on_hand</code> into <code>available</code></span>
+  They differ by exactly what is already sold. Overwrite one with the other and you re-sell boxed items.
+  The most common cause of overselling in an integration. → <a href="../platform/lessons/0001-the-shopify-object-model-end-to-end.html">P1.1</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Assuming one order is one shipment</span>
+  An order can hold several FulfillmentOrders, one per location. Model the fulfillment order, not the order.
+</div>
+
+<div class="scar silent">
+  <span class="who">A missing InventoryLevel is absence, not zero</span>
+  A variant not stocked at a location has no level there. You cannot write to a level that does not exist.
+</div>
+
+<div class="scar silent">
+  <span class="who"><code>tracked: false</code></span>
+  No meaningful quantity, and writes do nothing useful. Check it before trusting or setting a number.
+</div>
+
+<div class="scar">
+  <span class="who">Mapping an ERP item to a Shopify <em>product</em></span>
+  Prices, SKUs and stock are on the variant. Works only while every product has one variant, then breaks
+  permanently.
+</div>
+
+<h2>APIs, limits and versions</h2>
+
+<div class="scar money">
+  <span class="who">Retrying a query over 1,000 points</span>
+  The single-query ceiling is checked <b>before</b> execution, on every plan. Waiting never helps — reduce the
+  page size. → <a href="../platform/lessons/0002-the-two-apis-and-the-rate-limit-model.html">P1.2</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Porting REST error handling to GraphQL</span>
+  REST throttles with <b>429</b>; GraphQL throttles with <b>200 OK</b> and a <code>THROTTLED</code> error in
+  the body. A status-code check silently stops noticing.
+</div>
+
+<div class="scar silent">
+  <span class="who">Over-asking in a query</span>
+  The bucket must hold the <b>requested</b> cost before running. Fields you never read still reserve capacity.
+</div>
+
+<div class="scar money">
+  <span class="who">No API version pinned</span>
+  Requests go to the oldest supported version, which moves quarterly. Behaviour changes on Shopify's schedule.
+  → <a href="../platform/lessons/0003-api-versioning-and-the-quarterly-upgrade.html">P1.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Fall forward</span>
+  A retired pinned version is <b>silently served by a newer one</b>. Nothing errors. "It hasn't errored" is not
+  evidence of health.
+</div>
+
+<div class="scar silent">
+  <span class="who">Two versions in one codebase</span>
+  Your constant says one thing, a client library defaults to another. Both work, and disagree about one field,
+  sometimes.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Webhook subscriptions carry a version too</span>
+  Easy to pin your calls and forget the subscriptions. Upgrade both together.
+</div>
+
+<h2>Custom data</h2>
+
+<div class="scar money">
+  <span class="who">Metafields with no definitions</span>
+  Stored and inert: not editable in the admin, not validated, not filterable. Fixing it later means creating
+  definitions <em>and</em> reconciling every existing value.
+  → <a href="../platform/lessons/0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">The 10,000-byte Function cliff</span>
+  Function input queries do not return metafield values over 10,000 bytes — the Function gets
+  <code>null</code>. Stored fine, Admin API fine. Small test products pass; real ones do not.
+</div>
+
+<div class="scar silent">
+  <span class="who"><code>analytics_queryable</code> in TOML</span>
+  Documented: it <b>deploys without error and the capability is not set</b>. Verify capabilities after deploy.
+</div>
+
+<div class="scar">
+  <span class="who">Mutating a TOML-declared definition via the API</span>
+  Declarative definitions are read-only through the Admin API. Queries work; mutations error.
+</div>
+
+<div class="scar">
+  <span class="who">TOML only creates app-owned metaobjects</span>
+  Merchant-owned definitions must be created via GraphQL. The deploy succeeds and you get the wrong kind.
+  → <a href="../platform/lessons/0005-metaobjects-and-when-data-does-not-belong-on-the-product.html">P2.2</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">An id stored at the wrong level</span>
+  Verified on a live store: a product-level external id that actually identified only one variant. Every lookup
+  matched that one and silently mismatched the rest.
+</div>
+
+<h2>Inventory, locations, the till</h2>
+
+<div class="scar silent">
+  <span class="who">Inactive locations excluded by default</span>
+  <code>locationsCount</code> includes them; <code>locations()</code> does not. Verified on a live store:
+  count 4, list 3. The hidden one was inactive <b>and</b> flagged for online orders.
+  → <a href="../platform/lessons/0007-locations-and-multi-location-inventory.html">P3.2</a>
+</div>
+
+<div class="scar">
+  <span class="who">Treating "active" as "can ship"</span>
+  Separate properties. A location can be active and fulfil nothing.
+</div>
+
+<div class="scar">
+  <span class="who">A store locator built from the location list</span>
+  It will include warehouses and app-created fulfillment-service locations. Customers get offered places they
+  cannot visit.
+</div>
+
+<div class="scar money">
+  <span class="who">Publishing shelf stock as available</span>
+  Held, damaged and display items are on the shelf and not for sale. Customers travel for nothing.
+  → <a href="../platform/lessons/0006-three-ways-in-store-stock-reaches-the-storefront.html">P3.1</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">An unlabelled cache</span>
+  Twenty-minute-old availability shown as current. Usually right. When wrong, someone made a journey.
+</div>
+
+<div class="scar money">
+  <span class="who">Treating a retail order as unfulfilled</span>
+  A shop sale arrives created <b>and</b> fulfilled. Downstream systems create picking work for goods already
+  carried out. → <a href="../platform/lessons/0008-the-till-pos-lite-pro-the-retail-order-and-ui-extensions.html">P3.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Assuming every order has a customer or an address</span>
+  Retail orders are often anonymous with no shipping address. Failures cluster in one shop and look like a shop
+  problem.
+</div>
+
+<h2>Storefront</h2>
+
+<div class="scar money">
+  <span class="who"><code>update.js</code> for quantity changes</span>
+  Shopify documents it: <b>no quantity validation on items already in the cart</b>. It can oversell. Use
+  <code>change.js</code>. → <a href="../platform/lessons/0011-the-cart-ajax-api.html">P4.3</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Sending one discount code to "add" one</span>
+  The parameter is whole-state. One code sent removes every other code. An empty string clears all.
+</div>
+
+<div class="scar silent">
+  <span class="who">Addressing cart lines by variant id</span>
+  The line <code>key</code> identifies a line, not a variant. One variant can occupy two lines.
+</div>
+
+<div class="scar money">
+  <span class="who">Summing deprecated price fields</span>
+  <code>price</code>, <code>line_price</code> and <code>discounts</code> include <b>Scripts discounts only</b>.
+  "The line prices don't add up to the total" is always this — <b>the gap is the discount</b>.
+  → <a href="../platform/lessons/0012-discounts-on-the-storefront.html">P4.4</a>
+</div>
+
+<div class="scar silent">
+  <span class="who"><code>title</code> versus <code>product.title</code> on an order</span>
+  One is historical, the other current. A receipt on the wrong one rewrites history after a rename.
+</div>
+
+<h2>Checkout, Plus, Markets</h2>
+
+<div class="scar money">
+  <span class="who">Script tags past their sunset</span>
+  Thank you / Order status script tags: sunset <b>28 Aug 2025</b> for Plus, <b>26 Aug 2026</b> for non-Plus.
+  The feature simply stops. → <a href="../platform/lessons/0014-checkout-extensibility.html">P5.2</a>
+</div>
+
+<div class="scar money">
+  <span class="who">React checkout components not migrated</span>
+  <b>2025-07</b> is the last version supporting them. <b>Blocked from updating after 1 Oct 2026.</b>
+</div>
+
+<div class="scar silent">
+  <span class="who"><code>checkout.liquid</code> blocking Function APIs</span>
+  A store still carrying old checkout customisations must migrate before it can use Functions. The migration is a
+  prerequisite, not a competing task.
+</div>
+
+<div class="scar">
+  <span class="who">Getting the Plus gate wrong in either direction</span>
+  Checkout <em>steps</em> need Plus. Thank you / Order status do not. Functions do not. Market overrides need
+  Advanced. → <a href="../platform/lessons/0013-shopify-plus-and-markets.html">P5.1</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">A hardcoded market count</span>
+  Verified on a live store: <b>205 markets, 8 publications</b>. Code looping per market does 25× the work of
+  code looping per channel.
+</div>
+
+<div class="scar silent">
+  <span class="who">Writing a base price over a market override</span>
+  Both are real prices. One country sells wrong while every other market looks perfect.
+</div>
+
+<h2>Migration</h2>
+
+<div class="scar money">
+  <span class="who">The omitted line price</span>
+  Omit a price on an imported order and the platform can fill in the variant's <b>current</b> price. Counts
+  match, line items match, and the customer's history is wrong.
+  → <a href="../platform/lessons/0022-orders-money-and-the-shopify-to-shopify-replatform.html">P6.6</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Emails about 2016 orders</span>
+  Creating orders can fire customer notifications. Confirm and disable before any bulk order import. Test on a
+  Dev store with a real inbox.
+</div>
+
+<div class="scar silent">
+  <span class="who">Orders dated today</span>
+  Omit the date and a decade of history collapses onto the migration day. Every cohort report becomes
+  meaningless.
+</div>
+
+<div class="scar money">
+  <span class="who">Treating <code>COMPLETED</code> as success</span>
+  Per-line <code>userErrors</code> live only in the downloaded results file. <code>objectCount</code> counts
+  processed, not succeeded. → <a href="../platform/lessons/0018-three-ways-to-push-it-and-bulk-operations.html">P6.2</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">The <code>file</code> form field out of order</span>
+  It must be <b>last</b> in the multipart form. Earlier, the upload fails in a way that points nowhere.
+</div>
+
+<div class="scar money">
+  <span class="who">Quoting a limit from memory</span>
+  The daily variant throttle changed by <b>10×</b> between two checks three weeks apart. Date every limit.
+  Current: threshold <b>500,000 variants</b>, then <b>10,000/day</b>, Plus exempt.
+  → <a href="../platform/lessons/0019-the-huge-catalogue-load-and-the-throttle.html">P6.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Sizing from <code>productsCount</code></span>
+  Verified returning exactly <b>10,000</b> with <code>precision: AT_LEAST</code> — a floor, not a value. Even
+  <code>EXACT</code> is not a freshness promise.
+</div>
+
+<div class="scar silent">
+  <span class="who">The login surprise</span>
+  Passwords never move between platforms. On go-live morning every returning customer fails to sign in, and
+  nothing is broken. → <a href="../platform/lessons/0021-what-a-migration-is-and-what-never-moves.html">P6.5</a>
+</div>
+
+<div class="scar money">
+  <span class="who">No redirects</span>
+  Every old indexed URL becomes a 404. Traffic dies silently. The highest-value, least glamorous task in a
+  migration.
+</div>
+
+<div class="scar money">
+  <span class="who">No written stop condition for a cutover</span>
+  At 2am the pressure runs one way. Agree the abort criteria while everyone is calm.
+  → <a href="../platform/lessons/0020-the-cutover-and-the-proof.html">P6.4</a>
+</div>
+
+<div class="ask">
+  <b>Other Scars:</b> <a href="scars-apps.html">Apps &amp; Integrations</a> ·
+  <a href="scars-room.html">The Room</a>
+</div>
+
+<div class="footer-nav">
+  <span><a href="../platform/index.html">← Track 1 Map</a></span>
+  <span><a href="../index.html">The Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

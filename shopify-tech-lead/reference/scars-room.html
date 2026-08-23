@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scars — The Room</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a> · <a href="../room/index.html">Track 3</a></p>
+<p class="kicker">Reference · Track 3</p>
+<h1>Scars — The Room</h1>
+<p class="subtitle">The conversation traps. Read before a client call or an interview.</p>
+
+<h2>Explaining a system</h2>
+
+<div class="scar">
+  <span class="who">Starting with the database</span>
+  Concrete, so it feels safe. But the schema is a consequence of decisions the listener has not heard, so you are
+  giving answers before questions. → <a href="../room/lessons/0001-system-design-explained-out-loud.html">R1.1</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">The uninterrupted monologue</span>
+  Four minutes, no checkpoint. They lost you at minute one and are too polite to say. The meeting ends warmly and
+  nothing was communicated. <b>Check in every ninety seconds and offer to go back.</b>
+</div>
+
+<div class="scar">
+  <span class="who">Only the happy path</span>
+  Sounds complete, reads as inexperienced. The listener's unease has no name, so it becomes general lack of
+  confidence in you rather than a question you could answer.
+</div>
+
+<div class="scar">
+  <span class="who">Renaming their domain</span>
+  They say "styles", you say "product variants". Every sentence now needs translation and some will be wrong. Use
+  their nouns.
+</div>
+
+<div class="scar">
+  <span class="who">Answering a client like a grader</span>
+  Detail is generous with an interviewer and costly with a client. Same knowledge, opposite instinct.
+  → <a href="../room/lessons/0002-the-design-conversation-whiteboard-for-a-client.html">R1.2</a>
+</div>
+
+<div class="scar">
+  <span class="who">Naming your technology choices</span>
+  "A queue", not "BullMQ on Redis". The product name is either meaningless or triggers a question you did not want
+  to spend the meeting on.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Winning the meeting</span>
+  You can be right and lose the client's confidence. Aim for the better outcome, not the visible correction:
+  "that could work — the thing I'd worry about is X".
+</div>
+
+<h2>Scope and estimates</h2>
+
+<div class="scar money">
+  <span class="who">Guessing on field ownership</span>
+  You assume the ERP owns everything and the first run deletes the marketing team's descriptions. No undo. This is
+  the one genuinely blocking question. → <a href="../room/lessons/0005-owning-ambiguous-scope.html">R2.1</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Blocking for a week on twelve questions</span>
+  Nothing built, and the client concludes you cannot work independently. Every unnecessary question spends trust
+  you will want later.
+</div>
+
+<div class="scar silent">
+  <span class="who">An assumption stated with no consequence</span>
+  Buried in a list, unread, and wrong. <b>Name what happens if it is wrong</b> or you did not really flag it.
+</div>
+
+<div class="scar money">
+  <span class="who">A number invented to end a conversation</span>
+  It becomes the baseline you are measured against forever. Every later conversation is a variance from a figure
+  you knew was fiction. → <a href="../room/lessons/0006-estimating-pacing-and-holding-two-projects.html">R2.2</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Omitting the client's part of the timeline</span>
+  Credentials, decisions and vendor replies are often the longest waits. Absent from the estimate, every delay
+  looks like yours.
+</div>
+
+<div class="scar money">
+  <span class="who">Estimating only the happy path</span>
+  Failure handling and verification are a third to a half of integration work. Left out, the project is "nearly
+  done" for a very long time.
+</div>
+
+<div class="scar silent">
+  <span class="who">Working days versus calendar days</span>
+  You meant one, they heard the other, and nobody finds out until the deadline. Say the unit every time.
+</div>
+
+<div class="scar">
+  <span class="who">Splitting the day between two projects</span>
+  Integration state is large; switching costs are real. Two half-days produce less than one whole day, and the
+  loss is invisible on a timesheet.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Re-estimating late</span>
+  A number revised at week two is information. The same number at week six is a broken promise, for identical
+  work.
+</div>
+
+<h2>Getting a reply</h2>
+
+<div class="scar silent">
+  <span class="who">The buried ask</span>
+  Four paragraphs of context with a question in the middle. It reads as an update and gets no reply.
+  <b>Ask first, context last.</b> → <a href="../room/lessons/0007-communicating-with-a-busy-client.html">R2.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Two decisions in one message</span>
+  You get one answer and assume the other was agreed. It was not read. One decision per message.
+</div>
+
+<div class="scar money">
+  <span class="who">The destructive default</span>
+  If you must default, default to the <b>reversible</b> direction. Leaving data alone can be undone; overwriting
+  cannot.
+</div>
+
+<div class="scar">
+  <span class="who">No weekly note</span>
+  The client has no idea what is happening, so your first urgent message in three weeks arrives cold. Regular
+  contact is what makes an urgent request land.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">A blocker mentioned once</span>
+  Raised in week one, dropped, and by week six the delay is yours. <b>Repeat it every week, dated.</b> Repetition
+  is the mechanism.
+</div>
+
+<h2>Saying no, and disagreeing</h2>
+
+<div class="scar money">
+  <span class="who">Complying silently with something unwise</span>
+  You build the thing you know will oversell because saying so felt confrontational. The consequence is now partly
+  yours, because you knew. → <a href="../room/lessons/0012-saying-no-without-sounding-negative.html">R3.2</a>
+</div>
+
+<div class="scar">
+  <span class="who">"It's not best practice"</span>
+  An appeal to an authority the client does not recognise. Sounds like preference. <b>Name the specific
+  failure.</b>
+</div>
+
+<div class="scar">
+  <span class="who">A bare no with nothing after it</span>
+  The conversation ends with them wanting something and you blocking it. Always follow no with "what I can do
+  is".
+</div>
+
+<div class="scar silent">
+  <span class="who">Saying yes to everything</span>
+  Every yes is a silent no to something else. <b>"Where would you like those three days to come from?"</b> makes
+  the trade visible.
+</div>
+
+<div class="scar">
+  <span class="who">Three concerns instead of one</span>
+  Reads as resistance and triggers a defence of the whole idea. One specific concern, with money or
+  irreversibility attached. → <a href="../room/lessons/0014-disagreeing-upward-and-the-senior-narrative.html">R3.4</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Repeating an objection after a decision</span>
+  A reasonable position becomes obstruction and people stop including you. <b>Say it once, record it once, commit
+  fully.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Half-hearted execution of a decision you lost</span>
+  The work suffers and it is visibly your work. Commit properly or escalate — there is no third option.
+</div>
+
+<div class="scar silent">
+  <span class="who">Silent disagreement</span>
+  You thought it was wrong, said nothing, it went wrong. Nobody knows you knew, so you get the delivery and none
+  of the credit for the judgement.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Stockpiling "I told you so"</span>
+  If your recorded concern proves right, fix it without mentioning you called it. The record exists so the fix is
+  fast. People remember which one you used it for.
+</div>
+
+<h2>Speaking under pressure</h2>
+
+<div class="scar money">
+  <span class="who">Guessing a number to fill a silence</span>
+  It ends the awkward pause and goes straight into the plan.
+  → <a href="../room/lessons/0011-buying-thinking-time-and-saying-i-dont-know-yet.html">R3.1</a>
+</div>
+
+<div class="scar">
+  <span class="who">The unexplained pause</span>
+  Four seconds of silence reads as "he doesn't know". The same four seconds after "let me get this right rather
+  than fast" reads as care.
+</div>
+
+<div class="scar">
+  <span class="who">Apologising for your English</span>
+  It moves attention to the one thing you want in the background. Never apologise — use short sentences instead.
+</div>
+
+<div class="scar silent">
+  <span class="who">Twelve sentences instead of one</span>
+  Under pressure, <em>choosing</em> is what fails. One sentence per moment, drilled out loud.
+</div>
+
+<div class="scar">
+  <span class="who">A bare range</span>
+  "Three to eight days" reads as padding. It needs one named cause and a date when it collapses.
+  → <a href="../room/lessons/0013-a-range-not-a-number.html">R3.3</a>
+</div>
+
+<div class="scar">
+  <span class="who">"It depends on the data"</span>
+  True and useless. Depends on <em>what about</em> the data — match rate, blank rate, variant count?
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Inflating the high end</span>
+  Clients learn it quickly and then discount everything you say. The range must be your actual belief.
+</div>
+
+<h2>Review, mentoring, incidents</h2>
+
+<div class="scar money">
+  <span class="who">No severity on a blocking comment</span>
+  A real bug worded as a suggestion gets merged. The author read your tone correctly.
+  → <a href="../room/lessons/0015-mentoring-and-code-review-both-directions.html">R4.1</a>
+</div>
+
+<div class="scar">
+  <span class="who">Citing a principle instead of a consequence</span>
+  "This isn't idempotent" requires them to already know why it matters. "A retry would double the stock" does
+  not.
+</div>
+
+<div class="scar silent">
+  <span class="who">The same comment three times</span>
+  You are patching a systemic gap by hand forever. It belongs in a rule, a lint check or a document.
+</div>
+
+<div class="scar">
+  <span class="who">Explaining why you did it wrong</span>
+  When receiving review, justification reads as defensiveness. <b>"Good catch, I'll fix it"</b> is stronger than a
+  correct explanation.
+</div>
+
+<div class="scar money">
+  <span class="who">Investigating while it keeps breaking</span>
+  Every minute on root cause is a minute of continued damage. <b>Mitigate first</b> — pause the job, roll back,
+  hide the feature. → <a href="../room/lessons/0016-confident-problem-solving-under-pressure.html">R4.2</a>
+</div>
+
+<div class="scar money">
+  <span class="who">An untested change under pressure</span>
+  This is how a wrong stock number becomes a wrong stock number plus an outage.
+</div>
+
+<div class="scar">
+  <span class="who">Theorising out loud with no evidence</span>
+  A confident wrong theory gets repeated to their team and then retracted. Say "two possibilities" instead.
+</div>
+
+<div class="scar">
+  <span class="who">Silent thinking with an audience</span>
+  Identical thinking, opposite impression. Narrate the method or you look stuck while doing good work.
+</div>
+
+<h2>Interviews</h2>
+
+<div class="scar money">
+  <span class="who">The vague yes about experience you lack</span>
+  It survives one question and fails the second — and then every other answer is re-examined. A hedge costs more
+  than the gap it hid. → <a href="../room/lessons/0017-the-experience-gap-talking-about-what-you-have-not-built.html">R5.1</a>
+</div>
+
+<div class="scar">
+  <span class="who">"No" with nothing after it</span>
+  You confirmed the concern and offered nothing to weigh against it.
+</div>
+
+<div class="scar">
+  <span class="who">Blaming circumstances</span>
+  "I never got the opportunity" moves it outside your control — the opposite of the signal you want.
+</div>
+
+<div class="scar silent">
+  <span class="who">A generic "what I did about it"</span>
+  "I've been reading about it" produces no evidence. <b>The specificity is the proof.</b>
+</div>
+
+<div class="scar">
+  <span class="who">Leading with platform knowledge</span>
+  Table stakes. Everyone read the same documentation. It wins a screen and nothing after it.
+  → <a href="../room/lessons/0018-what-a-shopify-tech-lead-interview-actually-probes.html">R5.2</a>
+</div>
+
+<div class="scar">
+  <span class="who">A confident undated number</span>
+  Platform limits move. A limit with no date, said confidently, quietly shows you do not know they move.
+</div>
+
+<div class="scar silent">
+  <span class="who">Answering the words, not the probe</span>
+  "How long would it take?" answered as a duration, when it was testing estimating honesty. You were accurate and
+  failed, and nobody tells you.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">A perfect mock score with nothing built</span>
+  The mock scores what you can say. It cannot score what you have run. That combination is exactly the position
+  that lost an interview once.
+</div>
+
+<div class="ask">
+  <b>Other Scars:</b> <a href="scars-platform.html">Platform</a> ·
+  <a href="scars-apps.html">Apps &amp; Integrations</a>
+</div>
+
+<div class="footer-nav">
+  <span><a href="../room/index.html">← Track 3 Map</a></span>
+  <span><a href="../index.html">The Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

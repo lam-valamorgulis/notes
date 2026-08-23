@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1.3 — API Versioning and the Quarterly Upgrade</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P1 · Lesson 3</p>
+<h1>API versioning and the quarterly upgrade</h1>
+<p class="subtitle">Why "we upgrade every quarter" belongs in every estimate you ever give.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell a client, in one sentence, why their integration has
+  a permanent maintenance cost — and defend it as a feature of the platform rather than a flaw in
+  your build.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>The schedule, and the only three numbers you need</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Rule</th><th>Value</th></tr>
+  <tr><td>New stable version</td><td>Every <b>3 months</b>, at the start of the quarter, 5pm UTC</td></tr>
+  <tr><td>Support per version</td><td><b>At least 12 months</b></td></tr>
+  <tr><td>Overlap between consecutive versions</td><td><b>At least 9 months</b></td></tr>
+</table>
+</div>
+
+<p>Version names are dates: <code>2026-07</code>, <code>2026-10</code>, <code>2027-01</code>. So
+you always have around nine months to move, which is generous — and which is exactly why teams
+leave it until it is urgent.</p>
+
+<div class="diagram">
+  2026-07  released 1 Jul 2026 ──────────────▶ accessible until 16 Jul 2027
+  2026-10  released 1 Oct 2026 ──────────────▶ accessible until 16 Oct 2027
+  2027-01  released 1 Jan 2027 ──────────────▶ accessible until 16 Jan 2028
+
+  ~9 months of overlap. plenty of time, right up until it isn't.
+</div>
+
+<h3>Fall forward: the behaviour that decides everything</h3>
+
+<p>Here is the mechanism that makes an unpinned version dangerous. If your app targets a version
+that is no longer accessible, Shopify does not reject the request. It <b>falls forward</b> and
+serves the oldest accessible stable version.</p>
+
+<div class="diagram">
+  you request a retired 2026-10
+        │
+        ▼
+  Shopify serves 2027-01 instead
+        │
+        └── your code did not change. the API's behaviour DID.
+            nothing errored. nothing logged. field shapes moved.
+</div>
+
+<p>That is the whole risk in one picture: <b>the failure mode of ignoring versions is not an error,
+it is a silent behaviour change on a date you did not choose.</b> And if you send no version at
+all, requests go to the oldest supported stable version — which also moves quarterly.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> quarterly releases at 5pm UTC, minimum 12 months of
+support, at least 9 months of overlap, the fall-forward rule, that omitting a version defaults to
+the oldest supported one, and the accessible-until dates above —
+<a href="https://shopify.dev/docs/api/usage/versioning">About Shopify API versioning</a>.
+The latest stable version as of this date is <b>2026-07</b>.</p>
+
+<h3>So: pin it, once</h3>
+
+<p>One constant, read from configuration, used by every call. Never let a client library default to
+"latest" — and never let a second code path hold a different value. Two paths on two versions both
+work, and disagree occasionally, in one direction, about one field.</p>
+
+<h3>The upgrade, as a routine rather than an event</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Step</th><th>What</th></tr>
+  <tr><td>1</td><td>Read the release notes for the new version. Not the whole changelog — the one version's notes</td></tr>
+  <tr><td>2</td><td><b>Validate every query and mutation against the new schema.</b> This is the step that finds the problems</td></tr>
+  <tr><td>3</td><td>Change the one constant in a branch. Run the test suite</td></tr>
+  <tr><td>4</td><td>Run against a Dev store on the new version before production</td></tr>
+  <tr><td>5</td><td>Ship. Note the date you did it</td></tr>
+</table>
+</div>
+
+<p>Step 2 is the whole value, and it can be automated. This Course validated its own queries against
+the schema and found <b>two</b> already-deprecated fields —
+<code>ShopPlan.displayName</code> (use <code>publicDisplayName</code>) and
+<code>Market.enabled</code> (use <code>status</code>) — in queries that looked obviously correct.
+Two for two on the first attempt. A CI job doing that turns a quarterly upgrade into a red build
+you fix in an afternoon.</p>
+
+<p>For a <b>custom</b> app there is a second tool: a REST endpoint that lists the deprecated calls
+your app has made in the past 30 days, with migration steps and deadlines. It only covers custom
+apps, and it only covers REST — but if you have inherited a REST codebase, it is a free work list.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client's integration has worked untouched for two years. No deploys, no errors. <b>How many
+  versions have passed, and what is the state of that app?</b>
+</div>
+
+<p>Eight versions. And if the version was pinned, that pin retired around a year ago — so every
+request has been <b>falling forward</b> to whatever the oldest accessible version is now, and has
+done so through several rollovers. The app is not "stable"; it is running on an API contract nobody
+chose, which changed silently at least twice. The absence of errors proved nothing, because
+fall-forward is designed not to error. This is the strongest argument you will ever have for a
+maintenance retainer, and it is entirely honest.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — no version pinned</span>
+  Requests go to the oldest supported version, which moves every quarter. Your app's behaviour
+  changes on Shopify's schedule. The bug reports arrive weeks later, uncorrelated with any deploy
+  of yours, which makes them expensive to diagnose.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — fall forward</span>
+  A retired pinned version is served by a newer one instead of failing. Field shapes move,
+  defaults change, nothing logs. This is the reason "it hasn't errored" is not evidence of
+  health.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — two versions in one codebase</span>
+  Your constant says one thing, a client library defaults to another. Both work. They disagree
+  about one field, sometimes. This can survive for months and is miserable to find.
+</div>
+
+<div class="scar">
+  <span class="who">The upgrade treated as a project</span>
+  Left for nine months, it becomes an unbudgeted sprint with several breaking changes at once.
+  Done quarterly with schema validation in CI, it is an afternoon. The work is identical; only the
+  batching differs.
+</div>
+
+<div class="scar">
+  <span class="who">Deprecated but still working</span>
+  A deprecated field keeps returning data, so nothing forces you to act. Then it is removed. Treat
+  a deprecation warning as a dated task, not as information.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — webhook payloads are versioned too</span>
+  It is easy to pin your API calls and forget that webhook subscriptions carry a version as well.
+  Upgrade both together, or you will parse a new payload shape with old code.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When quoting the build, before anyone asks</span>
+  <q>One thing to build into your budget: Shopify releases a new version of their API every three
+  months, and each one is supported for about a year. So the integration needs a small maintenance
+  slot roughly quarterly. It's a few hours if we keep up. It's a fortnight if we leave it two
+  years, which is what usually happens.</q>
+  <span class="why-said">Raising it unprompted makes it a platform fact rather than a later
+  surprise. Clients accept costs they were warned about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a client says their existing integration "works fine, don't touch it"</span>
+  <q>I'd check one thing first. Shopify retires API versions after about a year, and when yours
+  retires they don't fail your requests — they quietly serve a newer version instead. So an
+  integration that hasn't been touched in two years is running on a version nobody picked, and it
+  changed without telling anyone. It might genuinely be fine. I'd rather know than assume.</q>
+  <span class="why-said">Describes a real mechanism instead of implying the previous developer was
+  careless. That keeps the client on your side.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>New stable version every 3 months.</b> Supported at least 12 months, with at least 9 months of overlap.</li>
+  <li><b>Latest stable is <code>2026-07</code></b> as of this Lesson, accessible until 16 July 2027.</li>
+  <li><b>Fall forward:</b> a retired version is silently served by a newer one. It does not error.</li>
+  <li><b>No version specified means the oldest supported one</b>, which also moves quarterly.</li>
+  <li><b>Pin it once</b>, in one constant. Two paths on two versions is a miserable bug.</li>
+  <li><b>Validate every query against the new schema in CI.</b> That step found two deprecated fields here on the first try.</li>
+  <li><b>Webhook subscriptions are versioned too.</b> Upgrade both together.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "it hasn't errored" is not evidence of health,
+because falling forward is designed never to error.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P1 done. <b>"next"</b> for custom data — the hole in most people's
+  Shopify knowledge.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0002-the-two-apis-and-the-rate-limit-model.html">← P1.2</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

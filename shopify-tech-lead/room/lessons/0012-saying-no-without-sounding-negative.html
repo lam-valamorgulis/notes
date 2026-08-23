@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R3.2 — Saying No Without Sounding Negative</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R3 · Lesson 2</p>
+<h1>Saying no without sounding negative</h1>
+<p class="subtitle">Refuse the request, keep the relationship, offer the smaller thing.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A three-part sentence shape that lets you decline anything without
+  becoming the person who says no.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why does "no" damage the relationship?</h3>
+
+<p>Because a bare no answers a different question than the one asked. They asked "can we have X?" and
+heard "no". What they actually wanted was <b>the outcome behind X</b> — and you have not addressed it, so
+the conversation ends with them wanting something and you blocking it.</p>
+
+<p>So the shape follows: acknowledge the outcome, name the real constraint, and offer the nearest thing
+that serves the outcome.</p>
+
+<div class="diagram">
+  1. ACKNOWLEDGE the goal      "I can see why you want that"
+  2. NAME the constraint       one specific, checkable reason
+  3. OFFER the nearest thing   "what I can do is…"
+
+  ── the request is refused. the goal is not.
+</div>
+
+<h3>The three kinds of no, and each needs different words</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Kind</th><th>The honest framing</th></tr>
+  <tr><td><b>Not possible</b> — the platform will not allow it</td><td>Name the platform rule. It is not your decision, so do not own it</td></tr>
+  <tr><td><b>Possible but unwise</b> — it will hurt them</td><td>Name the consequence, then offer the alternative. This is the hardest one</td></tr>
+  <tr><td><b>Possible but not now</b> — it competes with something</td><td>Make the trade-off visible and hand the choice back</td></tr>
+</table>
+</div>
+
+<h4>Not possible</h4>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>That one isn't available on your plan — Shopify restricts app content on the payment step to Plus. What
+  I can do on your plan is everything after the order is placed.</q><br>
+  <q>Shopify doesn't let us do that. What I can get close to is X — want me to show you?</q>
+  <span class="why-said">Attributes the limit to the platform, which is where it belongs, then immediately
+  offers something. Never let "not possible" be the last thing you say.</span>
+</div>
+
+<h4>Possible but unwise — the one that takes courage</h4>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>I can do that, and I want you to know what it costs before you decide. Adding a customer name here
+  moves us into a higher tier of Shopify's privacy rules — extra approval and a review. If support just
+  needs to find an order, an order number does the same job with none of that. Which would you like?</q><br>
+  <q>Happy to build it. The thing I'd worry about is that it'll oversell — that number includes items already
+  sold. Want me to use the sellable figure instead?</q>
+  <span class="why-said">Never refuse outright and never comply silently. Price it, offer the cheaper
+  option, and hand the decision back. They almost always take the cheaper option.</span>
+</div>
+
+<h4>Possible but not now</h4>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>I can do that this sprint if we move the reconciliation report to next. Your call — I'd keep the report,
+  because it's how we'd catch anything the sync gets wrong.</q><br>
+  <q>Yes, and it's about three days. Where would you like those three days to come from?</q>
+  <span class="why-said">The second sentence is the most useful in this Lesson. It never refuses anything
+  and it makes the cost unavoidable.</span>
+</div>
+
+<h3>The words to avoid</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do not say</th><th>Because</th><th>Say</th></tr>
+  <tr><td>"That's impossible"</td><td>Usually untrue, and it invites a challenge</td><td>"Shopify doesn't allow that on this plan"</td></tr>
+  <tr><td>"That's a bad idea"</td><td>Judges them, not the idea</td><td>"The thing I'd worry about is…"</td></tr>
+  <tr><td>"We'd never do that"</td><td>Makes it about identity</td><td>"I'd want to check one thing first"</td></tr>
+  <tr><td>"You don't need that"</td><td>You do not get to decide what they need</td><td>"What's the outcome you're after?"</td></tr>
+  <tr><td>"It's not best practice"</td><td>Means nothing to them and sounds like preference</td><td>Name the specific failure it causes</td></tr>
+</table>
+</div>
+
+<p>The last row is the most common mistake among good engineers. <b>"Best practice" is an appeal to
+authority you do not have. A named failure is an argument.</b></p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client asks you to scrape a vendor's website because the vendor will not give you API access. <b>Say no
+  in three parts.</b>
+</div>
+
+<p>Something close to: <b>"I can see why — they're blocking us and you need the data. Two problems though.
+Without their permission it risks breaching their terms, and it breaks the first time they change their
+page — silently, so we'd be showing stale data without knowing. What I'd rather do is ask them for the
+scheduled export instead; there's usually a button for it in their admin already. If you can get written
+permission for the other approach, I'll build it."</b>
+<br><br>
+Note the last clause. You have not refused permanently — you have named the condition under which you
+would proceed, which keeps the decision with them and keeps you out of the position of being the obstacle.
+And you have offered a concrete alternative that is probably faster anyway.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — complying silently with something unwise</span>
+  You build the thing you know will oversell, because saying so felt confrontational. The consequence
+  arrives later and is now partly yours, because you knew.
+</div>
+
+<div class="scar">
+  <span class="who">"It's not best practice"</span>
+  An appeal to an authority the client does not recognise. It sounds like personal preference and loses the
+  argument. Name the specific failure instead.
+</div>
+
+<div class="scar">
+  <span class="who">A bare no with nothing after it</span>
+  The conversation ends with them wanting something and you blocking it. Always follow no with "what I can
+  do is".
+</div>
+
+<div class="scar">
+  <span class="who">Owning a platform limit as your decision</span>
+  "I won't do that" when the truth is "Shopify doesn't allow it" makes you the obstacle for no reason.
+  Attribute limits accurately.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — saying yes to everything</span>
+  Every yes is a no to something else, silently. The project slips and nobody can point to a decision.
+  "Where would you like those three days to come from?" makes the trade visible.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — say it once, then do it</span>
+  If you raise a concern and the client reaffirms the request, that is their decision. Say "understood, I'll
+  build it as asked and I've noted the concern" and then build it properly. Repeating the objection is how a
+  reasonable position becomes obstruction.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Not possible</span>
+  <q>That specific page is Plus-only — Shopify doesn't allow app content on the payment and shipping steps
+  below that plan. What I can do on your plan is everything after the order is placed, plus the server-side
+  rules. If that page genuinely matters, it's a plan conversation, and I'd want to be sure it's worth it for
+  one message.</q>
+  <span class="why-said">Names the platform rule, offers the alternative, and declines to upsell them. That
+  last part is what makes the no trustworthy.</span>
+</div>
+
+<div class="script">
+  <span class="who">Possible but unwise</span>
+  <q>I can build it. Before you decide — that number includes stock that's already been sold but not shipped,
+  so sending it across would let customers buy things you can't ship. I'd use the sellable figure instead.
+  Same work, and it won't oversell. Shall I do that?</q>
+  <span class="why-said">Yes, then the consequence, then the better version, then a question. They get to
+  choose and the right thing is the easy choice.</span>
+</div>
+
+<div class="script">
+  <span class="who">Possible but not now</span>
+  <q>Yes — about three days. Where would you like those three days to come from? Right now they'd have to
+  come out of the reconciliation report, and I'd keep the report if it were me, because it's how we'd catch
+  anything going wrong quietly.</q>
+  <span class="why-said">Never refuses, makes the cost unavoidable, and gives a recommendation. This is the
+  most reusable sentence in the Chapter.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Three parts: acknowledge the goal · name the constraint · offer the nearest thing.</b></li>
+  <li><b>Refuse the request, never the outcome.</b> A bare no answers the wrong question.</li>
+  <li><b>Three kinds of no:</b> not possible · possible but unwise · possible but not now.</li>
+  <li><b>Never comply silently with something unwise.</b> Price it and hand the decision back.</li>
+  <li><b>"Where would you like those three days to come from?"</b> — never refuses, always makes the cost visible.</li>
+  <li><b>Never say "best practice".</b> Name the specific failure.</li>
+  <li><b>Say the concern once.</b> If they reaffirm, build it properly and note it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: always follow no with "what I can do is" — a no with an
+offer after it is not a refusal.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for giving a number without giving a promise.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0011-buying-thinking-time-and-saying-i-dont-know-yet.html">← R3.1</a></span>
+  <span><a href="0013-a-range-not-a-number.html">R3.3 · A range →</a></span>
+</div>
+
+</div>
+</body>
+</html>

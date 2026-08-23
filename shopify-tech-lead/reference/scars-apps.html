@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scars — Apps &amp; Integrations</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a> · <a href="../apps/index.html">Track 2</a></p>
+<p class="kicker">Reference · Track 2</p>
+<h1>Scars — Apps &amp; Integrations</h1>
+<p class="subtitle">Every "Where it hurts" from Track 2. The page to read before designing a sync.</p>
+
+<div class="note">
+  <span class="label">How to read this</span>
+  Red = costs money. Purple = fails with no error. Dashed = engineering judgement, not documented.
+  Verified against shopify.dev on 2026-08-23 unless noted.
+</div>
+
+<h2>The app itself</h2>
+
+<div class="scar money">
+  <span class="who">Picking custom distribution, then needing to sell it</span>
+  A custom app <b>cannot use the Billing API</b>. Reselling means changing distribution: App Store review,
+  compliance webhooks, protected-data approval, a listing. Ask "will anyone else ever install this?" first.
+  → <a href="../apps/lessons/0001-anatomy-of-a-shopify-app.html">A1.1</a>
+</div>
+
+<div class="scar">
+  <span class="who">Inheriting an admin-created legacy app</span>
+  Cannot use App Bridge, app extensions, or the Billing API, and cannot be created any more. "Add a theme app
+  extension" means replacing the app first.
+</div>
+
+<div class="scar silent">
+  <span class="who">Online token on a background job</span>
+  Tied to a person's session and permissions. Works for months, then stops when they leave or their permissions
+  change. Nothing logged. <b>Background work uses offline tokens.</b>
+  → <a href="../apps/lessons/0002-app-auth-session-tokens-and-token-exchange.html">A1.2</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Public app on non-expiring offline tokens</span>
+  Must migrate to expiring tokens by <b>January 2027</b>. Custom and merchant-created apps are exempt.
+</div>
+
+<div class="scar silent">
+  <span class="who">The refresh token dies before the access token</span>
+  Obtaining a new expiring offline token <b>invalidates the old refresh token immediately</b> while the old
+  access token keeps working. A second worker looks fine, then fails permanently on its first refresh.
+</div>
+
+<div class="scar">
+  <span class="who">Offline and online look identical</span>
+  Both start <code>shpat_</code>. Delegate tokens start <code>shppa_</code>. Store the type next to the token or
+  you cannot audit your own system.
+</div>
+
+<h2>Webhooks</h2>
+
+<div class="scar silent">
+  <span class="who">HMAC on a parsed body</span>
+  Middleware parses JSON before your handler; you sign the re-serialised object. It never matches and the code
+  looks correct. Capture raw bytes on that route.
+  → <a href="../apps/lessons/0003-webhooks-done-right.html">A1.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">A 3XX response</span>
+  <b>Any non-2XX is a failure, redirects included.</b> Your access log shows healthy 301s while Shopify's
+  counter climbs to eight.
+</div>
+
+<div class="scar money">
+  <span class="who">Secret rotation has an up-to-one-hour tail</span>
+  It can take <b>up to an hour</b> for the HMAC digest to use a new client secret. Verify against the new one
+  immediately and you reject real deliveries. Accept both during the overlap.
+</div>
+
+<div class="scar money">
+  <span class="who">The subscription deletes itself</span>
+  <b>8 consecutive failures</b> and it is gone — if configured via the Admin API. App-specific subscriptions are
+  not. Watch the failure rate; Shopify calls anything over <b>0.5%</b> higher than average.
+</div>
+
+<div class="scar">
+  <span class="who">Deduping on <code>Event-Id</code></span>
+  Two subscriptions on one topic produce two deliveries, two <code>Webhook-Id</code>s, one
+  <code>Event-Id</code>. Dedupe on <code>Webhook-Id</code>; correlate on <code>Event-Id</code>.
+</div>
+
+<div class="scar">
+  <span class="who">Webhooks can arrive a day late</span>
+  Shopify's own guidance is to compare the timestamp to now if a day's delay would matter. Always pair with a
+  scheduled re-read.
+</div>
+
+<h2>Privacy and scopes</h2>
+
+<div class="scar money">
+  <span class="who">One name field moves you to privacy level 2</span>
+  Level 1 excludes name, address, phone and email. Include any one and you need field-specific approval plus
+  data protection reviews. Teams walk into this via a support dashboard.
+  → <a href="../apps/lessons/0004-scopes-protected-customer-data-and-compliance.html">A1.4</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">The 30-day compliance clock nobody owns</span>
+  You return 200 and a human has 30 days to actually delete. An acknowledged-but-uncompleted request looks
+  identical to a completed one. Track them with a due date.
+</div>
+
+<div class="scar">
+  <span class="who"><code>customers/redact</code> timing</span>
+  If the customer ordered within six months, the request is <b>withheld for six months</b>. Only with no recent
+  order does it arrive after 10 days. Never promise a client fast deletion.
+</div>
+
+<div class="scar">
+  <span class="who">Scope creep is permanent</span>
+  Adding a scope is easy; removing one means merchants re-approve. Ask for what today's feature needs.
+</div>
+
+<h2>Backend and the queue</h2>
+
+<div class="scar money">
+  <span class="who">Treating HTTP 200 as success on GraphQL</span>
+  The most expensive habit on this API. Throttles, validation failures and partial successes all return 200.
+  Check <b>three levels</b>: HTTP status, <code>errors[]</code>, <code>userErrors[]</code>.
+  → <a href="../apps/lessons/0007-one-queue-with-retries-and-a-dead-letter.html">A2.3</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Retrying terminal errors</span>
+  8 attempts at something that can never succeed, spending budget the good records needed. Classify first:
+  transient · throttled · terminal · poison.
+</div>
+
+<div class="scar silent">
+  <span class="who">No jitter</span>
+  Synchronised retries recreate the outage you just recovered from. Nothing identifies you as the cause.
+</div>
+
+<div class="scar">
+  <span class="who">Concurrency against one bucket</span>
+  The limit is per app <b>and</b> store. Ten workers on one store share one budget. More workers redistribute
+  throttling; they do not add throughput.
+</div>
+
+<div class="scar money">
+  <span class="who">Business rules inside the API client</span>
+  Every rule next to an API call is a rule you must re-verify at each quarterly version bump.
+  → <a href="../apps/lessons/0005-the-nestjs-module-shape-for-a-sync-service.html">A2.1</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Pairwise id mapping</span>
+  <code>erp_id</code> and <code>shopify_id</code> as columns works with two systems and collapses at three.
+  Use a hub — your id in the middle. → <a href="../apps/lessons/0006-a-postgres-schema-for-a-sync-store.html">A2.2</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Writing <code>shadow</code> before the send</span>
+  A crash then makes you believe in a send that never happened. The record is skipped forever as "unchanged"
+  and the wrong value is permanent. <b>Send, confirm, then record.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">A token or a payload in the logs</span>
+  A token in a log store is as unrecoverable as a secret in git history. Order payloads contain names, emails and
+  addresses. <b>Note: <code>Product.events</code> messages contain staff full names and emails in plain text</b> —
+  verified on a live store. → <a href="../apps/lessons/0008-run-it-docker-compose-ci-and-what-to-log.html">A2.4</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Green dashboards on an idle sync</span>
+  Zero queue depth, no dead-letters, no errors — all true of a sync doing nothing. <b>Only reconciliation drift
+  measures correctness.</b>
+</div>
+
+<h2>The sync discipline</h2>
+
+<div class="scar money">
+  <span class="who">Overwriting sellable stock with warehouse stock</span>
+  Both numbers right, mapping wrong, result is overselling. The most expensive ownership mistake available.
+  → <a href="../apps/lessons/0010-ownership-per-field-not-per-record.html">A3.2</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Per-record ownership</span>
+  "The ERP owns products" quietly claims the quantity field. One nightly run resets every stock level.
+</div>
+
+<div class="scar silent">
+  <span class="who">The shared tag list</span>
+  Writing the list wholesale deletes the marketing team's tags. They add them back; you delete them tonight.
+  <b>Own a prefix, never the list.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Deltas instead of absolute values</span>
+  A retry applies it twice. Absolute writes are what make replay, backlogs and repair possible at all.
+  → <a href="../apps/lessons/0011-absolute-writes-safe-replay-and-tombstones.html">A3.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Partial payload to a whole-state mutation</span>
+  "Absolute" must also mean <b>complete</b>. Three of five variants sent means two deleted.
+</div>
+
+<div class="scar silent">
+  <span class="who">A hard-deleted source row</span>
+  An absence carries no information — deleted, unchanged, next page and source error look identical. Products
+  stay live and sellable for months.
+</div>
+
+<div class="scar money">
+  <span class="who">Using the webhook payload as data</span>
+  A four-hour-old retry overwrites the current price with an old one. <b>A webhook is a trigger, not a
+  source.</b> → <a href="../apps/lessons/0012-webhooks-are-a-hint-clocks-order-and-staleness.html">A3.4</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">The watermark from your own clock, or the scan's start</span>
+  Both silently drop every row changed during the scan. <b>Highest <code>updatedAt</code> you actually
+  saw</b>, from the source's clock.
+</div>
+
+<div class="scar silent">
+  <span class="who">An empty queue after a long outage</span>
+  It looks like a clean recovery and means the subscription was deleted and every event is gone.
+  → <a href="../apps/lessons/0013-the-backlog.html">A3.5</a>
+</div>
+
+<div class="scar money">
+  <span class="who">Draining a backlog at full speed, in arrival order</span>
+  Spends the whole budget on obsolete history while live changes queue behind it. Collapse to ids, re-read
+  current, drain by damage.
+</div>
+
+<div class="scar money">
+  <span class="who">Count-only reconciliation</span>
+  Every price off by a cent, or every stock level a week old, passes perfectly.
+  → <a href="../apps/lessons/0014-reconciliation-and-numbers-that-do-not-lie.html">A3.6</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Zero differences out of zero records</span>
+  An empty comparison set reports a clean pass. <b>Always publish the denominator.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">A global rate limiter across many stores</span>
+  The bucket is per app <b>and</b> store. A global limiter is a bottleneck 400× too small, with healthy
+  per-call metrics and a queue that grows forever.
+  → <a href="../apps/lessons/0015-store-17-of-four-hundred.html">A3.7</a>
+</div>
+
+<div class="scar money">
+  <span class="who">One try/catch around the whole fleet</span>
+  Store 17's revoked token stops stores 18 to 400. The classic multi-tenant outage.
+</div>
+
+<div class="scar silent">
+  <span class="who">Averaged fleet health</span>
+  399 healthy and 1 broken averages to healthy. Report the worst and the count outside tolerance.
+</div>
+
+<h2>Connectors</h2>
+
+<div class="scar money">
+  <span class="who">Treating a checkout-time integration like an async one</span>
+  Adding retries inside checkout multiplies the delay. The loss is invisible — abandoned carts raise no
+  tickets. → <a href="../apps/lessons/0016-integration-patterns-erp-crm-payments-fulfillment.html">A4.1</a>
+</div>
+
+<div class="scar money">
+  <span class="who">No fail-open / fail-closed decision</span>
+  Undecided means the code decides by throwing. <b>Fail open on information, fail closed on a promise.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Applying a truncated file</span>
+  Absence means deleted, the upload failed halfway, and half the catalogue is archived overnight.
+  <b>Row-count sanity gate, and a hold-for-human state.</b>
+  → <a href="../apps/lessons/0018-the-vendor-stock-feed-connector-csv-and-sftp.html">A4.3</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">A reordered CSV column</span>
+  Price and stock swap places. Every row parses. Every number is wrong. Exact header matching is the only
+  defence.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">SFTP has no delivery notification</span>
+  If the vendor's upload silently stops, you receive nothing — which looks exactly like "no changes today".
+  <b>Alert on the absence of a file.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">A reused SKU</span>
+  A retired code reused eighteen months later updates the <b>old</b> product, on its existing URL and history.
+  Tombstone retired keys. → <a href="../apps/lessons/0019-identifier-mapping-and-the-mapping-registry.html">A4.4</a>
+</div>
+
+<div class="scar silent">
+  <span class="who">Cached Shopify variant ids</span>
+  A product option change can destroy and recreate variants. Treat the Shopify id as a cache you can
+  re-resolve.
+</div>
+
+<div class="scar">
+  <span class="who">Coverage measured by row count</span>
+  "97% of 50,000" hides 1,500 invisible products, possibly including bestsellers. Report coverage <b>weighted
+  by units sold</b> too.
+</div>
+
+<h2>Patterns from a closed vendor platform</h2>
+
+<p class="small">Company, client and tenant removed on purpose. The pattern is the lesson.
+→ <a href="../apps/lessons/0020-when-the-vendor-will-not-give-you-an-api.html">A4.5</a></p>
+
+<div class="scar money">
+  <span class="who">Two ledgers for the same money</span>
+  A vendor holding a customer credit balance, plus store credit issued in Shopify. Both real, neither aware of
+  the other, and a customer can spend it twice. <b>Find this before go-live.</b>
+</div>
+
+<div class="scar money">
+  <span class="who">Recomputing a derived value</span>
+  A price computed from hidden rules is <b>not reproducible</b> from what is exposed. Read their number or show
+  nothing. A formula fitted to one example is a guess with a decimal point.
+</div>
+
+<div class="scar silent">
+  <span class="who">Assuming the system of record owns everything</span>
+  They may own the catalogue while <b>Shopify owns inventory</b>, flowing back to them. Establish ownership per
+  field even when one system is obviously the master.
+</div>
+
+<div class="scar silent">
+  <span class="who">Identity that encodes a location</span>
+  A key fusing item and location works for one location and breaks all at once when the second arrives, usually
+  mid-rollout.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">No published limits means no promised throughput</span>
+  You cannot discover a closed platform's rate limits responsibly on someone's production system. Say what you
+  measured and that it is not a commitment.
+</div>
+
+<div class="ask">
+  <b>Other Scars:</b> <a href="scars-platform.html">Platform</a> ·
+  <a href="scars-room.html">The Room</a>
+</div>
+
+<div class="footer-nav">
+  <span><a href="../apps/index.html">← Track 2 Map</a></span>
+  <span><a href="../index.html">The Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

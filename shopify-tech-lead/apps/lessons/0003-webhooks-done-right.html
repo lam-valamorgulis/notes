@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A1.3 — Webhooks Done Right</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A1 · Lesson 3</p>
+<h1>Webhooks done right</h1>
+<p class="subtitle">Five seconds, eight retries, and then your subscription is deleted.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A receiver that proves the message came from Shopify,
+  answers inside the deadline, survives the same message arriving twice, and does not quietly
+  unsubscribe itself after a bad afternoon.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<div class="diagram">
+  something happens in the store
+        │
+        ▼
+  Shopify POSTs to your URI
+        │   X-Shopify-Hmac-SHA256   base64 HMAC-SHA256(raw body, client secret)
+        │   X-Shopify-Webhook-Id    unique per DELIVERY   → dedupe on this
+        │   X-Shopify-Event-Id      same per merchant ACTION → correlate on this
+        ▼
+  your receiver:
+     1. verify HMAC on the RAW body      ── before parsing, before trusting
+     2. dedupe on X-Shopify-Webhook-Id   ── or be idempotent
+     3. enqueue                          ── do not process here
+     4. return 200                       ── within 5 seconds, total
+        │
+        └─ anything not 2XX (3XX included) = failure
+           → 8 retries over 4 hours, interval growing each time
+           → after 8 consecutive failures the subscription is DELETED
+             (if it was configured using the Admin API)
+</div>
+
+<h3>1 · Verify on the raw body</h3>
+
+<p>The signature is a base64-encoded HMAC-SHA256 of the <b>raw request body</b>, keyed with
+your app's <b>client secret</b>, in the <code>X-Shopify-Hmac-SHA256</code> header. Compute
+it, compare, reject on mismatch.</p>
+
+<p>"Raw" is load-bearing. Most frameworks parse JSON for you before your handler runs, and a
+parsed-then-re-serialised body is a <em>different byte string</em> — different key order,
+different whitespace. The HMAC then never matches and the cause is invisible in the code you
+are reading. Capture the raw bytes for this route specifically.</p>
+
+<p>Note the boundary: HMAC verification applies to <b>HTTPS delivery only</b>. Google Cloud
+Pub/Sub and Amazon EventBridge deliveries do not require it, because the transport already
+establishes the sender.</p>
+
+<h3>2 · Two different ID headers</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Header</th><th>Unique per</th><th>Use it to</th></tr>
+  <tr><td><code>X-Shopify-Webhook-Id</code></td><td>Delivery</td><td><b>Deduplicate</b></td></tr>
+  <tr><td><code>X-Shopify-Event-Id</code></td><td>Merchant action</td><td><b>Correlate</b> deliveries from the same cause</td></tr>
+</table>
+</div>
+
+<p>If you have more than one subscription on the same topic, you get a <b>separate delivery
+per subscription</b> — each with a different <code>Webhook-Id</code> but the <em>same</em>
+<code>Event-Id</code>. Dedupe on the wrong header and you throw away work you were supposed
+to do.</p>
+
+<h3>3 · Enqueue, do not process</h3>
+
+<p>Shopify allows a <b>one-second connection timeout and a five-second timeout for the whole
+request</b>. That budget is for acknowledging receipt, not for doing the work. Store the
+payload, return 200, process asynchronously. Then add a <b>reconciliation job</b> that
+periodically re-reads from the API to catch what you missed — Shopify's own guidance
+recommends exactly that pattern, which tells you how much they expect you to miss.</p>
+
+<h3>4 · Failure is a countdown</h3>
+
+<p>No response or an error means <b>8 retries over the next 4 hours</b>, with the interval
+growing each time. After <b>8 consecutive failures the subscription is automatically
+deleted</b> — and warning emails go to your app's emergency developer email address.</p>
+
+<div class="note">
+  <span class="label">The qualifier that matters</span>
+  Automatic deletion applies to subscriptions <b>configured using the Admin API</b>
+  (shop-specific). App-specific subscriptions declared in your app configuration are not
+  managed that way — Shopify's recovery guidance says you do not need to re-subscribe if your
+  app uses app-specific subscriptions. Which style you chose decides whether an outage costs
+  you a resubscribe script.
+</div>
+
+<p class="verified"><b>Verified 2026-08-23:</b> HMAC on raw body with the client secret and the
+HTTPS-only boundary · the 1-second connect and 5-second total timeouts · any non-2XX
+<b>including 3XX</b> treated as an error · Keep-Alive reuse ·
+<code>Webhook-Id</code> versus <code>Event-Id</code> · 8 retries over 4 hours then deletion of
+Admin-API-configured subscriptions ·
+<b>secret rotation taking up to an hour</b> to affect the HMAC digest —
+<a href="https://shopify.dev/docs/apps/build/webhooks/verify-deliveries">Verify webhook deliveries</a>
+and <a href="https://shopify.dev/docs/apps/build/webhooks/troubleshoot">Troubleshoot webhooks</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your receiver returns a <b>301 redirect</b> to a tidier URL. Deliveries look fine in your
+  access log. <b>What is Shopify recording?</b>
+</div>
+
+<p>Failures. <b>Any response outside the 200 range, including 3XX, is treated as an error.</b>
+Your access log shows 301s and looks healthy; Shopify's counter climbs toward eight, and then
+your subscription is gone. A redirect is one of the few ways to fail while appearing to
+succeed on your own side.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the parsed body</span>
+  Your middleware parses JSON before the handler. You HMAC the re-serialised object. It never
+  matches, and the code looks correct. Every webhook is rejected as unauthentic. Capture raw
+  bytes on this route.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a 3XX response</span>
+  As above. Non-2XX means failure, and redirects count. Terminate the webhook path exactly
+  where you say it terminates.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — secret rotation has a one-hour tail</span>
+  Rotate your app's client secret and it can take <b>up to an hour</b> for the HMAC digest to
+  be generated with the new secret. Verify against the new secret immediately and you reject
+  real deliveries for that hour, burning retries. Accept both secrets during the overlap.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — the subscription deletes itself</span>
+  Eight consecutive failures and it is gone. Your app then looks healthy and receives nothing,
+  which is worse than crashing. Watch the failure rate: Shopify calls anything over
+  <b>0.5%</b> higher than average.
+</div>
+
+<div class="scar">
+  <span class="who">Webhooks can arrive a day late</span>
+  Shopify's own guidance is to compare the webhook's timestamp with the current time if being
+  a day late would cause problems. So a webhook is not just unreliable in <em>whether</em> it
+  arrives — it is unreliable in <em>when</em>. Chapter A3 builds on exactly this.
+</div>
+
+<div class="scar">
+  <span class="who">Dedupe on the wrong header</span>
+  Two subscriptions on one topic produce two deliveries with one <code>Event-Id</code>.
+  Deduping on <code>Event-Id</code> silently drops the second, which some other part of your
+  system was waiting for.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Coming change — Events, in developer preview</span>
+  Shopify is previewing <b>Events</b> on the unstable API version, described as becoming the
+  primary subscription mechanism as topic coverage grows. Note the header is
+  <code>Shopify-Hmac-Sha256</code> — <b>no <code>X-</code> prefix</b>. Do not hardcode one
+  header name in a shared verifier.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client says "so it updates instantly"</span>
+  <q>Usually within seconds, yes. But a webhook is a notification, not a guarantee — it can
+  be delayed, and occasionally it doesn't arrive. So alongside it we run a check that
+  re-reads from Shopify on a schedule and fixes anything that drifted. Without that, one
+  missed message means one wrong stock number forever.</q>
+  <span class="why-said">Sets the expectation before the first miss, and sells the
+  reconciliation job as insurance rather than extra scope.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the integration silently stopped and the client asks what happened</span>
+  <q>Our endpoint failed eight times in a row, so Shopify removed the subscription — that's
+  designed behaviour, not a bug. I've fixed the endpoint, recreated the subscription, and
+  backfilled the gap. I'm also adding an alert on the failure rate so we hear about it from
+  monitoring rather than from you.</q>
+  <span class="why-said">Names the mechanism, does not hide behind it, and closes with the
+  thing that stops the same conversation happening twice.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you need a queue "just to receive a message"</span>
+  <q>We get five seconds total to answer, and that's the whole budget. If we do the work
+  inside those five seconds, a slow day means timeouts, and enough timeouts means Shopify
+  stops sending. So we accept the message, say yes immediately, and do the work behind it.</q>
+  <span class="why-said">A hard number and a named consequence. "Best practice" would have
+  lost this argument.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>HMAC the RAW body</b> with your client secret, before parsing. A re-serialised body never matches.</li>
+  <li><b>1 second to connect, 5 seconds total.</b> Enqueue and return 200; never process inline.</li>
+  <li><b>Any non-2XX is a failure — 3XX included.</b> A redirect fails while your own log looks fine.</li>
+  <li><b>8 retries over 4 hours, then the subscription is deleted</b> if it was configured via the Admin API. App-specific subscriptions are not.</li>
+  <li><b><code>Webhook-Id</code> to dedupe, <code>Event-Id</code> to correlate.</b> Two subscriptions on one topic means two deliveries, one Event-Id.</li>
+  <li><b>Secret rotation has an up-to-one-hour tail.</b> Accept both secrets during the overlap.</li>
+  <li><b>Always add a reconciliation job.</b> Shopify's own docs recommend it, which tells you how much you will miss.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a webhook is a hint that something changed —
+never proof, and never the only way you find out.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for scopes and the privacy obligations that come
+  with customer data.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0002-app-auth-session-tokens-and-token-exchange.html">← A1.2 · App auth</a></span>
+  <span><a href="0004-scopes-protected-customer-data-and-compliance.html">A1.4 · Scopes &amp; privacy →</a></span>
+</div>
+
+</div>
+</body>
+</html>

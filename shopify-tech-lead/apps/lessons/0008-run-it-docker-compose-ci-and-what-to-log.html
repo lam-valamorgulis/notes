@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2.4 — Run It: docker-compose, CI, and What to Log</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A2 · Lesson 4</p>
+<h1>Run it: docker-compose, CI, and what to log</h1>
+<p class="subtitle">One command to start it. And the four numbers that tell you whether it is actually working.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A sync you can start from a clean machine in one command,
+  a test suite that never touches Shopify, and a dashboard that answers "is it healthy?"
+  without you reading a single log line.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>One command, from nothing</h3>
+
+<pre><code>cp .env.example .env     # then fill it in
+docker compose up -d     # Postgres + Redis
+npm install
+npm run generate         # the synthetic catalogue
+npm run dev</code></pre>
+
+<p>The measure of this is not elegance. It is: could someone who has never seen the repo run
+it in ten minutes, and can <em>you</em> still run it in six months? The
+<code>docker-compose.yml</code> in the Project deliberately declares <b>no volumes</b>, so
+<code>docker compose down -v</code> returns you to a clean state — which is what you want
+constantly while learning, and rarely later.</p>
+
+<p>One detail that saves an afternoon: give Postgres a <b>healthcheck</b>. Without it the app
+starts before Postgres accepts connections and the first run fails with
+<code>ECONNREFUSED</code>, which reads like a configuration error and is not.</p>
+
+<h3>Three test layers, and only one is allowed near Shopify</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Layer</th><th>Tests</th><th>Talks to</th><th>Runs</th></tr>
+  <tr><td><b>Unit</b></td><td>Ownership rules, conflict resolution, watermark maths</td><td>Nothing</td><td>Every save</td></tr>
+  <tr><td><b>Integration</b></td><td>Real Postgres, real queue, a <em>fake</em> Shopify</td><td>Docker only</td><td>Every push</td></tr>
+  <tr><td><b>Contract</b></td><td>That your queries are still valid</td><td>The <em>schema</em>, not a store</td><td>Nightly, and on version bumps</td></tr>
+</table>
+</div>
+
+<p>CI must never need a Shopify store. A pipeline that depends on a live store is a pipeline
+that fails when someone else's token expires.</p>
+
+<p>The contract layer is the one people skip and then regret. Validate your GraphQL documents
+against the schema for your pinned version, in CI. This Course found <b>two</b> deprecated
+fields that way — <code>ShopPlan.displayName</code> and <code>Market.enabled</code> — in
+queries that looked obviously correct. A quarterly version bump becomes a red build instead of
+a production surprise.</p>
+
+<h3>What to log — and what not to</h3>
+
+<p>Structured, one object per line, with a <code>correlation_id</code> threaded from the
+webhook that started the work through every retry. Without that thread, a failure at 2am is
+unreadable.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Always log</th><th>Never log</th></tr>
+  <tr><td>The message id, the entity, the attempt number</td><td>The access token, or any part of it</td></tr>
+  <tr><td>The remaining rate-limit budget on each call</td><td>Whole webhook payloads — they carry personal data</td></tr>
+  <tr><td>Decisions: "skipped, shadow matched"</td><td>Customer names, emails, addresses</td></tr>
+  <tr><td>Every terminal error with its full body</td><td>Staff names from event feeds</td></tr>
+</table>
+</div>
+
+<p>That last one is real, not theoretical. Shopify's <code>Product.events</code> messages
+contain <b>staff full names and email addresses in plain text</b>. Anything that logs those
+events wholesale is quietly building a staff PII store inside your log retention.</p>
+
+<h3>The four numbers</h3>
+
+<p>Logs explain a problem. These tell you a problem exists:</p>
+
+<div class="diagram">
+  1. queue depth              ── going up and not coming down = falling behind
+  2. unresolved dead-letters  ── a work list, not a metric to admire
+  3. rate-limit headroom      ── the min of currentlyAvailable over a window
+  4. reconciliation drift     ── records where shadow ≠ Shopify
+</div>
+
+<p>Number 4 is the only one that measures <em>correctness</em>. The first three can all look
+perfect while the data is wrong, which is exactly how a broken sync survives for months.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Queue depth is zero, no dead-letters, plenty of rate-limit headroom, and no errors in the
+  logs for a week. <b>Can you tell the client the sync is healthy?</b>
+</div>
+
+<p>No. Every one of those is true of a sync that is doing nothing — a deleted webhook
+subscription, a watermark stuck in the future, a filter that matches no rows. All three
+"green" signals measure <em>effort</em>, not <em>outcome</em>. Only reconciliation drift
+distinguishes "working" from "idle", which is why it is the number you put in front of a
+client.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a token in the logs</span>
+  Log the request headers "just for debugging" and the access token is now in your log store,
+  your log vendor, and any backup of either. It grants read and write to the whole store. This
+  is not recoverable by deleting a log line, exactly like a secret in git history.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — payloads in the logs</span>
+  An order webhook contains a name, an email and an address. Logging payloads wholesale turns
+  your logging system into a customer-data store, with all the privacy obligations from A1.4
+  and none of the intent.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — green dashboards on an idle sync</span>
+  The scenario above. Nothing measures whether work happened, only whether errors did. This is
+  the most common way a sync is broken for months.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — no healthcheck on Postgres</span>
+  The app starts before the database is ready and dies on the first query. The message points
+  at connection settings, which are fine. Minutes lost every time a new person clones the
+  repo.
+</div>
+
+<div class="scar">
+  <span class="who">CI that needs a real store</span>
+  It passes until someone's token expires, a dev store is deleted, or a rate limit hits during
+  a build. Then the pipeline is red for a reason unrelated to the change, and people start
+  ignoring red pipelines.
+</div>
+
+<div class="scar">
+  <span class="who">No correlation id</span>
+  One webhook produces a receive line, three retry lines and a dead-letter line, in a log
+  shared with thousands of others. Without a shared id you cannot assemble the story, and the
+  incident takes an hour instead of a minute.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — do not alert on everything</span>
+  An alert that fires weekly and is always ignored is worse than no alert, because it trains
+  people to dismiss the channel. Alert on two things: unresolved dead-letters above a
+  threshold, and reconciliation drift above a threshold. Everything else is a dashboard.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks "how do we know it's working?"</span>
+  <q>Not from the absence of errors — a sync that's doing nothing has no errors either. We run
+  a nightly check that compares what we sent against what's actually in Shopify and reports
+  the differences. If that number is zero, it's working. That's the one I'd put on a
+  report.</q>
+  <span class="why-said">Gives them a single number that means something, and pre-empts the
+  false comfort of a quiet log.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to add "just a bit of extra logging" to debug a live issue</span>
+  <q>I'll add it around the decision, not the payload. Order and customer payloads have names
+  and emails in them, and once those are in our logs they're subject to the same privacy rules
+  as a database. I can get you the same answer without that.</q>
+  <span class="why-said">Says yes to the need and no to the method, with a reason that is
+  about their liability rather than your preference.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why tests do not run against the real store</span>
+  <q>Because then a build fails when someone's token expires or we hit a rate limit — nothing
+  to do with the code being tested. We test the logic against a fake Shopify, and separately
+  we validate our queries against Shopify's real schema every night. That second one already
+  caught two fields Shopify had deprecated.</q>
+  <span class="why-said">Has a concrete win to point at. An argument with evidence ends the
+  conversation.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>One command from a clean machine.</b> Declare a Postgres healthcheck, or the first run fails misleadingly.</li>
+  <li><b>Three test layers.</b> Unit needs nothing, integration needs Docker, contract needs the schema. <b>CI never needs a store.</b></li>
+  <li><b>Validate your GraphQL in CI.</b> That is how two deprecated fields were caught in this Course.</li>
+  <li><b>Thread a <code>correlation_id</code></b> from the webhook through every retry, or logs are unreadable.</li>
+  <li><b>Never log tokens or payloads.</b> A token in a log is as unrecoverable as a secret in git history.</li>
+  <li><b>Four numbers:</b> queue depth, unresolved dead-letters, rate-limit headroom, reconciliation drift.</li>
+  <li><b>Only drift measures correctness.</b> The other three look perfect on a sync that does nothing.</li>
+</ul>
+<p class="one-thing">If you remember one thing: no errors is not the same as working — only a
+comparison against reality tells you the sync is alive.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter A2 is done. <b>"next"</b> starts A3, the sync discipline —
+  the strongest material in this Course.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0007-one-queue-with-retries-and-a-dead-letter.html">← A2.3</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A2.2 — A Postgres Schema for a Sync Store</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A2 · Lesson 2</p>
+<h1>A Postgres schema for a sync store</h1>
+<p class="subtitle">Five tables. The interesting one is the one that stores what you last sent.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A schema that can answer three questions instantly: what is
+  this record called on the other side, did I already handle this message, and is what I sent
+  still what they have.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<p>Your database is not a copy of Shopify. Copying Shopify is a losing game — it is always
+newer than you. Your database holds the things <b>only you</b> know: the identity mapping, how
+far you have read, what you last sent, and what happened.</p>
+
+<div class="diagram">
+   id_map          "their id ↔ my id ↔ Shopify's id"
+   watermark       "how far have I read from each source"
+   inbox           "which messages have I already handled"
+   shadow          "what did I last successfully SEND"
+   outbox_dead     "what failed for good, and why"
+</div>
+
+<h3>1 · <code>id_map</code> — a hub, never pairwise</h3>
+
+<pre><code>CREATE TABLE id_map (
+  entity        text NOT NULL,          -- 'product' | 'variant' | 'location'
+  local_id      uuid NOT NULL,          -- YOUR id. the hub.
+  system        text NOT NULL,          -- 'erp' | 'shopify'
+  external_id   text NOT NULL,
+  PRIMARY KEY (entity, system, external_id),
+  UNIQUE (entity, system, local_id)
+);</code></pre>
+
+<p>Three systems, so the temptation is a table with <code>erp_id</code> and
+<code>shopify_id</code> side by side. Resist it. With <em>n</em> systems, pairwise mapping
+needs <em>n(n−1)/2</em> relationships and every new system rewrites the table. A hub — your own
+id in the middle — needs <em>n</em>. Adding a marketplace later becomes an insert, not a
+migration.</p>
+
+<p>Note the two constraints. The primary key stops one external id mapping to two locals. The
+unique stops one local mapping to two external ids in the same system. Both directions matter,
+and only writing one is the usual mistake.</p>
+
+<h3>2 · <code>watermark</code> — the highest value you actually saw</h3>
+
+<pre><code>CREATE TABLE watermark (
+  source        text PRIMARY KEY,       -- 'erp.items' | 'shopify.products'
+  last_seen_at  timestamptz NOT NULL,   -- the SOURCE's clock. never ours.
+  last_seen_id  text,                   -- tiebreak for equal timestamps
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);</code></pre>
+
+<p>Two rules, both learned expensively. Store the <b>source's</b> timestamp, never your own —
+mixing clocks silently drops rows. And store the <b>highest value you actually saw</b>, not
+the time the scan started. Saving the start time loses every row that changed during the scan,
+permanently and invisibly. Re-reading a few rows next time is cheap.</p>
+
+<p><code>last_seen_id</code> earns its place the first time two records share a timestamp to
+the second. Without it you either skip one or loop on it forever.</p>
+
+<h3>3 · <code>inbox</code> — idempotency, made a database constraint</h3>
+
+<pre><code>CREATE TABLE inbox (
+  message_id   text PRIMARY KEY,        -- X-Shopify-Webhook-Id, or the ERP's key
+  topic        text NOT NULL,
+  received_at  timestamptz NOT NULL DEFAULT now(),
+  handled_at   timestamptz
+);</code></pre>
+
+<p>A primary key is a better idempotency check than an <code>if</code> statement, because two
+workers racing cannot both win. The insert fails for the loser. Note
+<code>handled_at</code> is nullable on purpose: "received" and "finished" are different
+states, and the gap between them is where crashed work hides.</p>
+
+<h3>4 · <code>shadow</code> — the table people leave out</h3>
+
+<pre><code>CREATE TABLE shadow (
+  entity      text NOT NULL,
+  local_id    uuid NOT NULL,
+  system      text NOT NULL,
+  payload     jsonb NOT NULL,           -- exactly what we last SENT
+  sent_at     timestamptz NOT NULL,
+  PRIMARY KEY (entity, local_id, system)
+);</code></pre>
+
+<p>This is the one that separates a sync from a script. It records what you last
+<b>successfully sent</b> — and it is written only after a confirmed success.</p>
+
+<p>It buys three things. You can skip a write when nothing changed, which is most of the time.
+You can produce a real diff for reconciliation instead of comparing counts. And when someone
+asks "did we send the wrong price or did they change it after?", you can answer, which is
+otherwise unanswerable.</p>
+
+<h3>5 · <code>outbox_dead</code> — failures you can read</h3>
+
+<pre><code>CREATE TABLE outbox_dead (
+  id           bigserial PRIMARY KEY,
+  entity       text NOT NULL,
+  local_id     uuid,
+  attempt      int  NOT NULL,
+  error_code   text,                    -- 'THROTTLED' | userError code | HTTP status
+  error_body   jsonb,
+  failed_at    timestamptz NOT NULL DEFAULT now(),
+  resolved_at  timestamptz
+);</code></pre>
+
+<p>A dead-letter table you never read is a landfill. <code>resolved_at</code> is what makes it
+a work queue: unresolved rows are a number you can alert on.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your sync crashes after Shopify accepted a price update but before you wrote the
+  <code>shadow</code> row. On restart, what happens — and is it a problem?
+</div>
+
+<p>You resend the same price. That is fine, and it is fine <em>because</em> you send absolute
+values: setting the price to 12 twice leaves it at 12. This is why "shadow after success" is
+the safe ordering — writing shadow first would make you skip a write that never happened, and
+the wrong value would stay wrong forever. A duplicate write is cheap; a skipped write is
+permanent.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — pairwise id mapping</span>
+  <code>erp_id</code> and <code>shopify_id</code> as columns on one row works with two
+  systems and collapses at three. Adding a marketplace becomes a migration plus a backfill
+  plus a re-test, instead of an insert.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the watermark saved as "now"</span>
+  Using your own clock, or the scan's start time, drops rows changed during the scan. No
+  error, no log line, no count mismatch unless you reconcile. This is the single most common
+  cause of "a few products are just wrong".
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — writing <code>shadow</code> before the send</span>
+  Write it first and a crash makes you believe you sent something you did not. The record is
+  then skipped on every future run because "nothing changed". The wrong value is now
+  permanent. Order matters: send, confirm, then record.
+</div>
+
+<div class="scar">
+  <span class="who">Only one unique constraint on <code>id_map</code></span>
+  Guarding "one external id → one local" but not the reverse lets a local record acquire two
+  Shopify products. Both directions, or you will find out by seeing duplicates in the admin.
+</div>
+
+<div class="scar">
+  <span class="who">No tiebreak on equal timestamps</span>
+  Two records with the same <code>updated_at</code> and a strict <code>&gt;</code> filter
+  means one is skipped forever. Use <code>&gt;=</code> plus <code>last_seen_id</code>, and
+  accept re-reading one row.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — <code>jsonb</code> in <code>shadow</code></span>
+  Storing the sent payload as <code>jsonb</code> is deliberate: the shape changes when Shopify
+  changes, and you do not want a migration every quarter for a table that exists to be
+  compared, not queried. Do not do this for data you filter on.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks whether you are "copying their data"</span>
+  <q>Not really. We don't keep a second copy of your catalogue — Shopify stays the place to
+  look. What we store is the plumbing: which record matches which, how far we've read, and
+  what we last sent. That last one is what lets me tell you exactly what changed and when, if
+  anything ever looks wrong.</q>
+  <span class="why-said">Answers the data-residency worry honestly, and turns the shadow table
+  into a benefit the client can feel.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked why a few products are wrong and the rest are fine</span>
+  <q>Almost always it's records that changed while we were mid-scan, and our bookmark moved
+  past them. It's a known failure and it doesn't show up as an error — that's why we run a
+  reconciliation that compares what we sent against what's there, rather than trusting counts.
+  Give me the report and I'll tell you exactly which ones.</q>
+  <span class="why-said">Names the mechanism instead of promising to "look into it", which is
+  what separates a lead from a developer in that conversation.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Your database is not a copy of Shopify.</b> It holds mapping, position, what you sent, and what failed.</li>
+  <li><b><code>id_map</code> is a hub, not pairwise.</b> Your id in the middle: <em>n</em> relationships instead of <em>n(n−1)/2</em>.</li>
+  <li><b>Constrain both directions</b> on the mapping, or you will create duplicates.</li>
+  <li><b>Watermark = the source's clock, and the highest value you actually saw.</b> Never your clock, never the scan's start.</li>
+  <li><b>Idempotency belongs in a primary key</b>, not an <code>if</code>. Two racing workers cannot both insert.</li>
+  <li><b><code>shadow</code> is written after a confirmed success.</b> Before means believing in sends that never happened.</li>
+  <li><b>A dead-letter table needs <code>resolved_at</code></b>, or it is a landfill instead of a queue.</li>
+</ul>
+<p class="one-thing">If you remember one thing: store what you last sent — it is the only way
+to answer "did we break it, or did they change it?"</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the queue, and the throttle that returns HTTP 200.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0005-the-nestjs-module-shape-for-a-sync-service.html">← A2.1</a></span>
+  <span><a href="0007-one-queue-with-retries-and-a-dead-letter.html">A2.3 · The queue →</a></span>
+</div>
+
+</div>
+</body>
+</html>

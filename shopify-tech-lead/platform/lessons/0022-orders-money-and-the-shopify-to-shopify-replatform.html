@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.6 — Orders, Money, and the Shopify → Shopify Replatform</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Orders, money, and the Shopify → Shopify replatform</h1>
+<p class="subtitle">The omitted line price is the money bug that a count-only check will never catch.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know the specific way an imported order can silently misstate
+  what a customer paid — and why "Shopify to Shopify" is not the easy migration it sounds like.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is an order, really?</h3>
+
+<p>A product is a description of a thing. It can be re-derived, corrected, re-imported. An order is
+different in kind: it is a <b>record of a completed financial event</b>. It happened once, at a
+particular moment, for a particular amount.</p>
+
+<p>That means the ordinary migration instinct — send the data, let the platform fill in what it knows —
+is exactly wrong for orders. Anything the platform "helpfully" computes is a value it is inventing
+about the past.</p>
+
+<div class="trap">
+  <span class="label">The money bug</span>
+  If you create an order and <b>omit a line item's price</b>, the platform can fall back to the
+  variant's <b>current</b> price. So an order from three years ago, when the item cost $20, imports at
+  today's $35.
+  <br><br>
+  Nothing errors. The order exists. The counts match. The line items match. Every automated check
+  passes — and the customer's history now says they paid $35 for something they bought for $20.
+  Multiply across a decade of orders and the store's entire revenue history is wrong, in one direction,
+  invisibly.
+  <br><br>
+  <b>Always send every price explicitly on an imported order.</b> Never let a default fill in a
+  historical amount.
+</div>
+
+<p>This is the concrete reason the reconciliation Chapter insists on comparing <em>values</em> and not
+counts. A count-only check cannot see this at all, and it is the most expensive silent failure in
+migration work.</p>
+
+<h3>The four things to be explicit about</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Field</th><th>If you omit it</th></tr>
+  <tr><td><b>Line item price</b></td><td>May be filled from the variant's current price. <b>Always send it</b></td></tr>
+  <tr><td><b>The order's date</b></td><td>Imports as today, so the whole history collapses onto the migration date</td></tr>
+  <tr><td><b>Fulfilment state</b></td><td>Defaults to unfulfilled, so a decade of shipped orders looks like a backlog</td></tr>
+  <tr><td><b>Tax and discount amounts</b></td><td>Recalculated by today's rules rather than the rules that applied then</td></tr>
+</table>
+</div>
+
+<p>The pattern is one thing: <b>for an order, every default is a lie about the past.</b> Be explicit
+about everything, and treat a field you cannot source as a decision to escalate rather than a blank to
+leave.</p>
+
+<h3>And the notification problem</h3>
+
+<p>Creating orders can trigger customer-facing emails. Importing ten years of history could email
+customers about purchases they made in 2016. Before any bulk order import, <b>confirm what
+notifications will fire and switch them off</b>. Test on a Dev store with a real email address and
+watch what arrives — do not reason about it.</p>
+
+<h3>Shopify to Shopify: easier, and not easy</h3>
+
+<p>Moving between two Shopify stores sounds trivial — same platform, same shapes, same API. Some of
+that is true. What is not:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Assumption</th><th>Reality</th></tr>
+  <tr><td>Ids carry over</td><td><b>No.</b> Every product, variant, customer and order gets a new id. Every reference must be re-mapped</td></tr>
+  <tr><td>Apps come with it</td><td>Each app must be reinstalled and reconfigured, and its data separately exported and imported</td></tr>
+  <tr><td>Metafields come with it</td><td>Values move, but the <b>definitions</b> must exist first — and definitions are per store</td></tr>
+  <tr><td>Themes are portable</td><td>Files are. Their settings and content are separate, and app blocks reference apps that are not installed yet</td></tr>
+  <tr><td>Nothing is lost</td><td>Order history, saved payment methods and gift cards each have their own rules and limits</td></tr>
+</table>
+</div>
+
+<p>The genuine advantages: the shapes match so no field mapping is needed, and you can read the source
+with the same API you write the destination with — including bulk operations on both sides. So the
+<em>transformation</em> is easy. The <b>identity re-mapping is the whole job</b>, and it is the same
+mapping-registry problem from
+<a href="../../apps/lessons/0019-identifier-mapping-and-the-mapping-registry.html">A4.4</a>.</p>
+
+<div class="note">
+  <span class="label">What I did not verify today</span>
+  The exact mechanics: the field name for backdating an order, the scope and token type
+  <code>orderCreate</code> requires, per-minute order creation caps on development and trial stores,
+  how many notification emails fire per imported order, and which gateways permit saved payment methods
+  to move. These were verified for an earlier version of this material on <b>3 August 2026</b> and
+  <b>not re-checked today</b>. Confirm each before planning against it — the variant throttle in
+  <a href="0019-the-huge-catalogue-load-and-the-throttle.html">P6.3</a> moved 10× in three weeks, so
+  none of these should be inherited on trust.
+</div>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You import 50,000 historical orders. Counts match exactly, every order has the right number of line
+  items, every customer is linked. The client signs it off. <b>What have you not checked?</b>
+</div>
+
+<p>Whether the money is right. Counts, line-item counts and customer links can all be perfect while
+every price is today's price rather than the price paid. And this failure is <b>directional</b> — prices
+generally rise, so migrated history will overstate historical revenue, which makes every report built on
+it wrong in a way that looks plausible.
+<br><br>
+The check is to pick ten old orders, look up what the customer actually paid in the old system, and
+compare. Ten manual comparisons catch a failure that 50,000 automated row counts cannot. That is the
+same hand-check as step 4 of the cutover, and this is why it is there.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — the omitted line price</span>
+  The order imports with today's price. Customer history, revenue reports and any analysis built on
+  them are all wrong, in one direction, with every automated check passing.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — emails to customers about 2016 orders</span>
+  A bulk order import firing notifications. Thousands of confused customers and a support crisis, from
+  a setting nobody checked. Test on a Dev store with a real inbox first.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — orders dated today</span>
+  Omit the date and a decade of history stacks onto the migration day. Every cohort analysis, repeat-rate
+  and seasonality report the client owns becomes meaningless, and the data looks complete.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — everything unfulfilled</span>
+  The default state makes ten years of shipped orders look like an open backlog. Operations teams and
+  fulfilment integrations both react to that.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — assuming Shopify-to-Shopify is trivial</span>
+  Every id changes, so every reference must be re-mapped and every app reinstalled and re-exported.
+  Quoted as "same platform, should be quick", it overruns badly.
+</div>
+
+<div class="scar">
+  <span class="who">Metafield values before definitions</span>
+  Definitions are per store. Import values into a store with no definitions and you recreate the
+  inert-metafield problem from <a href="0004-metafields-definitions-and-the-cost-of-skipping-them.html">P2.1</a>
+  at full scale. Definitions first, always.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — order numbers will not match</span>
+  Customers hold old receipts and support search by old numbers. Decide deliberately: store the original
+  number in a metafield and make support able to search it, or accept the mismatch knowingly. Do not
+  discover it from a support ticket.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Before importing any orders</span>
+  <q>One thing I want to be careful about. When we recreate old orders, if we don't send the exact price
+  paid, the system can fill in today's price instead — so an order from 2019 would show what the item
+  costs now. Nothing would look broken; the numbers would just be wrong. So I'll send every price
+  explicitly and then check ten old orders by hand against your current system before we sign it off.</q>
+  <span class="why-said">Explains a silent failure in the client's own terms and commits to the specific
+  check that catches it. This is the sentence that makes a client trust the whole migration.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked to quote a Shopify-to-Shopify move as "simple"</span>
+  <q>It's simpler in one way — the data shapes match, so there's no translation. But every product,
+  customer and order gets a brand new ID in the new store, so everything that references anything has to
+  be re-mapped. And every app has to be reinstalled and its data exported separately. That's the actual
+  work, and it's the part that looks invisible from outside.</q>
+  <span class="why-said">Concedes the genuine advantage first, which makes the rest credible rather
+  than defensive.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>An order is a record of a financial event.</b> Every default is a lie about the past.</li>
+  <li><b>Always send line item prices explicitly.</b> Omitted, they can fill in today's price.</li>
+  <li><b>Be explicit about date, fulfilment state, tax and discounts</b> too.</li>
+  <li><b>Check what emails will fire</b> before a bulk order import. Test on a Dev store with a real inbox.</li>
+  <li><b>Shopify to Shopify: every id changes.</b> Identity re-mapping is the whole job.</li>
+  <li><b>Metafield definitions must exist before values.</b> Definitions are per store.</li>
+  <li><b>Hand-check ten old orders against the source.</b> No row count can catch a wrong price.</li>
+</ul>
+<p class="one-thing">If you remember one thing: on an imported order, never omit a price — the platform
+will fill in today's, and every automated check will pass.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter P6 done, and with it all of Track 1.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0021-what-a-migration-is-and-what-never-moves.html">← P6.5</a></span>
+  <span><a href="../index.html">Track 1 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

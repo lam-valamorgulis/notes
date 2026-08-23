@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A3.5 — The Backlog</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A3 · Lesson 5</p>
+<h1>The backlog</h1>
+<p class="subtitle">You were down four hours. "Catch up as fast as possible" is the wrong instinct.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A recovery plan that gets the important data right first, and
+  does not turn your own outage into a rate-limit outage.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is actually in a backlog?</h3>
+
+<p>Your service was down four hours. Twelve thousand changes queued. The instinct is to drain it
+at full speed. Test that instinct from first principles by asking what those twelve thousand
+items <em>are</em>.</p>
+
+<div class="diagram">
+  12,000 queued changes for 4,000 distinct products
+
+  product A: price → 10, price → 11, price → 12, stock → 5, stock → 3
+             └────────── 5 messages ──────────┘
+                           │
+                only TWO facts matter now:
+                  price is 12 · stock is 3
+
+  ── the backlog is mostly OBSOLETE. draining it in order
+     replays history you no longer care about.
+</div>
+
+<p>This is the key realisation, and it follows directly from A3.3: because your writes are
+absolute, <b>only the last value per field per record matters</b>. Everything before it is
+noise. A backlog is not 12,000 units of work — it is 4,000, and you get there by collapsing on
+<code>(record, field)</code> and keeping the newest.</p>
+
+<p>Feynman version: <b>you are not replaying a story, you are answering "what is true now?"</b>
+Twelve thousand messages, one question.</p>
+
+<h3>Then re-derive the source of truth</h3>
+
+<p>Push it further. If you only need the current value, do you need the queued messages at all?
+Mostly no. From A3.4, a message is only a hint. So the cleanest recovery is:</p>
+
+<div class="diagram">
+  1. collapse the queue to a set of AFFECTED IDS      (throw the payloads away)
+  2. re-read those ids from the source                 (current values, batched)
+  3. write them                                        (absolute, so order-free)
+  4. advance the watermark to the highest seen         (never to "now")
+</div>
+
+<p>Step 1 discards data, which feels wrong and is right. The payloads were stale the moment they
+were written. Keeping the ids and dropping the bodies is strictly better: less to store, fewer
+writes, and every value you write is current.</p>
+
+<h3>Order the work by damage, not by arrival</h3>
+
+<p>Not all fields cost the same when wrong. So drain by <b>consequence</b>:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Priority</th><th>What</th><th>Why first</th></tr>
+  <tr><td><b>1</b></td><td>Inventory, and anything price-related</td><td>Wrong now means overselling or selling at the wrong price. It costs money every minute</td></tr>
+  <tr><td><b>2</b></td><td>New and deleted items</td><td>A deleted item is still sellable; a new one is invisible</td></tr>
+  <tr><td><b>3</b></td><td>Descriptions, tags, images, SEO</td><td>Wrong is untidy, not expensive. It can wait an hour</td></tr>
+</table>
+</div>
+
+<p>A first-in-first-out queue treats a product description as equal to a stock level. It is not.
+Give the queue a priority field — one queue, as A2.3 argued, with priority inside it.</p>
+
+<h3>Do not cause the second outage</h3>
+
+<p>The rate limit does not care that you were down. Draining at full speed spends your whole
+budget, gets you throttled, and slows the recovery you are trying to accelerate — while also
+starving the live traffic that is still arriving.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Not</th></tr>
+  <tr><td>Reserve part of the budget for live traffic</td><td>Give the backlog everything</td></tr>
+  <tr><td>Read <code>throttleStatus</code> and stay under it</td><td>Push until 429s appear</td></tr>
+  <tr><td>Batch reads of collapsed ids</td><td>One read per message</td></tr>
+  <tr><td>Accept that tier 3 finishes later</td><td>Insist everything is caught up at once</td></tr>
+</table>
+</div>
+
+<p>And know the wall you may hit: webhook subscriptions configured via the Admin API are
+<b>deleted after 8 consecutive failures</b>. If your outage lasted long enough, there is no
+backlog to drain — the queue stopped filling. Recovery then means recreating the subscription
+<em>and</em> a full re-read of the outage window, because those events are simply gone.</p>
+
+<p class="verified"><b>Verified 2026-08-23:</b> 8 retries over 4 hours, then automatic deletion
+of subscriptions configured using the Admin API; recovery guidance is to re-subscribe where
+applicable and import the missing data —
+<a href="https://shopify.dev/docs/apps/build/webhooks/troubleshoot">Troubleshoot webhooks</a>.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You were down six hours. Your webhook subscription was created with the Admin API. <b>How big
+  is your backlog?</b>
+</div>
+
+<p>Zero — and that is the bad answer, not the good one. After 8 consecutive failures over about
+four hours, the subscription was deleted. Nothing has queued since. An empty queue looks like a
+clean recovery and means you have lost every event from the outage. Recovery is: recreate the
+subscription, then scan the source for everything changed in the whole window. This is exactly
+why A2.4 insists that "no errors" is not "working" — an empty queue is ambiguous, and you must
+know which kind of empty it is.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — draining at full speed</span>
+  You spend the whole rate-limit budget on the backlog, get throttled, and the live changes
+  arriving now queue behind history nobody needs. The recovery takes longer than if you had
+  paced it, and current data is wrong for longer.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — FIFO order</span>
+  Product descriptions from four hours ago sync before stock levels from four minutes ago. You
+  oversell during your own recovery. Priority is not an optimisation here; it is the difference
+  between a quiet recovery and refunds.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the empty queue after a long outage</span>
+  The subscription was deleted, so nothing queued. Dashboards look healthy. You are receiving
+  nothing and believe you have caught up. This is the worst failure mode in the Chapter because
+  every signal says success.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — advancing the watermark to "now" after recovery</span>
+  It is tempting: you just did a big catch-up, so mark it done. But anything changed <em>during
+  the catch-up</em> is now behind the watermark and lost. Same rule as always — the highest
+  value you actually saw.
+</div>
+
+<div class="scar">
+  <span class="who">Replaying stale payloads instead of re-reading</span>
+  You write 12,000 values, most of them obsolete, and every intermediate one is briefly live on
+  the storefront. Customers can see prices flicker through a history. Collapse to ids and read
+  current.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — when to stop draining and do a full sync</span>
+  Past some size, collapsing and re-reading a change list costs more than just re-reading
+  everything. There is no published threshold. Measure both on your own data, write the number
+  down, and make it a switch an operator can flip — not a decision made under pressure.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">During recovery, when asked "how long until it's caught up?"</span>
+  <q>Stock and prices will be right within about twenty minutes — I'm doing those first because
+  they're the ones that cost you money. Descriptions and images will trail behind for an hour or
+  two. I'm deliberately not pushing at full speed, because Shopify would start rejecting us and
+  the whole thing would take longer.</q>
+  <span class="why-said">Two timelines instead of one, ordered by the client's risk, plus the
+  reason for the pace. Nobody argues with this.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the queue is empty after a long outage</span>
+  <q>I need to be straight with you: the queue is empty because Shopify stopped sending, not
+  because we're caught up. After enough failures it removes the subscription — that's designed
+  behaviour. I've recreated it and I'm now re-reading everything that changed during the
+  window, so nothing is lost. It'll take longer than a normal catch-up.</q>
+  <span class="why-said">Says the uncomfortable thing first. A client who later discovers you
+  reported "caught up" will not trust the next report.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A backlog is mostly obsolete.</b> With absolute writes, only the last value per record and field matters.</li>
+  <li><b>Collapse to affected ids and throw the payloads away.</b> Then re-read current values.</li>
+  <li><b>Drain by damage, not arrival.</b> Inventory and price first, descriptions last.</li>
+  <li><b>Reserve budget for live traffic.</b> Full-speed draining causes a second, self-inflicted outage.</li>
+  <li><b>An empty queue after a long outage is a warning</b>, not a success — the subscription may have been deleted.</li>
+  <li><b>Admin-API subscriptions die after 8 consecutive failures.</b> Recovery is re-subscribe plus a full window re-read.</li>
+  <li><b>Never advance the watermark to "now" after a catch-up.</b> Highest seen, always.</li>
+</ul>
+<p class="one-thing">If you remember one thing: do not replay history, ask what is true now —
+and do the expensive-if-wrong fields first.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for how you prove any of this worked.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0012-webhooks-are-a-hint-clocks-order-and-staleness.html">← A3.4</a></span>
+  <span><a href="0014-reconciliation-and-numbers-that-do-not-lie.html">A3.6 · Reconciliation →</a></span>
+</div>
+
+</div>
+</body>
+</html>

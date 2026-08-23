@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R3.1 — Buying Thinking Time, and Saying "I Don't Know Yet"</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R3 · Lesson 1</p>
+<h1>Buying thinking time, and saying "I don't know yet"</h1>
+<p class="subtitle">Fixed sentences for the ten seconds when your English deserts you.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> Six sentences you have said out loud enough times that they arrive
+  without effort — so a hard question buys you thinking time instead of costing you composure.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what actually goes wrong under pressure?</h3>
+
+<p>You know the answer. You have read the Lesson. And in the moment, three things happen at once: you
+translate, you construct a sentence, and you manage the silence. Three tasks, one of which — the
+sentence — you can remove entirely by <b>knowing it in advance</b>.</p>
+
+<p>That is the whole method. Not "improve your English". <b>Pre-build the sentences for the four moments
+that recur</b>, drill them out loud until they are automatic, and spend your working memory on the
+answer instead of on the grammar.</p>
+
+<div class="diagram">
+  under pressure you are doing THREE things:
+      1. thinking of the answer      ← keep this
+      2. building the sentence       ← REMOVE THIS. pre-built.
+      3. managing the silence        ← the sentence handles it
+</div>
+
+<h3>Moment 1 · You need ten seconds</h3>
+
+<p>Silence feels much longer to you than to them. But an unexplained pause reads as "he doesn't know",
+while a <em>narrated</em> pause reads as care. So say what you are doing:</p>
+
+<div class="script">
+  <span class="who">Drill these out loud, five times each</span>
+  <q>Let me think about that for a second.</q><br>
+  <q>Good question. Let me get this right rather than fast.</q><br>
+  <q>Can I take that in two parts?</q>
+  <span class="why-said">All three buy the same ten seconds. The third also gives your answer a
+  structure, which makes the rest easier to say.</span>
+</div>
+
+<h3>Moment 2 · You need the question again</h3>
+
+<p>Never guess at a question you did not fully hear. Asking is normal — native speakers do it constantly
+— and mishearing costs far more.</p>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>Sorry, could you say that again?</q><br>
+  <q>Just to make sure I understood — you're asking about X, is that right?</q><br>
+  <q>When you say "sync", do you mean both directions or just one?</q>
+  <span class="why-said">The second one is the strongest: repeating the question in your own words both
+  confirms it and buys you the time to think while you say it.</span>
+</div>
+
+<h3>Moment 3 · You do not know</h3>
+
+<p>This is the one people fear and it is the biggest opportunity in the whole Chapter. <b>"I don't know"
+alone sounds weak. "I don't know yet, and here is how I'd find out" sounds senior.</b> The difference is
+one clause, and it converts a gap into a demonstration of method.</p>
+
+<div class="script">
+  <span class="who">Drill these — the highest-value sentences here</span>
+  <q>I don't know yet. What I'd do is load a sample at your real volume and measure it — about half a
+  day.</q><br>
+  <q>I'd have to check that. I wouldn't want to guess at a number that ends up in a plan.</q><br>
+  <q>I don't know that one. I do know where to look — Shopify publishes the limits and I'd check the
+  date on them.</q>
+  <span class="why-said">Each one refuses to guess and then supplies a method with a cost. Nobody
+  penalises that. Many people are relieved by it.</span>
+</div>
+
+<h3>Moment 4 · You lost the thread mid-sentence</h3>
+
+<p>It happens to everyone in a second language and it feels catastrophic. It is not, if you have a way
+out:</p>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>Let me start that again more simply.</q><br>
+  <q>Sorry — the short version is…</q><br>
+  <q>I'm overcomplicating it. The point is…</q>
+  <span class="why-said">All three reset without apologising twice. And "the short version is" almost
+  always produces a better answer than the one you abandoned.</span>
+</div>
+
+<h3>How to drill this</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Not</th></tr>
+  <tr><td>Say each sentence <b>out loud</b>, five times</td><td>Read them</td></tr>
+  <tr><td>Practise while doing something else — walking, washing up</td><td>Only at a desk with full attention</td></tr>
+  <tr><td>Record yourself once and listen back</td><td>Assume it sounds how you think it does</td></tr>
+  <tr><td>Pick <b>one</b> sentence per moment and own it</td><td>Try to remember all twelve</td></tr>
+</table>
+</div>
+
+<p>That last row matters most. <b>You need one sentence per moment, not twelve.</b> Four sentences,
+automatic, is worth more than twelve you have to choose between — because choosing is the thing that
+fails under pressure.</p>
+
+<div class="recall">
+  <span class="label">Do this now, out loud</span>
+  Say your one chosen sentence for each of the four moments, from memory, without looking. <b>Which one
+  did you have to think about?</b>
+</div>
+
+<p>Whichever one you hesitated on is not yet yours. Say that one ten more times today, out loud, while
+doing something else. The test is not whether you can recall it when you are calm and thinking about
+it — it is whether it arrives when you are not.
+<br><br>
+And notice which moment you found hardest to even imagine needing. For most people it is moment 3,
+because admitting not knowing feels like the risk. It is the opposite: <b>the person who says "I don't
+know yet, here's how I'd find out" is the person everyone trusts with the unknown parts.</b></p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — guessing a number to fill a silence</span>
+  It ends the awkward pause and goes straight into a plan. Every later conversation is then about a
+  variance from a figure you invented in a moment of discomfort.
+</div>
+
+<div class="scar">
+  <span class="who">The unexplained pause</span>
+  Four seconds of silence reads as "he doesn't know". The same four seconds after "let me get this right
+  rather than fast" reads as care. Same pause, opposite meaning.
+</div>
+
+<div class="scar">
+  <span class="who">Answering a question you did not hear</span>
+  You answer a different question well. The listener concludes you were not listening, which is worse
+  than the misunderstanding itself. Ask.
+</div>
+
+<div class="scar">
+  <span class="who">Apologising for your English</span>
+  It draws attention to the one thing you want in the background, and it invites the listener to start
+  evaluating your language instead of your answer. Never apologise for it. Just use short sentences.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — twelve sentences instead of one</span>
+  Under pressure, choosing between options is itself the thing that fails. One per moment, automatic.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — short sentences are a strength here</span>
+  A non-native speaker using short, clear sentences often communicates <em>better</em> than a native
+  speaker using long ones — especially to a client. Do not try to sound complex. Simple and definite is
+  the register you want anyway.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">A hard technical question you can answer, but need a moment for</span>
+  <q>Let me take that in two parts. First, whether it's possible — yes. Second, what it costs — that
+  depends on one thing, which is whether their system can tell us what changed since a timestamp.</q>
+  <span class="why-said">"In two parts" buys the pause and structures the answer. You now have a
+  scaffold instead of an open field.</span>
+</div>
+
+<div class="script">
+  <span class="who">A number you genuinely do not have</span>
+  <q>I don't know yet, and I don't want to guess — a number I invent today becomes the plan. Give me half
+  a day to load a real sample and I'll have a proper answer. What I can commit to now is that timing.</q>
+  <span class="why-said">Refuses, gives a method, gives a cost, and commits to something concrete. This
+  is the strongest available answer and it should be automatic.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you have over-explained and lost the room</span>
+  <q>I'm overcomplicating this. The short version: their system decides prices, Shopify decides stock, and
+  each one only travels one direction. That's it.</q>
+  <span class="why-said">Resets cleanly and usually lands better than the original attempt. Self-correcting
+  in public reads as confidence, not as weakness.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Pre-build the sentence so you can spend your attention on the answer.</b></li>
+  <li><b>Narrate the pause.</b> "Let me get this right rather than fast" turns silence into care.</li>
+  <li><b>Repeat the question back</b> — it confirms it and buys thinking time at the same time.</li>
+  <li><b>"I don't know yet" plus a method and a cost</b> is the strongest answer in this Lesson.</li>
+  <li><b>"The short version is…"</b> when you lose the thread. It usually improves the answer.</li>
+  <li><b>Never apologise for your English.</b> Use short sentences instead.</li>
+  <li><b>One sentence per moment, drilled out loud.</b> Choosing is what fails under pressure.</li>
+</ul>
+<p class="one-thing">If you remember one thing: "I don't know yet — here's how I'd find out" is a senior
+answer, and it needs to arrive without you thinking about it.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Or say <b>"drill R3"</b> and I will fire questions at you to practise against.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0010-agile-delivery-as-a-senior.html">← R2.6</a></span>
+  <span><a href="0012-saying-no-without-sounding-negative.html">R3.2 · Saying no →</a></span>
+</div>
+
+</div>
+</body>
+</html>

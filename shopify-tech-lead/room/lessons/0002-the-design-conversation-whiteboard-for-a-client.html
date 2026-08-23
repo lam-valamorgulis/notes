@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R1.2 — The Design Conversation: Whiteboard for a Client, Not a Grader</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R1 · Lesson 2</p>
+<h1>The design conversation: whiteboard for a client, not a grader</h1>
+<p class="subtitle">A grader wants to see what you know. A client wants to make a decision. Those need different answers.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can tell within thirty seconds whether you are being assessed or
+  being consulted — and change what you say accordingly.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does the listener need from this?</h3>
+
+<p>The same design, described to two people, should not sound the same. Ask what each of them will
+<em>do</em> with what you say.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th></th><th>A grader (interviewer, senior engineer)</th><th>A client or PM</th></tr>
+  <tr><td>Wants</td><td>Evidence you know the trade-offs</td><td>Enough to decide and to trust you</td></tr>
+  <tr><td>Values</td><td>Depth, rigour, edge cases</td><td>Clarity, cost, risk</td></tr>
+  <tr><td>Reaction to detail</td><td><b>More is better</b></td><td><b>More is worse</b></td></tr>
+  <tr><td>Reaction to "it depends"</td><td>Good, if you name what it depends on</td><td>Frustrating, unless you also give a default</td></tr>
+  <tr><td>Wants to hear about failure</td><td>Yes, in mechanism</td><td>Yes, in consequence and mitigation</td></tr>
+</table>
+</div>
+
+<p>The row that changes your behaviour most is the third. With a grader, adding detail scores points.
+With a client, <b>every unnecessary detail is a small withdrawal from their attention and their
+confidence</b>. Same knowledge, opposite instinct.</p>
+
+<h3>Tell which one you are in</h3>
+
+<div class="diagram">
+  signals you are being GRADED        signals you are being CONSULTED
+  "how would you handle…"             "what do you recommend?"
+  "what if it were 100× bigger?"      "how long, and how much?"
+  follow-ups go deeper                follow-ups go wider
+  they already know the answer        they are deciding something
+</div>
+
+<p>And the practical mixed case: a client meeting with their technical lead present contains both. Aim
+your answer at the decision-maker and offer the depth as an aside — <b>"happy to go deeper on the
+retry logic if that's useful"</b>. That sentence serves both listeners in nine words.</p>
+
+<h3>The client version: three things, then stop</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Say</th><th>Example</th></tr>
+  <tr><td><b>What it does</b>, in their words</td><td>"Your ERP decides prices; Shopify decides stock"</td></tr>
+  <tr><td><b>What it costs</b> — time, money, or a constraint</td><td>"Stock will be a minute or two behind, not instant"</td></tr>
+  <tr><td><b>What could go wrong, and what we do</b></td><td>"If their system is down, prices hold at the last known good ones"</td></tr>
+</table>
+</div>
+
+<p>Then stop. Silence after three clear points is not awkward — it is the space in which they ask the
+question they actually care about, which is more useful than anything you would have said next.</p>
+
+<h3>What to leave out on purpose</h3>
+
+<p>Naming these makes the omission a choice rather than a gap:</p>
+
+<ul>
+  <li><b>Technology names.</b> "A queue" not "BullMQ on Redis". The name conveys nothing and invites a
+      question you do not want to spend the meeting on.</li>
+  <li><b>Your table structure.</b> Nobody is deciding anything based on it.</li>
+  <li><b>How clever the hard part was.</b> This is the hardest one to resist and the least useful thing
+      you can say.</li>
+  <li><b>Failure modes with no consequence for them.</b> Mention the ones that change what they might
+      decide.</li>
+</ul>
+
+<h3>Drawing for a client</h3>
+
+<p>Boxes with <b>their nouns in them</b>. Arrows with verbs, not protocols — "sends prices", not
+"POST /products". And one arrow at a time, narrating as you draw, so the picture assembles at the speed
+they can follow rather than appearing complete and unreadable.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Mid-explanation, the client asks: "why can't it just be instant?" <b>What is the wrong answer, and
+  what is the right one?</b>
+</div>
+
+<p>The wrong answer is the true one delivered as a mechanism — webhook delivery guarantees, retry
+windows, eventual consistency. All correct, all irrelevant to their decision, and it converts a
+question into a lecture.
+<br><br>
+The right answer is a consequence plus a choice: <b>"It'll usually be a few seconds. I won't promise
+instant because Shopify's own guidance is that a notification can arrive late, and I'd rather build
+something that's definitely right than something that's usually instant. If genuinely-instant matters
+for a specific thing, tell me which, and I'll design that part differently."</b>
+<br><br>
+That answer gives them the number, the reason, and a way to push back if their need is real. The
+mechanism is available if they ask — and now it is their choice to go there.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar">
+  <span class="who">Answering a client like a grader</span>
+  Technically excellent and unusable. They cannot decide anything from it, so they defer, and the
+  meeting produces nothing. Depth is generous with a grader and costly with a client.
+</div>
+
+<div class="scar">
+  <span class="who">"It depends" with no default</span>
+  Honest, and it hands your job back to them. Always follow it with what you would do and what would
+  change your mind.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the polite nod</span>
+  You went too deep, they stopped following, and they will not say so. The meeting ends warmly and no
+  decision was made. Only checkpoints catch this.
+</div>
+
+<div class="scar">
+  <span class="who">Naming your technology choices</span>
+  Every product name is either meaningless to them or triggers a question about something they read
+  once. Say what it does.
+</div>
+
+<div class="scar">
+  <span class="who">Describing how hard it was</span>
+  It reads as either complaining or fishing, and it never helps a decision. If effort is relevant, it
+  is relevant as a number in an estimate.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — do not win the meeting</span>
+  You can be right and lose the client's confidence. If someone proposes something worse, the goal is
+  the better outcome, not the visible correction. "That could work — the thing I'd worry about is X" gets
+  there and leaves them intact.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Serving both audiences at once</span>
+  <q>At a high level: your ERP owns prices, Shopify owns stock, and we move each one direction only so
+  they can't fight. That's the whole design. Happy to go deeper on how we handle their system being
+  temporarily down, if that's useful.</q>
+  <span class="why-said">Complete for the decision-maker, with an explicit door for the technical
+  person. Nobody is bored and nobody is short-changed.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you genuinely do not know</span>
+  <q>I don't know yet, and I don't want to guess at it. What I'd do is load a sample at your real volume
+  and measure — that's about half a day and it turns a guess into a number. Can I do that before we
+  commit to a date?</q>
+  <span class="why-said">"I don't know" plus a concrete plan and a cost reads as rigour. "I don't know"
+  alone reads as unpreparedness. The difference is the next sentence.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone proposes a worse design</span>
+  <q>That could work. The thing I'd want to check is what happens when two people edit the same product
+  in both systems on the same day — with that approach I think we'd get a flicker. Want me to try it
+  and see, or shall we design around it now?</q>
+  <span class="why-said">Does not reject, names one specific consequence, and offers two ways forward.
+  You get the better outcome without anyone being corrected.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A grader wants evidence. A client wants a decision.</b> Same knowledge, opposite instinct on detail.</li>
+  <li><b>Tell which room you are in</b> from whether follow-ups go deeper or wider.</li>
+  <li><b>For a client: what it does, what it costs, what could go wrong — then stop.</b></li>
+  <li><b>Silence after three points</b> is where their real question arrives.</li>
+  <li><b>Leave out technology names, table structures, and how hard it was.</b></li>
+  <li><b>Never say "it depends" without a default</b> and what would change it.</li>
+  <li><b>Do not win the meeting.</b> Aim for the better outcome, not the visible correction.</li>
+</ul>
+<p class="one-thing">If you remember one thing: with a client, every extra detail costs you something —
+say three things and stop talking.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> The next two Lessons in R1 are marked depth — a full worked design.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0001-system-design-explained-out-loud.html">← R1.1</a></span>
+  <span><a href="0003-design-a-stock-availability-platform-domain-and-engine.html">R1.3 · A worked design →</a></span>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P6.3 — The Huge Catalogue Load, and the Throttle That Starts at 500,000</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P6 · Lesson 3</p>
+<h1>The huge catalogue load, and the throttle that starts at 500,000</h1>
+<p class="subtitle">This number decides whether a project is a month or a year. It moved once already.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can size a large catalogue load honestly, and you know why
+  quoting a number you have not measured on the real store is the mistake that ends projects.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>The throttle, as it stands today</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Rule</th><th>Value</th></tr>
+  <tr><td>Threshold before the extra throttle applies</td><td><b>500,000 product variants</b> on the store</td></tr>
+  <tr><td>After that</td><td><b>No more than 10,000 new variants per day</b></td></tr>
+  <tr><td>Plus stores</td><td><b>Exempt</b></td></tr>
+  <tr><td>Affects</td><td><code>productCreate</code>, <code>productUpdate</code>, <code>productVariantCreate</code>, and the matching REST product endpoints</td></tr>
+  <tr><td>Signal</td><td>429, with a message that a throttle has been applied</td></tr>
+</table>
+</div>
+
+<p>So below half a million variants this throttle never fires, and what actually paces a load is the
+ordinary rate limit from <a href="0002-the-two-apis-and-the-rate-limit-model.html">P1.2</a> — plus, on
+a non-Plus store, the smaller REST bucket.</p>
+
+<p class="verified"><b>Verified 2026-08-23</b> on both pages, which now agree —
+<a href="https://shopify.dev/docs/api/usage/limits">Shopify API limits</a> and
+<a href="https://shopify.dev/docs/api/admin-rest/usage/rate-limits">REST Admin API rate limits</a>.</p>
+
+<h3>Why this Lesson used to say something else</h3>
+
+<div class="note">
+  <span class="label">The number moved, and that is the real lesson</span>
+  As of <b>3 August 2026</b>, two Shopify pages disagreed about this throttle: one said the threshold
+  was 50,000 variants with a cap of 1,000 per day, the other said 500,000 and 10,000 per day. Both
+  agreed Plus was exempt.
+  <br><br>
+  Re-checked on <b>23 August 2026</b>, they agree — shopify.dev was corrected upward to the looser
+  figure. So the number changed by a factor of ten in under three weeks of checking.
+  <br><br>
+  <b>The habit survives even though the disagreement did not.</b> A number that can move like that is
+  a number you measure on the client's real store before you put it in a proposal.
+</div>
+
+<h3>Derive it: why does one number decide a project?</h3>
+
+<p>Take a 300,000-variant catalogue and do the arithmetic under each figure:</p>
+
+<div class="diagram">
+  at 10,000 new variants/day  →   300,000 / 10,000  =  30 days
+  at  1,000 new variants/day  →   300,000 /  1,000  = 300 days
+
+  same catalogue. same code. same client.
+  one is a project. the other is not deliverable.
+</div>
+
+<p>That is why this is not trivia. Almost no other single fact in Shopify development can change a
+timeline by 10×, and a proposal built on the wrong one is a commercial failure rather than a technical
+one.</p>
+
+<h3>How to size a load honestly</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Step</th><th>What</th></tr>
+  <tr><td>1</td><td><b>Count variants, not products.</b> Products are what clients count; variants are what the platform limits</td></tr>
+  <tr><td>2</td><td><b>Do not trust <code>productsCount</code>.</b> On a real store it returned 10,000 with precision <code>AT_LEAST</code> — a floor, not a value</td></tr>
+  <tr><td>3</td><td>Read the store's <b>plan</b>. Plus changes both the buckets and the throttle exemption</td></tr>
+  <tr><td>4</td><td><b>Load a real sample</b> — say 5,000 variants — and measure the wall-clock rate</td></tr>
+  <tr><td>5</td><td>Extrapolate from <em>that</em>, and quote a range with the measurement date</td></tr>
+</table>
+</div>
+
+<p>Step 2 is worth dwelling on. This Course queried a live Plus store and both
+<code>productsCount</code> and <code>productVariantsCount</code> returned exactly <code>10000</code>
+with <code>precision: AT_LEAST</code>, which the schema defines as "a limit was imposed and reached".
+<b>You cannot size a catalogue from a count query.</b> To get a true figure, page the connection or run
+a bulk query.</p>
+
+<p>And even <code>EXACT</code> is not a freshness promise — the documentation notes that "a write may
+not be reflected instantaneously".</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client says they have 80,000 products and asks how long the initial load takes. <b>What do you need
+  before you answer, and what do you say now?</b>
+</div>
+
+<p>You need four things: the <b>variant</b> count rather than the product count, their <b>plan</b>, a
+measured rate from a real sample load, and the date you measured it. 80,000 products at four variants
+each is 320,000 variants — still under the 500,000 threshold, so the extra throttle would not apply,
+but that is a conclusion you reached from a number you have not verified.
+<br><br>
+What you say now is a range with the reason for the range: it depends on variant count and plan, and
+you will have a real number after one sample load. Naming <em>why</em> you will not guess is what makes
+the eventual number believable.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — quoting from a remembered limit</span>
+  This exact number changed by 10× between two checks three weeks apart. A timeline built on a
+  remembered figure is a commitment built on nothing. Date every limit you quote.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — sizing from products instead of variants</span>
+  Clients count products; the platform limits variants. A four-variant average makes the real number
+  four times bigger, and every estimate derived from the wrong unit is wrong by that factor.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — sizing from <code>productsCount</code></span>
+  It can return a capped value with <code>precision: AT_LEAST</code>. Verified on a real store at
+  exactly 10,000. Read the precision or you are planning against a floor.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — testing on Plus, shipping to Basic</span>
+  Plus has ten times the REST bucket and no variant throttle. A load that flew in testing crawls in
+  production, and nothing in your code changed.
+</div>
+
+<div class="scar">
+  <span class="who">Assuming the throttle is the bottleneck when it is not</span>
+  Below 500,000 variants it never fires. If a load is slow there, the cause is the ordinary cost-based
+  limit or your own query size — and waiting will not fix an over-1,000-point query.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — do not measure on a client's live store</span>
+  A sample load teaches you the rate, and doing it on a production store spends the merchant's rate
+  limit and creates products you must remove. Measure on a Dev store of the same plan, and say that
+  is what you did.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When asked for a timeline on a large catalogue</span>
+  <q>I'll give you a range today and a number after one test load. The reason I'm careful is that
+  Shopify limits how fast new variants can be created once a store gets large, and that limit is
+  different on your plan than on others — I've also seen the published figure change. So I'd rather
+  measure it on a test store like yours than quote something I'd have to walk back.</q>
+  <span class="why-said">Explains the caution with a specific, verifiable mechanism. "It depends" with
+  a reason is a strong answer; "it depends" alone is not.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client says "we have 80,000 products"</span>
+  <q>The number I actually need is variants — every size and colour counts separately, and that's what
+  Shopify limits. If those 80,000 average four variants each, we're really talking about 320,000. Worth
+  getting exactly right before I put a date on anything, because the arithmetic changes a lot.</q>
+  <span class="why-said">Corrects the unit before it enters an estimate, and shows the arithmetic so
+  it does not look like hedging.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>The extra throttle starts at 500,000 variants</b>, then caps new ones at 10,000 per day. <b>Plus is exempt.</b></li>
+  <li><b>This number moved 10× in three weeks of checking.</b> Date every limit you quote.</li>
+  <li><b>Count variants, not products.</b> Clients count products; the platform limits variants.</li>
+  <li><b><code>productsCount</code> can return <code>AT_LEAST</code></b> — a floor, not a value. Verified at 10,000 on a real store.</li>
+  <li><b><code>EXACT</code> is not a freshness promise</b> either — a recent write may not be reflected.</li>
+  <li><b>Measure a real sample load and extrapolate.</b> On a Dev store of the same plan, not the client's.</li>
+  <li><b>Below 500,000 variants, the bottleneck is the ordinary cost-based limit</b>, not this throttle.</li>
+</ul>
+<p class="one-thing">If you remember one thing: measure the load on a store like theirs before you
+quote a date — the published number has already moved once.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the night it goes live.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0018-three-ways-to-push-it-and-bulk-operations.html">← P6.2</a></span>
+  <span><a href="0020-the-cutover-and-the-proof.html">P6.4 · The cutover →</a></span>
+</div>
+
+</div>
+</body>
+</html>

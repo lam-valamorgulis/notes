@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R3.3 — A Range, Not a Number</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R3 · Lesson 3</p>
+<h1>A range, not a number</h1>
+<p class="subtitle">The sentence that gives an honest estimate without giving a promise.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> One sentence pattern you can produce under pressure that satisfies
+  someone who wants a number, without you inventing one.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: why does a range annoy people?</h3>
+
+<p>Because a bare range gives them nothing to do. "Three to eight days" cannot go in a plan, cannot be
+argued with, and cannot be shortened. So it reads as evasion even when it is honest.</p>
+
+<p>The fix is not to narrow the range. It is to add the two things that make a range <b>useful</b>: why it
+is wide, and when it stops being wide.</p>
+
+<div class="diagram">
+  the four-part sentence
+
+  1. the LOW end, with its condition      "three days if X"
+  2. the HIGH end, with its condition     "eight if not X"
+  3. what X is                            one specific, checkable thing
+  4. when you will KNOW                   "within an hour of seeing their docs"
+
+  ── now they can act: they can go and get X.
+</div>
+
+<p>Part 4 is what turns it from a hedge into a plan. A range that <b>collapses on a named date</b> is
+something a PM can put in a schedule.</p>
+
+<h3>The pattern, and three fillings</h3>
+
+<div class="script">
+  <span class="who">Drill this shape until it is automatic</span>
+  <q>[LOW] if [CONDITION]. [HIGH] if not, because [CONSEQUENCE]. I'll know [WHEN].</q>
+  <span class="why-said">One shape, four slots. Learn the shape and you can fill it for anything, which
+  is far easier than remembering example sentences.</span>
+</div>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Situation</th><th>The sentence</th></tr>
+  <tr><td>An unknown API</td><td>"Three days if their API can tell me what changed since a timestamp. Eight if it can't, because then I compare full lists every night. I'll know within an hour of seeing their docs."</td></tr>
+  <tr><td>An unknown volume</td><td>"A week if the catalogue is under about fifty thousand variants. Three if it's much bigger, because the load itself becomes the project. I'll know today — I just need read access to count."</td></tr>
+  <tr><td>An unknown decision</td><td>"Two days if you're happy for the ERP to own descriptions. A week if your team needs to keep editing them in Shopify, because then we need a field-level merge. I'll know as soon as you've decided."</td></tr>
+</table>
+</div>
+
+<p>Notice the third one. The condition is <b>a decision the client owns</b>, so the sentence quietly makes
+their own delay visible without accusing anyone of anything.</p>
+
+<h3>When they insist on one number</h3>
+
+<p>Some people cannot use a range, and that is a legitimate constraint rather than stubbornness. Give them
+a number about something you control:</p>
+
+<div class="script">
+  <span class="who">Drill this</span>
+  <q>I'll give you a number on Thursday. To get it I need their API docs and half a day to test. What I can
+  commit to today is the Thursday date.</q>
+  <span class="why-said">A firm commitment, just not the one they asked for. A PM needs <em>something</em>
+  for the plan, and a date for a number is something.</span>
+</div>
+
+<p>If they still insist, give the high end as the number and say so explicitly: <b>"then I'd have to say
+eight days, because I have to quote the case where the unknown goes badly."</b> That is honest, and it
+usually makes them want the range back.</p>
+
+<h3>Two habits that protect the range afterwards</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Habit</th><th>Why</th></tr>
+  <tr><td><b>Say the unit.</b> "Three working days, not calendar days"</td><td>Half of all estimate arguments are this</td></tr>
+  <tr><td><b>Re-state the range when it collapses.</b> "It's the eight-day path — the unknown resolved the expensive way"</td><td>Ties the bad news to a risk you already named, which makes it information rather than a failure</td></tr>
+</table>
+</div>
+
+<div class="recall">
+  <span class="label">Do this now, out loud</span>
+  A client asks how long it takes to migrate their 60,000 products from another platform. You know almost
+  nothing yet. <b>Say the four-part sentence.</b>
+</div>
+
+<p>Something close to: <b>"Around three weeks if the product data is clean and everything has a stable
+product code. Six or more if a lot of the codes are missing or duplicated, because then matching becomes
+the bulk of the work rather than the loading. I'll know in two days — I need read access to both systems to
+measure the match rate."</b>
+<br><br>
+Check your version against the four slots. Did you give both ends? Did you name <em>one specific</em>
+condition rather than "it depends on the data"? Did you say when you would know, and what you need to know
+it?
+<br><br>
+The most common miss is slot 4. Without it the sentence is still a hedge — with it, you have given the
+client a two-day task that shortens their own project, which is a much better meeting.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a single number given under pressure</span>
+  It becomes the baseline you are measured against for the rest of the project. Every conversation after it
+  is about a variance from a figure you knew was a guess.
+</div>
+
+<div class="scar">
+  <span class="who">A range with no reason</span>
+  "Three to eight days" reads as padding and invites negotiation on the number rather than on the unknown.
+  The spread must have one named cause.
+</div>
+
+<div class="scar">
+  <span class="who">A range that never collapses</span>
+  If you cannot say when you will know, you have not identified the unknown precisely enough. Go back and
+  find the specific thing.
+</div>
+
+<div class="scar">
+  <span class="who">"It depends on the data"</span>
+  Technically true and useless. Depends on <em>what about</em> the data? Name the measurable property —
+  match rate, blank rate, variant count.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — working days versus calendar days</span>
+  You meant one, they heard the other, and nobody discovers it until the deadline. Say the unit every
+  time.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the range is not a negotiation opener</span>
+  Do not inflate the high end expecting to be pushed down. Clients learn that quickly, and then they discount
+  everything you say. The range should be your actual belief, which is what makes it defensible when it turns
+  out to be right.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The estimate</span>
+  <q>Three working days if their API can tell me what's changed since a given time. Eight if it can't,
+  because then I'd have to compare the full catalogue every night, which is a different piece of work. I'll
+  know within an hour of seeing their documentation — can you get me that?</q>
+  <span class="why-said">All four slots, the unit stated, and it ends by giving the client something they can
+  do to shorten it.</span>
+</div>
+
+<div class="script">
+  <span class="who">When they want one number</span>
+  <q>I'll give you a firm number on Thursday. To get there I need their API docs and half a day to run a test
+  load. If you need a single figure today, I'd have to quote the bad case — eight days — because I can't
+  promise the good one yet. I'd rather give you the real number on Thursday.</q>
+  <span class="why-said">Offers the commitment, then shows what insisting actually costs them. Most people
+  choose Thursday.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the range collapses badly</span>
+  <q>Update on the estimate, today rather than in three weeks. Their API can't do changed-since, so we're on
+  the eight-day path. Nothing's gone wrong — this was the unknown I flagged, and it resolved the expensive
+  way.</q>
+  <span class="why-said">Ties it back to a named risk. The same news delivered without that reference sounds
+  like a slip; with it, it sounds like the process working.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Four slots: low with its condition · high with its condition · what the condition is · when you will know.</b></li>
+  <li><b>A bare range reads as evasion.</b> The reason and the collapse date are what make it useful.</li>
+  <li><b>When they insist on a number, commit to a date for the number.</b></li>
+  <li><b>If truly forced, quote the high end and say why.</b> They usually want the range back.</li>
+  <li><b>Never say "it depends on the data".</b> Name the measurable property.</li>
+  <li><b>Say the unit</b> — working days, not calendar days.</li>
+  <li><b>Do not inflate the high end.</b> The range must be your real belief.</li>
+</ul>
+<p class="one-thing">If you remember one thing: always say when the range collapses — that is what turns a
+hedge into a plan.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for disagreeing with someone more senior.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0012-saying-no-without-sounding-negative.html">← R3.2</a></span>
+  <span><a href="0014-disagreeing-upward-and-the-senior-narrative.html">R3.4 · Disagreeing upward →</a></span>
+</div>
+
+</div>
+</body>
+</html>

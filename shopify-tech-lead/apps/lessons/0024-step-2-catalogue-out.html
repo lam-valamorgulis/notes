@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A5 Step 2 — Catalogue Out</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A5 · Project Step 2</p>
+<h1>Catalogue out</h1>
+<p class="subtitle">46,000 variants into a store that only lets you make two requests a second.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> The whole synthetic catalogue in your Dev store, loaded by
+  a bulk operation rather than 10,000 separate calls — and a second run that changes almost
+  nothing and finishes in seconds.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Where you push — answer this before anything else</h3>
+
+<div class="trap">
+  <span class="label">Read this twice</span>
+  You push to <b>your own Dev store</b>. Never to a client store. A client store has real
+  customers, real orders and live sales channels; 10,000 fake products there is an incident,
+  not a mistake you quietly undo. The Project has exactly one
+  <code>SHOPIFY_SHOP_DOMAIN</code> variable and no second one, on purpose — there is no
+  supported way for this code to write to a store that is not yours.
+</div>
+
+<p>If the Dev store does not exist yet, that is Step 2's first task, and it takes about two
+minutes:</p>
+
+<ol>
+  <li><b>Dev Dashboard → Stores → Create store.</b> Pick a <b>non-Plus</b> plan. You want the
+      small rate-limit bucket: 40 requests with a 2/second leak, not Plus's 400 and
+      20/second. Throttling is the lesson.</li>
+  <li><b>Create a custom app on that store</b> and install it.</li>
+  <li><b>Copy the Admin API access token</b> — it starts with <code>shpat_</code> — into
+      <code>project/.env</code> along with the store's
+      <code>*.myshopify.com</code> domain.</li>
+</ol>
+
+<p>Scopes for this Step, and nothing more:</p>
+
+<pre><code>write_products
+read_products</code></pre>
+
+<h3>Three ways to push, and why only one survives this volume</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Route</th><th>What it costs at 10,000 products</th><th>Verdict</th></tr>
+  <tr><td>One mutation per product</td>
+      <td>10,000 round trips. At the non-Plus leak rate that is over an hour of wall clock, plus every 429 you earn</td>
+      <td>Fine for a handful. Wrong here</td></tr>
+  <tr><td>CSV import</td>
+      <td>A merchant tool with its own separate rules, documented on help.shopify.com rather than
+          shopify.dev. <b>Verify its limits there before relying on any of them</b></td>
+      <td>A merchant tool, not an integration</td></tr>
+  <tr><td><b>Bulk operation</b></td>
+      <td>One upload, one mutation call, then you wait</td>
+      <td><b>This one</b></td></tr>
+</table>
+</div>
+
+<h3>The bulk import flow</h3>
+
+<div class="diagram">
+  1. stagedUploadsCreate          ── reserve a slot, get a URL + form params
+           │
+  2. POST the JSONL to that URL   ── the `file` field goes LAST in the form
+           │
+  3. bulkOperationRunMutation     ── pass the mutation as a STRING
+     ( mutation: "...", stagedUploadPath: "tmp/uploads/x.jsonl" )
+           │
+  4. wait ──┬── poll  bulkOperation(id:)          (2026-01 and higher)
+            └── or subscribe to bulk_operations/finish
+           │
+  5. download the result JSONL from `url`
+     ── and READ IT. Per-line userErrors live here, nowhere else.
+</div>
+
+<p class="verified"><b>Verified 2026-08-23</b> against
+<a href="https://shopify.dev/docs/api/usage/bulk-operations/imports">Bulk import data with the GraphQL Admin API</a>:
+JSONL capped at <b>100 MB</b> · must finish within <b>24 hours</b> or it is stopped and marked
+failed · the mutation is limited to <b>one connection field</b> · in <b>2026-01 and higher</b>
+an app may run <b>5</b> concurrent bulk mutation operations per shop, where older versions
+allowed only one of each type · poll with <code>bulkOperation(id:)</code> on 2026-01+, or
+<code>currentBulkOperation</code> before that. All three mutations in this Lesson were run
+through the schema validator before being written down.</p>
+
+<h3>Which mutation to run in bulk</h3>
+
+<p><code>productSet</code> is the one you want, because it is an <b>upsert</b>: give it a
+stable identifier and it creates the product the first time and updates it every time after.
+That is what makes the load re-runnable, and re-runnable is the whole point.</p>
+
+<div class="scar undocumented">
+  <span class="who">The docs contradict themselves here — check it yourself</span>
+  The bulk-import guide's argument table lists <em>"Valid values: productCreate,
+  collectionCreate, productUpdate, productUpdateMedia"</em> for the <code>mutation</code>
+  argument. The same page's own Limitations section says you <em>"can supply any GraphQL
+  Admin API mutation ... except <code>bulkOperationRunMutation</code> and
+  <code>bulkOperationRunQuery</code> themselves"</em>. Those cannot both be true, and
+  <code>productSet</code> is not in the four-value list.
+  <br><br>
+  <b>Do not resolve this by reasoning. Resolve it by running it</b> — one product, in a bulk
+  operation, on your Dev store. If it is refused, fall back to <code>productCreate</code>
+  for the first load and <code>productUpdate</code> afterwards, and keep your own mapping
+  table so you know which is which. Finding out now costs ten minutes. Finding out during a
+  client's cutover costs the weekend.
+</div>
+
+<div class="recall">
+  <span class="label">Before you read on</span>
+  Your bulk operation reports <code>status: COMPLETED</code>. Nothing errored. <b>Are all
+  10,000 products in?</b> Say why or why not.
+</div>
+
+<p>No — <code>COMPLETED</code> only means the operation ran to the end. Each individual line
+can still have failed with its own <code>userErrors</code>, and those live <b>only</b> in the
+result JSONL at <code>url</code>. An import that "completed" with 4,000 silent per-line
+failures looks exactly like a success from the outside. Download the result and count it.</p>
+
+<h3>Then make it re-runnable</h3>
+
+<p>Run the whole load a second time. Almost nothing has changed, so almost nothing should be
+written. That means filtering on your watermark — the highest <code>updatedAt</code> you
+actually saw — and pushing only what moved. On the real store this Course sampled, roughly a
+few percent of rows change on a given day. A sync that re-pushes everything nightly works
+right up until the catalogue grows, and then it stops finishing before morning.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — <code>productSet</code> deletes what you omit</span>
+  <code>productSet</code> treats the input as the <b>whole</b> desired state. Leave a variant
+  out of the list and it is removed, not ignored. Send a partial product and you delete the
+  rest of it. This is correct behaviour and it is the single most expensive surprise in the
+  mutation. Send complete objects, always.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — <code>COMPLETED</code> is not "worked"</span>
+  Per-line <code>userErrors</code> appear only in the downloaded result file. Never treat the
+  operation status as the outcome. Count the successes and compare them to the line count you
+  uploaded.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the form field order</span>
+  When you POST the JSONL to the staged URL, the <code>file</code> field must be
+  <b>last</b> in the multipart form. Put it earlier and the upload is rejected or silently
+  wrong, and the error you get points nowhere near the cause.
+</div>
+
+<div class="scar">
+  <span class="who">100 MB, and your file is bigger than you think</span>
+  The generated catalogue is already about 25 MB as plain records. Wrapped as
+  <code>productSet</code> variables — every variant, every option, every metafield — it grows
+  well past that. <b>Chunk the upload</b> and count bytes as you write, rather than
+  discovering the cap at 99%. On 2026-01+ you may run five operations at once, so chunking
+  costs you little.
+</div>
+
+<div class="scar">
+  <span class="who">One connection field</span>
+  The mutation you hand to <code>bulkOperationRunMutation</code> may contain only one
+  connection. A <code>productSet</code> selection asking for both
+  <code>variants</code> and <code>media</code> is rejected. Keep the selection set tiny —
+  you only need the id and the errors.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the 24-hour clock</span>
+  A bulk operation that exceeds 24 hours is stopped and marked failed. Nothing tells you at
+  hour 23. If a load is big enough that this is even conceivable, it is too big: split it.
+</div>
+
+<div class="scar">
+  <span class="who">Your Dev store is slower than the client's, and that is the point</span>
+  The store this catalogue was modelled on is Plus, which multiplies the buckets by ten and
+  is exempt from the extra variant throttle entirely. Your non-Plus Dev store is not. Expect
+  the load to behave <em>worse</em> for you than for the real store. That gap is the
+  experiment, not a problem to fix.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks how long the initial load takes</span>
+  <q>The upload itself is quick. What takes the time is the queue on Shopify's side, and I
+  can't promise a number until I've run it once against real volume. What I can promise is
+  that it's restartable — if it fails at 80% we don't start again from zero.</q>
+  <span class="why-said">Restartability is the thing a client actually cares about and rarely
+  knows to ask for. Offering it unprompted is what a lead sounds like.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone says "the import finished, so we're done"</span>
+  <q>The job finished, but each row can fail on its own and those errors are in a separate
+  results file. Give me twenty minutes to reconcile the counts before we tell anyone it
+  worked.</q>
+  <span class="why-said">This is the sentence that prevents the worst kind of go-live: the
+  one everybody has already celebrated.</span>
+</div>
+
+<div class="script">
+  <span class="who">When a PM asks why you are testing on a smaller plan than the client has</span>
+  <q>Their store is Plus, which gets ten times our rate limit and skips one throttle
+  completely. If I build against those limits I'll never see the throttling bugs. Testing
+  somewhere stricter means the client's store is the easy case, not the surprise.</q>
+  <span class="why-said">Reframes "worse environment" as deliberate margin. That is a lead's
+  argument, not a developer's excuse.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>You push to your own Dev store.</b> Never a client store. One domain variable, no second one.</li>
+  <li><b>Bulk operation, not 10,000 calls.</b> <code>stagedUploadsCreate</code> → upload → <code>bulkOperationRunMutation</code> → poll → <b>download the results</b>.</li>
+  <li><b><code>COMPLETED</code> is not "worked".</b> Per-line <code>userErrors</code> live only in the result JSONL. Count them.</li>
+  <li><b><code>productSet</code> deletes what you omit.</b> It sets whole state. Always send complete objects.</li>
+  <li><b>Limits:</b> 100 MB JSONL · 24 hours · one connection field · 5 concurrent on 2026-01+.</li>
+  <li><b>The <code>file</code> form field goes last.</b> Out of order fails in a way that points nowhere.</li>
+  <li><b>The docs disagree about which mutations bulk accepts.</b> Test it on your Dev store; do not reason about it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a load that reports success is not a load
+that worked — the truth is in the results file, and reading it is the job.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Say <b>"write the pusher"</b> when the Dev store exists and the
+  <code>.env</code> is filled, and we build it together against real limits.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0023-step-1-the-fake-erp.html">← Step 1</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

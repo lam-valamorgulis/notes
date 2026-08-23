@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R5.2 — What a Shopify Tech-Lead Interview Actually Probes</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R5 · Lesson 2 · <span class="pill depth">depth</span></p>
+<h1>What a Shopify tech-lead interview actually probes</h1>
+<p class="subtitle">Five things, and only one of them is Shopify knowledge.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can hear what a question is really testing, which lets you answer the
+  question behind it rather than the words.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is the hiring risk?</h3>
+
+<p>They are not trying to find out what you know. They are trying to avoid a specific set of bad outcomes,
+and every question is aimed at one of them.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>What they fear</th><th>So they probe</th></tr>
+  <tr><td>They ship something that silently corrupts data</td><td><b>Do you think about failure unprompted?</b></td></tr>
+  <tr><td>They cannot tell how a project is really going</td><td><b>Do you communicate risk early?</b></td></tr>
+  <tr><td>They hire someone who talks and cannot build</td><td><b>Have you actually done it?</b></td></tr>
+  <tr><td>The client stops trusting the supplier</td><td><b>Can you handle a client conversation?</b></td></tr>
+  <tr><td>They spend money on the wrong thing</td><td><b>Do you know when not to build?</b></td></tr>
+</table>
+</div>
+
+<p>Notice that only the third is about ability, and none of them is about Shopify trivia. Platform knowledge
+is table stakes — it gets you past a screen and wins you nothing after that.</p>
+
+<h3>Translating questions into what they test</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>They ask</th><th>They are testing</th><th>So include</th></tr>
+  <tr><td>"How would you sync products from an ERP?"</td><td>Failure thinking</td><td>The ownership table, and what happens on a retry — unprompted</td></tr>
+  <tr><td>"How long would that take?"</td><td>Estimating honesty</td><td>A range, its cause, and when it collapses</td></tr>
+  <tr><td>"Tell me about a project that went wrong"</td><td>Whether you own outcomes</td><td>What you did, what you learned, what you changed after</td></tr>
+  <tr><td>"A client wants X and you think it's a bad idea"</td><td>Client handling</td><td>Agree with the goal, one concern, hand back the decision</td></tr>
+  <tr><td>"How do you know the sync is working?"</td><td>Operational maturity</td><td>Reconciliation — and that no errors is not the same as working</td></tr>
+  <tr><td>"Have you done this in production?"</td><td>Honesty under pressure</td><td>Name the gap, the work, the remainder</td></tr>
+</table>
+</div>
+
+<h3>The five things worth demonstrating, in order of rarity</h3>
+
+<div class="diagram">
+  1. YOU VOLUNTEER FAILURES        rarest. biggest signal.
+  2. YOU MEASURE CORRECTNESS       reconciliation, not "no errors"
+  3. YOU SAY WHAT YOU WON'T BUILD  scope judgement
+  4. YOU GIVE HONEST NUMBERS       ranges with causes and dates
+  5. YOU KNOW THE PLATFORM         table stakes. necessary, not distinguishing.
+</div>
+
+<p>Most candidates lead with 5 and never reach 1. Reverse it. <b>The moment you volunteer a failure mode
+nobody asked about, the conversation changes character</b> — you stop being assessed and start being
+consulted.</p>
+
+<h3>The dated fact is worth more than the fact</h3>
+
+<p>Anyone can state a limit. Saying <b>"I checked that this month"</b> demonstrates something different — that
+you know platform facts move. This Course is a case in point: the daily variant throttle changed by a factor
+of ten between two checks three weeks apart, and two Admin API fields were found already deprecated by
+validating queries against the schema.</p>
+
+<p>So the strongest form of a technical answer is: the fact, the date, and what you would do if it had moved.
+That is a habit, and habits are what they are hiring.</p>
+
+<h3>Your questions for them</h3>
+
+<p>The questions you ask are read as evidence of how you work. Ask about the things a lead worries about:</p>
+
+<ul>
+  <li>"Who owns the decision when two systems disagree about a field?"</li>
+  <li>"How do you find out when something is quietly wrong in production?"</li>
+  <li>"What happened the last time a client integration went badly?"</li>
+  <li>"Who would I be pairing with on my first live cutover?"</li>
+</ul>
+
+<p>That last one does two things: it is a real question, and it signals you know a first cutover should not be
+done alone.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  They ask: "How would you keep 40,000 products in sync between an ERP and Shopify?" <b>What are the first two
+  things out of your mouth?</b>
+</div>
+
+<p>Questions, then ownership. <b>"Before I design it — can the ERP tell me what changed since a timestamp, and
+how does it signal a deletion? Those two answers change the whole approach. And then the first thing I'd
+settle is who owns each field, because ownership splits inside a single product: the ERP owns the title and
+price, Shopify owns the quantity."</b>
+<br><br>
+What you did not do is start with a diagram or a database. Asking two specific questions first demonstrates the
+habit they are actually testing for — and naming the ownership split in the same breath shows you know where
+this class of project goes wrong. Two sentences, and you have hit probes 1 and 3.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar">
+  <span class="who">Leading with platform knowledge</span>
+  Necessary and not distinguishing. Every other candidate has read the same documentation. It wins a screen and
+  nothing after it.
+</div>
+
+<div class="scar">
+  <span class="who">Only the happy path</span>
+  Sounds complete, reads as inexperienced, and the listener cannot name their unease — so it becomes a general
+  lack of confidence rather than a question you could have answered.
+</div>
+
+<div class="scar">
+  <span class="who">A confident undated number</span>
+  Platform limits move. A stated limit with no date, delivered confidently, is a small demonstration that you
+  do not know they move.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — answering the words, not the question</span>
+  "How long would it take?" answered as a duration, when it was testing your estimating honesty. You answered
+  accurately and failed the probe, and nobody tells you.
+</div>
+
+<div class="scar">
+  <span class="who">No questions, or process questions only</span>
+  "What's the tech stack?" is fine and reveals nothing. Ask about ownership, about how they detect quiet
+  failures, about what went wrong last time.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — one strong example beats five weak ones</span>
+  A single project you can go three levels deep on is worth more than five you can only describe. Pick the one
+  you know best — for you, that is the Project — and be ready to go all the way down into it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Opening a design answer</span>
+  <q>Two questions before I design anything, because they change the answer. Can the ERP tell me what's changed
+  since a given time? And how does it tell me something was deleted? If the answer to the first is no, this is a
+  nightly full comparison rather than an incremental sync — different piece of work.</q>
+  <span class="why-said">Demonstrates the habit rather than describing it, and shows you know which unknowns
+  are load-bearing.</span>
+</div>
+
+<div class="script">
+  <span class="who">Volunteering a failure</span>
+  <q>The bit I'd want to get right is what happens when the same webhook arrives twice — which it will. Without
+  handling that, a duplicate delivery becomes a duplicate order. So I'd make the message id a primary key and let
+  the second insert fail, rather than checking first, because two workers can both pass a check.</q>
+  <span class="why-said">Unprompted, specific, and it includes why the naive version is wrong. This single
+  answer moves you from assessed to consulted.</span>
+</div>
+
+<div class="script">
+  <span class="who">A limit, dated</span>
+  <q>The extra variant throttle kicks in at half a million variants on the store, then caps new ones at ten
+  thousand a day, and Plus is exempt. I checked that this month — and worth saying, that number had changed since
+  I last looked, so I'd re-check before quoting it in a proposal.</q>
+  <span class="why-said">The fact, the date, and the habit. The last clause is worth more than the number.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>They are avoiding bad outcomes</b>, not measuring knowledge. Answer the fear behind the question.</li>
+  <li><b>Five probes:</b> failure thinking · risk communication · have you built it · client handling · knowing when not to build.</li>
+  <li><b>Platform knowledge is table stakes.</b> Necessary, not distinguishing.</li>
+  <li><b>Volunteering a failure is the rarest and strongest signal.</b> It turns assessment into consultation.</li>
+  <li><b>Date your facts.</b> "I checked this month" demonstrates a habit; a confident number does not.</li>
+  <li><b>Answer the probe, not the words.</b> "How long?" is usually about estimating honesty.</li>
+  <li><b>Ask about field ownership, quiet failures, and who you would pair with on a first cutover.</b></li>
+</ul>
+<p class="one-thing">If you remember one thing: volunteer a failure mode nobody asked about — that is the
+moment the conversation changes.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"mock me"</b> for the full run.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0017-the-experience-gap-talking-about-what-you-have-not-built.html">← R5.1</a></span>
+  <span><a href="0019-the-full-mock.html">R5.3 · The full mock →</a></span>
+</div>
+
+</div>
+</body>
+</html>

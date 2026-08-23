@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A5 Step 4 — The Queue, the Dead-Letter and the Proof</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A5 · Project Step 4 · the last one</p>
+<h1>The queue, the dead-letter and the proof</h1>
+<p class="subtitle">Break it on purpose, then prove the report catches it. This is the step that changes what you can honestly claim.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A sync that survives every failure you can cause — and a nightly report that
+  names exactly which records are wrong. After this you can say "I built one, and here is how I know it
+  works."</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Three things, and the third is the point</h3>
+
+<div class="diagram">
+  1. THE QUEUE          retries, backoff with jitter, one shared budget per store
+  2. THE DEAD-LETTER    terminal failures, readable, with resolved_at
+  3. THE REPORT         ← the only thing that measures CORRECTNESS
+
+  1 and 2 make it survive. 3 makes it provable.
+</div>
+
+<p>Everything up to now could be wrong without you knowing. Step 4 is where that stops being true.</p>
+
+<h3>1 · The queue: classify before you retry</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Class</th><th>Detected by</th><th>Do</th></tr>
+  <tr><td><b>Transient</b></td><td>5xx, timeout, connection reset</td><td>Retry, exponential backoff <b>with jitter</b></td></tr>
+  <tr><td><b>Throttled</b></td><td><code>errors[].extensions.code === "THROTTLED"</code> — inside an <b>HTTP 200</b></td><td>Wait for budget. Not a failure, a queue</td></tr>
+  <tr><td><b>Terminal</b></td><td><code>data.*.userErrors[]</code>, bad scope, invalid field</td><td><b>Dead-letter on the first attempt.</b> Never retry</td></tr>
+  <tr><td><b>Poison</b></td><td>N identical failures</td><td>Dead-letter with the full error body</td></tr>
+</table>
+</div>
+
+<p>Write the three-level check as one function and use it everywhere:</p>
+
+<pre><code>// HTTP status → errors[] → userErrors[]. All three, every call.
+function classify(res, body) {
+  if (!res.ok)                                    return 'transient';
+  if (body.errors?.some(e => e.extensions?.code === 'THROTTLED'))
+                                                  return 'throttled';
+  if (body.errors?.length)                        return 'terminal';
+  const ue = findUserErrors(body.data);
+  if (ue.length)                                  return 'terminal';
+  return 'ok';
+}</code></pre>
+
+<p>And the speed limiter, which is prevention rather than recovery:</p>
+
+<pre><code>// throttleStatus arrives on SUCCESSES too. Use it to never be throttled.
+const { currentlyAvailable, restoreRate } = body.extensions.cost.throttleStatus;
+if (currentlyAvailable &lt; nextCost + MARGIN) {
+  await sleep(((nextCost - currentlyAvailable) / restoreRate) * 1000);
+}</code></pre>
+
+<p><b>Jitter is one line and prevents a second outage.</b> Without it, every job that failed at the same moment
+retries at the same moment, and your recovery reproduces the incident:</p>
+
+<pre><code>const delay = base * 2 ** attempt * (0.5 + Math.random() * 0.5);</code></pre>
+
+<h3>2 · The dead-letter, made readable</h3>
+
+<p>The <code>outbox_dead</code> table from A2.2, and the one column that matters:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Column</th><th>Why</th></tr>
+  <tr><td><code>error_code</code>, <code>error_body</code></td><td>The <em>actual</em> Shopify message, not your paraphrase</td></tr>
+  <tr><td><code>attempt</code></td><td>Distinguishes "tried once, terminal" from "tried eight times"</td></tr>
+  <tr><td><b><code>resolved_at</code></b></td><td><b>Makes it a work queue instead of a landfill.</b> Unresolved rows are a number you alert on</td></tr>
+</table>
+</div>
+
+<p>Then one endpoint: <code>GET /admin/dead-letters</code>, grouped by <code>error_code</code>. Grouping is what
+turns 900 failures into "three problems", which is the difference between a list and an action.</p>
+
+<h3>3 · The report — the three-way compare</h3>
+
+<div class="diagram">
+   Fake ERP        shadow            Shopify
+   (source)     (what we sent)     (what's there)
+       │              │                  │
+       ├── A ─────────┤                  │   source ≠ shadow  → WE ARE BEHIND
+       │              ├──── B ───────────┤   shadow ≠ Shopify → SOMEONE ELSE WROTE IT
+       └────── C ────────────────────────┘   source ≠ Shopify → conflict
+</div>
+
+<p>Compare by <b>consequence</b>, not everything: inventory and price nightly, existence nightly, text weekly.
+Read the Shopify side with a <b>bulk query</b>, not a paged loop — a nightly full compare is exactly what bulk
+operations are for.</p>
+
+<p>And the output rule: <b>always publish the denominator.</b></p>
+
+<div class="diagram">
+  BAD    "3 differences"                  ← out of how many?
+  BAD    "99.99% in sync"                 ← not actionable
+  GOOD   "compared 46,367 variants · 3 differences · here they are:
+            SK000412-M   price   shadow 24.99   shopify 19.99   → type B
+            SK001877-L   stock   shadow 4       shopify 0       → type B
+            SK003001-XS  price   source 12.50   shadow 11.00    → type A"
+</div>
+
+<p>Zero differences out of zero records looks exactly like a pass. Printing the denominator is the only thing
+that separates them.</p>
+
+<h3>4 · Now break it, deliberately, one at a time</h3>
+
+<p>This table is the actual deliverable of Step 4. Run each row, and write down what the report said.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>#</th><th>Cause</th><th>Expected</th><th>Report says</th></tr>
+  <tr><td>1</td><td><code>ERP_FAIL_MODE=down</code> mid-run</td><td>Retries, then dead-letter. Nothing lost</td><td>__________</td></tr>
+  <tr><td>2</td><td><code>ERP_FAIL_MODE=stale</code></td><td>You write an old value, then the next run corrects it</td><td>__________</td></tr>
+  <tr><td>3</td><td><code>ERP_FAIL_MODE=duplicate</code></td><td>No double-processing. Inbox rejects the second</td><td>__________</td></tr>
+  <tr><td>4</td><td><code>ERP_FAIL_MODE=price-mid-sync</code></td><td>An internally inconsistent batch, caught as type A</td><td>__________</td></tr>
+  <tr><td>5</td><td>Edit a price <b>in the Shopify admin</b></td><td><b>Type B.</b> shadow ≠ Shopify — someone else wrote it</td><td>__________</td></tr>
+  <tr><td>6</td><td>Delete a row in the ERP without a tombstone</td><td><b>Nothing happens</b> — and that is the finding</td><td>__________</td></tr>
+  <tr><td>7</td><td>Kill the sync mid-batch (<code>Ctrl-C</code>)</td><td>Re-run is harmless. Absolute writes</td><td>__________</td></tr>
+  <tr><td>8</td><td>Set the watermark to <code>now()</code> by hand</td><td>Rows silently skipped. The report is the only thing that notices</td><td>__________</td></tr>
+  <tr><td>9</td><td>Push hard enough to be throttled</td><td>The limiter should mean you never see <code>THROTTLED</code></td><td>__________</td></tr>
+  <tr><td>10</td><td>Send a product with 3 of its 5 variants</td><td><b>Two variants deleted.</b> Absolute must also mean complete</td><td>__________</td></tr>
+</table>
+</div>
+
+<p>Rows <b>6</b> and <b>8</b> are the important ones, because the expected result is <em>silence</em>. They are
+the two failures this whole Course keeps warning about, and feeling them is different from reading about
+them.</p>
+
+<h3>5 · The four numbers, on one page</h3>
+
+<div class="diagram">
+  GET /admin/health
+
+  queue depth ................ 0        ← rising and not falling = behind
+  unresolved dead-letters .... 3        ← a work list
+  rate-limit headroom (min) .. 812/1000 ← how close you got
+  reconciliation drift ....... 3 / 46,367 with the list
+                               └─ the ONLY one that measures correctness
+</div>
+
+<p>Alert on exactly two: unresolved dead-letters above a threshold, and drift above a threshold. Everything
+else is a dashboard. An alert that fires weekly and is always ignored trains people to ignore the channel.</p>
+
+<div class="recall">
+  <span class="label">Answer before you build</span>
+  Row 8: you set the watermark to <code>now()</code>, skipping a batch of real changes. Queue depth is zero, no
+  dead-letters, plenty of headroom, no errors anywhere. <b>Which of the four numbers moves?</b>
+</div>
+
+<p>Only <b>reconciliation drift</b>. The other three are all measuring <em>effort</em> — how much work you did
+and how well it went — and you did no work, perfectly. Drift is the only one comparing against reality, so it
+is the only one that can distinguish "nothing needed doing" from "we skipped everything".
+<br><br>
+That is why drift is the number you put in front of a client, and why "no errors this week" is not a status
+report. Run row 8 deliberately and watch three green numbers sit next to a broken sync — it is the most useful
+ten minutes in the Project.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — retrying terminal errors</span>
+  Eight attempts at something that can never succeed, spending the budget the valid records needed. If enough
+  bad records exist, you start failing good ones too — and those look broken as well.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — treating HTTP 200 as success</span>
+  Throttles, validation failures and partial successes all return 200 on GraphQL. One <code>classify()</code>
+  function, used everywhere, is the fix.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — no jitter</span>
+  Everything that failed together retries together. Your recovery causes the second spike, and nothing points
+  at you as the cause.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the unread dead-letter table</span>
+  Failures go somewhere, so the main path looks clean. Nobody looks. Alert on the count of <b>unresolved</b>
+  rows, not on the table existing.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a report with no denominator</span>
+  Zero out of zero is indistinguishable from a pass. Publish both numbers or the report proves nothing.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — auto-fixing every difference</span>
+  A type B difference means a human or another app wrote that field. Silently overwriting starts a fight where
+  your sync and a person take turns. Auto-fix only where ownership is unambiguous; queue the rest.
+</div>
+
+<div class="scar">
+  <span class="who">Comparing money as floats</span>
+  <code>10.10</code> and <code>10.1</code> are equal. A naive compare reports drift every single night, and a
+  report that cries wolf is worse than no report. Integer minor units, same currency.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — where to stop</span>
+  You could keep hardening this forever. The bar is the ten rows above passing and the report naming the
+  differences. Past that you are polishing, and the remaining gap is <b>real production pressure</b>, which you
+  cannot manufacture. Stop, and go and say you built it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">The one number that means "it works"</span>
+  <q>Every night we compare what we sent against what's actually in Shopify, field by field, for prices and
+  stock. The report says "we checked 46,367 values and found 3 differences, here they are". If I only told you
+  no errors had happened, that would sound reassuring and prove almost nothing — a sync that's stopped has no
+  errors either.</q>
+  <span class="why-said">Gives the number, the denominator, and pre-empts the weaker metric someone will
+  otherwise ask for.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 900 records did not sync</span>
+  <q>They were rejected, not delayed — each has a specific reason and I've grouped them into three problems
+  rather than 900 lines. I don't retry those, because they'd fail identically and use up the capacity the
+  working records need. Fix the three and they'll go through on the next run.</q>
+  <span class="why-said">Separates "failed" from "not tried yet", and turns a scary number into three
+  tasks.</span>
+</div>
+
+<div class="script">
+  <span class="who">Now that the Project runs — the sentence this Step buys you</span>
+  <q>I've built one end to end. It syncs a catalogue out and inventory back, and I deliberately broke it ten
+  different ways — stale data, duplicate messages, the other system down, a killed process mid-batch — to
+  check the report catches each one. What I haven't had is a real merchant's data wrong on a Monday morning
+  with someone on the phone. That's the part I can't manufacture.</q>
+  <span class="why-said">Specific enough that only someone who did it could say it, and it still names the
+  remainder honestly. That combination is the whole point of the Project.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Classify before retrying:</b> transient · throttled · terminal · poison. Only the first two are worth a retry.</li>
+  <li><b>One <code>classify()</code> function</b> checking HTTP status, <code>errors[]</code>, then <code>userErrors[]</code>.</li>
+  <li><b>Read <code>throttleStatus</code> on successes</b> and slow down before you are refused.</li>
+  <li><b>Jitter is one line</b> and prevents your recovery from causing the next outage.</li>
+  <li><b><code>resolved_at</code> makes the dead-letter a queue</b>, not a landfill. Group by error code.</li>
+  <li><b>Three-way compare, and always publish the denominator.</b> Zero out of zero looks like a pass.</li>
+  <li><b>Run all ten break-it rows.</b> Rows 6 and 8 are the ones where the expected result is silence.</li>
+</ul>
+<p class="one-thing">If you remember one thing: three of the four numbers measure effort — only reconciliation
+drift measures whether the data is right.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> When the ten rows pass, say <b>"review the project"</b> and I will read it as a
+  reviewer would — then we update <a href="../../room/lessons/0017-the-experience-gap-talking-about-what-you-have-not-built.html">R5.1</a>,
+  because the honest answer to "have you done this?" will have changed.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0025-step-3-webhooks-in-inventory-back.html">← Step 3</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

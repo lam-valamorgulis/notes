@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2.1 — Metafields, Definitions, and the Cost of Skipping Them</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 1</a></p>
+<p class="kicker">Track 1 · P2 · Lesson 1</p>
+<h1>Metafields, definitions, and the cost of skipping them</h1>
+<p class="subtitle">You can write a metafield without a definition. Almost everything then quietly stops working.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You can answer "can Shopify store this?" for almost anything a
+  client asks — and you will never again write a metafield without its definition.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does a platform do with a field it does not know about?</h3>
+
+<p>A metafield is a custom field on a Shopify resource. You can create one with a namespace, a key
+and a value, and it will be stored. Ask the first-principles question: <b>what can Shopify do with
+a value whose meaning it has never been told?</b></p>
+
+<p>Almost nothing. It cannot render an editor, because it does not know the type. It cannot validate,
+because it has no rules. It cannot offer it as a filter, because it does not know the values are
+comparable. So the value sits there, correct and inert.</p>
+
+<p>The <b>definition</b> is where you tell Shopify what the field means. That is the whole idea:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th></th><th>Without a definition</th><th>With a definition</th></tr>
+  <tr><td>Stored</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>Readable by API</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>Editable in the admin</td><td><b>No</b></td><td>Yes, with a proper editor</td></tr>
+  <tr><td>Validated</td><td><b>No</b></td><td>Yes, by type and rules</td></tr>
+  <tr><td>Usable for filtering, smart collections</td><td><b>No</b></td><td>Yes, via capabilities</td></tr>
+</table>
+</div>
+
+<p>Feynman version: <b>a metafield without a definition is a note in a language nobody has taught
+the building.</b> It is stored perfectly and useful to nobody but the code that wrote it.</p>
+
+<div class="note">
+  <span class="label">Found on a real store</span>
+  This Course sampled a live Plus store and found <b>169 metafield definitions</b> — 85 on products,
+  84 on variants. Every one reported <code>validationStatus: ALL_VALID</code>. So a well-run store
+  <em>does</em> define them. The failure mode below is what an integration does when nobody checks.
+</div>
+
+<h3>Four kinds of ownership, and you must know which you are writing</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Kind</th><th>Namespace</th><th>Who controls it</th></tr>
+  <tr><td><b>Merchant-owned</b></td><td>Any non-reserved, e.g. <code>custom</code></td><td>The merchant and every installed app</td></tr>
+  <tr><td><b>App-owned</b></td><td>The reserved <code>$app</code> (GraphQL) / <code>app</code> (TOML)</td><td>Your app. View-only in the admin by default</td></tr>
+  <tr><td><b>Shopify-reserved</b></td><td><code>shopify--</code> and standard definitions</td><td>Shopify controls the structure; the merchant owns the values</td></tr>
+  <tr><td><b>App-data</b></td><td>Tied to your app installation</td><td>Your app. <b>Completely hidden from the admin</b></td></tr>
+</table>
+</div>
+
+<p>The practical rule: put your app's own bookkeeping in the <b>app-reserved</b> namespace, so
+nothing else can change it. Put anything the merchant should edit in a <b>merchant-owned</b>
+namespace. And app-owned definitions can <em>only</em> be declared in the app-reserved namespace,
+which is deliberate — it lets Shopify guarantee the same shape on every shop your app is installed
+on.</p>
+
+<h3>The limits worth memorising</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Limit</th><th>Value</th></tr>
+  <tr><td>Most metafield types</td><td><b>64 KB</b> (65,536 bytes)</td></tr>
+  <tr><td><code>json</code></td><td><b>128 KB</b></td></tr>
+  <tr><td><code>id</code> and <code>url</code></td><td>2 KB</td></tr>
+  <tr><td>List types</td><td><b>128 items</b> — except metaobject references, <b>1,024</b></td></tr>
+  <tr><td>Single-line text predefined choices</td><td>128 values</td></tr>
+  <tr><td>Pinned definitions per resource type</td><td>50</td></tr>
+  <tr><td>Declarative (TOML) changes per deploy</td><td><b>25</b></td></tr>
+</table>
+</div>
+
+<p class="verified"><b>Verified 2026-08-23:</b> the four ownership kinds and their namespaces —
+<a href="https://shopify.dev/docs/apps/build/metafields">About metafields</a>. Size and list limits,
+pinned limit, and the Functions truncation below —
+<a href="https://shopify.dev/docs/apps/build/metafields/metafield-limits">Metafield limits</a>.
+The app-reserved-namespace constraint, the 25-changes-per-deploy cap, TOML definitions being
+read-only through the Admin API, and the capability support table —
+<a href="https://shopify.dev/docs/apps/build/metafields/definitions">Manage metafield definitions</a>.</p>
+
+<p class="verified disputed"><b>One number I could not settle.</b> The definitions page lists an
+app-scoped limit of <b>128</b> metafield definitions per owner type. The limits page says each app
+can create up to <b>256</b> per resource type, and the same for merchants. These may be describing
+declarative-versus-API definitions, but neither page says so. <b>Do not design against either
+number without testing it on your own store.</b> Reported here rather than resolved, because
+guessing which page is right is exactly how the variant-throttle mistake happened.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your integration writes a 40 KB JSON blob of product specifications into a metafield, and a
+  Shopify Function needs to read one value from it to apply a discount. It works in testing with
+  small products. <b>What happens on the real catalogue?</b>
+</div>
+
+<p>The Function receives <code>null</code>. <b>Shopify Functions input queries do not return
+metafield values larger than 10,000 bytes</b> — the value is still stored, and the Admin API still
+returns it in full, so every check you make from outside says the data is fine. Only the Function
+sees nothing, and only for large products. That is a size-dependent, silent, environment-specific
+failure: the worst combination available. Keep anything a Function reads well under 10 KB, and put
+the bulk elsewhere.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — writing metafields with no definitions</span>
+  Your integration writes them, the API reads them back, and every test passes. Then the merchant
+  cannot see or edit the data, it is not filterable, and nothing validates it. Months later the fix
+  means creating definitions <em>and</em> reconciling every existing value against the new type.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the 10,000-byte Function cliff</span>
+  As above. The value is stored, the Admin API returns it, and the Function gets <code>null</code>.
+  Small products work, big ones do not, and nothing logs anything.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — <code>analytics_queryable</code> in TOML</span>
+  Shopify's own documentation states that <code>capabilities.analytics_queryable</code> in
+  <code>shopify.app.toml</code> <b>deploys without an error but the capability is not set</b>. You
+  ask for a feature, the deploy succeeds, and you do not get it. Verify capabilities after deploy
+  rather than trusting a green deploy.
+</div>
+
+<div class="scar">
+  <span class="who">Mutating a declarative definition through the API</span>
+  Definitions declared in TOML are <b>read-only through the Admin API</b>. You can query them;
+  mutations return an error. If your code creates definitions at runtime and someone later moves
+  them to TOML, that code starts failing.
+</div>
+
+<div class="scar">
+  <span class="who">More than 25 definition changes in one deploy</span>
+  A hard cap. A big schema change has to be split across deploys, which matters when you planned a
+  single release.
+</div>
+
+<div class="scar">
+  <span class="who">Writing into a namespace you do not own</span>
+  <code>custom</code> is merchant-owned, so the merchant and every other app can change your
+  values. Fine for data the merchant should edit; wrong for your app's internal bookkeeping. Use
+  the app-reserved namespace for that.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — an id stored at the wrong level</span>
+  Verified on a real store: an external id written at <b>product</b> level actually identified only
+  <em>one</em> of that product's variants. Anything parsing it product-level matched that variant
+  and silently mismatched the others. Store an identifier at the level it identifies.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks "can Shopify store our custom product data?"</span>
+  <q>Yes, and there are two ways. Simple extra fields on a product — a care instruction, a fabric,
+  a supplier code — are straightforward. If the data has several parts that belong together, like a
+  size chart with rows and columns, that's a slightly different mechanism but still built in. What
+  I need from you is the list of fields and their types, because defining them properly up front is
+  what makes them editable and searchable later.</q>
+  <span class="why-said">Answers yes, distinguishes the two mechanisms without naming either, and
+  asks for the one input that prevents the expensive mistake.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you inherit an integration that skipped definitions</span>
+  <q>The data is all there, but it was saved without telling Shopify what it means — so your team
+  can't see or edit it in the admin, and it can't be used for filtering. Fixing it is
+  straightforward but not instant: we declare the fields properly, then check every existing value
+  matches the type we declared. I'd do it before adding anything new on top.</q>
+  <span class="why-said">Describes the symptom in the client's terms — "you can't see or edit it" —
+  rather than as a technical omission.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>A metafield without a definition is stored and inert.</b> Not editable, not validated, not filterable.</li>
+  <li><b>Four ownerships:</b> merchant-owned, app-owned (<code>$app</code>), Shopify-reserved (<code>shopify--</code>), and app-data (hidden from the admin).</li>
+  <li><b>App-owned definitions only exist in the app-reserved namespace.</b> That is what guarantees the same shape on every shop.</li>
+  <li><b>64 KB for most types, 128 KB for <code>json</code>, 128 list items</b> (1,024 for metaobject references).</li>
+  <li><b>Functions see <code>null</code> above 10,000 bytes.</b> Stored fine, API fine, Function blind.</li>
+  <li><b>TOML definitions are read-only via the Admin API</b>, and capped at 25 changes per deploy.</li>
+  <li><b><code>analytics_queryable</code> in TOML deploys silently without taking effect.</b> Verify capabilities after deploy.</li>
+</ul>
+<p class="one-thing">If you remember one thing: never write a metafield without its definition —
+the data will look fine and everything built on it will not work.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for when data does not belong on the product at all.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0003-api-versioning-and-the-quarterly-upgrade.html">← P1.3</a></span>
+  <span><a href="0005-metaobjects-and-when-data-does-not-belong-on-the-product.html">P2.2 · Metaobjects →</a></span>
+</div>
+
+</div>
+</body>
+</html>

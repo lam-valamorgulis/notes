@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A4.4 — Identifier Mapping and the Mapping Registry</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A4 · Lesson 4</p>
+<h1>Identifier mapping and the mapping registry</h1>
+<p class="subtitle">Their id, your id, Shopify's id. This is where syncs die.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A matching strategy that survives a product being renamed, a
+  variant being re-created, and a vendor changing their SKU format — plus the one metric that
+  tells you whether your mapping is actually any good.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does "the same product" even mean?</h3>
+
+<p>Two systems each hold a record. You claim they are the same thing. On what basis? Every sync
+answers this, and most answer it badly by accident.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Match on</th><th>Survives?</th><th>Fails when</th></tr>
+  <tr><td>Title</td><td><b>No</b></td><td>Anyone edits a word. Two products share a name</td></tr>
+  <tr><td>Handle</td><td><b>No</b></td><td>The title changes and the handle is regenerated</td></tr>
+  <tr><td>SKU</td><td>Mostly</td><td>The vendor changes format, or reuses a retired SKU</td></tr>
+  <tr><td>Barcode</td><td>Mostly</td><td>Blank on many products; shared across variants</td></tr>
+  <tr><td>Shopify's numeric id</td><td>Yes, until it changes</td><td><b>Variant ids are destroyed and recreated by some edits</b></td></tr>
+  <tr><td><b>A stored mapping</b></td><td><b>Yes</b></td><td>You lose the table</td></tr>
+</table>
+</div>
+
+<p>The conclusion is unavoidable: <b>never derive identity, store it.</b> Matching on any
+attribute means identity depends on data that people are allowed to edit. A stored mapping means
+identity is a fact you own.</p>
+
+<h3>The variant-id trap</h3>
+
+<p>This one catches almost everyone. Changing a product's <b>option</b> structure can delete and
+recreate its variants — which means new variant ids. Anything holding the old ids now points at
+nothing, silently.</p>
+
+<p>So your mapping must key variants on something stable across that operation. In practice: the
+source system's own variant key, held in your registry, with the Shopify id treated as a
+<em>cached</em> value that may need re-resolving rather than a permanent truth.</p>
+
+<h3>Hub, not pairwise — and the reason</h3>
+
+<div class="diagram">
+  PAIRWISE                       HUB
+  erp_id ↔ shopify_id            erp_id ─┐
+  erp_id ↔ market_id                     ├─▶ local_id ◀─┬─ shopify_id
+  shopify_id ↔ market_id                 │              └─ market_id
+  ...                            pos_id ─┘
+
+  n systems → n(n-1)/2 links     n systems → n links
+  3 systems → 3 links            adding one = an INSERT
+  5 systems → 10 links           not a migration
+</div>
+
+<p>Your own id in the middle. This is the <code>id_map</code> table from A2.2, and both unique
+constraints matter: one external id must not map to two locals, and one local must not map to two
+external ids in the same system. Only writing the first is the usual mistake, and it lets one
+product acquire two Shopify records.</p>
+
+<h3>Let Shopify hold the mapping too</h3>
+
+<p>A stored mapping in your database is authoritative, but writing the source's id into Shopify as
+well is cheap and pays for itself. It gives you a mapping that survives losing your database, and
+it lets a human in the admin answer "what is this in the ERP?".</p>
+
+<p>Shopify supports upserting by an identifier rather than by its own id, which lets you write and
+match without a lookup round trip:</p>
+
+<pre><code>mutation UpsertByCustomId($input: ProductSetInput!, $identifier: ProductSetIdentifiers!) {
+  productSet(input: $input, identifier: $identifier) {
+    product { id handle }
+    userErrors { field message code }
+  }
+}</code></pre>
+
+<p class="verified"><b>Validated against the 2026-07 Admin schema on 2026-08-23</b> —
+<code>productSet</code> accepts an <code>identifier</code> argument of type
+<code>ProductSetIdentifiers</code>. Required scopes: <code>write_products</code>,
+<code>read_products</code>. Check the current field names in GraphiQL on your own store before
+building against it; identifier support differs by resource type, and it is broader for lookup
+than for create-or-update.</p>
+
+<div class="note">
+  <span class="label">Found on a real store</span>
+  A live integration this Course sampled wrote its external ids into product metafields — but the
+  <b>product-level</b> id corresponded to only <em>one</em> of the variants. Parsing it at product
+  level therefore matched that variant and silently mismatched every other. If you store an
+  external id, store it at the level it actually identifies.
+</div>
+
+<h3>The metric that tells you if your mapping is good</h3>
+
+<p>Coverage as a percentage of rows is misleading. Weight it by something that matters:</p>
+
+<div class="diagram">
+  "97% of 50,000 SKUs are mapped"     sounds excellent
+   → 1,500 unmapped products           invisible on the storefront
+
+  weight by SALES instead:
+  "we cover 99.4% of units sold"       and name the gap
+   → the 1,500 include your 3 bestsellers?  then it is a bad number
+</div>
+
+<p>Report both: coverage by row, and coverage weighted by units sold. A gap in the long tail is a
+nuisance. A gap in a bestseller is an emergency, and a row-count percentage cannot tell them
+apart.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  You match on SKU. A vendor retires <code>ABC-100</code>, then eighteen months later reuses the
+  same SKU for a different product. <b>What happens, and when do you notice?</b>
+</div>
+
+<p>Your registry still holds a mapping for <code>ABC-100</code>, so the new product updates the
+<b>old</b> Shopify product — new title, new price, on a page that has the old product's URL,
+reviews and history. Nothing errors, because from the sync's point of view a mapped record was
+updated normally. You notice when a customer buys the wrong thing, or never. The defence is a
+tombstone on retirement plus a rule that a mapping for a retired key is not reusable — the new
+row needs a new local id. This is why deletions from A3.3 and identity are the same problem.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — a reused SKU</span>
+  The scenario above. A new product silently overwrites an old one on its existing URL. Tombstone
+  retired keys and refuse to reuse a mapping.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — matching on title or handle</span>
+  A marketer fixes a typo. Your next run cannot find the product, creates a duplicate, and both
+  are now live. Sales split, inventory splits, and reconciliation reports drift on both.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the recreated variant id</span>
+  A product option change destroys and recreates variants. Your cached Shopify variant ids point
+  nowhere. Writes fail or, worse, silently target nothing. Treat the Shopify id as a cache and be
+  able to re-resolve it.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a product-level id that identifies one variant</span>
+  Verified on a real store. Parsing it product-level matches one variant and mismatches the rest,
+  with no error at any layer. Store an identifier at the level it identifies.
+</div>
+
+<div class="scar">
+  <span class="who">Only one unique constraint</span>
+  Guard both directions or a single local record acquires two Shopify products. You find out by
+  seeing duplicates in the admin, which is a bad way to find out.
+</div>
+
+<div class="scar">
+  <span class="who">Coverage measured by row count</span>
+  97% sounds like a pass and hides 1,500 invisible products, possibly including bestsellers.
+  Always report coverage weighted by units sold alongside the row percentage.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — blank and shared barcodes</span>
+  Barcode looks like a natural key and is frequently blank, and sometimes shared across variants
+  of one product. A unique index on it will fail at import time on a real catalogue. Verify
+  uniqueness on the client's actual data before designing around it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Before building, asking about identity</span>
+  <q>I need one thing that never changes for a product. Not the name — those get edited. Something
+  like a product code that stays the same for the life of the product. And one important question:
+  do you ever reuse a code after discontinuing something? Because if so I need to handle that, or
+  a new product will overwrite an old one.</q>
+  <span class="why-said">Asks for the stable key and pre-empts the reuse trap in the same breath.
+  Most clients have never been asked the second question.</span>
+</div>
+
+<div class="script">
+  <span class="who">When 1,500 products are unmapped</span>
+  <q>We're matching 97% of your catalogue, but I'd rather show you it differently: those 1,500
+  unmatched products include four of your top sellers, so it's more serious than 3% sounds. Here's
+  the list — they mostly have blank product codes, so I need those filled in or a rule for what to
+  do without one.</q>
+  <span class="why-said">Refuses to let a comfortable percentage stand, and hands over a concrete
+  action rather than a problem.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Never derive identity, store it.</b> Matching on any editable attribute makes identity fragile.</li>
+  <li><b>Titles and handles are not keys.</b> They change, and handles regenerate.</li>
+  <li><b>Treat Shopify ids as a cache.</b> An option change can destroy and recreate variant ids.</li>
+  <li><b>Hub, not pairwise.</b> Your id in the middle: <em>n</em> links, and a new system is an insert.</li>
+  <li><b>Both unique constraints</b>, or one record acquires two Shopify products.</li>
+  <li><b>Write the external id into Shopify too</b>, at the level it actually identifies.</li>
+  <li><b>Report coverage weighted by units sold</b>, not only by row count. And tombstone retired keys.</li>
+</ul>
+<p class="one-thing">If you remember one thing: identity is something you record, never something
+you compute — and a reused key is the quietest disaster in this trade.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the vendor who will not give you an API at all.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0018-the-vendor-stock-feed-connector-csv-and-sftp.html">← A4.3</a></span>
+  <span><a href="0020-when-the-vendor-will-not-give-you-an-api.html">A4.5 · No API →</a></span>
+</div>
+
+</div>
+</body>
+</html>

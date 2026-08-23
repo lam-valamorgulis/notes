@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2.6 — Agile Delivery as a Senior</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R2 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Agile delivery as a senior</h1>
+<p class="subtitle">Standups, sprints, and what a senior is actually expected to do in them.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> You know what changes about ceremonies when you are senior — and it is
+  not "attend them better".</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what is a ceremony for?</h3>
+
+<p>Every ritual exists to move information. Ask what information, and to whom, and the right behaviour
+follows — including when to break the ritual.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Ceremony</th><th>Exists to move</th><th>A senior's job in it</th></tr>
+  <tr><td>Standup</td><td><b>Blockers</b>, to whoever can clear them</td><td>Surface risk early. Notice who is stuck and not saying so</td></tr>
+  <tr><td>Planning</td><td>Shared understanding of what and why</td><td>Push back on work that is not ready. Split anything too big</td></tr>
+  <tr><td>Review / demo</td><td>Evidence to the people who asked</td><td>Show it working, including what does not</td></tr>
+  <tr><td>Retro</td><td>A change, not a feeling</td><td>Turn one complaint into one owned action</td></tr>
+</table>
+</div>
+
+<p>The pattern: a junior <em>participates</em> in ceremonies; a senior <b>makes them produce their
+output</b>. A retro that ends with everyone feeling heard and nothing changing has failed, and it is the
+senior person's job to notice.</p>
+
+<h3>Standup: two sentences, and one of them matters</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Weak</th><th>Strong</th></tr>
+  <tr><td>"Yesterday I worked on the sync. Today I'll continue."</td><td>"The delta load works. Today I'm on inventory write-back. I'm blocked on the ERP credentials — chased Tuesday, still nothing."</td></tr>
+</table>
+</div>
+
+<p>The blocker is the only line with information in it. Say it every day it is true, dated. <b>A blocker
+mentioned once becomes your fault; a blocker repeated daily becomes a shared fact.</b> Repetition is the
+mechanism, not nagging.</p>
+
+<p>And the senior addition: notice who else is stuck. Someone saying "still working on it" for three days
+is a person who needs help and cannot ask. Asking them afterwards — not in the standup — is one of the most
+valuable things you will do that week.</p>
+
+<h3>Planning: the two words that make you useful</h3>
+
+<p><b>"Not ready."</b> A ticket with an unanswered load-bearing question is not estimable, and estimating
+it anyway is how a sprint becomes fiction. Say what is missing and what would make it ready.</p>
+
+<p>The counterpart is splitting. Integration work splits naturally along the flow:</p>
+
+<div class="diagram">
+  too big:  "sync products with the ERP"
+
+  split:    1. read from the ERP, log what we'd write   ← provable, safe
+            2. write titles and prices, one direction
+            3. inventory back the other way
+            4. reconciliation report
+            5. failure handling and the dead-letter
+
+  each one is demonstrable on its own.
+</div>
+
+<p>Step 1 is the move worth learning: <b>a read-only slice that logs its intentions</b>. It proves the
+hardest part — that you can get the data and understand it — without writing anything to a live store.
+Cheap, safe, and it de-risks everything after it.</p>
+
+<h3>Demo what does not work, too</h3>
+
+<p>Show the failure handling working. Break the ERP on purpose and let the audience watch the retry, the
+dead-letter and the report. That demo builds more confidence than any number of green screens, because it
+is the only evidence that the system has been thought about past the happy path.</p>
+
+<h3>Retro: one action with a name on it</h3>
+
+<p>Five complaints and no owner is a worse outcome than one complaint with a name and a date. If you can
+only get one thing out of a retro, get that. <b>Volunteer to own it yourself</b> when the room goes
+quiet — a senior taking one action makes the next retro produce two.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A ticket says "Sync products with the ERP", sized at three days by someone who has not seen the ERP's
+  API. <b>What do you say in planning?</b>
+</div>
+
+<p>That it is not ready, and exactly why. <b>"I can't size this yet. Two things decide it: whether their
+API can tell us what changed since a timestamp, and who owns product descriptions. If the API can do it,
+it's around three days. If it can't, it's more like eight, because we'd compare full lists every night.
+I can find out in an hour with their docs."</b>
+<br><br>
+Then split it. Take the read-only slice into this sprint — read from the ERP, log what we <em>would</em>
+write, change nothing. That is genuinely three days, it is provable at review, and it answers both
+questions as a side effect.
+<br><br>
+Notice what you have done: you refused a fictional estimate, gave a real range with its cause, and still
+put demonstrable work in the sprint. That combination is what "senior" means in a planning meeting.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — estimating an unready ticket</span>
+  The number goes in the plan, the unknown resolves the expensive way, and the sprint misses. Saying "not
+  ready" costs one uncomfortable minute.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — a blocker mentioned once</span>
+  Raised in week one, dropped, and by week six the delay is attributed to you. Repeat it daily, with the
+  date you last chased it.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — "still working on it" for three days</span>
+  Someone is stuck and cannot say so. Standup gives no signal because the words are the same each day.
+  Notice the repetition, and ask them privately.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the retro that produces feelings</span>
+  Everyone is heard, nothing changes, and the same complaint returns next month. Without one named owner
+  and one date, the meeting was a conversation.
+</div>
+
+<div class="scar">
+  <span class="who">A ticket that cannot be demonstrated</span>
+  "Set up the database schema" produces nothing anyone can see, so progress is invisible and unverifiable.
+  Slice along the flow, so every slice does something end to end.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — do not enforce process on someone else's team</span>
+  If you are the contractor or the new senior, arriving with opinions about their ceremonies spends
+  credibility on the least important thing available. Do the two behaviours that matter — clear blockers,
+  refuse unready work — and let the rituals be theirs.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Standup, with a blocker</span>
+  <q>Delta load is working end to end. Today I'm on inventory write-back. Still blocked on the ERP
+  credentials — I chased on Tuesday, nothing yet. If they land tomorrow the date holds; after that it
+  starts moving.</q>
+  <span class="why-said">Progress, plan, blocker, and the consequence of the blocker. Four clauses and the
+  last one is what gets it acted on.</span>
+</div>
+
+<div class="script">
+  <span class="who">Refusing an unready ticket</span>
+  <q>I don't want to put a number on this one yet — it'd be a guess and it'd end up in the plan. What I can
+  do this sprint is the read-only half: pull their data, log exactly what we'd change, write nothing. That's
+  three days I'm confident about, it's demonstrable, and it answers the two questions that decide the rest.</q>
+  <span class="why-said">Refuses and immediately offers something valuable of the same size. Almost
+  impossible to argue with, and it keeps the sprint full.</span>
+</div>
+
+<div class="script">
+  <span class="who">At the demo</span>
+  <q>Before I show you it working, I want to show you it failing. I'm going to turn the ERP off mid-sync.
+  You'll see it retry, then give up on the ones that can't work, and then the report tells us exactly which
+  records need attention. That's the part I'd want to see if I were you.</q>
+  <span class="why-said">Demonstrating failure handling is the single most confidence-building thing you can
+  do in a review, and almost nobody does it.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Every ceremony exists to move information.</b> A senior makes it produce its output.</li>
+  <li><b>Standup is for blockers.</b> Repeat them daily, dated, with the consequence.</li>
+  <li><b>Notice who is quietly stuck.</b> Three days of "still working on it" is a signal.</li>
+  <li><b>"Not ready" is the most useful thing you can say in planning</b> — with what is missing.</li>
+  <li><b>Split along the flow, and lead with a read-only slice</b> that logs its intentions.</li>
+  <li><b>Demo the failure handling.</b> It builds more confidence than green screens.</li>
+  <li><b>One retro action with a name and a date</b> beats five complaints. Volunteer to own it.</li>
+</ul>
+<p class="one-thing">If you remember one thing: refuse to estimate what is not ready, and offer a
+read-only slice instead — you keep the sprint honest and full at the same time.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter R2 done.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0009-build-vs-buy-lock-in-and-the-exit.html">← R2.5</a></span>
+  <span><a href="../index.html">Track 3 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

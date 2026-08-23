@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A4.6 — Worked Example: Integrating a Stock-Availability SaaS</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A4 · Lesson 6 · <span class="pill depth">depth</span></p>
+<h1>Worked example: integrating a stock-availability SaaS</h1>
+<p class="subtitle">One integration end to end, using stockinstore as the concrete case.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> One complete integration you can describe from discovery to
+  rollout — with the two places it is genuinely hard, and the answer to "should we build this
+  ourselves?"</div>
+
+<div class="note">
+  <span class="label">Why a named vendor here</span>
+  <a href="https://www.stockinstore.com/">stockinstore</a> is a public commercial product, so
+  naming it costs nobody anything — unlike a client's own systems. It is used here as a concrete
+  example of a whole product category: Find in Store, store locator, click-and-collect, and ship
+  from store.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>What the category does</h3>
+
+<p>A retailer has physical shops and a Shopify store. Customers want to know whether a specific
+size is in a specific shop, reserve it, or have it shipped from the nearest one. Shopify alone
+models inventory per location — so why buy a product for this at all?</p>
+
+<p>First-principles answer: <b>Shopify tells you how many. The category answers "where, and can I
+have it?"</b> That means a store locator with opening hours, availability presented per shop, a
+pickup flow with reservation, and allocation logic deciding which shop fulfils a shipment. Shopify
+gives you the numbers; almost none of the rest.</p>
+
+<h3>Which of the four shapes is it?</h3>
+
+<p>All four at once, which is what makes it a good worked example:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Shape</th><th>Here</th><th>Timing</th></tr>
+  <tr><td>1 Catalogue in</td><td>Products and locations pushed to the vendor</td><td>Daily is fine</td></tr>
+  <tr><td>4 State both ways</td><td>Inventory per location, continuously</td><td>Minutes</td></tr>
+  <tr><td>3 Decision during</td><td>"Is this in stock near me?" on a product page and in checkout</td><td><b>Milliseconds</b></td></tr>
+  <tr><td>2 Event out</td><td>A pickup order going back so the shop knows to pick it</td><td>Seconds</td></tr>
+</table>
+</div>
+
+<h3>Discovery: the questions that decide the project</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Question</th><th>Why it decides things</th></tr>
+  <tr><td>How many shops, and does each have a Shopify location?</td><td>No location means no per-shop inventory. That is a Shopify configuration project first</td></tr>
+  <tr><td>Is the shop's stock in Shopify, or only in a POS?</td><td>If only in a POS, you have a second integration before this one starts</td></tr>
+  <tr><td>Is the number sellable stock or everything on the shelf?</td><td>The overselling question from A3.2. Ask before agreeing to anything</td></tr>
+  <tr><td>Does pickup <b>reserve</b> stock, or just inform?</td><td>Reserving is a promise. Informing is not. This is the fail-open/fail-closed line</td></tr>
+  <tr><td>What is their p99 latency and uptime?</td><td>Shape 3 lives inside a customer's page load</td></tr>
+  <tr><td>What identifier do they match on?</td><td>Their key, your key, Shopify's key — A4.4 all over again</td></tr>
+</table>
+</div>
+
+<h3>The two genuinely hard parts</h3>
+
+<h4>1 · The storefront read path</h4>
+
+<p>A customer on a product page asks "is this near me?" That request is synchronous, on a page a
+customer is waiting for, and it depends on a third party.</p>
+
+<div class="diagram">
+  product page → "in stock near me?" → vendor API → render
+
+  budget: a few hundred ms, or the customer scrolls past
+  vendor down → show WHAT?
+</div>
+
+<p>Apply the heuristic from A4.1: <b>fail open on information, fail closed on a promise.</b>
+Availability display is information — if the vendor is slow or down, <b>hide the panel</b>. Never
+block the page and never guess a number. A missing badge is invisible; a wrong badge sends someone
+to a shop for nothing.</p>
+
+<p>Then: cache, and cache with an honest label. A short cache is fine for "in stock at this shop"
+if the page says "checked a few minutes ago". A cache with no label reads as a live promise.</p>
+
+<h4>2 · Click and collect is a promise, so it must fail closed</h4>
+
+<p>Reservation is different in kind. You are telling a customer an item is waiting for them.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>If the vendor is down at…</th><th>Do</th></tr>
+  <tr><td>Browsing — the availability panel</td><td><b>Fail open.</b> Hide it. No harm done</td></tr>
+  <tr><td>Checkout — choosing pickup</td><td><b>Fail closed.</b> Remove pickup as an option rather than accept a reservation you cannot confirm</td></tr>
+  <tr><td>After the order — notifying the shop</td><td><b>Queue and retry.</b> This is shape 2, asynchronous</td></tr>
+</table>
+</div>
+
+<p>Three different answers for one vendor being down, decided by what you are promising at each
+moment. That table <em>is</em> the design.</p>
+
+<h3>Rollout: by shop, not by feature</h3>
+
+<div class="diagram">
+  1. one shop, staff only, display OFF        prove the data is right
+  2. one shop, display ON                     prove the read path
+  3. one shop, pickup ON                      prove the promise
+  4. a cohort of shops                        pick DIFFERENT ones — busy, quiet, odd POS
+  5. all shops
+</div>
+
+<p>Cohort by <b>variety</b>, not by convenience. The shop with the unusual POS or the one that
+counts stock weekly is the one that will find your bugs. Rolling out to five similar shops proves
+almost nothing.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Their availability API takes 900 ms at p99. The client wants the in-stock badge on every product
+  card in a collection grid — 24 cards per page. <b>What do you say?</b>
+</div>
+
+<p>Not that way. Twenty-four synchronous calls at 900 ms will either block the page or arrive after
+the customer has scrolled away, and it multiplies your load on the vendor by 24. Three better
+options: fetch availability for the whole page in <b>one batched call</b> if they support it; load
+badges <b>after</b> the page renders, so a slow vendor delays only the badges; or show availability
+only on the product page, where the customer has actually chosen something. Recommend the third
+plus the second — and note that "the badge everywhere" is a design request whose cost lives
+entirely in someone else's latency.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — reserving stock you cannot confirm</span>
+  Accepting a pickup order while the vendor is unreachable means promising an item that may not be
+  there. The customer drives to the shop. That is worse than losing the sale, because it costs the
+  client the customer.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — shelf stock treated as sellable</span>
+  Damaged units, held items and display stock are on the shelf and not for sale. Publish the shelf
+  number as availability and you send people to collect things that are not available.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a cache with no label</span>
+  Five-minute-old availability shown as if live. Nothing errors and the number is usually right.
+  When it is wrong, a customer has made a journey. Label the freshness on the page.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a shop with no Shopify location</span>
+  Shopify cannot express per-shop inventory for a shop that is not a location. Availability for it
+  is silently absent, which looks like "out of stock everywhere". Audit locations against real
+  shops during discovery.
+</div>
+
+<div class="scar">
+  <span class="who">Synchronous third-party calls in a collection grid</span>
+  As above. Latency multiplied by the number of cards, on a page the customer is watching. Batch
+  it, defer it, or move it to the product page.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — the vendor's plan gates matter too</span>
+  A vendor's own product tiers can require a particular Shopify plan for some features while others
+  work on any plan. So "does this need Plus?" can have a different answer per feature. Confirm it
+  with the vendor per feature, in writing, before you scope.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">Build versus buy, when asked</span>
+  <q>You could build it, and the inventory part isn't the hard bit — Shopify already tracks stock
+  per location. What you'd be building is the store locator, the pickup flow, the reservation
+  logic, and the shop-facing screens, then maintaining them forever. Buying gets you that on day
+  one. I'd buy it, and keep the ability to leave: our data stays ours, and the integration is one
+  module we could point elsewhere.</q>
+  <span class="why-said">Recommends buying without pretending it is free, and names the exit — the
+  question a client should ask and usually does not.</span>
+</div>
+
+<div class="script">
+  <span class="who">When asked what happens if the vendor has an outage</span>
+  <q>Three different things, depending on what we're promising at that moment. Browsing: the
+  in-stock panel just disappears, and nobody notices. Checkout: pickup stops being offered, because
+  I won't promise an item I can't confirm. And orders already placed queue up and send when they're
+  back. The rule is that we hide information but we never make a promise we can't keep.</q>
+  <span class="why-said">One memorable rule with three concrete consequences. This answer gets
+  repeated back to you in later meetings, which is how you know it worked.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client wants to launch to all 40 shops at once</span>
+  <q>I'd rather do one shop with the display switched off first, so we can check the numbers
+  against what's actually on the shelf without any customer seeing it. Then one shop live, then a
+  handful — and I'd pick your most awkward ones deliberately, because those are where we'll find
+  the problems. All 40 at once means finding them everywhere simultaneously.</q>
+  <span class="why-said">Argues for a staged rollout by naming what each stage proves, rather than
+  by appealing to caution.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Shopify tells you how many; this category answers "where, and can I have it?"</b></li>
+  <li><b>It is all four shapes at once</b>, which is why it is a good worked example.</li>
+  <li><b>Fail open on information, fail closed on a promise.</b> One vendor outage, three different answers.</li>
+  <li><b>Availability display: hide it when the vendor is down.</b> Pickup at checkout: withdraw the option.</li>
+  <li><b>Label cache freshness on the page.</b> An unlabelled cache reads as a live promise.</li>
+  <li><b>Audit shops against Shopify locations in discovery.</b> No location means no per-shop stock.</li>
+  <li><b>Cohort by variety, not convenience.</b> The awkward shop finds the bugs.</li>
+</ul>
+<p class="one-thing">If you remember one thing: decide what you are promising at each moment —
+that single question produces the whole failure design.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter A4 is done, and with it all of Track 2's reading.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0020-when-the-vendor-will-not-give-you-an-api.html">← A4.5</a></span>
+  <span><a href="../index.html">Track 2 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

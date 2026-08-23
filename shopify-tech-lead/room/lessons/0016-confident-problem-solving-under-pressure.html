@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R4.2 — Confident Problem-Solving Under Pressure</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t3">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 3</a></p>
+<p class="kicker">Track 3 · R4 · Lesson 2 · <span class="pill depth">depth</span></p>
+<h1>Confident problem-solving under pressure</h1>
+<p class="subtitle">Debugging while someone watches. The method is the confidence.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A fixed debugging sequence you narrate out loud — so being watched makes
+  you look methodical instead of making you rush.</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does the watcher actually judge?</h3>
+
+<p>Not whether you find it quickly. They cannot tell how hard the bug is. What they can see is <b>whether
+you have a method or are guessing</b> — and guessing is visible immediately, because a guesser jumps between
+unrelated hypotheses.</p>
+
+<p>So confidence under pressure is not a personality trait to acquire. It is <b>a visible sequence</b>, and
+the sequence is what you practise.</p>
+
+<div class="diagram">
+  1. REPRODUCE     "let me make it happen again"
+  2. NARROW        halve the search space. say which half.
+  3. HYPOTHESIS    one, stated out loud, with a test
+  4. TEST          the cheapest test that could disprove it
+  5. FIX           and say what class of bug it was
+</div>
+
+<h3>Narrate every step</h3>
+
+<p>Silence while you think looks like being stuck. Narrating turns the same thinking into a demonstration:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Step</th><th>Say</th></tr>
+  <tr><td>Reproduce</td><td>"First I want to see it happen. Can you tell me the exact product and time?"</td></tr>
+  <tr><td>Narrow</td><td>"Two possibilities: we sent the wrong value, or we sent the right one and something changed it after. Our log tells us which — so that's the first thing to check."</td></tr>
+  <tr><td>Hypothesis</td><td>"My guess is the watermark. If that's right, we'd expect a gap in the records around that timestamp — let's look."</td></tr>
+  <tr><td>Test</td><td>"That would rule it out cheaply, so let's do that before the harder check."</td></tr>
+  <tr><td>Fix</td><td>"This is the same class as the one last month — a value we trusted that we should have re-read."</td></tr>
+</table>
+</div>
+
+<p>Step 2 is the one that reads as senior. <b>Splitting the problem in half out loud</b> shows you are
+reducing a search space rather than trying things. That single sentence changes how the rest of the session
+is perceived.</p>
+
+<h3>The three sentences that buy you room</h3>
+
+<div class="script">
+  <span class="who">Drill these</span>
+  <q>Before I guess, let me check one thing.</q><br>
+  <q>I don't know yet. Here's how I'd narrow it down.</q><br>
+  <q>Two possibilities. Let me rule out the cheap one first.</q>
+  <span class="why-said">All three replace a silence or a guess with a visible method. The third is the most
+  useful and the most reusable.</span>
+</div>
+
+<h3>What to do when you are genuinely stuck</h3>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Do</th><th>Not</th></tr>
+  <tr><td>Say what you have ruled out</td><td>Keep trying things silently</td></tr>
+  <tr><td>Ask for the thing you are missing — a log, an example, access</td><td>Work around the gap and hope</td></tr>
+  <tr><td>Say "I'd like twenty minutes on my own with this"</td><td>Debug badly with an audience</td></tr>
+  <tr><td>Offer a mitigation while you investigate</td><td>Leave it broken while you look for the cause</td></tr>
+</table>
+</div>
+
+<p>That last row is the tech-lead move. <b>Separating "stop the bleeding" from "find the cause" is a senior
+instinct</b>, and saying it out loud is worth more than the fix — because it shows you know the client's
+priority is not your curiosity.</p>
+
+<h3>Under real pressure: what you refuse</h3>
+
+<ul>
+  <li><b>No untested change to production</b>, however small and however urgent it feels.</li>
+  <li><b>No fix you cannot explain.</b> If you do not know why it works, you do not know what else it did.</li>
+  <li><b>No skipping the reproduction.</b> A fix for a bug you never reproduced is a guess with a
+      deployment.</li>
+  <li><b>No debugging at 2am if it can wait until 8am.</b> Mitigate, sleep, fix properly.</li>
+</ul>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A client is on a call. Stock is wrong on about two hundred products and they want it fixed now. <b>What are
+  your first two sentences?</b>
+</div>
+
+<p>Something close to: <b>"First, let's stop it getting worse — I'm going to pause the sync so nothing else
+gets overwritten while we look. Then: can you give me two product codes that are wrong, so I can see it
+happen rather than guess?"</b>
+<br><br>
+Two sentences, two moves. <b>Mitigate, then reproduce.</b> Pausing the sync is the "stop the bleeding" step,
+and it buys you the thing you most need — time to work properly. Asking for two specific examples starts the
+method and also gently converts the client from a spectator into a participant.
+<br><br>
+What you did not do: start theorising about the cause on the call. You have no evidence yet, and a wrong
+theory said out loud to a worried client is expensive to retract.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — an untested change under pressure</span>
+  The urgency is real and the change is still untested. This is how a wrong stock number becomes a wrong stock
+  number plus an outage.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — investigating while it keeps breaking</span>
+  Every minute spent on root cause is a minute of continued damage. Mitigate first — pause the job, roll back,
+  hide the feature — then investigate.
+</div>
+
+<div class="scar">
+  <span class="who">Theorising out loud with no evidence</span>
+  A confident wrong theory told to an anxious client is repeated to their team and then has to be retracted.
+  Say "two possibilities" instead of naming one.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — a fix you cannot explain</span>
+  It stops the symptom and you do not know why. So you do not know what else changed, and the same cause
+  resurfaces somewhere else later, looking unrelated.
+</div>
+
+<div class="scar">
+  <span class="who">Silent thinking with an audience</span>
+  Identical thinking, opposite impression. Narrate, or you look stuck while doing good work.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — you are allowed to ask for the room</span>
+  "Give me twenty minutes on my own and I'll come back with something" is a completely acceptable thing to say,
+  and it produces a better outcome than an hour of watched flailing. Very few people say it.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">First response to a live problem</span>
+  <q>Let's stop it getting worse first — I'll pause the sync so nothing else gets overwritten. Then give me two
+  product codes that are wrong and I'll trace exactly what we sent and when. I'd rather see it than guess at
+  it.</q>
+  <span class="why-said">Mitigation, then method, in two sentences. It also converts the client into someone
+  supplying evidence rather than watching.</span>
+</div>
+
+<div class="script">
+  <span class="who">Mid-investigation, asked "what's causing it?"</span>
+  <q>Two possibilities and I don't want to guess between them yet. Either we sent the wrong value, or we sent
+  the right one and something else changed it afterwards — and our record of what we sent will tell us which.
+  Ten minutes.</q>
+  <span class="why-said">Refuses to name a cause, shows the method, and gives a time. All three reduce the
+  client's anxiety more than a confident guess would.</span>
+</div>
+
+<div class="script">
+  <span class="who">Asking for the room</span>
+  <q>Give me twenty minutes on my own with this and I'll come back with either a cause or a much better
+  question. It's paused, so nothing's getting worse while I do.</q>
+  <span class="why-said">Names what you will return with — including the honest possibility that it is a better
+  question. And it reminds them the bleeding has stopped.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Confidence is a visible sequence:</b> reproduce · narrow · hypothesis · test · name the class.</li>
+  <li><b>Narrate every step.</b> Silent thinking looks like being stuck.</li>
+  <li><b>"Two possibilities — let me rule out the cheap one first"</b> is the sentence that reads as senior.</li>
+  <li><b>Mitigate before you investigate.</b> Stop the bleeding, then find the cause.</li>
+  <li><b>Never name a cause without evidence.</b> A retracted theory is expensive.</li>
+  <li><b>No untested production change, no fix you cannot explain, no skipping the reproduction.</b></li>
+  <li><b>You are allowed to ask for twenty minutes alone.</b> Almost nobody does.</li>
+</ul>
+<p class="one-thing">If you remember one thing: say "let's stop it getting worse first" — that sentence alone
+marks you out as someone who has done this before.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Chapter R4 done.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0015-mentoring-and-code-review-both-directions.html">← R4.1</a></span>
+  <span><a href="../index.html">Track 3 Map</a></span>
+</div>
+
+</div>
+</body>
+</html>

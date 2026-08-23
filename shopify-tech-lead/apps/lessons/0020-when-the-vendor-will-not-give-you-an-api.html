@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A4.5 — When the Vendor Will Not Give You an API</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A4 · Lesson 5</p>
+<h1>When the vendor will not give you an API</h1>
+<p class="subtitle">A real refusal, the four routes left, and how to say it to a client without blaming anyone.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> When a vendor says no, you have four costed options and a
+  sentence that keeps the project moving instead of stalling it in a blame conversation.</div>
+
+<div class="note">
+  <span class="label">Where this comes from</span>
+  The patterns below were learned from a real integration investigation against a live platform.
+  Every company, client, tenant and traceable number has been removed on purpose. The pattern is
+  the lesson; the identity is not.
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>The refusal is usually structural, not obstructive</h3>
+
+<p>Your first instinct is that the vendor is being difficult. Usually they are not. A platform can
+be genuinely unable to give you access, and recognising which situation you are in changes what
+you ask for.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>What you observe</th><th>What it usually means</th></tr>
+  <tr><td>No self-serve key page anywhere in their admin</td><td>They never built external access. Nobody is refusing you; the feature does not exist</td></tr>
+  <tr><td>Auth requires a secret only their own app has</td><td>Their API exists solely to serve their own front end</td></tr>
+  <tr><td>Browser access controls locked to their own domain</td><td>A third party must integrate <b>server-side or not at all</b></td></tr>
+  <tr><td>"Read access only, for security reasons"</td><td>A policy decision, which means it can be escalated — unlike a missing feature</td></tr>
+</table>
+</div>
+
+<p>That distinction is the useful one. <b>A missing capability needs a roadmap conversation. A
+policy needs an escalation.</b> Asking the wrong one wastes a fortnight.</p>
+
+<h3>Probe politely, and record exactly what you found</h3>
+
+<p>Before escalating, establish the facts, using only what you are entitled to use. An
+unauthenticated request that returns a clear "missing authentication" is a fact you can quote. An
+auth attempt that fails because a required secret was never shared with you is also a fact you can
+quote — and it is a far stronger position than "we could not get it working".</p>
+
+<div class="trap">
+  <span class="label">The line you do not cross</span>
+  Probing documented endpoints with credentials you were given is engineering. Scraping a UI you
+  were not granted access to, reverse-engineering a mobile app's secret, or reusing a session token
+  captured from a browser is not — regardless of how easy it is or how much the client wants it.
+  <b>Get written authorisation for anything beyond documented, credentialed access</b>, and if it
+  is refused, that answer is itself the finding you report.
+</div>
+
+<h3>The four routes, in order of preference</h3>
+
+<div class="diagram">
+  1. SERVER-SIDE with real credentials     ← ask for this first
+     they issue you a key, or the client's own account is used
+     server-to-server, so browser restrictions do not apply
+
+  2. THEIR EXPORT                           ← the usual real answer
+     a scheduled file. often already exists as a UI button
+     becomes the A4.3 connector. boring and reliable
+
+  3. THE CLIENT AS THE INTEGRATION POINT    ← underrated
+     the client already has access. they push to you
+     no vendor cooperation needed at all
+
+  4. INVERT: make Shopify the source        ← the strategic answer
+     stop reading from them. write to them, or work around them
+</div>
+
+<p>Route 2 is where most of these end up, and it is not a defeat. A scheduled export is a legitimate
+integration with one genuine advantage over an API: a full snapshot answers the deletion question
+that APIs make hard. Check their admin UI for an export button before assuming there is nothing —
+the capability frequently exists as a manual feature nobody described to you as an integration.</p>
+
+<p>Route 4 is the one to raise with a client when the vendor blocks you repeatedly. If the data you
+need can be owned in Shopify instead, the dependency disappears. That is a business conversation,
+not a technical one, and it belongs on the table.</p>
+
+<h3>Patterns to expect from a closed platform</h3>
+
+<p>Real findings, company removed. These recur:</p>
+
+<ul>
+  <li><b>One endpoint serves two very different screens.</b> Their internal API is shaped for their
+      UI, not for you, so a single call returns far more than you want and still misses one field
+      you need.</li>
+  <li><b>A value is derived, never stored.</b> A price computed from rules at read time cannot be
+      read back as a stored field, and it is <em>not reproducible</em> from what they expose — the
+      inputs are partly hidden. Do not promise a client you can recompute it.</li>
+  <li><b>Their identity format encodes a location.</b> A key like <code>{itemId}_{locationId}</code>
+      means identity and place are fused, so a multi-location rollout re-opens your mapping design.</li>
+  <li><b>They hold a ledger you did not know about.</b> Store credit or a balance living on their
+      side means issuing the same thing in Shopify creates <b>two ledgers for the same money</b>.
+      Find this before go-live, not after.</li>
+  <li><b>Ownership reverses for one field.</b> They may own the catalogue while <em>Shopify</em>
+      owns inventory, flowing back to them. Do not assume the system of record owns everything.</li>
+  <li><b>Their sync omits more than it sends.</b> Expect gaps: per-variant images, cost, barcode,
+      compare-at price, and most metadata. Enumerate what is missing early — it is usually a longer
+      list than the client expects.</li>
+</ul>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  A vendor's platform computes a buy price from rules. You have their exposed market price and the
+  rule percentages. Your calculation gives $3.40; the platform shows $3.03. <b>What do you tell
+  the client?</b>
+</div>
+
+<p>That you cannot reproduce their number, and therefore will not display it as if you could. The
+gap means an input is hidden — a rounding rule, a different base price, a step you cannot see. Two
+bad answers: display your calculation (now you are showing a wrong price to customers), or keep
+tuning until one example matches (you have fitted to a sample of one, and it will break on the
+next). The correct answer is to <b>read their number or show nothing</b>, and to tell the client
+that recomputing it is not on the table. That sentence is worth more than a week of reverse
+engineering.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — two ledgers for the same money</span>
+  The vendor holds a credit balance and you also issue store credit in Shopify. Both are real,
+  neither knows about the other, and a customer can spend the same balance twice. This is the most
+  expensive finding on the list and it is invisible until someone does it.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — recomputing a derived value</span>
+  You reproduce their formula from a small sample, it matches, and it ships. Then it diverges on
+  data you never saw, and the store displays wrong prices. A formula fitted to one example is a
+  guess wearing a decimal point.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — assuming the system of record owns everything</span>
+  They own the catalogue, so you assume they own inventory too, and you overwrite Shopify's stock
+  with theirs. Both numbers were right; the direction was wrong. Establish ownership per field even
+  when one system is obviously the master.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — identity that encodes a location</span>
+  A key that fuses item and location works perfectly for one location. The second location
+  arrives, and every mapping assumption breaks at once — usually mid-rollout.
+</div>
+
+<div class="scar">
+  <span class="who">Escalating a missing feature</span>
+  Pushing hard for a key that does not exist as a product burns goodwill and weeks. Establish
+  first whether you are facing an absent capability or a policy, and route accordingly.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — throughput you cannot promise</span>
+  A closed platform publishes no rate limits. You do not know them, and you cannot discover them
+  responsibly on someone else's production system. So <b>refuse to quote a throughput figure</b>.
+  Say what you measured, on what, and that it is not a commitment.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When the vendor has said no</span>
+  <q>They won't issue API access — I don't think that's them being difficult, I think they never
+  built it for third parties. So here are our options, cheapest first: they already have an export
+  button in their admin, and a scheduled version of that file would work well. Or you use your own
+  login and push the data to us. Or we escalate for proper access, which is slower and might still
+  be no. I'd start with the export.</q>
+  <span class="why-said">Removes the blame, names three costed options, recommends one. The client
+  leaves the meeting with a decision to make rather than a problem to worry about.</span>
+</div>
+
+<div class="script">
+  <span class="who">When the client asks you to "just scrape it"</span>
+  <q>I'd need that in writing from them, not from us. Without permission it risks breaching their
+  terms, and it breaks the first time they change their page — usually silently, so we'd be showing
+  stale data without knowing. If you can get written agreement I'll build it. Otherwise the export
+  route is slower to set up and far cheaper to own.</q>
+  <span class="why-said">Does not lecture. Names the legal risk and the maintenance risk, then
+  offers to proceed with authorisation. That is a lead's answer, not a refusal.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you find the second ledger</span>
+  <q>I've found something that needs a decision before we go further. Their system already tracks a
+  credit balance per customer. If we also issue store credit in Shopify, you'd have two records of
+  the same money and a customer could spend it twice. We need to pick one place for that balance to
+  live — I'd say theirs, since it's already there.</q>
+  <span class="why-said">A finding, its consequence in plain money terms, the decision required,
+  and a recommendation. Four sentences.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Distinguish a missing capability from a policy.</b> One needs a roadmap talk, the other an escalation.</li>
+  <li><b>Four routes:</b> server-side credentials · their export · the client as the integration point · invert and own it in Shopify.</li>
+  <li><b>Their export is usually the real answer</b>, and a full snapshot answers deletions better than an API.</li>
+  <li><b>Do not scrape without written authorisation.</b> A refusal is itself a finding to report.</li>
+  <li><b>Never recompute a derived value</b> you cannot reproduce exactly. Read it or show nothing.</li>
+  <li><b>Look for a second ledger.</b> Two records of the same money is the most expensive thing you can miss.</li>
+  <li><b>Never quote throughput for a closed platform.</b> No published limits means no commitment.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a vendor's "no" is a scoping input, not a
+blocker — arrive at the next meeting with four options and a recommendation.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the full worked integration.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0019-identifier-mapping-and-the-mapping-registry.html">← A4.4</a></span>
+  <span><a href="0021-worked-example-integrating-a-stock-availability-saas.html">A4.6 · Worked example →</a></span>
+</div>
+
+</div>
+</body>
+</html>

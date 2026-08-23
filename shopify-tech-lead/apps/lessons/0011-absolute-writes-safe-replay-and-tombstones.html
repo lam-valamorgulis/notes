@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A3.3 — Absolute Writes, Safe Replay and Tombstones</title>
+<link rel="stylesheet" href="../../assets/base.css">
+</head>
+<body class="t2">
+<div class="wrap">
+
+<p class="mapnav"><a href="../../index.html">← The Map</a> · <a href="../index.html">Track 2</a></p>
+<p class="kicker">Track 2 · A3 · Lesson 3</p>
+<h1>Absolute writes, safe replay and tombstones</h1>
+<p class="subtitle">Send the value, never the change. Then "deleted" has to become a value too.</p>
+
+<div class="win">
+  <strong>Your win today.</strong> A sync you can re-run at any moment, from any point, without
+  thinking about it — and which can tell the difference between "gone" and "not in this batch".
+</div>
+
+<div class="block works">
+<h2>How it works</h2>
+
+<h3>Derive it: what does a crash cost you?</h3>
+
+<p>A sync will be interrupted. Not might — will. A deploy, a timeout, a 429, a machine
+restart. So the honest starting question is not "how do we avoid interruption" but <b>"what
+does an interruption cost?"</b></p>
+
+<p>That cost is decided by one choice: whether your writes describe a <em>change</em> or a
+<em>state</em>.</p>
+
+<div class="diagram">
+  DELTA                              ABSOLUTE
+  "add 3 to stock"                   "stock is 12"
+  "increase price by 2"              "price is 14.99"
+
+  send twice → 6 added   ✗           send twice → still 12   ✓
+  crash mid-batch → unknown ✗        crash mid-batch → re-run ✓
+  replay → corrupts       ✗          replay → harmless       ✓
+</div>
+
+<p>With deltas, a retry is a bug. You must therefore know exactly which writes landed, which
+means perfect bookkeeping across a network you do not control. That is the hard problem, and
+it is <em>self-inflicted</em>.</p>
+
+<p>With absolute values the whole problem dissolves. Setting stock to 12 twice leaves it at 12.
+Retrying is free. You no longer need to know what landed, because sending it again costs
+nothing. Feynman version: <b>an absolute write is a statement of fact, and repeating a true
+statement does not make it truer.</b></p>
+
+<p>This is why the rule is not "prefer absolute writes". It is: <b>absolute writes are what
+make everything else in this Chapter possible.</b> Backlogs, replay, reconciliation repair —
+all of them assume you can re-send safely.</p>
+
+<h3>Idempotency is a property you build, not a promise you make</h3>
+
+<p>Absolute writes give you idempotency at the <em>value</em> level. You still need it at the
+<em>message</em> level, because a webhook can arrive twice and an ERP page can repeat a row.
+That is what the <code>inbox</code> table in A2.2 is for: the message id is a primary key, so
+two racing workers cannot both process it. The loser's insert fails.</p>
+
+<p>Note the layering. Absolute writes make a <em>duplicate</em> harmless. The inbox makes it
+<em>unnecessary</em>. You want both, because they fail in different ways.</p>
+
+<h3>Then deletion breaks it</h3>
+
+<p>Absolute writes cover "this is the value". They say nothing about "this no longer exists".
+And here is the structural problem, from first principles:</p>
+
+<div class="diagram">
+  your sync reads a page of changed items.
+  item X is not in it.
+
+  does that mean          (a) X was deleted?
+                          (b) X did not change?
+                          (c) X is on a later page?
+                          (d) the source had an error?
+
+  ── an ABSENCE cannot distinguish these. It carries no information.
+</div>
+
+<p>So deletion has to be represented by a <b>presence</b>, not an absence. That is a
+<b>tombstone</b>: a record that says "this is gone", with a timestamp, that flows through your
+sync like any other change.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Source does</th><th>You can tell?</th><th>Consequence</th></tr>
+  <tr><td>Hard delete — the row vanishes</td><td><b>No</b></td><td>Deleted items live forever in Shopify</td></tr>
+  <tr><td>Soft delete — a flag flips, <code>updatedAt</code> moves</td><td><b>Yes</b></td><td>It arrives as a normal change you can act on</td></tr>
+</table>
+</div>
+
+<p>This is why the Fake ERP in the Project has a soft-delete flag from its first line. If the
+real vendor hard-deletes, you have a genuine problem to raise — and the only remedies are
+expensive: a periodic full-list comparison, or asking them for a deletions feed.</p>
+
+<h3>What "deleted" should mean in Shopify</h3>
+
+<p>Rarely an actual delete. Deleting a Shopify product destroys its id, its handle, its URL and
+its history — and if the ERP un-deletes it tomorrow, you cannot put it back. Prefer to
+<b>archive or unpublish</b>, and record the tombstone on your side. Reversible beats tidy.</p>
+
+<div class="recall">
+  <span class="label">Answer before reading on</span>
+  Your sync sends "set stock to 0" for an item, then crashes. It restarts and re-sends the same
+  message. Meanwhile a customer bought nothing and the ERP still says 0. <b>Any harm?</b> Now
+  answer the same question if the message had been "reduce stock by 5".
+</div>
+
+<p>Absolute: no harm at all. Setting 0 twice leaves 0, and you never had to know whether the
+first attempt landed. Delta: you have reduced stock by 10 when the truth was 5, and the store
+now shows negative or blocked availability. Worse, you cannot detect it from the message — you
+would have to compare against the source, which is the reconciliation work you were trying to
+avoid. One choice removed a whole category of bug, and it was made before any code was
+written.</p>
+</div>
+
+<div class="block hurts">
+<h2>Where it hurts</h2>
+
+<div class="scar money">
+  <span class="who">Costs money — an ERP that only emits deltas</span>
+  Some genuinely do: "3 units received". You cannot make those safe to replay. The fix is not
+  cleverness — it is to convert to absolute at the boundary by reading the current total after
+  applying the delta, and to make that read part of the same job. If the vendor cannot give you
+  a total, say so in writing before the estimate.
+</div>
+
+<div class="scar money">
+  <span class="who">Costs money — deleting instead of archiving</span>
+  A Shopify product delete destroys the id, handle and URL. If the source un-deletes, you
+  create a new product with a new URL, losing SEO and any external link. Archive, unpublish,
+  and keep the mapping.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — the hard-deleted source row</span>
+  Items removed from the ERP simply stop appearing. Your sync sees nothing and does nothing.
+  The products stay live and sellable for months. There is no error, no count mismatch, and no
+  complaint until someone buys one.
+</div>
+
+<div class="scar silent">
+  <span class="who">Fails with no error — partial absolute writes</span>
+  Absolute means <em>complete</em>. Sending a product with three of its five variants, using a
+  mutation that sets whole state, deletes the other two. "Absolute" and "partial" together are
+  a destructive combination. Send whole objects.
+</div>
+
+<div class="scar">
+  <span class="who">Idempotency implemented as an <code>if</code></span>
+  Checking "have I seen this id?" then inserting is two steps, and two workers can both pass
+  the check. Make the id a primary key and let the database refuse the second one. A constraint
+  cannot have a race condition.
+</div>
+
+<div class="scar undocumented">
+  <span class="who">Judgement, not documentation — tombstones need a lifetime</span>
+  Keep tombstones forever and the table grows without bound. Delete them too early and a
+  replayed old message resurrects a deleted item. Keep them at least as long as your longest
+  possible replay window, and write that number down next to the retention rule.
+</div>
+</div>
+
+<div class="block say">
+<h2>What you say to a client/PM</h2>
+
+<div class="script">
+  <span class="who">When a client asks what happens if the sync crashes mid-run</span>
+  <q>We just run it again. Every update we send is a complete statement — "this price is
+  14.99" — rather than an instruction like "add two". So sending it twice changes nothing.
+  That's deliberate, and it's why a failed run isn't an incident.</q>
+  <span class="why-said">Turns a scary question into a designed-for answer, with a concrete
+  example the client can picture.</span>
+</div>
+
+<div class="script">
+  <span class="who">When you discover the vendor hard-deletes records</span>
+  <q>There's a gap I need to flag. When you remove a product from your ERP, nothing tells us —
+  it just stops appearing, which looks identical to "unchanged". So deleted items would stay on
+  sale. Two options: ask them for a deleted-items flag, or we compare full lists nightly, which
+  is slower and costs more. I'd push for the flag.</q>
+  <span class="why-said">Names the invisible failure, gives two costed options, and states a
+  preference. That is the shape of every good escalation.</span>
+</div>
+
+<div class="script">
+  <span class="who">When someone asks you to delete products that leave the catalogue</span>
+  <q>I'd rather archive them. Deleting destroys the product's web address and its history, so
+  if it comes back next season it comes back as a new page with no search ranking. Archived is
+  invisible to customers and reversible in one click.</q>
+  <span class="why-said">Frames a reversibility argument in terms of SEO and next season, which
+  are things the client already worries about.</span>
+</div>
+</div>
+
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li><b>Send the value, not the change.</b> "Stock is 12", never "add 3".</li>
+  <li><b>Absolute writes make replay free</b>, which is what every other technique in this Chapter assumes.</li>
+  <li><b>Absolute must also mean complete.</b> A partial payload to a whole-state mutation deletes the rest.</li>
+  <li><b>Idempotency at two levels:</b> absolute values make a duplicate harmless, the inbox primary key makes it unnecessary.</li>
+  <li><b>An absence carries no information.</b> Deleted, unchanged, next page, and source error look identical.</li>
+  <li><b>Deletion needs a tombstone</b> — a presence that says "gone", flowing like any other change.</li>
+  <li><b>Archive, do not delete, in Shopify.</b> A delete destroys the id, handle and URL irreversibly.</li>
+</ul>
+<p class="one-thing">If you remember one thing: make every write safe to repeat, and a crash
+stops being an incident.</p>
+</div>
+
+<div class="ask">
+  <b>Ask questions.</b> Then <b>"next"</b> for the two clocks you cannot trust.
+</div>
+
+<div class="footer-nav">
+  <span><a href="0010-ownership-per-field-not-per-record.html">← A3.2</a></span>
+  <span><a href="0012-webhooks-are-a-hint-clocks-order-and-staleness.html">A3.4 · Clocks and staleness →</a></span>
+</div>
+
+</div>
+</body>
+</html>
