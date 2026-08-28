@@ -1,0 +1,519 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signals and graceful shutdown — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 27 of 52 · Lesson 27 · Reliability</p>
+  <h1>Signals and graceful shutdown</h1>
+  <p class="subtitle">The line between a script and a service. A deploy must not drop a single request.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 27 of 52.</span> This lesson builds one domain-expert ability: <b>debug a problem that has no ready answer online</b>. <a href="../reference/52-week-plan.html#w27">Week 27 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> the spine survives a deploy with zero failed requests. You will also find the reason most &ldquo;graceful shutdown&rdquo; code takes <b>3.5 seconds instead of 0.5</b> — and fix it in one line.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 21&ndash;25 made the spine work and made it fast. This module makes it <b>survive</b>. Every deploy, every scale-down and every crash is a shutdown, and most services do it badly without anyone noticing.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — somebody is about to stop your process</h2>
+  <p>A deploy, an autoscaler, a <code>docker stop</code>. All of them do the same thing: send your process a <b>signal</b>, wait a bit, then kill it.</p>
+  <p>At that moment your server is in the middle of something. Maybe forty requests are in flight. What happens to them is entirely up to you, and doing nothing means dropping all forty.</p>
+
+  <h2>Two signals, and only one of them is a conversation</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Signal</th><th>Means</th><th>Can you handle it?</th></tr></thead>
+    <tbody>
+      <tr><td><code>SIGTERM</code></td><td>&ldquo;Please stop.&rdquo; The polite one. What every orchestrator sends first.</td><td><b>Yes.</b> This is your whole opportunity.</td></tr>
+      <tr><td><code>SIGINT</code></td><td>Ctrl+C in a terminal.</td><td><b>Yes.</b> Handle it the same way.</td></tr>
+      <tr><td><code>SIGKILL</code></td><td>&ldquo;You are stopped.&rdquo; The kernel ends you.</td><td><b>No.</b> Not ever.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>That last row is not a convention you could argue with. Try to listen for it:</p>
+  <pre><code>process.on('SIGKILL', () =&gt; {});
+<span class="out">// throws: EINVAL</span></code></pre>
+
+  <p>Verified on Node v24.14.0. The operating system will not deliver <code>SIGKILL</code> to your program at all, so there is nothing to hook.</p>
+
+  <div class="soundbite">
+    <span class="label">The shape of every shutdown</span>
+    <p>An orchestrator sends <code>SIGTERM</code>, waits a <b>grace period</b> — 30 seconds by default in Kubernetes — and then sends <code>SIGKILL</code>. Everything you do happens inside that window, or it does not happen.</p>
+  </div>
+
+  <!-- ============ THE FOUR STEPS ============ -->
+  <h2>The four steps, in this order</h2>
+  <ol>
+    <li><b>Stop accepting new work.</b> <code>server.close()</code>. Existing connections are untouched.</li>
+    <li><b>Tell the load balancer.</b> Make the readiness check fail, so no more traffic is routed here.</li>
+    <li><b>Let in-flight work finish.</b> Wait, but not forever.</li>
+    <li><b>Close what you own</b> — database pool, queue connections — then exit.</li>
+  </ol>
+
+  <p>The order matters. Close the database first and every in-flight request fails at the last moment, which is worse than never accepting them.</p>
+
+  <!-- ============ THE BUG ============ -->
+  <h2>The three seconds nobody expects</h2>
+  <p>Here is a shutdown that looks correct. A request takes 500 ms; we call <code>close()</code> at 50 ms and wait for its callback.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">request finished at        533 ms
+shutdown complete at      3540 ms   ← three seconds of nothing</span></code></pre>
+
+  <p>The work was done at 533 ms. The process sat there for another <b>three seconds</b>. Nothing was happening. Why?</p>
+
+  <p>Because <code>server.close()</code> waits for every <b>connection</b> to end, not every request. HTTP keep-alive means the client holds its socket open in case it wants to send another request. That socket is idle, doing nothing, and it is holding your shutdown hostage until it times out.</p>
+
+  <pre><code>server.keepAliveTimeout   <span class="out">// 5000 — five seconds, by default</span></code></pre>
+
+  <div class="tip">
+    <span class="label">The one-line fix</span>
+    <code>server.closeIdleConnections()</code> ends the sockets that have no request on them, leaving the
+    busy ones alone. Call it repeatedly while draining:
+    <pre style="margin:.6rem 0 0;"><code>server.close(onDone);
+const t = setInterval(() =&gt; server.closeIdleConnections(), 50);
+t.unref();</code></pre>
+    <b>Measured: 3540 ms becomes 538 ms.</b> Same requests, same result, six times faster — and inside a
+    30-second grace period that difference is the margin you have when something goes wrong.
+  </div>
+
+  <div class="trap">
+    <span class="label">Why this reaches production and stays there</span>
+    Nothing fails. The deploy works, the requests complete, the logs are clean. You simply pay three
+    seconds on every rolling restart of every pod, forever. It is invisible until you are deploying
+    fifty pods and wondering why a rollout takes twenty minutes.
+  </div>
+
+  <!-- ============ READINESS ============ -->
+  <h2>Liveness and readiness are different questions</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Check</th><th>Asks</th><th>If it fails</th><th>During shutdown</th></tr></thead>
+    <tbody>
+      <tr><td><code>/health</code> — liveness</td><td>Is this process alive?</td><td>You are <b>killed and restarted</b>.</td><td>Keep returning 200. You are alive.</td></tr>
+      <tr><td><code>/ready</code> — readiness</td><td>Should traffic come here?</td><td>You are <b>removed from the pool</b>.</td><td>Return 503 <b>immediately</b>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Getting these the wrong way round is a real outage</span>
+    Fail <b>liveness</b> during shutdown and the orchestrator concludes the process is broken, so it
+    <code>SIGKILL</code>s you in the middle of draining — the exact thing you were trying to avoid.
+    <p style="margin:.6rem 0 0;">And there is a delay you cannot skip. A load balancer notices a failed readiness check on its own schedule, often several seconds. So <b>fail readiness first, then wait a
+    few seconds before calling <code>close()</code></b>. Otherwise requests are still being routed to a
+    server that has stopped accepting them.</p>
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig27-title" width="640" height="250">
+      <title id="fig27-title">The shutdown timeline from SIGTERM to exit, and where the wasted seconds go</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">THE GRACE PERIOD — EVERYTHING HAPPENS IN HERE</text>
+
+      <line x1="30" y1="76" x2="610" y2="76" style="stroke: var(--rule); stroke-width: 3;"></line>
+
+      <line x1="40" y1="52" x2="40" y2="100" style="stroke: var(--accent); stroke-width: 2.5;"></line>
+      <text x="40" y="44" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px; font-weight: 700;">SIGTERM</text>
+      <text x="40" y="118" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">0s</text>
+
+      <rect x="46" y="60" width="120" height="32" rx="5" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="106" y="80" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">/ready → 503</text>
+
+      <rect x="172" y="60" width="120" height="32" rx="5" style="fill: var(--card-bg); stroke: var(--ink-faint); stroke-width: 1.5;"></rect>
+      <text x="232" y="76" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">wait ~5s for the</text>
+      <text x="232" y="87" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">load balancer</text>
+
+      <rect x="298" y="60" width="150" height="32" rx="5" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 1.8;"></rect>
+      <text x="373" y="76" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 9px; font-weight: 700;">close() + drain</text>
+      <text x="373" y="87" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">+ closeIdleConnections()</text>
+
+      <rect x="454" y="60" width="100" height="32" rx="5" style="fill: var(--card-bg); stroke: var(--ink-faint); stroke-width: 1.5;"></rect>
+      <text x="504" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">close pool, exit</text>
+
+      <line x1="600" y1="52" x2="600" y2="100" style="stroke: var(--warn); stroke-width: 2.5;"></line>
+      <text x="600" y="44" text-anchor="middle" style="fill: var(--warn); font-family: monospace; font-size: 10px; font-weight: 700;">SIGKILL</text>
+      <text x="600" y="118" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">30s</text>
+
+      <line x1="20" y1="140" x2="620" y2="140" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="164" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">without closeIdleConnections()</text>
+      <rect x="20" y="174" width="280" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="160" y="196" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700;">3540 ms</text>
+
+      <text x="340" y="164" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">with it</text>
+      <rect x="340" y="174" width="280" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="480" y="196" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 12px; font-weight: 700;">538 ms</text>
+
+      <text x="320" y="232" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Same requests, same result. The three seconds were an idle socket, doing nothing.</text>
+    </svg>
+    <figcaption>Measured on Node v24.14.0. The default <code>keepAliveTimeout</code> is 5000 ms.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Somebody taps you on the shoulder and says the building closes in thirty seconds. You do not drop what you are holding and run.</p>
+    <p class="part cont">You stop letting new people in. You finish serving whoever is at your desk, lock your drawers, and then leave. If you take too long, you are carried out anyway.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A shop at closing time. The door is locked so nobody new comes in, but the customers already inside are served properly. The alternative is turning off the lights with people still at the till.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      In a shop you can <em>see</em> whether anyone is left. Your server cannot tell a customer still being served from one just <b>standing near the door</b>.</p>
+    <p class="part limit cont">That is the keep-alive socket, and it is why a correct-looking shutdown took 3540 ms instead of 538 ms. Nobody was being served for three of those seconds. The server was waiting for someone who had finished but not walked out. The browser keeps the connection, in case it wants something else.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think <code>server.close()</code> means &ldquo;wait for the requests to finish&rdquo;. It means &ldquo;wait for the <b>connections</b> to finish&rdquo;, and those are not the same thing.</p>
+    <p class="part cont">A request lasts milliseconds. A connection lingers for <code>keepAliveTimeout</code>, five seconds by default, doing nothing at all. So the difference is invisible in any test with one request and no reuse. It costs three seconds on every restart of every instance in production.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why <code>server.close()</code> can take seconds after the last request finished. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — shut the spine down under load</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The shutdown, in full</b></p>
+  <pre><code>let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;                <span class="cmt">// a second SIGTERM must not restart this</span>
+  shuttingDown = true;
+  console.error(`${signal} received, draining`);
+
+  ready = false;                           <span class="cmt">// 1 · /ready starts returning 503</span>
+  await sleep(5000);                       <span class="cmt">// 2 · let the load balancer notice</span>
+
+  server.close(() =&gt; console.error('http closed'));   <span class="cmt">// 3 · no new connections</span>
+  const idle = setInterval(() =&gt; server.closeIdleConnections(), 50);
+  idle.unref();                            <span class="cmt">// the fix — do not wait on empty sockets</span>
+
+  const hard = setTimeout(() =&gt; {          <span class="cmt">// 4 · never hang forever</span>
+    console.error('drain timed out — forcing exit');
+    process.exit(1);
+  }, 20000);
+  hard.unref();
+
+  await once(server, 'close');
+  await pool.end();                        <span class="cmt">// 5 · close what you own, LAST</span>
+  clearTimeout(hard);
+}
+
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () =&gt; shutdown(sig));</code></pre>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Separate <code>/health</code> (stays 200) and <code>/ready</code> (goes 503 first).</li>
+    <li>The idle-connection sweep. Measure shutdown time with it and without.</li>
+    <li>A hard timeout, so a stuck request cannot hold you past the grace period.</li>
+    <li>Repeated signals are ignored. A second Ctrl+C must not restart the sequence.</li>
+    <li><b>Zero failed requests</b> when <code>SIGTERM</code> arrives mid-load.</li>
+  </ol>
+
+  <pre><code><span class="cmt"># the test that matters</span>
+node spine.js &amp;
+autocannon -c 20 -d 20 http://localhost:3000/health &amp;
+sleep 8 &amp;&amp; kill -TERM $(pgrep -f "node spine.js")
+
+<span class="cmt"># autocannon must report 0 errors and 0 non-2xx</span></code></pre>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Two shutdown durations — with and without the idle sweep — and an autocannon summary showing
+    <b>0 errors</b>. Add both to <code>DECISIONS.md</code>, with your chosen grace period and why.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A rolling deploy of 40 pods takes 22 minutes. Each pod terminates cleanly with no errors in the logs. The team's fix is to raise the deploy parallelism.</p>
+    Work out roughly how long each pod is taking, say what you would measure to confirm the cause, and explain why raising parallelism treats the symptom.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b><code>preStop</code> hooks</b> are the orchestrator's way of doing step 2 for you, and are worth
+    knowing once you deploy on one. <b>Draining a job queue</b> — finishing the work you already accepted —
+    is <a href="../reference/52-week-plan.html#w42">week 42</a>. <b>Connection draining at the load
+    balancer</b> is infrastructure, not Node. <b>Errors that escape</b> are
+    <a href="../reference/52-week-plan.html#w28">next week</a>, and they decide when you should <em>not</em>
+    shut down gracefully at all.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: Node.js docs — <a href="https://nodejs.org/api/process.html#signal-events">process signal events</a>, and the <code>server.close</code> and <code>closeIdleConnections</code> entries in <a href="https://nodejs.org/api/http.html">http</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your two shutdown durations and I'll tell you whether the gap is keep-alive or something else.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li><code>SIGTERM</code> is a request you can handle. <code>SIGKILL</code> cannot be caught — <code>process.on('SIGKILL')</code> throws <code>EINVAL</code>.</li>
+      <li>Order: fail readiness, wait for the load balancer, <code>close()</code>, drain, then close what you own.</li>
+      <li><b>Liveness stays 200 during shutdown.</b> Fail it and you are killed mid-drain.</li>
+      <li><code>server.close()</code> waits for <b>connections</b>, not requests. Idle keep-alive sockets hold it open.</li>
+      <li><code>closeIdleConnections()</code> on a timer fixes it. Measured: <b>3540 ms → 538 ms</b>.</li>
+      <li>Always add a hard timeout. A stuck request must not hold you past the grace period.</li>
+      <li>Guard against a second signal, or Ctrl+C twice restarts the whole sequence.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b><code>close()</code> waits for connections, not requests — and an idle socket is still a connection.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "process", "http". Four results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the <code>EINVAL</code> from <code>process.on('SIGKILL')</code> and the default <code>keepAliveTimeout</code> of 5000 ms. Also the 3540 ms against 538 ms shutdown durations. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0025-build-an-image-thumbnail-service.html">← Lesson 25</a>
+    <a href="./0028-operational-versus-programmer-errors.html">Next: Lesson 28 — Operational versus programmer errors →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Your last request finished at 533 ms, but shutdown completed at 3540 ms. Why?",
+      options: [
+        "An idle keep-alive socket was open, and close() waits for connections",
+        "The event loop needed time to drain its remaining timers and callbacks",
+        "Node flushes its log buffers before allowing the process to finally exit",
+        "The database pool takes three seconds to release its pooled connections"
+      ],
+      answer: 0,
+      why: "server.close() waits for every connection to end, not every request. HTTP keep-alive keeps a socket open for keepAliveTimeout, which defaults to 5000 ms, doing nothing. Sweeping with closeIdleConnections() cut the same shutdown to 538 ms."
+    },
+    {
+      q: "During shutdown, what should the liveness check return?",
+      options: [
+        "200, because the process is alive and failing it invites a SIGKILL",
+        "503, so that the orchestrator knows this instance is going away soon",
+        "200 for five seconds, then 503, matching the load balancer's interval",
+        "Nothing at all, since a draining server should not answer new requests"
+      ],
+      answer: 0,
+      why: "Liveness asks whether the process is alive; readiness asks whether traffic should come here. Failing liveness during shutdown tells the orchestrator the process is broken, so it kills you mid-drain — exactly what graceful shutdown exists to prevent. Fail readiness instead."
+    },
+    {
+      q: "Why wait a few seconds after failing readiness before calling server.close()?",
+      options: [
+        "The load balancer notices on its own schedule and is still routing traffic",
+        "Node needs that time to finish registering the signal handler internally",
+        "The grace period does not start counting until the first check has failed",
+        "Open sockets cannot be enumerated until the current event loop turn ends"
+      ],
+      answer: 0,
+      why: "A readiness probe runs on an interval, often several seconds. Between failing it and the balancer noticing, requests are still being routed to you. Close too early and those arrive at a server that has stopped accepting connections, which is a real failed request."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Walk me through a graceful shutdown in Node.”",
+      answer: "On <code>SIGTERM</code> I do four things in order. First, <b>fail the readiness check</b>, so the load balancer stops sending traffic, and wait a few seconds for it to notice. Then <code>server.close()</code>, which stops new connections but leaves in-flight ones alone. Then I drain, with a <b>hard timeout</b> so a stuck request cannot hold me past the grace period. Only at the end do I close the database pool, because closing it first would fail every request that was still finishing. Liveness keeps returning 200 throughout — failing it would get me killed mid-drain. <br>Why: the order is the answer; anyone can name the four steps."
+    },
+    {
+      prompt: "Interviewer: “Our pods take 3 seconds each to terminate. Where does that go?”",
+      answer: "Almost certainly idle <b>keep-alive sockets</b>. <code>server.close()</code> waits for every connection to end, not every request, and a browser or proxy holds its socket open for <code>keepAliveTimeout</code> — 5000 ms by default — in case it sends another request. So the work finishes in milliseconds and the process waits on an empty socket. I measured exactly this: 533 ms of work, 3540 ms of shutdown. Calling <code>server.closeIdleConnections()</code> on a short interval while draining brought it to 538 ms. <br>Why: giving the two numbers turns a plausible theory into a diagnosis."
+    },
+    {
+      prompt: "Interviewer: “Can you handle SIGKILL?”",
+      answer: "No, and it is not a matter of convention — the kernel does not deliver it to the process at all. <code>process.on('SIGKILL')</code> throws <code>EINVAL</code>; I checked. That is exactly why the <code>SIGTERM</code> path matters: an orchestrator sends <code>SIGTERM</code>, waits out a grace period, and then sends <code>SIGKILL</code>. Everything you intend to do has to fit inside that window, which is why I always add a hard timeout that exits before the grace period expires. <br>Why: connecting &ldquo;cannot be handled&rdquo; to &ldquo;so the timeout matters&rdquo; shows why the fact is useful."
+    }
+  ]);
+</script>

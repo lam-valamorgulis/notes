@@ -1,0 +1,554 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Background work — queues, retries, idempotency — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 42 of 52 · Lesson 42 · The data layer</p>
+  <h1>Background work — queues, retries, idempotency</h1>
+  <p class="subtitle">Slow work does not belong in a request. And a retry can charge a customer twice.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 42 of 52.</span> This lesson builds one domain-expert ability: <b>design work that survives being run twice</b>. <a href="../reference/52-week-plan.html#w42">Week 42 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will charge a test customer <b>9,998 cents for a 4,999 cent order</b> — with no bug in your code, and no retry you wrote. Then you will fix it in four lines.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 40 and 41 gave the spine a database and a cache. Both are things a request <b>waits</b> for. This
+    week is about the work a request should not wait for at all.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what does a slow request cost?</h2>
+  <p>Not just the user's patience. While a request runs it holds three things. A socket, a slot in your concurrency limit, and often a pool connection from <a href="./0040-postgres-pools-transactions-and-n-plus-one.html">week 40</a>. Eight hundred milliseconds of work is eight hundred milliseconds of holding all three.</p>
+
+  <p>Same 800 ms task, two designs. Measured on Node v24.14.0:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Design</th><th>One request</th><th>20 at once</th></tr></thead>
+    <tbody>
+      <tr><td>Do it in the request</td><td><b>842 ms</b>, status 200</td><td>817 ms until the last response</td></tr>
+      <tr><td>Queue it, return a job id</td><td><b>3 ms</b>, status <b>202</b></td><td><b>21 ms</b> until the last response</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">A queue does not make work faster</span>
+    Those 20 jobs still take <b>16 seconds</b> to process. Nothing sped up. What changed is that nobody is
+    holding a socket, a connection or a spinner while it happens.
+    <p style="margin:.6rem 0 0;">This matters because people reach for a queue expecting speed and get
+    confused when total throughput is unchanged. A queue moves work off the request path and lets you
+    control its rate separately. That is the benefit, and it is a big one.</p>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">The test for whether work belongs in a request</span>
+    <p>Does the user need the <b>result</b> to continue? If yes, it stays. If they only need to know you accepted it, queue it. An email, a PDF, a webhook, a thumbnail.</p>
+  </div>
+
+  <!-- ============ AT LEAST ONCE ============ -->
+  <h2>The promise a queue actually makes</h2>
+  <p>You want &ldquo;run this job exactly once&rdquo;. No queue gives you that. What you get is <b>at-least-once</b>, and the reason is worth understanding, because it explains the whole rest of the lesson.</p>
+
+  <p>A worker takes a job, does the work, then tells the queue it is done. Between those last two steps it can die. A deploy, an out-of-memory kill, a network partition, or the <code>SIGKILL</code> from <a href="./0027-signals-and-graceful-shutdown.html">week 27</a>.</p>
+
+  <p>The queue now knows one thing only: <b>no acknowledgement arrived</b>. It cannot tell these apart:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What really happened</th><th>What the queue sees</th></tr></thead>
+    <tbody>
+      <tr><td>The worker died before doing the work</td><td>No acknowledgement</td></tr>
+      <tr><td>The worker did the work, then died</td><td>No acknowledgement</td></tr>
+      <tr><td>The worker did the work and acknowledged, but the ack was lost</td><td>No acknowledgement</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Only one choice is safe: <b>redeliver</b>. Losing a job is worse than repeating one — usually. Watch what &ldquo;repeating one&rdquo; means with a real database:</p>
+
+  <pre><code>run 1: worker died before acknowledging
+queue cannot know the work was done, so it redelivers...
+<span class="out">charged total: 9998 cents   &lt;- the customer paid TWICE for one job</span></code></pre>
+
+  <div class="trap">
+    <span class="label">There is no bug in that code</span>
+    The job did exactly what it was told, twice, because the queue did exactly what it promised. You cannot
+    fix this by writing the job more carefully. The delivery guarantee is the thing you have to design
+    around.
+  </div>
+
+  <!-- ============ IDEMPOTENCY ============ -->
+  <h2>Idempotency — the only real answer</h2>
+  <p><b>Idempotent</b> means running it twice has the same effect as running it once. With at-least-once delivery this is not a nice property. It is the requirement.</p>
+
+  <p>The mechanism is a key the job carries, and a uniqueness rule the database enforces. You already have both — this is week 40's unique constraint and week 40's transaction, doing a new job:</p>
+
+  <pre><code>create table processed_jobs (idempotency_key text primary key, charged_at timestamptz default now());
+
+async function run(job) {
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO processed_jobs(idempotency_key) VALUES($1)', [job.key]);
+    await client.query('INSERT INTO charges(user_id, cents) VALUES($1,$2)', [job.userId, job.cents]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') return 'already done — nothing to do';   <span class="cmt">// week 40's code</span>
+    throw e;
+  }
+}</code></pre>
+
+  <p>Same crash, same redelivery. Measured:</p>
+
+  <pre><code>run 1: worker died before acknowledging
+run 2: already done — nothing to do
+<span class="out">charged total: 4999 cents   &lt;- correct</span></code></pre>
+
+  <div class="tip">
+    <span class="label">The transaction is the whole trick — read it again</span>
+    The key and the charge are inserted in <b>one transaction</b>. So either both happened or neither did.
+    <p style="margin:.6rem 0 0;">Write the key first and commit separately, and a crash between them leaves a key with no charge.
+    The job is now marked done, and the customer was never charged. That is worse than the double charge,
+    because nothing ever detects it.</p>
+  </div>
+
+  <p>Where does the key come from? It must be stable across retries, so it cannot be generated inside the job. Use something from the work itself: <code>charge:order-1042</code>. If the client supplies it, your HTTP endpoint becomes safe to retry too. That is the same problem one layer up.</p>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 265" role="img" aria-labelledby="fig42-title" width="640" height="265">
+      <title id="fig42-title">The queue cannot tell three different failures apart</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">THE WORKER STOPPED. WHAT DOES THE QUEUE KNOW?</text>
+
+      <rect x="20" y="36" width="185" height="62" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="112" y="58" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">died BEFORE the work</text>
+      <text x="112" y="80" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">must re-run</text>
+
+      <rect x="227" y="36" width="185" height="62" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="58" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">died AFTER the work</text>
+      <text x="320" y="80" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">must NOT re-run</text>
+
+      <rect x="434" y="36" width="186" height="62" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="527" y="58" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">acked, ack was lost</text>
+      <text x="527" y="80" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">must NOT re-run</text>
+
+      <path d="M 112 104 L 300 128" style="fill:none; stroke: var(--ink-faint); stroke-width: 1.5;"></path>
+      <path d="M 320 104 L 320 126" style="fill:none; stroke: var(--ink-faint); stroke-width: 1.5;"></path>
+      <path d="M 527 104 L 340 128" style="fill:none; stroke: var(--ink-faint); stroke-width: 1.5;"></path>
+
+      <rect x="180" y="132" width="280" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="154" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">the queue sees: no acknowledgement</text>
+
+      <text x="320" y="192" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Three different truths, one observation. So it redelivers — every time.</text>
+      <text x="320" y="210" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">That is at-least-once, and no queue can do better without your help.</text>
+
+      <text x="320" y="240" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">Your help is an idempotency key the database enforces.</text>
+      <text x="320" y="258" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured: 9,998 cents without one, 4,999 cents with one.</text>
+    </svg>
+    <figcaption>Both totals came from the same job, run the same way, against PostgreSQL 18.3.</figcaption>
+  </div>
+
+  <!-- ============ RETRIES ============ -->
+  <h2>Retries — and the ones you must not make</h2>
+  <p>Retry with exponential backoff and jitter, exactly as in <a href="./0008-build-a-concurrent-multi-api-aggregator.html">week 8</a>. Measured:</p>
+
+  <pre><code><span class="out">attempt 1: upstream 503 -> retry in 104 ms
+attempt 2: upstream 503 -> retry in 186 ms
+attempt 3: ok  (after 292 ms)</span></code></pre>
+
+  <p>The jitter is not decoration. Without it, every worker that failed at the same moment retries at the same moment. You have rebuilt the spike from <a href="./0041-redis-and-the-three-ways-a-cache-lies.html">week 41</a>.</p>
+
+  <p>The harder question is <b>what</b> to retry. Retrying a permanent failure is not persistence, it is a loop:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Failure</th><th>Retry?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>503, timeout, connection reset</td><td><b>Yes</b></td><td>Operational. It may be fine in a second.</td></tr>
+      <tr><td>429 rate limited</td><td><b>Yes</b>, after <code>Retry-After</code></td><td>They told you when.</td></tr>
+      <tr><td>400 invalid email address</td><td><b>No</b></td><td>It will be invalid forever. Dead-letter it.</td></tr>
+      <tr><td>404, 403</td><td><b>No</b></td><td>Nothing about waiting changes the answer.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>That is <a href="./0028-operational-versus-programmer-errors.html">week 28</a>'s taxonomy again, deciding a new question. Operational errors are worth retrying; the others are not.</p>
+
+  <!-- ============ DEAD LETTER ============ -->
+  <h2>The dead-letter path, and who looks at it</h2>
+  <p>Every queue needs a maximum attempt count and somewhere for jobs that exhaust it. Measured:</p>
+
+  <pre><code><span class="out">attempts made : 3
+dead-lettered : {"attempts":3,"reason":"invalid email address"}</span>
+<span class="cmt">// without a max, this job retries forever and never leaves the queue</span></code></pre>
+
+  <p>A job that retries forever is not resilience. It is a job consuming a worker slot permanently. Behind it, a queue grows until the process runs out of memory.</p>
+
+  <div class="trap">
+    <span class="label">A dead-letter queue nobody reads is a bin</span>
+    This is the part almost everybody skips. Store the job payload, every attempt, and the last error.
+    Then <b>alert on the queue being non-empty</b>, and name the person who looks. Without that last step
+    you have built a place for failures to be silent, which is worse than not having one.
+  </div>
+
+  <!-- ============ THE USER ============ -->
+  <h2>What the user sees while it runs</h2>
+  <p>Moving work to a queue changes your API, and the HTTP for it already exists:</p>
+
+  <pre><code>POST /reports
+<span class="out">202 Accepted
+Location: /jobs/8f3a
+{ "jobId": "8f3a", "state": "waiting" }</span>
+
+GET /jobs/8f3a
+<span class="out">200 { "state": "active" }
+200 { "state": "completed", "result": "/reports/8f3a.pdf" }
+200 { "state": "failed", "reason": "..." }</span></code></pre>
+
+  <p><b>202</b> means &ldquo;accepted, not finished&rdquo; — which is exactly true, and different from 200. The <code>Location</code> header tells the client where to look without you inventing a convention.</p>
+
+  <div class="tip">
+    <span class="label">The failure the client must handle</span>
+    A job can fail <b>after</b> you returned 202. So <code>failed</code> has to be a real state in your
+    status response, and the client needs to do something with it. This is the most commonly skipped part
+    of moving work to a queue, and it is why users end up staring at a spinner that never resolves.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A worker does a job, then tells the queue it finished. If it dies between those two steps, the queue only knows one thing: <b>no acknowledgement arrived</b>.</p>
+    <p class="part cont">It cannot tell whether the work was done or not. Losing a job is usually worse than repeating one, so it sends the job again. That is called at-least-once, and every queue works this way.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Posting a letter with no delivery confirmation. If you hear nothing back, you cannot tell whether it never arrived or the reply got lost. So you send it again.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A second letter is harmless. A second job charges someone twice. I measured it against a real database. One 4,999 cent order, one crash before the acknowledgement, and the customer paid <b>9,998 cents</b>.</p>
+    <p class="part limit cont">And there was no bug in that job. It did exactly what it was told, twice, because the queue did exactly what it promised. You cannot write the job more carefully to avoid this. The delivery guarantee is a fact you design around, not a defect you fix.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People try to make delivery exactly-once. You cannot. The failure lives in the gap between doing the work and reporting it, and no protocol removes that gap.</p>
+    <p class="part cont">So you make the <b>job</b> safe to repeat instead. It carries a stable key. The database refuses a second row with it — the same unique constraint that gives you a 409. The key and the work go in <b>one transaction</b>, so either both happened or neither did. Commit them separately, and a crash between them marks the job done without doing it.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain why a queue cannot promise to run your job exactly once. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — move the slow work off the request</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Pick the spine's slowest route and move it to a BullMQ job. Return <b>202</b> with a <code>Location</code> header.</li>
+    <li>A <code>GET /jobs/:id</code> endpoint with <code>waiting</code>, <code>active</code>, <code>completed</code> and <b><code>failed</code></b> as real states.</li>
+    <li>Exponential backoff <b>with jitter</b>, and a maximum attempt count.</li>
+    <li>Retry only operational failures. A 400 goes straight to the dead-letter path.</li>
+    <li>A dead-letter store holding the payload, the attempts and the last error. Plus <b>an alert, and a named person who reads it</b>.</li>
+    <li><b>Run the same job twice on purpose.</b> Prove the side effect happened once. This is the week's real deliverable.</li>
+    <li>Kill the worker <b>mid-job</b> with <code>SIGKILL</code>, restart it, and prove the same thing.</li>
+    <li>Make requirements 6 and 7 automated tests.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">Requirement 7 is the one that finds the real bug</span>
+    Running a job twice in a test is easy, and it usually passes. Killing the worker <b>mid-transaction</b>
+    is what exposes the version where the key was committed separately from the work. That failure is
+    silent — the job is marked done and nothing happened — so a test is the only way you will ever see it.
+  </div>
+
+  <div class="drill">
+    <span class="label">The drill — five minutes, out loud</span>
+    <p class="situation">&ldquo;A retry sent the confirmation email twice. Design the fix.&rdquo;</p>
+    Do not start with the email. Start by saying <b>why</b> the retry happened and why the queue was right
+    to retry. Then give the idempotency key you would use, say where the record of it lives, and say what
+    happens if the send succeeds but recording it fails. That last question is the whole interview.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Job priorities, rate limiting and repeatable jobs</b> are all in BullMQ and worth reading about.
+    <b>The outbox pattern</b> is the proper answer to &ldquo;write to the database and enqueue atomically&rdquo;,
+    and it deserves real study. <b>Kafka and other log-based systems</b> solve a different problem from a
+    work queue. <b>Exactly-once processing</b> is achievable with careful transactional design, and the
+    word still hides a lot. <b>Saga and compensating transactions</b> handle work that spans services.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://docs.bullmq.io/">BullMQ documentation</a> — especially
+    <a href="https://docs.bullmq.io/guide/retrying-failing-jobs">retrying failing jobs</a> — and
+    <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/202">202 Accepted</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — tell me your idempotency key and I'll try to find two jobs that would collide on it.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Work stays in the request only if the user needs the <b>result</b> to continue. Otherwise, queue it.</li>
+      <li>Measured: 842 ms inline versus <b>3 ms</b> and a 202. The work still takes 16 s — a queue moves it, it does not speed it up.</li>
+      <li>Queues are <b>at-least-once</b>. A missing acknowledgement has three possible causes and the queue cannot tell them apart.</li>
+      <li>Measured: one 4,999 cent order, one crash → <b>9,998 cents charged</b>, with no bug in the job.</li>
+      <li>Fix the <b>job</b>, not the delivery. A stable key, a unique constraint, and the key plus the work in <b>one transaction</b>.</li>
+      <li>Retry operational failures with jittered backoff; never a 400. A dead-letter queue needs a maximum attempt count, an alert and a named person, or it is a bin.</li>
+      <li><code>failed</code> must be a real state in your job status, because a job can fail after you returned 202.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>you cannot make delivery exactly-once, so you make the job safe to repeat.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> BullMQ documentation ("Retrying failing jobs"); MDN ("202 Accepted"). The double charge, the idempotency-key result, the retry timings and the dead-letter output were all measured. They ran against <b>PostgreSQL 18.3</b> via PGlite 0.5.8, on <b>Node v24.14.0</b>, on 2026-08-28. The 842 ms versus 3 ms comparison came from a real <code>http</code> server measured the same day. An in-process worker stood in for BullMQ. The at-least-once behaviour shown is a property of acknowledged delivery, not of BullMQ specifically. All are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0041-redis-and-the-three-ways-a-cache-lies.html">← Lesson 41</a>
+    <a href="./0043-build-the-spine-with-a-real-data-layer.html">Next: Lesson 43 — Build — the spine with a real data layer →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why can no queue promise to run your job exactly once?",
+      options: [
+        "A worker can die between doing the work and acknowledging it, and that gap cannot be removed",
+        "Network partitions may duplicate the job message itself before any worker receives it",
+        "Workers process jobs concurrently, so two of them can claim the same job at the same time",
+        "Acknowledgements are sent asynchronously, so the queue applies them out of order"
+      ],
+      answer: 0,
+      why: "The queue sees only that no acknowledgement arrived, and that has three possible causes: the worker died before the work, after the work, or the ack itself was lost. It cannot tell them apart, and losing a job is usually worse than repeating one, so it redelivers. That is at-least-once, and the fix is to make the job safe to repeat."
+    },
+    {
+      q: "Why must the idempotency key and the actual work go in one transaction?",
+      options: [
+        "A crash between them marks the job done without doing it, and nothing detects that",
+        "Two statements outside a transaction may be reordered by the connection pool",
+        "The unique constraint is only enforced when the insert happens inside a transaction",
+        "Committing separately holds a pool connection twice as long under retry load"
+      ],
+      answer: 0,
+      why: "If the key commits first and the work fails, the job is recorded as done and the customer was never charged. No error is raised and no retry happens, so nothing ever notices. That is worse than the double charge it was meant to prevent, because the double charge is at least visible."
+    },
+    {
+      q: "A job fails with 400 invalid email address. What should the queue do?",
+      options: [
+        "Send it to the dead-letter path, since no amount of waiting will change the answer",
+        "Retry with a longer backoff, in case the address becomes valid after a user edit",
+        "Retry once more, then mark it completed so the queue does not keep growing",
+        "Requeue it at low priority so valid jobs are processed ahead of it"
+      ],
+      answer: 0,
+      why: "This is week 28's taxonomy deciding a new question. Operational failures — 503, timeout, connection reset — may be fine in a second and are worth retrying. A 400 is permanent, so retrying it is a loop that holds a worker slot forever. Dead-letter it, alert on the queue being non-empty, and name who reads it."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “A retry sent the confirmation email twice. Design the fix.”",
+      answer: "First, the retry was correct. The worker died between sending and acknowledging, and the queue only knows that no acknowledgement arrived — it cannot tell whether the work was done, so it redelivers. That is at-least-once and every queue does it. So I do not stop the retry; I make the job safe to repeat. The job carries a stable key from the work itself, like <code>email:order-1042</code>, and I insert that key with a unique constraint <b>in the same transaction</b> as recording the send. A duplicate raises 23505 and the job returns without sending. The hard part is that the email leaves my system before I can record it, so I record the intent first and accept a small chance of a missed send over a double send. <br>Why: starting with why the retry was right, and naming the send-before-record gap, is what makes this an engineering answer rather than a patch."
+    },
+    {
+      prompt: "Interviewer: “When do you move work into a queue?”",
+      answer: "When the user does not need the <b>result</b> to continue — an email, a PDF, a webhook, a thumbnail. If they need the answer, it stays in the request. I measured the difference: the same 800 ms task took 842 ms inline and 3 ms as a queued job returning 202 with a <code>Location</code> header. But I am careful about what that buys. The work still takes the same total time — 20 jobs still take 16 seconds — so a queue does not make anything faster. What it does is stop a request holding a socket, a concurrency slot and a pool connection while it waits, and let me control the processing rate separately. <br>Why: correcting the common belief that a queue is a speed-up, while still recommending it, shows you understand what you are buying."
+    },
+    {
+      prompt: "Interviewer: “What do you do with jobs that keep failing?”",
+      answer: "First I split them. Operational failures — 503, timeout, connection reset — get retried with exponential backoff and <b>jitter</b>, because without jitter every worker that failed together retries together and I have built a load spike. Permanent failures like a 400 get no retries at all; waiting will never make an invalid email address valid. Everything that exhausts its attempt limit goes to a dead-letter store with the payload, the attempt count and the last error. The part people skip is the last one: I alert on that queue being non-empty and name who reads it. A dead-letter queue nobody looks at is just a quiet place for failures, which is worse than not having one. <br>Why: the retry-or-not split plus the named owner are the two things that separate a designed system from a configured one."
+    }
+  ]);
+</script>

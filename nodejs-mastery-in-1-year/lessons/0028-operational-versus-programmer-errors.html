@@ -1,0 +1,515 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operational versus programmer errors — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 28 of 52 · Lesson 28 · Reliability</p>
+  <h1>Operational versus programmer errors</h1>
+  <p class="subtitle">One kind you handle. The other you crash on. Mixing them up is how services corrupt data quietly.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 28 of 52.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/52-week-plan.html#w28">Week 28 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a rule that tells you what to do with any error in about two seconds. And a demonstration that an <code>uncaughtException</code> handler <b>keeps a broken process alive</b> — which is the single most dangerous line in most Node codebases.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0006-async-errors-and-unhandled-rejections.html">Week 6</a> was about where an async error <em>goes</em>. This week is about what to <em>do</em> with it once you have caught it — and when catching it is the wrong move.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — &ldquo;handle your errors&rdquo; is bad advice</h2>
+  <p>Take two errors that both reach the same <code>catch</code>:</p>
+  <ul>
+    <li><code>ECONNREFUSED</code> — the database is restarting.</li>
+    <li><code>TypeError: cannot read properties of undefined</code> — you have a bug.</li>
+  </ul>
+  <p>The first one means the world outside misbehaved, and your program is fine. Retry, or return a 503. The second means <b>your program is not what you think it is</b>. Its state may already be wrong, and continuing means acting on assumptions you have just proved false.</p>
+  <p>Treating those the same is the mistake. So you need a name for the difference:</p>
+
+  <div class="soundbite">
+    <span class="label">The two categories</span>
+    <p>An <b>operational error</b> is an expected failure in a correct program. You handle it and carry on. A <b>programmer error</b> is a bug. You <b>crash</b>, because a program in an unknown state is more dangerous than a restart.</p>
+  </div>
+
+  <h2>The test — one question, two seconds</h2>
+  <p><b>&ldquo;Did I anticipate this when I wrote the code?&rdquo;</b></p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Error</th><th>Kind</th><th>What you do</th></tr></thead>
+    <tbody>
+      <tr><td>Invalid JSON in a request body</td><td>Operational</td><td><code>400</code> and carry on</td></tr>
+      <tr><td>Database connection refused</td><td>Operational</td><td>Retry, then <code>503</code></td></tr>
+      <tr><td>File not found</td><td>Operational</td><td><code>404</code>, or create it</td></tr>
+      <tr><td>Upstream timeout</td><td>Operational</td><td>Retry with backoff (week 8)</td></tr>
+      <tr><td><code>TypeError</code>, <code>ReferenceError</code></td><td><b>Programmer</b></td><td><b>Crash.</b> Let it restart.</td></tr>
+      <tr><td>A failed assertion about your own state</td><td><b>Programmer</b></td><td><b>Crash.</b></td></tr>
+      <tr><td>A required config value missing at boot</td><td><b>Programmer</b></td><td><b>Crash at start-up</b>, loudly.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Notice that the category is <b>not a property of the error object</b>. It is a property of your intent. The same <code>ENOENT</code> is operational when a user asks for a missing file. It is a programmer error when your own config file has vanished.</p>
+
+  <!-- ============ MARKING ============ -->
+  <h2>Marking the difference in code</h2>
+  <p>Since it is intent, you have to say so. One base class and a flag:</p>
+
+  <pre><code>class AppError extends Error {
+  constructor(message, { code, status = 500, cause } = {}) {
+    super(message, { cause });        <span class="cmt">// keeps the original stack — see below</span>
+    this.name = 'AppError';
+    this.code = code;                 <span class="cmt">// week 21's stable client-facing code</span>
+    this.status = status;
+    this.isOperational = true;        <span class="cmt">// the whole point of the class</span>
+  }
+}</code></pre>
+
+  <p>Then the top-level handler has something to ask:</p>
+
+  <pre><code>function onError(err, req, res) {
+  if (err.isOperational) {
+    return sendError(res, err.status, err.code, err.message);   <span class="cmt">// week 21</span>
+  }
+  logger.fatal({ err }, 'programmer error — restarting');
+  res.destroy();                       <span class="cmt">// this request is not getting an answer</span>
+  shutdown('programmer-error');         <span class="cmt">// week 27's graceful path</span>
+}</code></pre>
+
+  <div class="tip">
+    <span class="label"><code>cause</code> keeps the trail — verified</span>
+    <code>new Error(msg, { cause: original })</code> preserves the original error and its stack:
+    <pre style="margin:.6rem 0 0;"><code>wrapped.message      <span class="out">// 'could not save link'</span>
+wrapped.cause.message <span class="out">// 'connection refused'</span>
+wrapped.cause.stack   <span class="out">// 'at low (...)'  ← still there</span></code></pre>
+    Wrap freely to add context. Never wrap by copying the message into a new error and throwing that away
+    — that is how a stack trace stops naming the line that broke.
+  </div>
+
+  <!-- ============ THE DANGEROUS LINE ============ -->
+  <h2>The most dangerous line in most Node codebases</h2>
+  <pre><code>process.on('uncaughtException', (err) =&gt; {
+  logger.error(err);        <span class="cmt">// and then... nothing</span>
+});</code></pre>
+
+  <p>It looks responsible. It is the opposite. Watch what it actually does:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">handler ran: boom
+...and the process is STILL ALIVE 100ms later
+exit code: 0</span></code></pre>
+
+  <p>Registering that handler <b>overrides Node's decision to exit</b>. A bug threw, nobody knows what state anything is in, and the process carries on serving traffic and reports success.</p>
+
+  <div class="trap">
+    <span class="label">What &ldquo;unknown state&rdquo; actually costs</span>
+    Consider a request that threw halfway through:
+    <ul style="margin:.4rem 0 0;">
+      <li>A database transaction is open and will never be committed or rolled back. That row is <b>locked</b>.</li>
+      <li>A module-level cache was half-updated, so every later request reads a value that never existed.</li>
+      <li>A counter was incremented but the work it counted never happened.</li>
+    </ul>
+    None of that appears in a log. The service keeps answering, and the wrong numbers spread. <b>A restart costs you seconds. Corrupt data costs you a week</b>, and you may not find out for months.
+  </div>
+
+  <div class="tip">
+    <span class="label">The correct use — log, then exit</span>
+    <pre style="margin:0 0 .6rem;"><code>process.on('uncaughtException', (err) =&gt; {
+  logger.fatal({ err }, 'uncaught exception');
+  <span class="cmt">// give the log one tick to flush, then go</span>
+  setTimeout(() =&gt; process.exit(1), 100).unref();
+});</code></pre>
+    The handler exists so you can <b>record why</b>, not so you can continue. Anything that restarts you —
+    a container platform, <code>systemd</code>, <code>pm2</code> — then gives you a fresh, correct process.
+    Verified: an uncaught throw exits with code <b>1</b>, even if you had set <code>process.exitCode = 0</code>.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig28-title" width="640" height="250">
+      <title id="fig28-title">One question sorts every error into handle-and-continue or log-and-crash</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">ONE QUESTION, TWO ROADS</text>
+
+      <rect x="210" y="34" width="220" height="42" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="52" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">Did I anticipate this?</text>
+      <text x="320" y="68" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">when I wrote the code</text>
+
+      <line x1="240" y1="80" x2="150" y2="106" style="stroke: var(--good); stroke-width: 2;" marker-end="url(#a28g)"></line>
+      <text x="168" y="98" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">yes</text>
+
+      <line x1="400" y1="80" x2="490" y2="106" style="stroke: var(--warn); stroke-width: 2;" marker-end="url(#a28w)"></line>
+      <text x="446" y="98" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">no</text>
+
+      <rect x="24" y="112" width="250" height="76" rx="8" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="149" y="132" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">OPERATIONAL</text>
+      <text x="149" y="150" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">bad input · connection refused</text>
+      <text x="149" y="163" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">timeout · file not found</text>
+      <text x="149" y="181" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">handle it · carry on</text>
+
+      <rect x="366" y="112" width="250" height="76" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="491" y="132" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">PROGRAMMER</text>
+      <text x="491" y="150" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">TypeError · ReferenceError</text>
+      <text x="491" y="163" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">broken assumption · bad config</text>
+      <text x="491" y="181" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">log it · crash · restart</text>
+
+      <text x="320" y="216" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">The category is not a property of the error. It is a property of your intent.</text>
+      <text x="320" y="236" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">So you have to mark it yourself — nothing can infer it for you.</text>
+
+      <defs>
+        <marker id="a28g" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--good);"></path></marker>
+        <marker id="a28w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--warn);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Verified: registering an <code>uncaughtException</code> handler keeps the process alive after a throw.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Things go wrong in two ways. Somebody outside gave you something bad — that is normal, you deal with it and carry on.</p>
+    <p class="part cont">Or <em>you</em> were wrong about something. Then you do not know what else you were wrong about. Carrying on means acting on beliefs you just proved false. Better to stop and start again from a known state.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A pharmacist. A prescription with bad handwriting is normal: you refuse it and ask again. But noticing you may have mislabelled a bottle is different. You stop the whole counter, because you no longer know which bottles are right.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A pharmacist <em>feels</em> the difference and stops on instinct. Your program feels nothing. Both errors arrive at the same <code>catch</code> as the same shape of object, with no marking.</p>
+    <p class="part limit cont">So <b>nothing can infer the category for you</b>. That is why the class with the flag exists. The worst case has no equivalent in a pharmacy. A Node process with an <code>uncaughtException</code> handler <b>keeps serving customers</b> after realising it mislabelled the bottle. The handler quietly cancelled the decision to stop.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People add <code>uncaughtException</code> to make the service more reliable. It does the opposite, and the output shows why. The process stays alive, at exit code 0.</p>
+    <p class="part cont">Uptime is not the goal. <b>Correctness is.</b> A restart costs seconds and gives you a process you can trust. Continuing gives you a service that answers every request quickly, and some answers are wrong. No error anywhere tells you which ones.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why crashing can be safer than continuing. Name one concrete thing that could be broken. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — an error taxonomy for the spine</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>An <code>AppError</code> base class with <code>code</code>, <code>status</code> and <code>isOperational</code>.</li>
+    <li>Named subclasses for the spine's real failures: <code>ValidationError</code> (400), <code>NotFoundError</code> (404), <code>ConflictError</code> (409), <code>UpstreamError</code> (503).</li>
+    <li>Every deliberate failure throws one of those. Nothing throws a bare <code>Error</code>.</li>
+    <li>One top-level handler: operational errors get week 21's error body, everything else logs and triggers week 27's shutdown.</li>
+    <li><code>uncaughtException</code> and <code>unhandledRejection</code> handlers that <b>log and exit</b>. Never continue.</li>
+    <li>Config validated at boot. A missing required value <b>crashes before the server listens</b>.</li>
+  </ol>
+
+  <p><b>Then prove the difference.</b> Add two routes and watch what happens to the process:</p>
+  <pre><code><span class="cmt"># operational — the server must survive and answer</span>
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:3000/links -d 'not json'   <span class="out"># 400</span>
+curl -s localhost:3000/health                                                        <span class="out"># still 200</span>
+
+<span class="cmt"># programmer — the server must NOT survive</span>
+curl -s localhost:3000/boom      <span class="cmt"># route does: undefined.foo</span>
+curl -s localhost:3000/health    <span class="out"># connection refused — it exited, and that is correct</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Requirement 6 is the one people skip, and it is the cheapest</span>
+    A missing <code>DATABASE_URL</code> discovered on the first request is an outage at 3am. The same
+    mistake discovered at boot is a container that never starts, which the deploy catches and rolls back
+    automatically. <b>Move failures earlier and they get cheaper.</b> This is the same reasoning as
+    <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">week 9</a>'s parse-before-run.
+  </div>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Your error class file, and the four <code>curl</code> outputs above. Add one line to
+    <code>DECISIONS.md</code>: which errors you decided are operational, and why.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A service has 100% uptime for six months. Then an audit finds that about 0.3% of orders have a total that does not match their line items. The logs are clean. The code has an <code>uncaughtException</code> handler that logs and continues.</p>
+    Explain how the two facts are connected, and say why the clean logs are evidence <em>for</em> your theory rather than against it.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Circuit breakers</b> — refusing to call a dependency that keeps failing — are the next step after
+    retries, and were flagged in <a href="./0008-build-a-concurrent-multi-api-aggregator.html">week 8</a>.
+    <b>Error reporting services</b> are a tool choice, not an idea.
+    <b>Carrying request context into an error</b> needs <code>AsyncLocalStorage</code>, which is
+    <a href="../reference/52-week-plan.html#w29">week 29</a> and tagged <b>depth</b>.
+    <b>Retrying safely</b> depends on idempotency — <a href="../reference/52-week-plan.html#w42">week 42</a>.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://github.com/goldbergyoni/nodebestpractices">Node.js Best Practices</a>,
+    the error-handling section — it is the best writing on this subject anywhere — and
+    <a href="https://nodejs.org/api/errors.html">Node docs: errors</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a list of errors from your own code and I'll argue about which ones you marked operational.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li><b>Operational:</b> an expected failure in a correct program. Handle it and carry on.</li>
+      <li><b>Programmer:</b> a bug. Log it and <b>crash</b>, because unknown state is worse than a restart.</li>
+      <li>The test: <b>did I anticipate this when I wrote the code?</b></li>
+      <li>The category is your <b>intent</b>, not a property of the error. Mark it yourself with a flag.</li>
+      <li>An <code>uncaughtException</code> handler <b>keeps the process alive</b> — verified, at exit code 0.</li>
+      <li>Use it to <b>log and exit</b>, never to continue. Uptime is not the goal; correctness is.</li>
+      <li>Wrap errors with <code>{ cause }</code> — the original stack survives. Validate config at boot, because a failure that happens earlier is a cheaper failure.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a restart costs seconds and corrupt data costs a week.</b> Crashing is the safe option, not the dramatic one.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js Best Practices — error handling; Node.js official documentation — "errors", "process". Three results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the process surviving a throw once a handler is registered, and <code>error.cause</code> preserving the original stack.</p>
+  <p class="small">Also an uncaught throw exiting with code 1, despite <code>process.exitCode = 0</code>. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0027-signals-and-graceful-shutdown.html">← Lesson 27</a>
+    <a href="./0029-observability-logs-you-can-trace.html">Next: Lesson 29 — Observability — logs you can trace →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What happens after a throw if you have registered an uncaughtException handler?",
+      options: [
+        "The handler runs and the process keeps going, with exit code still zero",
+        "The handler runs and then Node exits anyway, with a non-zero exit code",
+        "The handler runs only if the error was thrown outside any request handler",
+        "The handler runs and Node restarts the event loop from a clean state"
+      ],
+      answer: 0,
+      why: "Registering the handler overrides Node's decision to exit. Verified: the process was still alive 100 ms after the throw and finished with exit code 0. That is why the handler should log and then call process.exit — it exists to record why, not to continue."
+    },
+    {
+      q: "Which of these is a programmer error rather than an operational one?",
+      options: [
+        "A required configuration value is missing when the service starts up",
+        "A request arrives with a body that is not valid JSON for that endpoint",
+        "The database refuses a connection because it is restarting right now",
+        "An upstream API takes longer than the configured request timeout"
+      ],
+      answer: 0,
+      why: "The other three are things a correct program expects from the outside world, so they are handled. Missing config means your own deployment is wrong, and every later assumption built on it is unsafe. Crash at boot: a container that never starts is caught by the deploy and rolled back."
+    },
+    {
+      q: "Why is crashing safer than logging and continuing after a TypeError?",
+      options: [
+        "An open transaction or half-updated cache would otherwise go unnoticed",
+        "Node cannot reclaim the memory used by the failed request unless it exits",
+        "The stack trace is only written to disk during the shutdown sequence",
+        "Continuing prevents the orchestrator from recording the failure at all"
+      ],
+      answer: 0,
+      why: "A request that threw halfway may have left a transaction open, a cache half-updated, or a counter incremented for work that never happened. None of that is logged. The service keeps answering and the wrong values spread. A restart costs seconds; corrupt data costs far more."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you decide what to do with an error?”",
+      answer: "I ask one question: <b>did I anticipate this when I wrote the code?</b> If yes it is <b>operational</b> — bad input, a refused connection, a timeout — and I handle it and carry on. If no it is a <b>programmer error</b>, which means my program is not what I thought it was, so I log it and let the process exit. The category is not a property of the error object; it is my intent, so I mark it explicitly with an <code>isOperational</code> flag on a base class. Nothing can infer it for me. <br>Why: saying the category is intent, not type, is the insight the question is testing."
+    },
+    {
+      prompt: "Interviewer: “Should you catch uncaughtException?”",
+      answer: "Yes, to <b>log and then exit</b> — never to continue. Registering the handler overrides Node's decision to exit, and I verified that: the process was still alive 100 ms after the throw, at exit code 0. That is the dangerous part. A request that threw halfway may have left a transaction open or a cache half-updated, and none of that is logged, so the service keeps answering and some answers are silently wrong. A restart costs seconds and gives me a process I can trust. <br>Why: &ldquo;yes, but to exit&rdquo; is a more precise answer than either &ldquo;yes&rdquo; or &ldquo;never&rdquo;."
+    },
+    {
+      prompt: "Interviewer: “100% uptime, but 0.3% of orders have wrong totals. Where do you look?”",
+      answer: "Those two facts belong together. I would look for an <code>uncaughtException</code> or <code>unhandledRejection</code> handler that logs and continues. It converts a crash into silent corruption: a request throws halfway, leaves state half-written, and the process carries on serving. The perfect uptime is the <b>symptom</b>, not the defence — the service never restarted because something stopped it from restarting. Clean logs fit too, since the handler logged at a level nobody alerts on. <br>Why: reading 100% uptime as evidence of a problem is the move the interviewer is watching for."
+    }
+  ]);
+</script>

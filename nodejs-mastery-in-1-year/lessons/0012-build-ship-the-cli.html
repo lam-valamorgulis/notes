@@ -1,0 +1,575 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — ship the CLI — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 12 of 52 · Lesson 12 · Modules &amp; a real CLI</p>
+  <h1>Build — ship the CLI</h1>
+  <p class="subtitle">One finished tool. Finished means a stranger can install it and it never surprises them.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 12 of 52.</span> This lesson builds one domain-expert ability: <b>debug a problem that has no ready answer online</b>. A user tells you 900 files went in and 897 came out. Nothing on the internet will tell you why — that number is the only clue you get. <a href="../reference/52-week-plan.html#w12">Week 12 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will ship a real, installable command-line tool. Along the way you will find out that the obvious way to rename a file <b>silently destroys data</b>, and you will fix it. That fix is the difference between a script and a tool.
+  </div>
+
+  <div class="note">
+    <span class="label">What this week assembles — and the one new thing it adds</span>
+    Most of this is weeks 9 to 11 put together. Modules and resolution from
+    <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">week 9</a>. <code>argv</code>, the two
+    output streams and exit codes from
+    <a href="./0010-the-process-argv-streams-and-exit-codes.html">week 10</a>. <code>bin</code>,
+    <code>files</code> and publishing from
+    <a href="./0011-package-json-in-full-and-publishing.html">week 11</a>.
+    <p style="margin:.7rem 0 0;"><b>One subject here is genuinely new, and it is why this build exists.</b> The filesystem does not behave like the rest of your program. <code>fs.rename</code> destroys the
+    file it lands on. Checking first does not save you. </p>
+    <p style="margin:.5rem 0 0;">Weeks 9 to 11 could not have taught you that. A tool is the first thing you write that can hurt somebody. You will also meet
+    <code>fs.link</code>, <code>fs.unlink</code>, <code>EEXIST</code> and the words <em>race
+    condition</em> for the first time.</p>
+    <p style="margin:.5rem 0 0;">If anything <em>else</em> below feels new, go back — that is the signal.</p>
+    <p style="margin:.5rem 0 0;"><b>Skipped week 11?</b> Do its steps 1 to 4 now. This build needs
+    <code>bin</code> and <code>files</code> to be installable.</p>
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what makes a tool different from a script?</h2>
+  <p>A script runs on your machine, on your files, while you watch. A tool runs on a stranger's machine,
+  on files you have never seen, while nobody watches.</p>
+  <p>Everything that separates the two is about <b>what happens when things go wrong</b>. So build the
+  tool by asking, for each part: <em>what is the worst thing this could do to someone?</em></p>
+
+  <div class="soundbite">
+    <span class="label">The rule for this week</span>
+    <p>A tool that does its job well and destroys data once is <b>worse than useless</b>, because people trusted it first.</p>
+  </div>
+
+  <h2>The bug hiding in the obvious solution</h2>
+  <p>A bulk renamer renames files. The obvious call is <code>fs.rename</code>. Try it:</p>
+
+  <pre><code>const fs = require('node:fs');
+<span class="cmt">// a.txt contains "A". b.txt contains "B". Both exist.</span>
+fs.renameSync('a.txt', 'b.txt');</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>What actually happened</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">a.txt gone | b.txt now contains: A</span></code></pre>
+
+  <p><b>The original <code>b.txt</code> is gone.</b> Not moved, not backed up — overwritten. No error, no
+  warning, no exit code. The file that said "B" no longer exists anywhere.</p>
+
+  <p>This is not an accident. <code>rename(2)</code> is defined to replace the destination atomically. That is what you want when you write a temp file and swap it into place. It is exactly
+  what you do <em>not</em> want when a batch rename happens to produce a name that already exists.</p>
+
+  <div class="trap">
+    <span class="label">Why this reaches real users and not you</span>
+    You test on four files with obvious names. Nothing collides, so nothing is lost, and the tool looks
+    finished. A stranger unzips nine hundred photos from a Linux server onto a Mac. The archive holds both <code>IMG_0042.jpg</code> and <code>img_0042.JPG</code>; on the Mac those are <b>one</b> name, so one photo is already lost at unzip time. Then your tool renames <code>IMG_0043.jpg</code> to <code>photo_0043.jpg</code> — a name that already exists — and <code>rename</code> destroys that one too. Your tool reported success.
+  </div>
+
+  <h2>The fix — ask the filesystem, do not ask yourself</h2>
+  <p>The tempting fix is to check first:</p>
+
+  <pre><code><span class="cmt">// WRONG — looks careful, is not</span>
+if (!fs.existsSync(dest)) fs.renameSync(src, dest);</code></pre>
+
+  <p>Between the check and the rename, anything can create <code>dest</code>. That gap is a
+  <b>race condition</b>, and it is the same shape of bug as every other check-then-act. On your laptop it
+  never fires. On a machine where a sync client is also writing, it does.</p>
+
+  <p>The correct move is to make the filesystem refuse, in one operation. <code>fs.link</code> fails with
+  <code>EEXIST</code> if the target exists — verified:</p>
+
+  <pre><code>link(x, y) -&gt; <span class="out">EEXIST</span>   <span class="cmt">// the target already existed, so it refused</span></code></pre>
+
+  <pre><code><span class="cmt">// RIGHT — one atomic operation that cannot overwrite</span>
+try {
+  fs.linkSync(src, dest);   <span class="cmt">// fails if dest exists</span>
+  fs.unlinkSync(src);       <span class="cmt">// only now remove the original</span>
+} catch (err) {
+  if (err.code === 'EEXIST') <span class="cmt">/* report the collision, skip this file */</span>;
+  else throw err;
+}</code></pre>
+
+  <p>Read the order carefully. The original is removed <b>only after</b> the new name exists. If the
+  process dies between the two lines, you have two names for one file — untidy, and nothing is lost.
+  Do it the other way round and a crash loses the file entirely.</p>
+
+  <div class="tip">
+    <span class="label">The honest limit of this fix</span>
+    <code>link</code> only works <b>within one filesystem</b>. Across a mount point it fails with <code>EXDEV</code> — but so does <code>rename</code>, so this is not a price you pay for choosing the safer call. The real fix there is copy-then-verify-then-delete. <code>link</code> does have one limit <code>rename</code> does not: <b>you cannot hard-link a directory</b>. It fails with <code>EPERM</code>, so skip anything that is not a file before you try.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig12-title" width="640" height="250">
+      <title id="fig12-title">rename overwrites the destination; link then unlink cannot lose a file</title>
+
+      <text x="20" y="22" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">rename(a, b) — ONE STEP, AND b IS GONE</text>
+
+      <rect x="20" y="34" width="86" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="63" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">a.txt</text>
+      <text x="63" y="66" text-anchor="middle" style="fill: var(--ink-faint); font-family: monospace; font-size: 10px;">"A"</text>
+
+      <rect x="120" y="34" width="86" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="163" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">b.txt</text>
+      <text x="163" y="66" text-anchor="middle" style="fill: var(--ink-faint); font-family: monospace; font-size: 10px;">"B"</text>
+
+      <line x1="212" y1="54" x2="272" y2="54" style="stroke: var(--warn); stroke-width: 2;" marker-end="url(#a12w)"></line>
+      <text x="242" y="46" text-anchor="middle" style="fill: var(--warn); font-family: monospace; font-size: 9px;">rename</text>
+
+      <rect x="286" y="34" width="86" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 4 3;"></rect>
+      <text x="329" y="58" text-anchor="middle" style="fill: var(--ink-faint); font-family: monospace; font-size: 10px;">a.txt gone</text>
+
+      <rect x="386" y="34" width="86" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="429" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">b.txt</text>
+      <text x="429" y="66" text-anchor="middle" style="fill: var(--warn); font-family: monospace; font-size: 10px;">"A"</text>
+
+      <text x="492" y="58" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">"B" destroyed</text>
+
+      <line x1="20" y1="100" x2="620" y2="100" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="128" style="fill: var(--good); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">link(a, b) THEN unlink(a) — TWO STEPS, NOTHING CAN BE LOST</text>
+
+      <rect x="20" y="140" width="150" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="95" y="158" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">1 · link</text>
+      <text x="95" y="174" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">refuses if b exists (EEXIST)</text>
+
+      <line x1="176" y1="162" x2="216" y2="162" style="stroke: var(--good); stroke-width: 2;" marker-end="url(#a12g)"></line>
+
+      <rect x="222" y="140" width="150" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="297" y="158" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">2 · unlink the old name</text>
+      <text x="297" y="174" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">only after the new one exists</text>
+
+      <text x="392" y="156" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Crash between the two steps?</text>
+      <text x="392" y="172" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">Two names, one file. Untidy, not lost.</text>
+
+      <text x="320" y="218" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">Never check-then-act. Ask the filesystem to refuse, in one operation.</text>
+      <text x="320" y="238" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Order the steps so that a crash at any moment loses nothing.</text>
+
+      <defs>
+        <marker id="a12w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--warn);"></path></marker>
+        <marker id="a12g" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--good);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Measured on Node v24.14.0: <code>rename</code> onto an existing file leaves no trace of what was there.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A script is something you run while you are watching. A tool is something a stranger runs while
+      nobody is watching. Everything that makes the second one harder is about the moments when things go wrong. A name already exists. A folder cannot be written to. The program crashes halfway through. </p>
+    <p class="part cont">The tool has to survive all of those without destroying anything.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Moving into a new flat. <code>rename</code> is putting your box down in a spot without looking, and
+      whatever was there is crushed. <code>link</code> then <code>unlink</code> is different. You put the box in the new room first. You check it is really there. Only then do you clear the old room.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      With boxes you would <em>see</em> the crushed thing. Here you see nothing at all — no error, no
+      warning, exit code <code>0</code>, and a report saying the job succeeded. That silence is the whole
+      danger, and the analogy cannot show it. </p>
+    <p class="part cont">The other break: with a box you could look first and then
+      decide. In a filesystem, looking first is a <b>race condition</b>. Something can create the file in the gap between your look and your move. You cannot look. You have to make the filesystem refuse.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People believe <code>--dry-run</code> makes a tool safe. It does not. A dry run tells the user what the tool <em>intends</em> to do. Say the plan is &ldquo;rename a onto b&rdquo;. The dry run prints that plan, and hides the destruction inside it. </p>
+    <p class="part cont"><b><code>--dry-run</code> is a preview, not a guard.</b> The guard is the operation that cannot overwrite. You need both, and they
+      are not the same thing.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why <code>if (!fs.existsSync(dest)) fs.renameSync(...)</code>
+      looks careful but is not, and what you would do instead.
+      <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — <code>bulk-rename</code></h2>
+  <p>One tool, published, that you would let someone point at their photo folder.</p>
+
+  <p><b>Requirements.</b> Every one is testable, and every one comes from weeks 9 to 11:</p>
+  <ol>
+    <li><code>bulk-rename &lt;pattern&gt; &lt;replacement&gt; [dir]</code>, parsed with <code>util.parseArgs</code>.</li>
+    <li><code>--dry-run</code> prints the plan and changes nothing. It is the <b>default</b>; renaming needs <code>--go</code>.</li>
+    <li>The plan goes to <b>stdout</b>. Progress, warnings and collisions go to <b>stderr</b>.</li>
+    <li>A name collision is <b>reported and skipped</b>, never overwritten. Use <code>link</code> + <code>unlink</code>.</li>
+    <li>Exit <code>0</code> on success, <code>1</code> on bad arguments, <code>2</code> if any file was skipped. Set <code>process.exitCode</code> — never call <code>process.exit()</code>.</li>
+        <li><code>bin</code>, <code>files</code> and <code>exports</code> set so a stranger can <code>npm i -g</code> it.</li>
+    <li><code>--help</code> prints usage to <b>stdout</b> and exits <code>0</code>. No arguments at all
+    prints the same text to <b>stderr</b> and exits <code>1</code>. That difference is the whole of week
+    10 in two lines.</li>
+  </ol>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The shape — fill in the middle yourself</b></p>
+  <pre><code>#!/usr/bin/env node
+const { parseArgs } = require('node:util');
+const fs   = require('node:fs');
+const path = require('node:path');
+
+let opts;
+try {
+  opts = parseArgs({
+    options: { 'dry-run': { type: 'boolean' }, go: { type: 'boolean' } },
+    allowPositionals: true,
+  });
+} catch (err) {
+  console.error('bad arguments:', err.message);
+  process.exitCode = 1;
+  return;
+}
+
+const [pattern, replacement, dir = '.'] = opts.positionals;
+const commit = opts.values.go === true
+            &amp;&amp; opts.values['dry-run'] !== true;   <span class="cmt">// safe by default; --dry-run always wins</span>
+
+let skipped = 0;
+for (const name of fs.readdirSync(dir)) {
+    const full = path.join(dir, name);
+  if (!fs.lstatSync(full).isFile()) continue;   <span class="cmt">// link cannot take a directory</span>
+
+  const next = name.replaceAll(pattern, replacement);
+  if (next === name) continue;
+
+  console.log(`${name} -&gt; ${next}`);           <span class="cmt">// the plan, on stdout</span>
+  if (!commit) continue;
+
+  try {
+    fs.linkSync(path.join(dir, name), path.join(dir, next));
+    fs.unlinkSync(path.join(dir, name));
+  } catch (err) {
+    if (err.code === 'EEXIST') {
+      console.error(`skipped ${name}: ${next} already exists`);   <span class="cmt">// stderr</span>
+      skipped++;
+    } else {
+      throw err;                                <span class="cmt">// a real bug — let it crash</span>
+    }
+  }
+}
+if (skipped) process.exitCode = 2;</code></pre>
+
+  <p><b>Now prove it.</b> Build a folder designed to break your tool, in a temporary directory so you
+  cannot damage anything real:</p>
+
+  <pre><code>cd $(mktemp -d)
+printf 'one\n'   &gt; IMG_1.txt
+printf 'two\n'   &gt; IMG_2.txt
+printf 'DO NOT LOSE ME\n' &gt; photo_2.txt      <span class="cmt"># the collision</span>
+
+<span class="cmt"># run it as `node /path/to/bulk-rename.js` until you npm i -g it below</span>
+<span class="cmt"># 1 · dry run by default — nothing changes</span>
+bulk-rename IMG photo .
+ls                                            <span class="out"># all three files still there</span>
+
+<span class="cmt"># 2 · commit, and watch the collision be refused</span>
+bulk-rename IMG photo . --go
+echo "exit was $?"                            <span class="out"># 2</span>
+cat photo_2.txt                               <span class="out"># DO NOT LOSE ME  ← still there</span>
+
+<span class="cmt"># 3 · the plan is clean data, the warnings are not in it</span>
+bulk-rename IMG photo . 2&gt;/dev/null | head</code></pre>
+
+  <div class="tip">
+    <span class="label">The test that matters</span>
+    Step 2 is the whole week. <code>photo_2.txt</code> must still say <b>DO NOT LOSE ME</b>. Now go back,
+    swap <code>link</code> + <code>unlink</code> for a plain <code>fs.renameSync</code>, and run it again.
+    Watch the file's contents change. <b>Do that once, deliberately, so you never do it by accident.</b>
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Then ship it</b> — the week 11 loop, for real this time:</p>
+  <pre><code>npm pack --dry-run          <span class="cmt"># read the file list before you upload it</span>
+npm publish --access public
+npm i -g @yourname/bulk-rename
+bulk-rename --help</code></pre>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A user reports: "I ran it on 900 photos, it said it renamed 900 files, and now I have 897."</p>
+    You have the source in front of you. Name the most likely line, say why the user's count was three
+    short rather than one, and say which of your six requirements would have caught it.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Undo</b> — writing a log you can replay backwards — is the right next feature and is genuinely
+    harder than the rename itself, so it is left as an exercise rather than taught badly.
+    <b>Concurrency</b> is skipped too: renaming files one at a time is correct here, and the moment you do
+    them in parallel you get a whole new class of collision. <b>Watching a folder</b> with
+    <code>fs.watch</code> is not in this course — its behaviour differs by operating system in ways that
+    would take a week of their own.
+  </div>
+
+  <div class="note">
+    <span class="label">🎉 Weeks 9–12 complete</span>
+    You can explain how Node finds a file, write a program that behaves properly inside a pipeline, defend
+    every field in a <code>package.json</code>, and you have <b>published a real tool</b>. Next on
+    <a href="../index.html">The Map</a>: <b>week 13 — the first review week</b>. No new material. You
+    rebuild three things from memory and sit mock interview 1.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your <code>bulk-rename</code> and I will run it against a folder designed to
+    break it. That is more useful to you than me reading the code.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A script runs while you watch. A <b>tool</b> runs on a stranger's files while nobody watches.</li>
+      <li><code>fs.rename</code> onto an existing name <b>destroys it silently</b> — no error, exit code 0.</li>
+      <li><code>if (!exists) rename()</code> is a <b>race condition</b>. Never check then act.</li>
+      <li>Use <code>link</code> (fails <code>EEXIST</code>) then <code>unlink</code>. Order it so a crash loses nothing.</li>
+      <li><code>--dry-run</code> is a <b>preview, not a guard</b>. You need the safe operation as well.</li>
+      <li>Destructive actions should need a flag. Safe should be the default.</li>
+      <li>Plan on stdout, warnings on stderr, honest exit code, <code>npm pack --dry-run</code> before you publish.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>make the filesystem refuse, in one operation — never look first and then act.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — <a href="https://nodejs.org/api/fs.html">fs</a>, <a href="https://nodejs.org/api/process.html">process</a>, <a href="https://nodejs.org/api/util.html#utilparseargsconfig">util.parseArgs</a>. Two results here came from running them on <b>Node v24.14.0</b> on 2026-08-28. </p>
+  <p class="small">Two things were measured. The overwrite result: <code>b.txt</code> held "B", then held "A" after the rename, with no error. And the <code>EEXIST</code> that <code>link</code> returns. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0011-package-json-in-full-and-publishing.html">← Lesson 11</a>
+    <a href="./0014-buffers-and-binary.html">Next: Lesson 14 — Buffers and binary →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "fs.rename('a.txt', 'b.txt') runs while b.txt already exists. What happens to b.txt?",
+      options: [
+        "It is replaced by a.txt, with no error and no warning at all",
+        "The call fails with EEXIST, so nothing on disk is changed",
+        "Node keeps b.txt and renames the source to b.txt.1 instead",
+        "The rename is atomic, so b.txt keeps the contents it had"
+      ],
+      answer: 0,
+      why: "rename is defined to replace the destination atomically, which is exactly what you want when swapping a temp file into place. In a bulk rename it is silent data loss: no error, no warning, exit code 0, and the tool reports success."
+    },
+    {
+      q: "Why is `if (!fs.existsSync(dest)) fs.renameSync(src, dest)` not actually safe?",
+      options: [
+        "Something can create dest in the gap between the check and the move",
+        "existsSync returns a stale answer that Node caches for performance",
+        "renameSync ignores the result of any check that ran before it",
+        "existsSync cannot see files that another process currently has open"
+      ],
+      answer: 0,
+      why: "This is check-then-act, and the gap between the two is a race condition. On a laptop it never fires. On a machine where a sync client or another process is writing, it does. The fix is one operation that refuses by itself, such as link, which fails with EEXIST."
+    },
+    {
+      q: "Your renamer should link then unlink, in that order. Why not unlink first?",
+      options: [
+        "A crash between the steps would then lose the file completely",
+        "unlink refuses to run while the source file still has a hard link",
+        "The new name has to be created first for the exit code to be right",
+        "Node buffers unlink calls, so their order cannot be relied upon"
+      ],
+      answer: 0,
+      why: "Order the steps so a crash at any moment is survivable. Link first and a crash leaves two names for one file: untidy, nothing lost. Unlink first is worse than a crash risk — it never works at all. Once the source name is gone, link fails with ENOENT, and so does the data."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “You wrote a bulk file renamer. What was the hardest part?”",
+      answer: "Not the renaming — the <b>collisions</b>. I found that <code>fs.rename</code> onto an existing name replaces it silently: no error, no warning, exit code 0. I proved it with two files and watched one disappear. The naive fix, checking <code>existsSync</code> first, is a <b>race condition</b>, because something can create the file in the gap. So I used <code>link</code>, which fails with <code>EEXIST</code> if the target exists, then <code>unlink</code> the original — in that order, so a crash between the two steps leaves two names for one file instead of none. <br>Why: naming the race condition, and the ordering argument, is what separates this from a beginner's answer."
+    },
+    {
+      prompt: "Interviewer: “How do you make a destructive command-line tool safe?”",
+      answer: "Three separate things, and people usually only do the first. <b>One:</b> safe by default — a dry run unless the user passes an explicit flag like <code>--go</code>. <b>Two:</b> the underlying operation must be unable to destroy anything, because a dry run only previews the plan; if the plan itself is destructive, the preview prints it anyway. <b>Three:</b> an honest exit code, so a partial failure is visible to whatever script wraps me. A dry run is a preview, not a guard, and confusing the two is the common mistake. <br>Why: separating the preview from the guard is the insight; most candidates give only the flag."
+    },
+    {
+      prompt: "Interviewer: “A user says it renamed 900 files but they now have 897. Where do you look?”",
+      answer: "Three files were <b>overwritten</b>, not lost in transit. That count tells me three renames produced a name that already existed, and the tool replaced it instead of refusing. So I look for a plain <code>fs.rename</code> on the write path. I would also check the exit code, because a tool that skips files must report a non-zero code — reporting success while losing data is the part that let this reach the user. The fix is <code>link</code> plus <code>unlink</code>, and <code>process.exitCode = 2</code> whenever anything is skipped. <br>Why: reading a number like 897 as evidence, instead of asking for more information, is what the interviewer is testing."
+    }
+  ]);
+</script>

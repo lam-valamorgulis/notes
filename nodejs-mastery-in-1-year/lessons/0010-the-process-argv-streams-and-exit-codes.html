@@ -1,0 +1,556 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The process — argv, streams and exit codes — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 10 of 52 · Lesson 10 · Modules &amp; a real CLI</p>
+  <h1>The process — argv, streams and exit codes</h1>
+  <p class="subtitle">How to write a program that behaves properly inside a shell, and one line that silently throws your output away.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 10 of 52.</span> This lesson builds one domain-expert ability: <b>predict how it behaves in a case you have never seen</b>. <a href="../reference/52-week-plan.html#w10">Week 10 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> your program will work correctly <b>inside a pipeline</b> — right stream, right exit code, no lost output. You will also reproduce a bug yourself that silently deletes <b>99.9% of your output</b> and leaves no error behind.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">Week 9</a> was how Node finds your code. This week is how your program talks to the world outside it. Next week you package it; <a href="../reference/52-week-plan.html#w12">week 12</a> you ship it.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what does a shell actually give you?</h2>
+  <p>A shell runs your program and gives it exactly four things. Not more:</p>
+  <ol>
+    <li><b>A list of words</b> — the command line, split up. In Node this is <code>process.argv</code>.</li>
+    <li><b>Three open files</b> — numbered 0, 1 and 2. Called stdin, stdout and stderr.</li>
+    <li><b>A set of environment variables</b> — <code>process.env</code>.</li>
+    <li><b>One number back</b> when you finish — the exit code.</li>
+  </ol>
+
+  <p>That is the entire contract. A program is "well behaved" when it uses all four the way the shell
+  expects. Most bad command-line tools break the same three rules, so take them one at a time.</p>
+  <p><b>Three of the four get a section below.</b> The fourth is <code>process.env</code>. It is held back until <a href="../reference/52-week-plan.html#w27">week 27</a>, where configuration and secrets have a real service to live in. For today, know only two things. It is a plain object of strings. A missing variable reads as <code>undefined</code>, not an error.</p>
+
+  <h2>Why there are two output streams, not one</h2>
+  <p>This looks like a historical accident. It is not. Derive it.</p>
+  <p>A shell lets you connect one program's output to the next program's input:</p>
+  <pre><code>myTool data.csv | sort | head -20</code></pre>
+  <p>For that to work, what leaves <code>myTool</code> must be <b>only the data</b>. If a progress message like <code>Reading 400 rows…</code> went down the same channel, <code>sort</code> would try to sort it. The friendly message would corrupt the data.</p>
+  <p>So you need a second channel that goes to the human instead of to the next program. That is stderr. The rule follows on its own, and it is not a style preference:</p>
+
+  <div class="soundbite">
+    <span class="label">The rule</span>
+    <p><b>stdout is for the answer. stderr is for everything else:</b> progress, warnings and errors. Anything you would delete if a machine were reading goes there.</p>
+  </div>
+
+  <p>Use this quick test on any line you print. <em>If somebody piped this into another program, would this line be part of the data?</em> If no, it goes to stderr.</p>
+
+  <h2>Reading the command line without a library</h2>
+  <p><code>process.argv</code> is a plain array, and the first two entries are always the same:</p>
+  <pre><code><span class="cmt">// node rename.js --dry-run --name bob a.txt</span>
+process.argv[0]  <span class="out">// '/path/to/node'      — the runtime</span>
+process.argv[1]  <span class="out">// '/path/to/rename.js' — your script</span>
+process.argv.slice(2)  <span class="out">// ['--dry-run','--name','bob','a.txt'] — yours</span></code></pre>
+
+  <p>Parsing that by hand is where the bugs live, so Node now ships a parser. <code>util.parseArgs</code> is built in — no dependency:</p>
+
+  <pre><code>const { parseArgs } = require('node:util');
+
+const { values, positionals } = parseArgs({
+  options: {
+    'dry-run': { type: 'boolean' },
+    name:      { type: 'string' },
+  },
+  allowPositionals: true,
+});</code></pre>
+
+  <p>Run with <code>--dry-run --name bob a.txt</code>, that gives you exactly:</p>
+  <pre><code>{"values":{"dry-run":true,"name":"bob"},"positionals":["a.txt"]}</code></pre>
+
+  <div class="tip">
+    <span class="label">Why start here and not with a library</span>
+    Libraries like <code>commander</code> and <code>yargs</code> are good, and you may well use one later. Start without one for a week, so you know what the library is doing for you. A dependency you can rebuild yourself is a choice. A dependency you cannot is a risk.
+  </div>
+
+  <!-- ============ THE BUG ============ -->
+  <h2>The line that silently deletes your output</h2>
+  <p>Here is the part of this lesson that is worth the whole week. This is not a rumour — the numbers below came from running it.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>big.js</b></p>
+  <pre><code>const line = 'x'.repeat(200);
+for (let i = 0; i &lt; 300000; i++) console.log(i + ' ' + line);
+process.exit(0);   <span class="cmt">// ← this line</span></code></pre>
+
+  <p>Run it two ways. The reader is made slow on purpose, because a real one often is:</p>
+
+  <pre><code>node big.js | (sleep 0.3; cat) | wc -l
+<span class="out">// 320          ← with process.exit(0)</span>
+
+<span class="cmt"># now delete the process.exit line and run again</span>
+node big.js | (sleep 0.3; cat) | wc -l
+<span class="out">// 300000       ← without it</span></code></pre>
+
+  <p><b>320 lines out of 300,000 arrived.</b> Over 99.9% of the output vanished. No error. No warning. Exit code 0, so every script around it believed the job succeeded.</p>
+
+  <h2>Why it happens — and why it hides</h2>
+  <p>Derive it from what you already know about the event loop.</p>
+  <p>When stdout is a <b>terminal or a file</b>, Node writes synchronously on Linux and macOS. <b>That is a platform rule, not something you can derive.</b> The bytes are gone by the time <code>console.log</code> returns.</p>
+  <p>When stdout is a <b>pipe</b>, Node on Linux and macOS writes <b>asynchronously</b>. The data is queued. The real writing happens later, on the event loop.</p>
+  <p>Windows is the other way round: pipes there are synchronous, terminals are not. This whole bug is a POSIX bug. Learn the rule, then check it with the one-liner below rather than trusting your memory.</p>
+  <p>You can confirm which one you have:</p>
+  <pre><code>node -e "console.log(process.stdout._handle.constructor.name)" | cat
+<span class="out">// Pipe</span></code></pre>
+  <p>Now <code>process.exit()</code> does exactly what its name says: it ends the process <b>immediately</b>. It does not drain queues. It does not wait for the event loop. Every queued write is thrown away, with no message at all.</p>
+
+  <div class="trap">
+    <span class="label">This is why the bug reaches production</span>
+    At small volume it looks fine — but the reason is not the one people give. The same script with 20,000 lines and a <b>fast</b> reader printed all 20,000, because <code>cat</code> emptied the pipe as fast as Node filled it, so Node's own queue never grew. Give those same 20,000 lines a <b>slow</b> reader and only <b>320</b> arrive — the same 320 as at 300,000 lines. That number is the size of the operating system's pipe buffer, about 64&nbsp;KB. <b>The bug appears when the reader is slower than the writer</b>, which describes production and does not describe your laptop.
+  </div>
+
+  <div class="tip">
+    <span class="label">The fix is to stop calling it</span>
+    Set <code>process.exitCode</code> instead, and let the program end on its own. Node exits when there is no work left, and by then the queue has drained.
+    <pre style="margin:.6rem 0 0;"><code>process.exitCode = 1;   <span class="cmt">// good — a wish, honoured on the way out</span>
+process.exit(1);        <span class="cmt">// dangerous — an order, obeyed instantly</span></code></pre>
+    Keep <code>process.exit()</code> for the one case it is right: you must stop <em>now</em> and losing buffered output is acceptable.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig10-title" width="640" height="300">
+      <title id="fig10-title">console.log to a pipe queues bytes; process.exit throws the queue away, process.exitCode does not</title>
+
+      <text x="20" y="24" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">WHERE YOUR BYTES GO</text>
+
+      <rect x="20" y="46" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="80" y="66" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">console.log</text>
+      <text x="80" y="82" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">returns at once</text>
+
+      <line x1="142" y1="69" x2="196" y2="69" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a10)"></line>
+
+      <rect x="198" y="40" width="150" height="58" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="273" y="60" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">THE QUEUE</text>
+      <text x="273" y="76" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">bytes waiting to be</text>
+      <text x="273" y="89" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">written by the event loop</text>
+
+      <line x1="350" y1="69" x2="404" y2="69" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a10)"></line>
+
+      <rect x="406" y="46" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="466" y="66" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">the next program</text>
+      <text x="466" y="82" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">reads when ready</text>
+
+      <line x1="20" y1="128" x2="620" y2="128" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="156" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">process.exit(0) — the queue is discarded</text>
+      <rect x="20" y="168" width="290" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="165" y="184" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">320 of 300,000 lines arrived</text>
+      <text x="165" y="200" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">no error · no warning · exit code 0</text>
+
+      <text x="330" y="156" style="fill: var(--good); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">process.exitCode — the queue drains</text>
+      <rect x="330" y="168" width="290" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="475" y="184" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">300,000 of 300,000 lines arrived</text>
+      <text x="475" y="200" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">Node leaves once the work is finished</text>
+
+      <text x="320" y="248" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">The queue only exists when stdout is a pipe. To a terminal or a file, the write already happened.</text>
+      <text x="320" y="272" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">That is why this bug never shows up while you are testing by hand.</text>
+
+      <defs>
+        <marker id="a10" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Measured on Node v24.14.0. The numbers are from a real run, not an estimate.</figcaption>
+  </div>
+
+  <!-- ============ EXIT CODES ============ -->
+  <h2>The number you give back</h2>
+  <p>The exit code is how the shell, CI, and every wrapper script learn whether you succeeded. Get it wrong and a failing job is reported as a pass.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>You write</th><th>Shell sees</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>nothing</td><td><code>0</code></td><td>Success. This is the default, so silence means "it worked".</td></tr>
+      <tr><td><code>process.exitCode = 3</code></td><td><code>3</code></td><td>Your own failure code. Output still drains.</td></tr>
+      <tr><td><code>process.exit(4)</code></td><td><code>4</code></td><td>Same number, but the process stops immediately.</td></tr>
+      <tr><td>an uncaught <code>throw</code></td><td><code>1</code></td><td>Node's generic failure. Fine, but it tells the caller nothing.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Those four rows were run and checked, not remembered. The dangerous default is the first row. A tool catches its own error and prints a message. Then it <em>ends normally</em>. It reports success while having done nothing.</p>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Print to a screen and the letters are already gone. The print command has finished delivering them. Print into another program and they are not gone. They go into a waiting line. Something else delivers them a moment later. <code>process.exit()</code> stops your program that same instant. Anything still in the waiting line is thrown away, and nobody is told.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Printing to the screen is handing a letter straight to the person. Printing into a pipe is dropping it in a postbox: it has left your hand, but it has not arrived. <code>process.exit()</code> is setting fire to your own outbox on your way out of the building.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A burnt postbox is obvious — there is smoke, and somebody complains. This failure is completely silent. There is no error and no warning. The exit code is still <code>0</code>. So every script around yours is told the job succeeded. </p>
+    <p class="part cont">And one more break, which explains the number 320. The <b>postbox is not yours</b> — it belongs to the operating system, and whatever reached it does get delivered. What burns is the pile still on your own desk, inside your process. That is why a little output survived and almost none of it did.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People read <code>process.exit(0)</code> as &ldquo;finish now&rdquo;. It does not mean finish. It means <b>stop</b>, and those are different words. Finishing would mean delivering what you already promised to deliver. </p>
+    <p class="part cont">The confusion survives because the two behave identically on a laptop, where output is small and goes to a terminal. It only separates under load — which is the definition of a bug that reaches production.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why <code>process.exit(0)</code> can lose output inside a pipeline. Then say why it never does when you run the program by hand. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — a tool that survives a pipeline</h2>
+  <p>Write <code>wordfreq.js</code>. It counts word frequency. It must obey all four parts of the shell contract.</p>
+
+  <p><b>Requirements — every one of these is testable:</b></p>
+  <ol>
+    <li>Reads a file when given a path; reads <b>stdin</b> when the path is missing and input is piped in.</li>
+    <li>Counts to stdout, one <code>word count</code> per line. Nothing else on stdout.</li>
+    <li>Prints <code>Read N lines…</code> to <b>stderr</b>, so a pipeline never sees it.</li>
+    <li>Supports <code>--top N</code> and <code>--min-length N</code> through <code>util.parseArgs</code>.</li>
+    <li>Exits <code>0</code> on success, <code>1</code> on a bad argument, <code>2</code> when the file is missing — using <code>process.exitCode</code>, never <code>process.exit()</code>.</li>
+  </ol>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The skeleton — fill in the middle yourself</b></p>
+  <pre><code>#!/usr/bin/env node
+const { parseArgs } = require('node:util');
+const fs = require('node:fs');
+
+let opts;
+try {
+  opts = parseArgs({
+    options: { top: { type: 'string' }, 'min-length': { type: 'string' } },
+    allowPositionals: true,
+  });
+} catch (err) {
+  console.error('bad arguments:', err.message);  <span class="cmt">// stderr</span>
+  process.exitCode = 1;                          <span class="cmt">// not process.exit</span>
+  return;
+}
+
+const file = opts.positionals[0];
+const input = file
+  ? fs.createReadStream(file)
+  : process.stdin;          <span class="cmt">// stdin is a Readable stream</span>
+
+<span class="cmt">// ... count words, then:</span>
+<span class="cmt">// console.log(word, n)          → the answer, stdout</span>
+<span class="cmt">// console.error('Read', n, 'lines') → the note, stderr</span></code></pre>
+
+  <div class="trap">
+    <span class="label">You have not been taught streams yet — here is the bridge</span>
+    Requirement 1 needs you to read from <code>process.stdin</code>, and a stream is
+    <a href="../reference/52-week-plan.html#w15">week 15</a>. <a href="./0005-the-async-ladder-callbacks-promises-async-await.html">Week 5</a>
+    deliberately told you to skip <code>for await…of</code> until then, so you are not missing something
+    you should have learned. Use this one line and treat it as a black box:
+    <pre style="margin:.6rem 0;"><code>const text = await new Response(input).text();</code></pre>
+    It works on a file stream and on <code>process.stdin</code> — verified on Node v24.14.0. It reads the
+    <b>whole input into memory</b> before counting. That is fine for a book and completely wrong for a
+    4&nbsp;GB log. Week 15 is where you learn why, and what to do instead. Knowing that this line has a
+    limit is enough for today.
+  </div>
+
+  <p><b>Now prove each requirement.</b> A build with no proof is a build you hope works:</p>
+  <pre><code><span class="cmt"># 1 · works as a source in a pipeline</span>
+node wordfreq.js book.txt | sort -k2 -rn | head -5
+
+<span class="cmt"># 2 · the note went to stderr, so the data stayed clean</span>
+node wordfreq.js book.txt 2&gt;/dev/null | head -3
+
+<span class="cmt"># 3 · works as a sink, reading stdin</span>
+cat book.txt | node wordfreq.js | head -3
+
+<span class="cmt"># 4 · the exit code is honest</span>
+node wordfreq.js no-such-file.txt; echo "exit was $?"   <span class="out"># 2</span>
+
+<span class="cmt"># 5 · nothing is lost under a slow reader — the week's real test</span>
+node wordfreq.js big.txt | (sleep 0.3; cat) | wc -l</code></pre>
+
+  <div class="tip">
+    <span class="label">One test you must run in a real terminal</span>
+    <code>process.stdout.isTTY</code> is <code>true</code> when output goes to a terminal, and <code>undefined</code> when it is piped or captured. Use it to decide whether to print colour. Check it in your own terminal window — many tools that capture output will report <code>undefined</code> in both cases, which makes the test look broken when it is not.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A nightly job writes a large report through your tool into a file. It has been green for months. Someone adds <code>| gzip</code> to the end of the command. The report is now truncated. The job still reports success every night.</p>
+    Name the cause in one sentence, then say which one line you would change.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Signals</b> — <code>SIGTERM</code> and graceful shutdown — are the same <code>process</code> object, but they belong to <a href="../reference/52-week-plan.html#w27">week 27</a>, where there is a real service to shut down. <b>Reading stdin as a stream properly</b>, with backpressure, waits for <a href="../reference/52-week-plan.html#w15">week 15</a>. And <code>child_process</code> — being the shell rather than the tool — is <a href="../reference/52-week-plan.html#w24">week 24</a>.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/api/process.html">process</a> (see "process.exit" and "a note on process I/O"), and <a href="https://nodejs.org/api/util.html#utilparseargsconfig">util.parseArgs</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your <code>wordfreq.js</code> and I'll run it through a pipeline and try to break it. That is more useful than me reading it.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A shell gives your program four things: <b>argv</b>, three streams, <b>env</b> (week 27), and one number back.</li>
+      <li><b>stdout is the answer; stderr is everything else.</b> Test: would a machine reading this want the line?</li>
+      <li><code>process.argv.slice(2)</code> is your part. Parse it with the built-in <code>util.parseArgs</code>, not a dependency.</li>
+      <li>To a terminal or file, writes are synchronous. <b>To a pipe, they are queued.</b></li>
+      <li><code>process.exit()</code> discards that queue. Measured: <b>320 of 300,000 lines</b> survived, with exit code <code>0</code>.</li>
+      <li>It hides while the reader keeps up, so no queue ever builds. It appears the moment the reader falls behind.</li>
+      <li>Use <code>process.exitCode = n</code> and let Node leave on its own.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b><code>process.exit()</code> means stop, not finish — and to a pipe those are very different.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "process", "util.parseArgs". Three results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. </p>
+  <p class="small">They are the truncation numbers (320 of 300,000 lines with <code>process.exit</code>, 300,000 without), the exit-code table, and the <code>parseArgs</code> output. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">← Lesson 9</a>
+    <a href="./0011-package-json-in-full-and-publishing.html">Next: Lesson 11 — package.json in full, and publishing →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A progress message like 'Reading 400 rows' should go to stderr. What is the reason?",
+      options: [
+        "stdout carries the data, so a note there would corrupt the next program's input",
+        "stderr is written synchronously, so the message cannot be lost during a crash",
+        "stdout is buffered by the shell, so notes printed there arrive out of order",
+        "stderr has a higher priority, so the human sees the note before the data"
+      ],
+      answer: 0,
+      why: "The two streams exist so a pipeline can separate the answer from the notes. If a note went to stdout, the next program in the pipe would treat it as data and try to sort, count, or parse it. The test for any line is: would a machine reading this want it?"
+    },
+    {
+      q: "Your tool prints 300,000 lines then calls process.exit(0). Piped to a slow reader, 320 arrive. Why?",
+      options: [
+        "Writes to a pipe are queued, and process.exit ends the process before the queue drains",
+        "The pipe buffer holds only 320 lines, so the operating system dropped the rest",
+        "console.log stops working once the receiving program has fallen far enough behind",
+        "Exit code 0 tells the receiving program to stop reading whatever is still coming"
+      ],
+      answer: 0,
+      why: "To a terminal or a file, Node writes synchronously. To a pipe, it queues the bytes and writes them on the event loop. process.exit() ends the process immediately without draining that queue, so the queued writes are discarded. Setting process.exitCode instead lets Node leave normally, after the queue is empty."
+    },
+    {
+      q: "Why does the truncation bug almost never appear while you are testing the tool by hand?",
+      options: [
+        "Output goes to a terminal, where writes are synchronous, so no queue ever builds",
+        "Terminals read faster than programs, so the queue is emptied before exit happens",
+        "Node detects an interactive session and switches process.exit to a safe version",
+        "Manual tests use fewer lines, and Node skips buffering below a size threshold"
+      ],
+      answer: 0,
+      why: "The queue only exists when stdout is a pipe. Running by hand sends output to a terminal, where Node writes synchronously on Linux and macOS, so nothing is ever pending when exit runs. The same code, piped into a slow reader, loses almost everything — which is why this reaches production."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why should I not call process.exit()?”",
+      answer: "Because <code>process.exit()</code> means <b>stop</b>, not <b>finish</b>. When stdout is a pipe, Node queues writes and drains them on the event loop, and <code>process.exit()</code> ends the process before that happens — so queued output is discarded silently, with exit code 0. I measured this: 300,000 lines into a slow reader gave 320 with <code>process.exit(0)</code> and all 300,000 without it. I set <code>process.exitCode</code> instead and let Node leave once it has nothing left to do. <br>Why: giving the measured numbers turns an opinion into evidence, which is what the interviewer is listening for."
+    },
+    {
+      prompt: "Interviewer: “What makes a command-line tool well behaved?”",
+      answer: "It respects the four things a shell gives it. It reads arguments from <code>process.argv</code> and copes with them being wrong. It puts <b>only the answer on stdout</b> and every note, warning and error on <b>stderr</b>, so it can sit in the middle of a pipeline without corrupting the data. It reads stdin when no file is given, so it can also sit at the end of one. And it returns an honest exit code, so CI can tell success from failure. <br>Why: naming the pipeline is what separates someone who has written a tool from someone who has written a script."
+    },
+    {
+      prompt: "Interviewer: “A nightly job goes green but the output file is truncated. Where do you look?”",
+      answer: "First I would check whether the command was changed to pipe the output anywhere — into <code>gzip</code>, <code>tee</code>, or another process. A pipe changes Node's stdout from a synchronous write to a queued one. Then I would look for <code>process.exit()</code> in the tool, because that discards the queue and still leaves exit code 0, which is exactly the shape of the symptom: silent data loss with a green job. The fix is one line — <code>process.exitCode</code> instead of <code>process.exit()</code>. <br>Why: connecting a green build to silent data loss shows you think about failure modes, not just errors."
+    }
+  ]);
+</script>

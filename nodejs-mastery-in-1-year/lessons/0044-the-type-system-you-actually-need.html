@@ -1,0 +1,553 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The type system you actually need — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 44 of 52 · Lesson 44 · TypeScript for Node</p>
+  <h1>The type system you actually need</h1>
+  <p class="subtitle">Not all of TypeScript. The four parts that catch real Node bugs.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 44 of 52.</span> This lesson builds one domain-expert ability: <b>make a whole class of bug impossible to write</b>. <a href="../reference/52-week-plan.html#w44">Week 44 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> six real Node mistakes, caught before you run anything. And one that TypeScript happily lets through — which is the more useful thing to learn.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    The spine works, is tested, is hardened and has a data layer. Nothing this week changes what it does.
+    It changes how many of your mistakes are <b>possible</b>.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what is a type checker for?</h2>
+  <p>Not documentation, and not autocomplete. Those are side benefits. The real one:</p>
+
+  <div class="soundbite">
+    <span class="label">What you are actually buying</span>
+    <p>A test that runs on <b>every line</b>, in <b>every branch</b>. That includes branches your tests never reach: the error path, the empty array, the missing environment variable.</p>
+  </div>
+
+  <p>That is exactly where your test suite is weakest. <a href="./0035-node-test-the-built-in-runner.html">Week 35</a> measured a file with 100% branch coverage and 50% function coverage. A type checker does not care what your tests reached.</p>
+
+  <p>So learn the parts that catch <b>Node</b> bugs. That is four things, and it is genuinely most of the value.</p>
+
+  <!-- ============ 1 UNKNOWN ============ -->
+  <h2>1 · <code>unknown</code>, and why <code>any</code> is not a type</h2>
+  <p>Two functions doing the same wrong thing. Measured with TypeScript 7.0.2, <code>strict: true</code>:</p>
+
+  <pre><code>function withAny(v: any)         { return v.toUpperCase(); }
+function withUnknown(v: unknown) { return v.toUpperCase(); }
+
+<span class="out">a.ts(3,43): error TS18046: 'v' is of type 'unknown'.</span>
+<span class="cmt">// one error. the `any` version produced NOTHING AT ALL.</span></code></pre>
+
+  <div class="trap">
+    <span class="label"><code>any</code> is not "a value of unknown type"</span>
+    It is <b>&ldquo;stop checking&rdquo;</b>. The checker steps aside, and every value derived from it is also
+    unchecked. One <code>any</code> at a boundary quietly disables type safety for everything downstream of
+    it.
+    <p style="margin:.6rem 0 0;"><code>unknown</code> says the same thing honestly. I do not know what this is, so <b>you must check before you use it</b>. Same ignorance, opposite consequence.</p>
+  </div>
+
+  <p>You meet <code>unknown</code> whether you ask for it or not. Under <code>strict</code>, a caught error is <code>unknown</code>:</p>
+
+  <pre><code>try { JSON.parse('{'); } catch (e) { console.log(e.message); }
+<span class="out">a.ts(6,50): error TS18046: 'e' is of type 'unknown'.</span></code></pre>
+
+  <p>That is not pedantry. JavaScript can throw anything — a string, a number, <code>undefined</code>. Your <code>catch</code> was assuming, and now it has to check:</p>
+
+  <pre><code>catch (e) { console.log(e instanceof Error ? e.message : String(e)); }   <span class="cmt">// compiles</span></code></pre>
+
+  <!-- ============ 2 DISCRIMINATED UNIONS ============ -->
+  <h2>2 · Discriminated unions — the shape that makes the check compulsory</h2>
+  <p>Your error taxonomy from <a href="./0028-operational-versus-programmer-errors.html">week 28</a> is a union. A call either worked or it did not, and the two carry different data.</p>
+
+  <pre><code>type Result =
+  | { ok: true;  value: string }
+  | { ok: false; error: string };
+
+function bad(r: Result) { return r.value; }
+<span class="out">a.ts(15,36): error TS2339: Property 'value' does not exist on type 'Result'.
+  Property 'value' does not exist on type '{ ok: false; error: string; }'.</span></code></pre>
+
+  <p>Read the second line. It does not say &ldquo;you might be wrong&rdquo;. It names <b>the exact case you forgot</b>. Add the check and the types change underneath you:</p>
+
+  <pre><code>function render&lt;T&gt;(r: Result&lt;T&gt;): string {
+  if (r.ok) return String(r.value);     <span class="cmt">// r.value exists — TS knows ok is true here</span>
+  return r.error.code;                   <span class="cmt">// r.error exists — and r.value does not</span>
+}</code></pre>
+
+  <p>That is <b>narrowing</b>: an ordinary <code>if</code> teaching the compiler something. No casts, no assertions. The tag <code>ok</code> is what makes it work, which is why these are called discriminated unions.</p>
+
+  <div class="tip">
+    <span class="label">Why this beats <code>value?: string</code></span>
+    An optional field says both fields <em>might</em> be there, in any combination — including neither, and
+    both. A union says exactly two shapes exist. You then cannot construct the impossible state, which is
+    a stronger guarantee than being reminded to check for it.
+  </div>
+
+  <!-- ============ 3 NEVER ============ -->
+  <h2>3 · <code>never</code> — the compiler tells you what you forgot</h2>
+  <p>The job types from <a href="./0042-background-work-queues-retries-idempotency.html">week 42</a>, with one case missing from the switch:</p>
+
+  <pre><code>type Job = { kind: 'email' } | { kind: 'pdf' } | { kind: 'webhook' };
+
+switch (j.kind) {
+  case 'email': return 'e';
+  case 'pdf':   return 'p';
+  default: { const never: never = j; return never; }
+}
+<span class="out">b.ts(31,22): error TS2322: Type '{ kind: "webhook"; }' is not assignable to type 'never'.</span></code></pre>
+
+  <p>The error <b>names the case</b>: <code>webhook</code>. Not &ldquo;a case is missing&rdquo; — which one.</p>
+
+  <div class="tip">
+    <span class="label">This is the trick worth stealing today</span>
+    Six months from now somebody adds <code>{ kind: 'sms' }</code> to <code>Job</code>. Every switch in the
+    codebase that forgot to handle it <b>fails to compile</b>, and each error names the file, the line, and
+    the case. Without <code>never</code>, those switches quietly fall through to a default and drop the job.
+  </div>
+
+  <!-- ============ 4 REAL BUGS ============ -->
+  <h2>4 · What it catches in real Node code</h2>
+  <p>Five mistakes anyone can make in an afternoon. All measured:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The code</th><th>The error</th></tr></thead>
+    <tbody>
+      <tr><td><code>req.headers['content-length'].length</code></td><td><code>TS2532: Object is possibly 'undefined'</code></td></tr>
+      <tr><td><code>const t: string = await readFile('a.txt')</code></td><td><code>TS2322: Type 'NonSharedBuffer' is not assignable to type 'string'</code></td></tr>
+      <tr><td><code>parseInt(process.env.PORT)</code></td><td><code>TS2345: 'string | undefined' is not assignable to 'string'</code></td></tr>
+      <tr><td><code>const f: Link = links.find(…)</code></td><td><code>TS2322: '{…} | undefined' is not assignable to '{…}'</code></td></tr>
+      <tr><td>A <code>switch</code> missing a case</td><td><code>TS2322: Type '{ kind: "webhook" }' is not assignable to type 'never'</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Every one of these is a real production incident in miniature. A header that is sometimes absent. A <code>Buffer</code> where a string was expected. A missing environment variable in one environment only. A <code>find</code> that returns nothing on an edge case.</p>
+
+  <p>Notice the pattern: <b>almost all of them are <code>undefined</code></b>. That is the single biggest thing <code>strict</code> mode buys you in Node, and it is why <code>strict</code> is not negotiable. Without it, most of this table disappears.</p>
+
+  <!-- ============ THE HOLE ============ -->
+  <h2>The hole — and it is exactly where your data comes in</h2>
+  <p>Now the measurement that matters more than all of the above. This file compiles with <b>zero errors</b>:</p>
+
+  <pre><code>const body = JSON.parse('{"url": 123}');       <span class="cmt">// JSON.parse returns any</span>
+const url: string = body.url;                   <span class="cmt">// no error</span>
+const len: number = url.toUpperCase().length;   <span class="cmt">// no error</span>
+console.log(url.trim());
+
+<span class="out">tsc: 0 errors
+at run time: TypeError: b.url.trim is not a function</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Zero errors, and it crashes</span>
+    <code>JSON.parse</code> returns <code>any</code>, so the checker steps aside — and it stays aside for
+    <code>url</code>, and for <code>len</code>, and for everything after. The <code>: string</code>
+    annotation is a <b>claim you made</b>, and TypeScript believed you.
+    <p style="margin:.6rem 0 0;">This is not a flaw to work around. It is the boundary of what a type
+    checker <em>can</em> do. Types are erased before the program runs, so they cannot check data that
+    arrives while it is running.</p>
+  </div>
+
+  <p>So the rule from <a href="./0037-the-inspector-and-hardening-your-input.html">week 37</a> comes back with a second reason. <b>Validate at the boundary</b> — every request body, every environment variable, every third-party response. Then the types are true because something checked, not because you asserted.</p>
+
+  <pre><code>function toCreateLink(body: unknown): CreateLink {   <span class="cmt">// unknown, never any</span>
+  if (typeof body !== 'object' || body === null) throw new ValidationError('body');
+  const { url, code } = body as Record&lt;string, unknown&gt;;
+  if (typeof url !== 'string' || !isSafeTarget(url)) throw new ValidationError('url');
+  if (code !== undefined &amp;&amp; typeof code !== 'string') throw new ValidationError('code');
+  return { url, code };                              <span class="cmt">// now the type is earned</span>
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">Where the type system stops and you start</span>
+    Inside your service the checker is doing real work. At the edge it can do nothing at all. So one
+    validating function per entry point, returning a typed value — and everything past it can be trusted.
+    Libraries like Zod do this for you; the principle is what matters.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig44-title" width="640" height="250">
+      <title id="fig44-title">Types check the inside of a program, never the data arriving at its edge</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">WHERE THE COMPILER CAN AND CANNOT HELP</text>
+
+      <rect x="20" y="38" width="150" height="112" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="95" y="60" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">THE EDGE</text>
+      <text x="95" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">request bodies</text>
+      <text x="95" y="94" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">process.env</text>
+      <text x="95" y="108" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">API responses</text>
+      <text x="95" y="132" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">types do nothing</text>
+
+      <rect x="188" y="66" width="94" height="56" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="235" y="88" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">validate</text>
+      <text x="235" y="105" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">unknown → typed</text>
+
+      <rect x="300" y="38" width="320" height="112" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="460" y="60" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">INSIDE YOUR SERVICE</text>
+      <text x="460" y="82" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">every line, every branch, including the ones tests never reach</text>
+      <text x="460" y="100" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">undefined · missing switch case · Buffer where a string was expected</text>
+      <text x="460" y="130" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">types do real work</text>
+
+      <path d="M 174 94 L 184 94" style="stroke: var(--ink-faint); stroke-width: 2;"></path>
+      <path d="M 286 94 L 296 94" style="stroke: var(--ink-faint); stroke-width: 2;"></path>
+
+      <rect x="20" y="166" width="600" height="36" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="189" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">JSON.parse('{"url":123}').url  →  tsc: 0 errors  →  TypeError at run time</text>
+
+      <text x="320" y="226" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">Types are erased before the program runs. Something must check at the door.</text>
+      <text x="320" y="244" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured with TypeScript 7.0.2, strict mode.</text>
+    </svg>
+    <figcaption>Both halves are real. The compiler is powerful inside and blind at the edge.</figcaption>
+  </div>
+
+  <!-- ============ GENERICS ============ -->
+  <h2>Generics — one that is worth it</h2>
+  <p>Generics are where people over-reach. The test is simple: a generic is worth it when <b>the output type depends on the input type</b>. Otherwise it is decoration.</p>
+
+  <pre><code>async function withRetry&lt;T&gt;(fn: () =&gt; Promise&lt;T&gt;, attempts = 3): Promise&lt;T&gt; {
+  let last: unknown;
+  for (let i = 0; i &lt; attempts; i++) {
+    try { return await fn(); } catch (e) { last = e; }
+  }
+  throw last;
+}</code></pre>
+
+  <p>Retry a function returning <code>Link</code> and you get a <code>Link</code> back. Retry one returning <code>number</code> and you get a <code>number</code>. Without the generic the return type is <code>any</code>, and you have just disabled checking at every call site.</p>
+
+  <div class="trap">
+    <span class="label">The generic that is not doing anything</span>
+    <code>function log&lt;T&gt;(x: T): void</code> gains you nothing — nothing depends on <code>T</code>. If you
+    cannot say which output type a type parameter determines, delete it and use <code>unknown</code>.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A type checker is a test that runs on every line and every branch. That includes branches your tests never reach. The error path, the empty array, the missing environment variable.</p>
+    <p class="part cont">It runs before the program does. So it catches a whole class of mistake for free. And it catches them in code nobody thought to test.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A form that will not submit until every required box is filled. It cannot tell you the address is real. It can guarantee you did not leave it blank.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A form checks what someone typed. TypeScript checks what <b>you wrote</b>, then it is erased before the program runs. So it can never look at data arriving while the program runs.</p>
+    <p class="part limit cont">I measured this: <code>JSON.parse('{"url":123}')</code>, then <code>const url: string = body.url</code>, compiled with <b>zero errors</b> and crashed with <code>TypeError: b.url.trim is not a function</code>. <code>JSON.parse</code> returns <code>any</code>, the checker stepped aside, and my <code>: string</code> was a claim it simply believed.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People read <code>any</code> as &ldquo;a value whose type I do not know&rdquo;. It means <b>&ldquo;stop checking&rdquo;</b>, and everything derived from it is unchecked too. One <code>any</code> at a boundary turns off type safety for everything downstream.</p>
+    <p class="part cont"><code>unknown</code> expresses the same ignorance with the opposite result: you must check before you use it. Measured, the difference is stark — the <code>unknown</code> version produced <code>TS18046</code>, and the <code>any</code> version produced <b>no error at all</b>.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain to a teammate why their fully typed code still crashed on a bad API response. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — type the hard parts first</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li><code>strict: true</code>. Everything in this lesson depends on it. Nothing else is negotiable either.</li>
+    <li>Type the spine's <b>trickiest</b> function — the one with an ambiguous return. Not the easy ones.</li>
+    <li>Type the week 28 error taxonomy as a <b>discriminated union</b>, and narrow it with a plain <code>if</code>.</li>
+    <li>Put a <code>never</code> check in the default of every switch over a union. Then add a case to the union and watch what fails.</li>
+    <li>One validating function per entry point: <code>unknown</code> in, a typed value out. <b>No <code>any</code> at any boundary.</b></li>
+    <li>Write <b>one</b> generic that is genuinely worth it, and say which output type its parameter determines.</li>
+    <li>Grep for <code>any</code>. For each one, delete it or write a one-line comment defending it.</li>
+  </ol>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;Type a function that returns a user or a not-found error. No <code>any</code>, no <code>throw</code>.&rdquo;</p>
+    The constraint is the whole question. No <code>throw</code> means the failure must be in the
+    <b>return type</b>, so the caller cannot ignore it. Write it, then write the caller and show that
+    reaching the user without checking does not compile.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>The build setup</b> — <code>tsconfig.json</code>, <code>tsx</code>, source maps that make a stack trace
+    name your <code>.ts</code> line — is <a href="../reference/52-week-plan.html#w45">week 45</a>, and it is
+    marked depth because it is mostly a one-time cost. <b>Conditional and mapped types</b> are powerful and
+    easy to overuse. <b>Declaration merging and module augmentation</b> matter when typing someone else's
+    library. <b>Zod and runtime validators</b> do the boundary work described here properly, and are worth
+    adopting once you understand what they are for.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: the <a href="https://www.typescriptlang.org/docs/handbook/2/everyday-types.html">TypeScript handbook</a> —
+    especially <a href="https://www.typescriptlang.org/docs/handbook/2/narrowing.html">Narrowing</a> — and
+    <a href="https://nodejs.org/en/learn/typescript/introduction">Node's own TypeScript guide</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me the <code>any</code> you decided to keep, and I'll try to break it.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A type checker is a test on <b>every line and branch</b>, including the ones your suite never reaches.</li>
+      <li><code>any</code> means <b>stop checking</b>, and it spreads. Measured: the <code>unknown</code> version errored, the <code>any</code> version gave <b>no error at all</b>.</li>
+      <li>Under <code>strict</code>, a caught error is <code>unknown</code> — narrow it with <code>e instanceof Error</code>. <b>Discriminated unions</b> make the check compulsory, and the error names the case you forgot.</li>
+      <li><code>const _never: never = j</code> in a default: add a case to the union and every stale switch fails to compile, by name.</li>
+      <li>Most of what it catches in Node is <b><code>undefined</code></b> — headers, <code>process.env</code>, <code>find</code>. That is why <code>strict</code> is not optional.</li>
+      <li>The hole: <code>JSON.parse</code> returns <code>any</code>. Measured <b>0 compile errors</b>, then <code>TypeError</code> at run time.</li>
+      <li>So <b>validate at the boundary</b>: <code>unknown</code> in, a typed value out. Then the type is earned rather than claimed.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>types are erased before the program runs. They never see data arriving at the door.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> TypeScript handbook ("Everyday Types", "Narrowing"); Node.js documentation ("TypeScript introduction"). The error codes here are <code>TS18046</code>, <code>TS2339</code>, <code>TS2345</code>, <code>TS2532</code> and <code>TS2322</code>. All came from compiling the code with <b>TypeScript 7.0.2</b> under <code>strict: true</code>, on <b>Node v24.14.0</b>, on 2026-08-28. That includes the zero-error compile that then threw <code>TypeError</code>. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0043-build-the-spine-with-a-real-data-layer.html">← Lesson 43</a>
+    <a href="./0045-the-build-setup.html">Next: Lesson 45 — The build setup →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What is the practical difference between any and unknown?",
+      options: [
+        "any turns checking off for everything derived from it; unknown forces a check first",
+        "unknown allows only primitive values, while any also allows objects and functions",
+        "any is erased at compile time, whereas unknown adds a run-time type tag to the value",
+        "unknown can be assigned to any other type, but any cannot be assigned to unknown"
+      ],
+      answer: 0,
+      why: "Measured: v.toUpperCase() on an unknown produced TS18046, and the identical code on an any produced no error at all. any means stop checking, and it spreads to every value derived from it. unknown expresses the same ignorance with the opposite consequence."
+    },
+    {
+      q: "Why does JSON.parse('{\"url\":123}').url assigned to a string compile with zero errors?",
+      options: [
+        "JSON.parse returns any, so the annotation is a claim the checker simply accepts",
+        "String coercion is applied automatically when a number is assigned to a string",
+        "The value is only checked when the property is read, not when it is assigned",
+        "Literal types from a string argument are not analysed unless the call is const"
+      ],
+      answer: 0,
+      why: "Measured: zero compile errors, then TypeError: b.url.trim is not a function at run time. JSON.parse returns any, so the checker steps aside for the parsed value and everything derived from it. Types are erased before the program runs, so they can never check data that arrives while it runs. Validate at the boundary."
+    },
+    {
+      q: "What does assigning the switch subject to a never variable in the default branch buy you?",
+      options: [
+        "Adding a case to the union makes every stale switch fail to compile, naming the case",
+        "It throws at run time when an unexpected value reaches the default branch",
+        "It tells the compiler the switch is complete, which removes the need for a return",
+        "It narrows the union so the earlier case branches can share a single return type"
+      ],
+      answer: 0,
+      why: "Measured: the compiler reported TS2322: Type '{ kind: \"webhook\" }' is not assignable to type 'never' — it named the exact case that was missing. So when someone adds a new job kind next year, every switch that forgot it fails to compile with the file, the line and the case. Without it those switches silently fall through and drop the job."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why use TypeScript on a Node service?”",
+      answer: "Because it is a test that runs on <b>every line and every branch</b>, including the branches my suite never reaches — the error path, the empty array, the environment variable missing in one environment. In Node, most of what it catches is <code>undefined</code>: a header that is <code>string | string[] | undefined</code>, <code>process.env.PORT</code> which is <code>string | undefined</code>, an <code>Array.find</code> that returns nothing. That is why <code>strict</code> is not optional — without it most of that disappears. I would answer the &ldquo;was it worth it&rdquo; question with a list of the actual bugs the compiler caught during migration, not with an opinion. <br>Why: framing it as branch coverage your tests cannot reach, plus the undefined pattern, is more concrete than &ldquo;it catches type errors&rdquo;."
+    },
+    {
+      prompt: "Interviewer: “Our code is fully typed and it still crashed on an API response. How?”",
+      answer: "Types are erased before the program runs, so they can never check data arriving while it runs. <code>JSON.parse</code> returns <code>any</code>, which means <b>stop checking</b> — and it spreads to everything derived from it. I measured exactly this: <code>JSON.parse('{\"url\":123}')</code>, then <code>const url: string = body.url</code>, compiled with <b>zero errors</b> and threw <code>TypeError: b.url.trim is not a function</code>. The annotation was a claim, and the compiler believed me. The fix is one validating function per entry point that takes <code>unknown</code> and returns a typed value, so the type is earned rather than asserted. <br>Why: knowing that this is the boundary of what a checker can do, rather than a bug to work around, is the mark of someone who has actually shipped typed code."
+    },
+    {
+      prompt: "Interviewer: “How do you model a function that can fail?”",
+      answer: "As a <b>discriminated union</b> in the return type, so the caller cannot ignore it: <code>{ ok: true, value: T } | { ok: false, error: { code, message } }</code>. A plain <code>if (r.ok)</code> narrows it — inside that branch <code>r.value</code> exists and <code>r.error</code> does not. I prefer this to optional fields, because optional fields allow the impossible states: both present, or neither. And I prefer it to throwing when the failure is an expected outcome rather than an exception, which is the operational-versus-programmer split I already use for errors. For switches over the union I put <code>const _never: never = x</code> in the default, so adding a case breaks every stale switch by name. <br>Why: choosing the union over optional fields, and giving the reason, shows you are designing the type rather than annotating the code."
+    }
+  ]);
+</script>

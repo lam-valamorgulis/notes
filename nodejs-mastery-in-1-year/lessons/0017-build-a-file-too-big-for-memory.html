@@ -1,0 +1,520 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — a file too big for memory — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 17 of 52 · Lesson 17 · Streams</p>
+  <h1>Build — a file too big for memory</h1>
+  <p class="subtitle">Process more data than the machine has RAM, in flat memory, and prove it with a graph.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 17 of 52.</span> This lesson builds one domain-expert ability: <b>predict how it behaves in a case you have never seen</b>. <a href="../reference/52-week-plan.html#w17">Week 17 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a tool that processes a file <b>larger than your machine's memory</b> and never grows past a flat line. Measured on a 191 MB file: <b>67 MB streaming against 657 MB with <code>readFileSync</code></b>.
+  </div>
+
+  <div class="note">
+    <span class="label">This week assembles weeks 14 to 16 — and adds one thing</span>
+    Buffers and chunk boundaries from <a href="./0014-buffers-and-binary.html">week 14</a>. Backpressure from
+    <a href="./0015-readable-writable-and-backpressure.html">week 15</a>. <code>Transform</code> and
+    <code>pipeline</code> from <a href="./0016-transform-streams-and-pipeline.html">week 16</a>.
+    <p style="margin:.6rem 0 0;">The one new idea is <b>restartability</b>. A job that runs for an hour will eventually be interrupted. A job you cannot resume is a job you run twice.</p>
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the number that decides everything</h2>
+  <p>Read a whole file into a string and your memory cost is the file size. Read it in chunks and your cost is <b>one chunk</b>, whatever the file size.</p>
+  <p>That is not a small saving. It is a different shape:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Approach</th><th>Memory for a 191 MB file</th><th>Memory for a 20 GB file</th></tr></thead>
+    <tbody>
+      <tr><td><code>readFileSync</code></td><td><b>657 MB</b> (measured)</td><td>The process is killed.</td></tr>
+      <tr><td>Streaming</td><td><b>67 MB</b> (measured)</td><td><b>67 MB.</b> Same number.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Note that 657 MB is more than three times the file. A JavaScript string is UTF-16, so ASCII text roughly doubles when decoded. The raw bytes are held at the same time. <b>&ldquo;It is only a 191 MB file&rdquo; is not a safe thought.</b></p>
+
+  <!-- ============ THE BUG ============ -->
+  <h2>The bug that ruins the first attempt</h2>
+  <p>Week 14 taught that a chunk boundary can cut a <em>character</em> in half. The same cut also lands in the middle of a <b>line</b>, and that breaks records.</p>
+
+  <p>Take a CSV of 2000 rows and split each chunk on newlines, treating every piece as a row:</p>
+
+  <pre><code><span class="cmt">// WRONG — each chunk is treated as if it were whole</span>
+r.on('data', (c) =&gt; {
+  for (const line of c.toString().split('\n')) {
+    const cols = line.split(',');
+    <span class="cmt">// ...</span>
+  }
+});</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0, 64-byte chunks):</p>
+  <pre><code><span class="out">naive  -> malformed rows: 1093 | example: "3,c"</span></code></pre>
+
+  <p><b>More than half the rows are damaged.</b> The example is the row <code>3,customer-3,21</code> cut after two characters of the name. It still has commas in it, so it still parses. It is just wrong.</p>
+
+  <div class="trap">
+    <span class="label">Why this is worse than a crash</span>
+    A broken row does not throw. It parses into something with the wrong number of columns, or the right number and wrong values. The job finishes, reports success, and writes bad data. <b>Silent corruption at scale is the worst outcome in this whole course</b>, and it is two lines of code away.
+  </div>
+
+  <h2>The fix — carry the remainder</h2>
+  <p>Keep whatever came after the last newline, and put it in front of the next chunk:</p>
+
+  <pre><code>let rest = '';
+r.on('data', (c) =&gt; {
+  const parts = (rest + c.toString()).split('\n');
+  rest = parts.pop();            <span class="cmt">// the unfinished last piece — keep it</span>
+  for (const line of parts) handle(line);
+});
+r.on('end', () =&gt; { if (rest) handle(rest); });   <span class="cmt">// the final line</span></code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output:</b></p>
+  <pre><code><span class="out">carry  -> malformed rows: 0</span></code></pre>
+
+  <p>That is the same shape as week 14's <code>StringDecoder</code> and week 16's <code>flush</code>. All three are the same idea: <b>hold back the unfinished piece until the rest arrives</b>. Once you see it once, you see it everywhere.</p>
+
+  <div class="tip">
+    <span class="label">Do not write this by hand in real code</span>
+    <code>node:readline</code> does it for you, correctly, and handles <code>\r\n</code> too:
+    <pre style="margin:.6rem 0 0;"><code>const rl = readline.createInterface({ input, crlfDelay: Infinity });
+for await (const line of rl) { <span class="cmt">/* one whole line, always */</span> }</code></pre>
+    Write it by hand <b>once</b>, this week, so you know what <code>readline</code> is protecting you from. Then use <code>readline</code> forever.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig17-title" width="640" height="250">
+      <title id="fig17-title">Memory is flat when streaming and tracks the file size when reading it whole</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">MEMORY AGAINST FILE SIZE</text>
+
+      <line x1="60" y1="180" x2="600" y2="180" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="60" y1="180" x2="60" y2="40" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <text x="330" y="200" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">file size →</text>
+      <text x="30" y="110" text-anchor="middle" transform="rotate(-90 30 110)" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">memory →</text>
+
+      <path d="M 60 176 L 200 150 L 340 110 L 480 62 L 560 44" style="fill: none; stroke: var(--warn); stroke-width: 2.6;"></path>
+      <text x="470" y="52" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">readFileSync</text>
+      <circle cx="340" cy="110" r="4" style="fill: var(--warn);"></circle>
+      <text x="348" y="106" style="fill: var(--warn); font-family: monospace; font-size: 10px;">657 MB at 191 MB</text>
+
+      <line x1="60" y1="168" x2="560" y2="168" style="stroke: var(--good); stroke-width: 2.6;"></line>
+      <text x="440" y="162" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">streaming</text>
+      <circle cx="340" cy="168" r="4" style="fill: var(--good);"></circle>
+      <text x="150" y="162" style="fill: var(--good); font-family: monospace; font-size: 10px;">67 MB — flat, at any size</text>
+
+      <line x1="560" y1="36" x2="560" y2="180" style="stroke: var(--ink-faint); stroke-width: 1; stroke-dasharray: 3 3;"></line>
+      <text x="566" y="100" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">RAM</text>
+      <text x="566" y="112" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">limit</text>
+
+      <text x="330" y="226" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">One line crosses the limit eventually. The other never does. That is the whole reason streams exist.</text>
+    </svg>
+    <figcaption>Both points measured on Node v24.14.0 with the same 191 MB file.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      You can read a book two ways. Carry the whole book, or read one page and put it down. Carrying the whole book gets harder as the book gets bigger. Reading a page at a time costs the same for every book.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Emptying a swimming pool. One way is to find a container as big as the pool. The other is a bucket you carry back and forth. The bucket takes longer, and it works for a pool of any size.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      Water does not care where you cut it. Your data does. Fill a bucket from a pool and you get water. Fill a chunk from a file and you can get <b>half a row</b>.</p>
+    <p class="part limit cont">That is the real difficulty and the analogy hides it completely. Streaming is not just &ldquo;the same job with less memory&rdquo;. It is the same job with <b>the boundaries in the wrong places</b>. Every unfinished piece has to be carried to the next bucket by hand.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think the risk of streaming is running out of memory. It is not — that is the risk of <em>not</em> streaming.</p>
+    <p class="part cont">The risk of streaming is <b>silent corruption</b>. A cut record still parses. It has commas in it. Nothing throws, the job reports success, and the wrong number reaches a report. Measured on a 2000-row file: <b>1093 damaged rows and zero errors</b>.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why processing a file in chunks can corrupt records. Then say what you carry between chunks to prevent it. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — <code>bigcount</code></h2>
+  <p>A tool that reads a log or CSV of any size and reports totals, in flat memory.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>1 · Make a file bigger than you want to hold</b></p>
+  <pre><code>node -e "
+  const fs=require('fs');
+  const w=fs.createWriteStream('huge.csv');
+  w.write('id,name,amount\n');
+  let i=0;
+  (function pump(){
+    while(i++ &lt; 4000000){
+      if(!w.write(\`\${i},customer-\${i%997},\${i%13*7}\n\`)) return w.once('drain',pump);
+    }
+    w.end();
+  })();
+  w.on('finish',()=&gt;console.log((fs.statSync('huge.csv').size/1048576).toFixed(0),'MB'));
+"</code></pre>
+  <p>Note that the generator itself honours backpressure. Writing four million lines without that is
+  week 15's bug, on the way in.</p>
+
+  <p><b>Requirements.</b> Every one is testable:</p>
+  <ol>
+    <li>Reads the file with <code>pipeline</code>, never <code>readFileSync</code>.</li>
+    <li>Splits lines correctly — <b>zero</b> malformed rows. Prove it by counting.</li>
+    <li>Reports total rows, total amount, and the top 5 names by amount.</li>
+    <li><b>Peak memory stays flat</b> as the file grows. Print it at the end.</li>
+    <li>Prints progress to <b>stderr</b> every 500,000 rows, so stdout stays clean data (week 10).</li>
+    <li><b>Resumable.</b> <code>--from-line N</code> skips the first N rows and carries on.</li>
+  </ol>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The shape</b></p>
+  <pre><code>const { pipeline } = require('node:stream/promises');
+const readline = require('node:readline');
+const fs = require('node:fs');
+
+const totals = new Map();
+let rows = 0, sum = 0, peak = 0;
+
+const rl = readline.createInterface({
+  input: fs.createReadStream(file),
+  crlfDelay: Infinity,
+});
+
+for await (const line of rl) {          <span class="cmt">// backpressure is the loop itself</span>
+  rows++;
+  if (rows &lt;= skip) continue;           <span class="cmt">// --from-line</span>
+  const [, name, amount] = line.split(',');
+  <span class="cmt">// ...accumulate...</span>
+  if (rows % 500000 === 0) {
+    const mb = process.memoryUsage().rss / 1048576;
+    if (mb &gt; peak) peak = mb;
+    console.error(`${rows} rows, ${mb.toFixed(0)} MB`);    <span class="cmt">// stderr</span>
+  }
+}</code></pre>
+
+  <div class="trap">
+    <span class="label">The requirement that will catch you</span>
+    Requirement 3 says <em>top 5 names</em>. There are 997 distinct names, so a <code>Map</code> is fine. Now
+    imagine 40 million distinct names. <b>Your accumulator is not flat any more</b> — the file streams, but
+    the totals do not. Streaming the input does not make a program constant-memory. The <em>state you keep</em>
+    has to be bounded too, and that is the part people forget.
+  </div>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Prove every requirement</b></p>
+  <pre><code><span class="cmt"># 2 · zero malformed rows</span>
+node bigcount.js huge.csv 2&gt;/dev/null | grep malformed        <span class="out"># 0</span>
+
+<span class="cmt"># 4 · flat memory — run on a file 4x bigger and compare</span>
+node bigcount.js huge.csv 2&gt;&amp;1 &gt;/dev/null | tail -1
+
+<span class="cmt"># 5 · stdout is clean data, so a pipeline can read it</span>
+node bigcount.js huge.csv 2&gt;/dev/null | head -3
+
+<span class="cmt"># 6 · resume gives the same answer as one whole run</span>
+node bigcount.js huge.csv --from-line 2000000</code></pre>
+
+  <p>Then, for the graph: sample <code>process.memoryUsage().rss</code> every 500,000 rows, write the
+  numbers to a file, and plot them. <b>A flat line is the deliverable.</b> A rising line means something in
+  your accumulator grows with the input, and you should find it before moving on.</p>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    The memory graph, and the two malformed-row counts — naive and carried. Those three artefacts are the
+    whole of weeks 14 to 17 in one page.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A nightly aggregation streams a 30 GB log and has worked for months. Traffic doubles. Now it is killed by the memory limit. The code still uses <code>pipeline</code> throughout, and nothing about the reading changed.</p>
+    Say where the memory is going, why <code>pipeline</code> did not protect them, and what you would measure first.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Parallel processing</b> of one file — splitting by byte range across workers — is real and belongs
+    with <a href="../reference/52-week-plan.html#w23">week 23</a>, where there are workers to give it to.
+    <b>Proper CSV parsing</b> with quoted fields containing commas and newlines is a solved problem; use a
+    library, and know that <code>split(',')</code> is a teaching simplification, not production code.
+    <b>Compressed input</b> is one more <code>pipeline</code> stage and needs no new idea.
+  </div>
+
+  <div class="note">
+    <span class="label">🎉 Weeks 14–17 complete</span>
+    You can explain what a <code>Buffer</code> is, why a chunk boundary breaks characters and records, what
+    backpressure is and what ignoring it costs, and why <code>pipeline</code> exists. And you have processed
+    a file bigger than memory in a flat line. Next on <a href="../index.html">The Map</a>:
+    <b>weeks 18–21 — EventEmitter, and servers from scratch</b>, where the <b>spine API</b> begins.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/en/learn/modules/how-to-use-streams">How to use streams</a> and <a href="https://nodejs.org/api/readline.html">readline</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your memory graph. If it is not flat, I will tell you which line is holding on to something.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Reading a file whole costs the file size. Streaming costs <b>one chunk</b>, whatever the size.</li>
+      <li>Measured on 191 MB: <b>657 MB</b> with <code>readFileSync</code>, <b>67 MB</b> streaming.</li>
+      <li>A chunk boundary cuts records as well as characters. Measured: <b>1093 of 2000 rows damaged</b>, with no error.</li>
+      <li>Fix it by carrying the remainder into the next chunk. Same idea as <code>StringDecoder</code> and <code>flush</code>.</li>
+      <li>In real code use <code>node:readline</code> with <code>crlfDelay: Infinity</code>. Write it by hand once, then never again.</li>
+      <li>Streaming the input is not enough. <b>The state you accumulate must be bounded too.</b></li>
+      <li>A job that runs for an hour needs to be resumable, or you will run it twice.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the danger of streaming is not running out of memory. It is a cut record that still parses.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "How to use streams", "readline". Three results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the 657 MB and 67 MB peaks on the same 191 MB file. Also the 1093 malformed rows against 0. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0016-transform-streams-and-pipeline.html">← Lesson 16</a>
+    <a href="./0018-eventemitter-the-pattern-under-everything.html">Next: Lesson 18 — EventEmitter — the pattern under everything →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Splitting each chunk on newlines damaged 1093 of 2000 rows. Why did nothing throw?",
+      options: [
+        "A cut row still contains commas, so it parses into wrong values",
+        "The stream swallowed the errors because no error listener was set",
+        "Node repairs malformed rows automatically and logs only a warning",
+        "The rows were written to the output before the parser could check"
+      ],
+      answer: 0,
+      why: "A record cut in half is still a string with commas in it. It parses into the wrong number of columns, or the right number and wrong values. The job finishes and reports success. Silent corruption is worse than a crash, because nothing tells you to look."
+    },
+    {
+      q: "Your job streams a 30 GB log with pipeline, yet memory still grows. Where is it going?",
+      options: [
+        "Into the state you accumulate, which grows with the number of keys",
+        "Into the stream's queue, because pipeline raises the highWaterMark",
+        "Into the file handles, one of which is kept open for every chunk",
+        "Into the decoder, which keeps every chunk it has already converted"
+      ],
+      answer: 0,
+      why: "Streaming the input bounds the input. It says nothing about what you keep. A Map that gains a key per distinct value grows with the data, so the program is not constant-memory however good the reading is. Bound the accumulator, or write partial results out as you go."
+    },
+    {
+      q: "Why does reading a 191 MB text file whole cost about 657 MB?",
+      options: [
+        "A JavaScript string is UTF-16, so ASCII roughly doubles when decoded",
+        "Node keeps three copies of any file it reads with a synchronous call",
+        "The file is decompressed in memory before the string is handed back",
+        "Reading a file allocates a buffer equal to the free memory available"
+      ],
+      answer: 0,
+      why: "The raw bytes are read first, then decoded into a JavaScript string. Strings are UTF-16, so one-byte ASCII characters take two bytes each, and both representations exist at once. The cost is a multiple of the file size, not the file size — so 'it is only 191 MB' is not a safe thought."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Process a 50 GB log and count errors by hour. Sketch it.”",
+      answer: "I would stream it, never read it whole. A <code>createReadStream</code> into <code>readline</code> with <code>crlfDelay: Infinity</code>, then a <code>for await</code> loop, which gives me backpressure for free. Per line I parse the hour and increment a counter. The key question is the <b>accumulator</b>: hours are bounded, so a <code>Map</code> is safe. If I were grouping by something unbounded, like user id, I would have to write partial results out or aggregate in a database instead. I would also make it resumable by line number, because a job this long will be interrupted. <br>Why: naming the accumulator as the real risk is what separates this from a beginner answer."
+    },
+    {
+      prompt: "Interviewer: “What goes wrong when you split a file into chunks?”",
+      answer: "The chunk boundary lands wherever the buffer happens to end, so it cuts through both characters and records. I measured it on a 2000-row CSV read in 64-byte chunks: splitting each chunk on newlines damaged <b>1093 rows</b>, and nothing threw, because a cut row still has commas in it. The fix is to carry the piece after the last newline into the next chunk. That is the same idea as <code>StringDecoder</code> for characters and <code>flush</code> for a transform. In real code I use <code>node:readline</code>, which does it correctly. <br>Why: connecting the three places the same idea appears shows you learned a principle, not three tricks."
+    },
+    {
+      prompt: "Interviewer: “Is streaming always the right choice?”",
+      answer: "No, and the cost is real. Streaming is more code, the boundaries are in the wrong places, and a bug there corrupts data silently instead of crashing. If the input is bounded and small — a config file, an API response you control — reading it whole is simpler and safer. I stream when the input size is <b>not under my control</b>, because then the whole-file version does not fail gradually. It works, and works, and then one day the process is killed. <br>Why: saying when not to stream shows judgement; answering &ldquo;always stream&rdquo; shows a rule you were told."
+    }
+  ]);
+</script>

@@ -1,0 +1,521 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing and data in Nest — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 49 of 52 · Lesson 49 · NestJS</p>
+  <h1>Testing and data in Nest</h1>
+  <p class="subtitle">Dependency injection pays for itself in tests, or it does not pay at all. Prove it here.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 49 of 52.</span> This lesson builds one domain-expert ability: <b>collect the evidence that a design choice paid off</b>. <a href="../reference/52-week-plan.html#w49">Week 49 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a one-line database swap, and the number that says what it costs — <b>0.33 ms per test</b>. That is the whole bill for the container, and now you can defend it.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0047-modules-and-dependency-injection.html">Week 47</a> claimed the container earns its keep
+    in tests. This week is where that claim gets checked, and where the data layer from weeks 40&ndash;43
+    goes in without infecting the whole codebase.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — why is a fake database hard?</h2>
+  <p>Not because writing a fake is hard. Because of <b>where the real one is named</b>.</p>
+
+  <pre><code><span class="cmt">// this service can never be tested without Postgres</span>
+import { pool } from '../db.js';
+class LinkService {
+  async resolve(code) { return pool.query('select url from links where code=$1', [code]); }
+}</code></pre>
+
+  <p>The dependency is not a parameter. It is an <b>import</b>, resolved at module load, before anybody can intervene. To swap it you must intercept the module system. That is where mocking libraries come from, and where test suites go to become unmaintainable.</p>
+
+  <div class="soundbite">
+    <span class="label">The whole reason injection helps here</span>
+    <p>If a dependency arrives as a <b>constructor argument</b>, swapping it needs no cleverness at all. It is just a different argument.</p>
+  </div>
+
+  <!-- ============ THE SWAP ============ -->
+  <h2>The swap, and the three ways to do it</h2>
+  <p>All three are one line, and they differ in what you hand over. Measured on NestJS 12.0.1:</p>
+
+  <pre><code>.overrideProvider(Store).useClass(FakeStore)        <span class="out">// https://fake</span>
+.overrideProvider(Store).useValue({ find: async () =&gt; … })   <span class="out">// https://stub</span>
+.overrideProvider(Store).useFactory({ factory: () =&gt; … })    <span class="out">// https://made</span></code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Style</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td><code>useClass</code></td><td>The fake has real behaviour worth reusing — an in-memory store.</td></tr>
+      <tr><td><code>useValue</code></td><td>A stub for one test. Also where a <code>mock.fn</code> from week 36 goes.</td></tr>
+      <tr><td><code>useFactory</code></td><td>The fake needs building, or needs other providers injected into it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ============ THE COST ============ -->
+  <h2>What the container costs, in milliseconds</h2>
+  <p>Building the same object graph, 200 times each. Measured:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>How</th><th>Per build</th><th>For a 1,000-test suite</th></tr></thead>
+    <tbody>
+      <tr><td>Plain <code>new</code>, hand-wired</td><td>0.00 ms</td><td>&mdash;</td></tr>
+      <tr><td><code>Test.createTestingModule().compile()</code></td><td><b>0.33 ms</b></td><td>0.33 s</td></tr>
+      <tr><td>…with an <code>overrideProvider</code></td><td>0.27 ms</td><td>0.27 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Now you can answer the question honestly</span>
+    A third of a millisecond per test. A thousand tests is a third of a second, once, for the whole suite.
+    Set against a swap that would otherwise cost one rebuild per level of your graph, that is a bargain —
+    and you can now say so with a number instead of a feeling.
+  </div>
+
+  <p>Not everything is that cheap. Compare a unit test with an end-to-end one:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Style</th><th>50 calls</th><th>Each</th></tr></thead>
+    <tbody>
+      <tr><td>Call the controller class directly</td><td><b>0 ms</b></td><td>too fast to measure</td></tr>
+      <tr><td>Real HTTP against a listening app</td><td><b>38 ms</b></td><td>0.76 ms</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">And that 38 ms is the optimistic number</span>
+    The handler measured here does nothing. A real end-to-end test also starts the app, connects to a
+    database, and often resets it between cases. The HTTP is never the expensive part.
+    <p style="margin:.6rem 0 0;">So the question is not &ldquo;is end-to-end slower?&rdquo; It is <b>&ldquo;what does it check that a unit test cannot?&rdquo;</b> The guard, the pipe, the filter, the serialisation, and the wiring itself. That is a real list, and it is why some tests must be
+    end-to-end.</p>
+  </div>
+
+  <!-- ============ PORTS ============ -->
+  <h2>Wiring the data layer without spreading it everywhere</h2>
+  <p>The mistake is letting <code>pg</code> types reach your service. Then every test needs Postgres, and a database change touches files that have nothing to do with data.</p>
+
+  <p>Define the dependency in <b>your own words</b>, and inject it by a token:</p>
+
+  <pre><code><span class="cmt">// the port — no framework, no pg. this is your language.</span>
+export interface LinkStore {
+  find(code: string): Promise&lt;{ code: string; url: string } | undefined&gt;;
+}
+export const LINK_STORE = Symbol('LINK_STORE');
+
+<span class="cmt">// the adapter — the ONLY file that knows Postgres exists</span>
+@Injectable() class PgLinkStore implements LinkStore { … }
+
+<span class="cmt">// the service depends on the interface, never the adapter</span>
+@Injectable() class LinkService {
+  constructor(@Inject(LINK_STORE) private store: LinkStore) {}
+  async resolve(code: string) { return (await this.store.find(code))?.url ?? null; }
+}
+
+@Module({ providers: [LinkService, { provide: LINK_STORE, useClass: PgLinkStore }] })
+class LinksModule {}</code></pre>
+
+  <p>Now the swap is the same one line, and the in-memory version is a real implementation rather than a mock. Measured:</p>
+
+  <pre><code><span class="out">  real adapter : https://from-postgres
+  swapped      : https://memory
+  missing key  : null</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Why a <code>Symbol</code> token, and why <code>implements</code></span>
+    An interface does not exist at run time, so Nest cannot inject by it — you need a token, and a
+    <code>Symbol</code> cannot collide with anything. And <code>implements LinkStore</code> on both the real
+    adapter and the fake means the <b>compiler</b> keeps them in step. A fake that drifts from the real
+    thing is a test that proves nothing, and week 44's checker is what stops that.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig49-title" width="640" height="250">
+      <title id="fig49-title">The service depends on an interface, so only the adapter knows about Postgres</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">WHERE THE WORD "POSTGRES" IS ALLOWED TO APPEAR</text>
+
+      <rect x="20" y="38" width="170" height="78" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="105" y="60" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">LinkService</text>
+      <text x="105" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 9px;">@Inject(LINK_STORE)</text>
+      <text x="105" y="100" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">knows nothing about pg</text>
+
+      <rect x="235" y="38" width="170" height="78" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="320" y="60" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">interface LinkStore</text>
+      <text x="320" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">your words, not a library's</text>
+      <text x="320" y="100" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">erased at run time — hence the Symbol</text>
+
+      <rect x="450" y="26" width="170" height="46" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="535" y="45" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">PgLinkStore</text>
+      <text x="535" y="61" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">the only file importing pg</text>
+
+      <rect x="450" y="82" width="170" height="46" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="535" y="101" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">InMemoryStore</text>
+      <text x="535" y="117" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">a real implementation, not a mock</text>
+
+      <path d="M 192 77 L 231 77" style="stroke: var(--ink-faint); stroke-width: 2;"></path>
+      <path d="M 407 70 L 446 50" style="stroke: var(--ink-faint); stroke-width: 1.5; stroke-dasharray: 3 3;"></path>
+      <path d="M 407 84 L 446 104" style="stroke: var(--ink-faint); stroke-width: 1.5; stroke-dasharray: 3 3;"></path>
+
+      <rect x="20" y="146" width="600" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="164" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">.overrideProvider(LINK_STORE).useClass(InMemoryStore)</text>
+      <text x="320" y="179" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">one line · 0.33 ms per test · both sides checked by <tspan style="font-family: monospace;">implements LinkStore</tspan></text>
+
+      <text x="320" y="212" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">A fake that drifts from the real thing is a test that proves nothing.</text>
+      <text x="320" y="236" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured on NestJS 12.0.1 — real adapter, swapped adapter, and a missing key returning null.</text>
+    </svg>
+    <figcaption>The interface is the contract. The compiler enforces it on both implementations.</figcaption>
+  </div>
+
+  <!-- ============ WHEN E2E ============ -->
+  <h2>When is an end-to-end test worth its slowness?</h2>
+  <p>When it checks something a unit test <b>structurally cannot</b>:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Worth it end-to-end</th><th>Not worth it</th></tr></thead>
+    <tbody>
+      <tr><td>The guard actually blocks the route</td><td>A pure function's branches</td></tr>
+      <tr><td>The pipe rejects a bad body with 400</td><td>A calculation with many cases</td></tr>
+      <tr><td>The filter turns your error into the right status</td><td>Anything you can call directly</td></tr>
+      <tr><td>The wiring is correct — providers resolve</td><td>A repeat of a unit test, but slower</td></tr>
+      <tr><td>A real transaction commits and rolls back</td><td>Behaviour you have already covered</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Look at the left column: <b>every row is something that only exists once the pieces are joined together</b>. That is the definition, and it is a short list. A large end-to-end suite is usually a unit-test suite in a slow costume.</p>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A fake database is easy to write. What makes it hard is <b>where the real one is named</b>. If a service imports the database directly, that choice was made when the file loaded, before any test could intervene.</p>
+    <p class="part cont">If it arrives as a constructor argument instead, swapping it needs no cleverness. It is just a different argument, and the container makes that one line.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A socket in a wall. The lamp does not care what is behind it, so you can test the lamp on any supply. If the lamp were soldered to the mains, you could only test it in one building.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A socket has a physical shape, so a bad plug will not fit. An interface is erased before the program runs. So nothing at run time stops a fake drifting away from the real thing.</p>
+    <p class="part limit cont">That is why both classes say <code>implements LinkStore</code> — the <b>compiler</b> becomes the shape of the socket. It is also why the injection needs a <code>Symbol</code> token. Nest cannot inject by an interface that no longer exists at run time. A fake that has quietly drifted is worse than no test, because it still passes.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People assume the container is too slow for tests, or that it is free. Neither. Measured: <code>createTestingModule().compile()</code> costs <b>0.33 ms</b>, against effectively zero for a plain <code>new</code>.</p>
+    <p class="part cont">A thousand tests is a third of a second, once. That is the whole bill, and it is worth saying out loud. &ldquo;Dependency injection makes tests easier&rdquo; is an opinion. <b>0.33 ms for a one-line swap</b> is an argument.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain why importing your database module directly makes a service hard to test. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — port the suite, then prove the claim</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Port the week 35&ndash;38 tests to Nest's testing module. Same assertions. If an assertion had to change, ask whether the <b>behaviour</b> changed or only the plumbing.</li>
+    <li>Define <b>ports</b> for Postgres, the cache and the queue — interfaces in your own words, injected by <code>Symbol</code> tokens.</li>
+    <li>Both the real adapter and the fake say <code>implements</code>. Break one on purpose and confirm the compiler catches the drift.</li>
+    <li><b>Swap the database in one line.</b> Then run the identical suite against the real one, changing nothing else.</li>
+    <li>Time your suite <b>with and without</b> the container. Write the number down. Defend it or drop the container.</li>
+    <li>Keep end-to-end tests for the short list: the guard blocks, the pipe rejects, the filter maps, a transaction rolls back.</li>
+    <li>Find one end-to-end test that is really a unit test in a slow costume, and rewrite it.</li>
+  </ol>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;Show me a unit test where dependency injection genuinely saved you work.&rdquo;</p>
+    Show the test, then show <b>what it would have looked like without the container</b> — every level of the
+    graph rebuilt by hand. The comparison is the answer. If the two versions look about the same, you have
+    found a place where the container is not earning its keep, and saying that is a better answer than
+    pretending.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Testcontainers</b> — a real Postgres per test run in Docker — is the honest answer for the data layer
+    and worth adopting. <b><code>@nestjs/typeorm</code> and Prisma</b> integrate an ORM into the container,
+    with the trade-offs from week 40. <b>Transactional tests</b>, where each case rolls back, are a fast way
+    to keep a database suite isolated. <b>Contract tests</b> keep a fake and its real implementation honest
+    at run time, which is the gap the compiler cannot close alone.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: NestJS docs — <a href="https://docs.nestjs.com/fundamentals/testing">Testing</a> and
+    <a href="https://docs.nestjs.com/fundamentals/custom-providers">Custom providers</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a test and its hand-wired equivalent, and I'll tell you if the container earned its place.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A fake is easy; the problem is <b>where the real one is named</b>. An import is decided at load time, before a test can act.</li>
+      <li>A constructor argument needs no cleverness to swap. That is the entire benefit.</li>
+      <li>Three one-line overrides: <code>useClass</code> for real behaviour, <code>useValue</code> for a stub, <code>useFactory</code> when the fake needs building.</li>
+      <li>Measured: <b>0.33 ms</b> per <code>createTestingModule().compile()</code> — a third of a second across a thousand tests.</li>
+      <li>Define <b>ports</b> in your own words and inject by a <code>Symbol</code>, so only the adapter imports <code>pg</code>.</li>
+      <li><code>implements</code> on both the real and the fake makes the compiler stop them drifting apart.</li>
+      <li>End-to-end only for what unit tests structurally cannot reach: the guard, the pipe, the filter, the wiring, a real transaction.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a drifted fake is worse than no test, because it still passes.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> NestJS documentation ("Testing", "Custom providers"). The measurements are the 0.33 ms compile cost, the three override styles, and the 0 ms against 38 ms comparison. So is the port-and-adapter swap. All ran on <b>NestJS 12.0.1</b> with <b>TypeScript 7.0.2</b>, on <b>Node v24.14.0</b>, on 2026-08-28. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0048-controllers-pipes-guards-interceptors.html">← Lesson 48</a>
+    <a href="./0050-build-the-spine-rebuilt-in-nestjs.html">Next: Lesson 50 — Build — the spine rebuilt in NestJS →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why does importing the database module directly make a service hard to test?",
+      options: [
+        "The dependency is chosen when the file loads, before any test can intervene",
+        "Imports are cached, so a second test receives a connection the first one closed",
+        "Module imports are read-only in strict mode, which blocks assignment to the binding",
+        "The database module runs its connection logic eagerly, which slows every test file"
+      ],
+      answer: 0,
+      why: "The dependency is not a parameter, it is an import resolved at module load. To swap it you have to intercept the module system, which is where mocking libraries come from and where suites become unmaintainable. A constructor argument needs no cleverness — it is just a different argument."
+    },
+    {
+      q: "What does createTestingModule().compile() cost compared with plain construction?",
+      options: [
+        "About 0.33 ms per build, so roughly a third of a second across a thousand tests",
+        "About 33 ms per build, which is why most suites reuse one module across files",
+        "Nothing measurable, because the container caches the compiled graph between calls",
+        "It depends on graph depth, roughly doubling with each additional level of providers"
+      ],
+      answer: 0,
+      why: "Measured over 200 builds: 0.33 ms each, against effectively zero for a hand-wired new. A thousand tests is a third of a second, once. Knowing that number is what turns \"DI makes tests easier\" from an opinion into an argument you can defend."
+    },
+    {
+      q: "Why inject a store through a Symbol token rather than by its interface?",
+      options: [
+        "An interface does not exist at run time, so there is nothing for Nest to resolve",
+        "Symbols are compared by reference, which makes provider lookup faster than by name",
+        "A token allows several implementations to be registered under one name at once",
+        "Interfaces cannot be decorated with Injectable, which providers are required to be"
+      ],
+      answer: 0,
+      why: "TypeScript interfaces are erased before the program runs, so Nest has no value to look up. A Symbol token gives it one, and cannot collide with anything. Pair it with implements on both the real adapter and the fake, so the compiler stops them drifting apart — a drifted fake still passes, which is worse than no test."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Show me where dependency injection genuinely saved you work.”",
+      answer: "Swapping the database in a test. With the container it is one line — <code>.overrideProvider(LINK_STORE).useClass(InMemoryStore)</code> — and nothing else in the graph changes. Hand-wired, I would have to rebuild every level between the store and the thing under test, and that grows with the depth of the graph. I know what it costs, too: <code>createTestingModule().compile()</code> measured at <b>0.33 ms</b>, so a thousand tests is a third of a second. If the comparison ever looked about the same, I would say so — that would be a place where the container is not earning its keep. <br>Why: having the cost number, and being willing to say when it does not pay, is what makes the claim credible."
+    },
+    {
+      prompt: "Interviewer: “How do you keep the database out of your business logic?”",
+      answer: "I define a <b>port</b> — an interface in my own words, like <code>LinkStore</code> with a <code>find</code> method — and the service depends on that, injected by a <code>Symbol</code> token. The only file that imports <code>pg</code> is the adapter that implements it. So a database change touches one file, and no test needs Postgres unless it is testing the adapter. Both the real adapter and the in-memory one say <code>implements LinkStore</code>, so the compiler keeps them in step — a fake that has drifted from the real thing is worse than no test, because it still passes. <br>Why: the drift point is the part most people miss, and it is what makes the fake trustworthy rather than convenient."
+    },
+    {
+      prompt: "Interviewer: “When do you write an end-to-end test?”",
+      answer: "Only for things a unit test structurally cannot reach: that the guard actually blocks the route, that the pipe rejects a bad body with a 400, that the filter maps my error type to the right status, that the providers resolve at all, and that a real transaction commits and rolls back. Everything on that list only exists once the pieces are joined. I measured the difference — 50 direct controller calls were too fast to time, and 50 real HTTP requests took 38 ms, and that was with a handler that does nothing. So a large end-to-end suite is usually a unit-test suite in a slow costume. <br>Why: giving a short, specific list of what only e2e can check is stronger than a general statement about the test pyramid."
+    }
+  ]);
+</script>

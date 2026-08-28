@@ -1,0 +1,524 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When you do not know — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 7 of 7 · Lesson 20 · The rehearsal</p>
+  <h1>When you do not know</h1>
+  <p class="subtitle">The hard questions are not the danger. The seconds after them are. Rehearse those seconds.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 7 of 7.</span> This lesson builds one domain-expert ability: <b>explain it from first principles, with no jargon and no notes</b>. Under pressure, with no page to read from. <a href="../reference/7-day-plan.html#d7">Day 7 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> twelve sentences arrive without thinking. You can say "I do not know" and gain ground. You never apologise for your English again.
+  </div>
+
+  <div class="note">
+    <span class="label">Nothing new here either</span>
+    This lesson adds no Node knowledge. It adds <b>sentences</b>. Sentences are the part that fails first when you are nervous, and the part almost nobody rehearses.
+  </div>
+
+  <h2>Start from the problem</h2>
+
+  <p>Think back to any interview that went badly. The damage was almost never the hard question itself.</p>
+
+  <p>The damage was the ten seconds after it. The silence, the guess, the apology, the lost thread.</p>
+
+  <p>Two failures cause almost all of it, and they arrive together.</p>
+
+  <ul>
+    <li><b>You do not know the answer.</b> So you guess, or you freeze.</li>
+    <li><b>Your English deserts you.</b> Not your grammar — your <em>access</em> to words, under stress.</li>
+  </ul>
+
+  <p>Both feel like knowledge problems. Neither is. More Node facts fix neither of them.</p>
+
+  <h2>Derive the fix from how you are graded</h2>
+
+  <p>Start from what the interviewer is actually doing. They are predicting what you will be like as a colleague.</p>
+
+  <p>So they are grading <b>reasoning</b>, not recall. That single fact settles everything else.</p>
+
+  <p>Step one: silence cannot be graded. If they hear nothing, they score nothing. So silence is always the worst option.</p>
+
+  <p>Step two: a confident wrong answer is worse than no answer. It tells them you cannot tell what you know from what you do not.</p>
+
+  <p>That is a frightening thing in a colleague. It is how a wrong claim reaches production.</p>
+
+  <p>Step three: so the best answer must do two things. It must show reasoning, and it must be honest about the gap.</p>
+
+  <div class="soundbite">
+    <span class="label">The shape that works — say this out loud</span>
+    <p><b>"I have not used that. What I know that is close is X. My guess would be Y, and I would check it by Z."</b></p>
+  </div>
+
+  <p>Step four: under stress you cannot compose that shape. Working memory is already full.</p>
+
+  <p>So it has to be <b>rehearsed</b>, not invented. That is the whole method of this lesson.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig20-title">
+      <title id="fig20-title">A decision tree for what to say when a question arrives</title>
+
+      <rect x="230" y="14" width="180" height="30" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="34" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">a question arrives</text>
+
+      <line x1="320" y1="44" x2="320" y2="62" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <rect x="212" y="62" width="216" height="26" rx="13" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="320" y="79" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">pause one second — always</text>
+
+      <line x1="320" y1="88" x2="320" y2="104" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="110" y1="104" x2="530" y2="104" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="110" y1="104" x2="110" y2="122" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="320" y1="104" x2="320" y2="122" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="530" y1="104" x2="530" y2="122" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+
+      <rect x="20" y="122" width="180" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="110" y="143" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">I know this</text>
+
+      <rect x="230" y="122" width="180" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="143" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">I half know this</text>
+
+      <rect x="440" y="122" width="180" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="530" y="143" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">I do not know this</text>
+
+      <rect x="20" y="168" width="180" height="60" rx="6" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="110" y="188" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Answer. Then stop.</text>
+      <text x="110" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">&ldquo;Does that answer it,</text>
+      <text x="110" y="219" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">or go deeper?&rdquo;</text>
+
+      <rect x="230" y="168" width="180" height="60" rx="6" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="320" y="188" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">&ldquo;What I know that</text>
+      <text x="320" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">is close is&hellip;&rdquo;</text>
+      <text x="320" y="219" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">Reason forward out loud.</text>
+
+      <rect x="440" y="168" width="180" height="60" rx="6" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="530" y="188" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">&ldquo;I do not know.</text>
+      <text x="530" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">My guess is X, and</text>
+      <text x="530" y="219" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">I would check it by Y.&rdquo;</text>
+
+      <rect x="20" y="244" width="600" height="28" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="320" y="263" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">never: silence, a confident guess, or an apology for your English</text>
+
+      <text x="320" y="290" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">All three branches end in speech. Only the bottom bar loses the round.</text>
+    </svg>
+    <figcaption>Three branches, one forbidden bar. Rehearse the branch you use least, which is the right-hand one.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      When you are nervous, your brain has no spare room to build a sentence. So build the sentences beforehand.</p>
+    <p class="part cont">Then, in the room, you are only choosing one. Choosing is cheap. Composing is not.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A pilot does not invent words during an emergency. They read a checklist that was written when nobody was frightened.</p>
+    <p class="part cont">The calm version of you writes the sentences today. The nervous version of you only has to pick one tomorrow.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A pilot reads the checklist off a card. You cannot read anything tomorrow.</p>
+    <p class="part limit cont">So the sentences must be small enough to hold in memory. Say them out loud enough times and they arrive on their own. Twelve is about the limit. A written list of forty is a list you will not have.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People believe "I do not know" costs them the job. It does not. The <b>guess</b> costs them the job.</p>
+    <p class="part cont">An interviewer is imagining you in a code review, or in an incident at 2am. Someone who says "I am not sure, I would check" is safe. Someone who sounds certain and is wrong is dangerous.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why a confident guess scores lower than an honest "I do not know". Then say what you add after those four words. <b>Send it to me and I will tell you where the gap is.</b>
+      Say it out loud, not in your head. That is the whole point of this lesson.</p>
+    </div>
+  </div>
+
+  <h2>The twelve rescue sentences</h2>
+
+  <p>Four groups of three. Learn them until they arrive without effort.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Group</th><th>Say this</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3"><b>Did not understand</b></td><td>"Sorry, could you say that again a little slower?"</td></tr>
+      <tr><td>"Just to check I understood — you are asking about X. Is that right?"</td></tr>
+      <tr><td>"I am not familiar with that term. Could you describe what it does?"</td></tr>
+      <tr><td rowspan="3"><b>Need a moment</b></td><td>"Let me think about that for a second."</td></tr>
+      <tr><td>"There are two ways to look at this. Let me start with the simpler one."</td></tr>
+      <tr><td>"Can I draw this? It is easier to show than to say."</td></tr>
+      <tr><td rowspan="3"><b>Do not know</b></td><td>"I have not used that. What I know that is close is…"</td></tr>
+      <tr><td>"I do not know. My guess would be X, and I would check it by Y."</td></tr>
+      <tr><td>"I would rather look that up than give you a confident wrong answer."</td></tr>
+      <tr><td rowspan="3"><b>Lost the thread</b></td><td>"Sorry, let me start that again."</td></tr>
+      <tr><td>"The short version is…"</td></tr>
+      <tr><td>"Does that answer it, or would you like me to go deeper?"</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">How to learn twelve sentences in one evening</span>
+    Read them aloud once. Then cover the table and say each group from memory. Repeat until all four groups arrive with no pause. This takes about fifteen minutes and is the highest-value fifteen minutes of Day 7.
+  </div>
+
+  <h2>The one-second pause</h2>
+
+  <p>Before every answer, stop for one second. Deliberately.</p>
+
+  <p>It does two things at once, and both of them matter.</p>
+
+  <ul>
+    <li>It sounds calm. A fast answer sounds nervous, even when it is right.</li>
+    <li>It stops you answering a question they did not ask. That is the more common failure.</li>
+  </ul>
+
+  <p>One second feels like a very long time from the inside. It is almost invisible from the outside.</p>
+
+  <h2>Thinking out loud</h2>
+
+  <p>Never go silent for more than about ten seconds. They cannot grade what they cannot hear.</p>
+
+  <p>If you are stuck, say what you are stuck on. That sentence is worth more than the decision that follows it.</p>
+
+  <div class="soundbite">
+    <span class="label">The stuck sentence</span>
+    <p><b>"I am deciding between two shapes here. One is a worker pool with a fixed limit. The other is a queue with workers pulling from it. I will take the pool, because it is easier to test."</b></p>
+  </div>
+
+  <p>That sentence shows two designs, a decision, and a reason. Silence would have shown none of them.</p>
+
+  <h2>The five Node questions most likely to catch you out</h2>
+
+  <p>These are the gaps this sprint did not close, on purpose. Prepare the honest answer, not the fake one.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Question</th><th>The honest shape to say</th></tr></thead>
+    <tbody>
+      <tr><td>"Have you used <code>AsyncLocalStorage</code>?"</td><td>"Not in production. What I know that is close is passing a request id explicitly. I understand it keeps context across async calls without threading it through."</td></tr>
+      <tr><td>"How would you use <code>diagnostics_channel</code>?"</td><td>"I have not used it. My guess is a publish-and-subscribe hook for instrumentation without patching. I would check the docs before claiming more."</td></tr>
+      <tr><td>"Talk about raw TCP with <code>net</code>."</td><td>"I have built on <code>http</code>, not below it. What I do know is that <code>http</code> is built on <code>net</code>, and both are emitters and streams."</td></tr>
+      <tr><td>"Which message broker have you run?"</td><td>"I have used a queue in this design, not operated a broker. I know the properties I need: retries, backoff, and a dead-letter queue."</td></tr>
+      <tr><td>"How deep is your Kubernetes experience?"</td><td>"Shallow, and I would say so. I know what my service needs from it: a health check, a <code>SIGTERM</code>, and time to drain."</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the answer that sounds like a memorised page</span>
+    If you have never used a thing, do not describe it in the words of its documentation. Interviewers hear that instantly, and they will go one level deeper to check. <b>Naming the boundary of your experience is stronger than covering it.</b> "I have not run one, but I know the properties I need" is a senior sentence.
+  </div>
+
+  <h2>Speaking English under pressure</h2>
+
+  <p>Three things, and only three. Do not add a fourth.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Do this</th><th>Why it works</th></tr></thead>
+    <tbody>
+      <tr><td><b>Slow down</b></td><td>Speed is what makes an accent hard to follow, not the accent itself.</td></tr>
+      <tr><td><b>Finish final consonants</b></td><td>Endings carry tense and number. Dropping them costs more meaning than any vowel.</td></tr>
+      <tr><td><b>Never apologise for your English</b></td><td>It moves their attention from your answer onto your accent. You never want that trade.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>If a word will not come, describe it instead. "The thing that holds open connections" is a perfectly good sentence.</p>
+
+  <div class="drill">
+    <span class="label">Drill · 20 minutes, out loud, tonight</span>
+    <p class="situation">Sit alone. Say every rescue sentence from memory, group by group, until none of them needs a pause.</p>
+    Then run the harder half.
+    <ul>
+      <li>Answer three questions you genuinely cannot answer, using the "do not know" shape.</li>
+      <li>Read one of your own stories aloud, deliberately finishing every final consonant.</li>
+      <li>Record 60 seconds. Listen back once, only for pace. Do not judge the accent.</li>
+      <li>Practise the one-second pause five times, until it stops feeling long.</li>
+      <li>Say the stuck sentence out loud twice, so it exists before you need it.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — there is none tonight</span>
+    Nothing to read here, and that is deliberate. This lesson is a <b>rehearsal</b>, not a topic. The source is your own voice, out loud, in a room by yourself. Twenty minutes of that beats any page you could open.
+  </div>
+
+  <div class="tip">
+    <span class="label">Where the answers behind these sentences live</span>
+    <a href="0001-what-node-is-and-the-one-rule.html">L01 · the runtime</a> ·
+    <a href="0002-the-event-loop-and-print-order.html">L02 · print order</a> ·
+    <a href="0005-async-errors-and-the-combinators.html">L05 · async errors</a> ·
+    <a href="0007-backpressure-and-the-pull-model.html">L07 · backpressure</a> ·
+    <a href="0014-operational-versus-programmer-errors.html">L14 · error kinds</a> ·
+    <a href="0016-worker-threads-versus-cluster.html">L16 · threads and cluster</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>They grade <b>reasoning</b>, not recall. So silence is always the worst option.</li>
+      <li>A confident wrong answer is worse than none. It says you cannot judge your own knowledge.</li>
+      <li>The shape: <b>"I have not used that. What I know that is close is X. I would check it by Y."</b></li>
+      <li><b>Twelve rescue sentences</b>, four groups of three, learned until they need no thought.</li>
+      <li>Pause <b>one second</b> before every answer. It sounds calm and prevents the wrong answer.</li>
+      <li>Never silent for more than ten seconds. If stuck, <b>say what you are stuck on</b>.</li>
+      <li>Slow down, finish final consonants, and <b>never apologise for your English</b>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>"I do not know" costs you nothing. The guess costs you the job.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> this lesson introduces no measured number and no new Node behaviour. The Node answers it points at are taught in Days 1 to 6. Each of those lessons names its own measurement and date.</p>
+
+  <div class="ask">
+    Want the hard version? Say <b>"ask me five things I do not know"</b> and answer each one out loud with the shape above.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0019-the-full-mock.html">← The full mock</a></span>
+    <span><a href="0021-questions-you-ask-and-closing.html">Next: The questions you ask →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "The interviewer asks about a Node module you have never used. What is the strongest response?",
+      options: [
+        "Say you have not used it, name the closest thing you do know, then say how you would check",
+        "Give your best guess in a confident voice, since an answer scores better than no answer",
+        "Ask them to move on to another question and come back to this one at the very end",
+        "Describe the general area around it in detail until they interrupt with a new question"
+      ],
+      answer: 0,
+      why: "The interviewer is predicting what you are like as a colleague, so they want to see whether you can tell what you know from what you do not. Naming the boundary and then reasoning from the nearest thing you do know shows both honesty and method. A confident guess is the dangerous answer, because that is how a wrong claim reaches production. Deferring or padding gives them nothing to grade."
+    },
+    {
+      q: "Why is a deliberate one-second pause before answering worth rehearsing?",
+      options: [
+        "It sounds calm, and it stops you answering a question they did not actually ask you",
+        "It gives the interviewer time to write their notes down before you begin speaking",
+        "It makes the answer shorter, because you drop the parts you cannot say in English",
+        "It signals that the question was hard, so a weaker answer is judged more kindly"
+      ],
+      answer: 0,
+      why: "Two effects, both real. A fast answer sounds nervous even when it is correct, and a one second gap reads as considered. More importantly it gives you time to check what was actually asked, which is the most common way a good answer lands on the wrong question. From the inside the pause feels very long. From the outside it is almost invisible."
+    },
+    {
+      q: "You are stuck in the middle of a live-coding task. What should you do?",
+      options: [
+        "Say exactly what you are stuck on, out loud, and what the two options in front of you are",
+        "Keep typing quietly so the flow is not broken, and explain the whole thing at the end",
+        "Apologise for the pause, explain that English is your second language, then continue",
+        "Delete what you have written and restart from a design you are more confident about"
+      ],
+      answer: 0,
+      why: "Naming the two options and picking one shows a decision with a reason, which is exactly what the round is grading. Silence gives them nothing and reads as being lost. Apologising moves their attention from your reasoning onto your accent, which is never a trade you want. Restarting burns the clock on a problem a single sentence would have settled."
+    },
+    {
+      q: "Which of these should you never do about your English in an interview?",
+      options: [
+        "Apologise for it, because it moves attention from your answer onto your accent",
+        "Slow down your speech, because a slower pace makes the accent much more obvious",
+        "Ask them to repeat a question, because it shows that you were not listening well",
+        "Use a rehearsed sentence, because it sounds prepared rather than genuinely thought"
+      ],
+      answer: 0,
+      why: "Apologising is the only one that hurts you. It tells the interviewer to start listening to how you sound instead of what you say, and you never win that trade. Slowing down actively helps, because speed is what makes an accent hard to follow. Asking someone to repeat a question is normal and shows care. Rehearsed sentences are the whole method of this lesson."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Have you used AsyncLocalStorage?”",
+      answer: "Not in production, no. What I know that is close is passing a request id explicitly through the call chain, which is what I have actually done. My understanding is that AsyncLocalStorage keeps a value alive across async boundaries, so a logger deep in the stack can read the request id without every function taking it as a parameter. I would want to check the cost before reaching for it, because it hooks into async resource tracking. If this is something your team relies on, I would read the docs properly rather than guess further. <br>Why: they are testing whether you inflate. Naming the boundary of your experience, then reasoning from the nearest real thing, scores far higher than a fluent answer copied from a documentation page."
+    },
+    {
+      prompt: "Interviewer: “You have gone quiet. What are you thinking?”",
+      answer: "Let me say it out loud. I am deciding between two shapes here. One is a worker pool with a fixed limit, where a small number of runners pull the next item until the list is empty. The other is a queue with separate consumers, which is closer to what I would use in production. I am going to take the pool, because it is easier to test and it keeps the results in input order. If you would rather see the queue version, I can switch. <br>Why: silence cannot be graded, so this question is a rescue the interviewer is offering you. Two named options, one decision, one reason — that is the whole answer, and it takes fifteen seconds."
+    },
+    {
+      prompt: "Interviewer: “What do you do when you do not know something at work?”",
+      answer: "I say so quickly, because the cost of a wrong confident answer is much higher than the cost of admitting a gap. Then I do three things. I name what I do know that is nearest, so the conversation keeps moving. I say what my guess is and, more importantly, how I would check it — usually the official docs, or a small script that measures the behaviour instead of arguing about it. Then I come back with the answer, rather than letting it quietly drop. I would rather look something up than give a confident wrong answer. <br>Why: this is a culture question, not a knowledge one. They are imagining you in a code review or an incident at 2am, and they want someone whose certainty can be trusted."
+    }
+  ]);
+</script>

@@ -1,0 +1,492 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw your service — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 4 of 7 · Lesson 10 · Your own service</p>
+  <h1>Draw your service</h1>
+  <p class="subtitle">Today is the day that decides the interview. Everyone can talk about the event loop. Only you can talk about this.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 4 of 7.</span> This lesson builds one domain-expert ability: <b>explain it from first principles, with no jargon and no notes</b>. <a href="../reference/7-day-plan.html#d4">Day 4 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can draw the spine API on a whiteboard in about ninety seconds. Five boxes, the arrows between them, and one arrow labelled with what fails. Every box survives a follow-up question.
+  </div>
+
+  <h2>Start from the problem — what can the interviewer actually check?</h2>
+
+  <p>They have five minutes. They cannot read your code. They cannot call your team.</p>
+
+  <p>So they cannot check your features. A list of features is unfalsifiable, and both of you know it.</p>
+
+  <p>What they <em>can</em> check is whether your description holds together. They ask a question. Your answer must fit what you already said.</p>
+
+  <p>That is the whole test. So give them something with a shape, not a list.</p>
+
+  <div class="soundbite">
+    <span class="label">The reframe — say this to yourself before you start</span>
+    <p>They are not asking <b>what</b> you built. They are asking whether you know <b>why it is shaped that way</b>. A drawing is the fastest way to show that.</p>
+  </div>
+
+  <h2>Derive the five layers</h2>
+
+  <p>Every request-serving system answers the same four questions. The layers fall out of the questions.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The question</th><th>The layer it creates</th></tr></thead>
+    <tbody>
+      <tr><td>Who is asking?</td><td><b>Client</b></td></tr>
+      <tr><td>What happens before my code sees it?</td><td><b>Edge</b> — TLS, load balancing, timeouts</td></tr>
+      <tr><td>Where does my code run?</td><td><b>Your process</b> — routes, validation, errors</td></tr>
+      <tr><td>Where does the truth live?</td><td><b>Data</b> — the store and its constraints</td></tr>
+      <tr><td>What is slow, and moved off the path?</td><td><b>Behind</b> — cache and queue</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Five layers. Always the same five. That is why it is repeatable under pressure.</p>
+
+  <p>Then add <b>one arrow labelled with what fails</b>. A drawing with no failure on it looks like marketing.</p>
+
+  <h2>The drawing, grounded in the spine API</h2>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 430" role="img" aria-labelledby="fig10-title">
+      <title id="fig10-title">The spine API in five layers, with the failure arrow marked</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">DRAW THIS FROM MEMORY IN NINETY SECONDS</text>
+
+      <text x="20" y="42" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-weight: 700;">1 · CLIENT</text>
+      <rect x="20" y="48" width="600" height="30" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="320" y="68" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">browser follows a short link · a script posts a new one</text>
+
+      <line x1="320" y1="78" x2="320" y2="94" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="315,94 325,94 320,102" style="fill: var(--ink-faint);"></polygon>
+
+      <text x="20" y="118" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-weight: 700;">2 · EDGE</text>
+      <rect x="20" y="124" width="600" height="30" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="320" y="144" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">TLS · load balancer · the client timeout I do not control</text>
+
+      <line x1="320" y1="154" x2="320" y2="170" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="315,170 325,170 320,178" style="fill: var(--ink-faint);"></polygon>
+
+      <text x="20" y="194" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">3 · MY NODE PROCESS — one thread</text>
+      <rect x="20" y="200" width="600" height="96" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2.5;"></rect>
+
+      <rect x="34" y="212" width="140" height="34" rx="5" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="104" y="227" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 9.5px;">POST /links</text>
+      <text x="104" y="240" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">201 · 400 · 409 · 413</text>
+
+      <rect x="182" y="212" width="140" height="34" rx="5" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="252" y="227" text-anchor="middle" style="fill: var(--accent-2); font-family: monospace; font-size: 9.5px;">GET /:code</text>
+      <text x="252" y="240" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">302 · 404 — the hot path</text>
+
+      <rect x="330" y="212" width="132" height="34" rx="5" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="396" y="227" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 9.5px;">GET /links/:code</text>
+      <text x="396" y="240" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">200 · 404</text>
+
+      <rect x="470" y="212" width="136" height="34" rx="5" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.2;"></rect>
+      <text x="538" y="227" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 9.5px;">DELETE · /health</text>
+      <text x="538" y="240" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">204 · 404 · 200</text>
+
+      <rect x="34" y="256" width="572" height="28" rx="5" style="fill: var(--paper); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="320" y="274" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px;">one sendError() — every failure is { error: { code, message, details } }</text>
+
+      <line x1="180" y1="296" x2="180" y2="318" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="175,318 185,318 180,326" style="fill: var(--ink-faint);"></polygon>
+      <line x1="460" y1="296" x2="460" y2="318" style="stroke: var(--accent-2); stroke-width: 2; stroke-dasharray: 5 3;"></line>
+      <polygon points="455,318 465,318 460,326" style="fill: var(--accent-2);"></polygon>
+
+      <text x="20" y="342" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-weight: 700;">4 · DATA</text>
+      <rect x="20" y="348" width="290" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="165" y="365" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">store · one row per code</text>
+      <text x="165" y="380" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9.5px; font-weight: 700;">unique index → the real 409</text>
+
+      <text x="330" y="342" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">5 · BEHIND — off the hot path</text>
+      <rect x="330" y="348" width="140" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="400" y="365" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">cache</text>
+      <text x="400" y="380" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">reads &gt;&gt; writes</text>
+
+      <rect x="480" y="348" width="140" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="550" y="365" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">queue</text>
+      <text x="550" y="380" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">click counts, later</text>
+
+      <text x="20" y="414" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">THE FAILURE ARROW:</text>
+      <text x="152" y="414" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">no timeout on the store → pool empties → even /health stops answering</text>
+    </svg>
+    <figcaption>Five layers, always the same five. The last line is the one that makes the drawing believable.</figcaption>
+  </figure>
+
+  <h2>Defend each box in one sentence</h2>
+
+  <p>A box you cannot defend is worse than no box. Learn these five sentences.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Box</th><th>The sentence</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /:code</code></td><td>The hot path. Reads vastly outnumber writes, so this is the route I optimise.</td></tr>
+      <tr><td><b>302, not 301</b></td><td>A 301 is cached by browsers and cannot be taken back. I chose control over one round trip.</td></tr>
+      <tr><td><b>The 409</b></td><td>A custom code that is already taken. The unique index is what makes it real, not my <code>if</code>.</td></tr>
+      <tr><td><b>The error shape</b></td><td>One <code>sendError</code>. <code>code</code> is stable, <code>message</code> is free to reword, <code>details</code> is structured.</td></tr>
+      <tr><td><b>The queue</b></td><td>Counting a click must not slow a redirect. The write goes to a queue and lands late.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The 400 against 409 test</h2>
+
+  <p>This is the status-code question interviewers actually ask. Do not recite a definition.</p>
+
+  <div class="soundbite">
+    <span class="label">Say the test, not the definition</span>
+    <p><b>"I ask one question: could this exact request have succeeded a minute ago? If no, it is a 400. If yes, and it only fails because of what exists now, it is a 409."</b></p>
+  </div>
+
+  <p>Broken JSON is a 400. Retrying never helps.</p>
+
+  <p>A short code someone else just took is a 409. It was free a minute ago.</p>
+
+  <p>That difference is actionable. A 409 means pick another code. A 400 means fix your request.</p>
+
+  <h2>The two objects inside the box</h2>
+
+  <p>They may point at your process box and ask what your handler receives. Most candidates wave.</p>
+
+  <p>Both objects come from the same family. Every stream, socket and process in Node is an <code>EventEmitter</code>.</p>
+
+  <pre><code>req: IncomingMessage -&gt; Readable      -&gt; Stream -&gt; <b>EventEmitter</b>
+res: ServerResponse  -&gt; OutgoingMessage -&gt; Stream -&gt; <b>EventEmitter</b></code></pre>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    <code>req instanceof Readable</code> is <b>true</b>. <code>res instanceof Writable</code> is <b>false</b> — it goes through <code>OutgoingMessage</code> and only implements the interface. Also: <code>emit</code> is <b>synchronous</b>, <code>emit('error')</code> with no listener <b>throws</b>, and <code>defaultMaxListeners</code> is <b>10</b>.
+  </div>
+
+  <p>Saying that <code>res</code> is not really a <code>Writable</code> proves you checked. Nobody guesses that.</p>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A drawing is a promise. Each box says "this part has one job", and each arrow says "this is what travels".</p>
+    <p class="part cont">The interviewer then pokes at it. A real drawing keeps its shape. A made-up one falls apart at the second question.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A floor plan of a house. It does not list the furniture. It shows the rooms and the doors between them.</p>
+    <p class="part cont">Anyone can check a floor plan by walking it. Say the kitchen is next to the hall, then say it is upstairs, and the plan is wrong.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A floor plan is still. A service is not. Nothing on a floor plan can be slow.</p>
+    <p class="part limit cont">Your drawing must show time and failure. That is why one arrow is labelled with what breaks. Without it you have drawn a picture of a healthy day. Healthy days are not what they ask about.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People draw the system they wish they had built. They add a cache they never wrote, or a queue that is still a plan.</p>
+    <p class="part cont">The second question always finds it. Draw what exists, then say plainly what is planned and why it is not there yet.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why the drawing has an arrow labelled with a failure. Then say what a drawing without one looks like. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · draw it three times from memory</span>
+    <p class="situation">Close this page. On paper, draw the five layers, the five routes, the store, the cache and the queue. Then add the failure arrow.</p>
+    Do it three times today, with a gap between each one. Time yourself. The target is ninety seconds. Say each box out loud as you draw it, because you will have to do that in the room.
+    <ul>
+      <li>Run 1 — page open beside you. Just get the shape.</li>
+      <li>Run 2 — page closed. Note what you forgot.</li>
+      <li>Run 3 — page closed, out loud, on a clock.</li>
+    </ul>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the tour of the code</span>
+    Do not walk through your folders. "There is a routes folder, then a services folder…" tells the interviewer nothing about the system. It tells them about your editor. <b>Layers and failures, never folders.</b>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/api/http.html">Node — <code>http</code></a>, the <code>IncomingMessage</code> and <code>ServerResponse</code> sections only. Then <a href="https://nodejs.org/api/events.html">Node — <code>events</code></a>, the first page.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0021-build-the-spine-api-version-1.html">Week 21 · Build the spine API</a> ·
+    <a href="../../lessons/0020-http-from-scratch.html">Week 20 · HTTP from scratch</a> ·
+    <a href="../../lessons/0018-eventemitter-the-pattern-under-everything.html">Week 18 · EventEmitter</a> ·
+    <a href="../../lessons/0030-build-harden-the-spine-api.html">Week 30 · Harden the spine API</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Five layers, always the same five: <b>client, edge, my process, data, behind</b>.</li>
+      <li>Add <b>one arrow labelled with what fails</b>. A drawing with no failure reads as marketing.</li>
+      <li><code>GET /:code</code> is the hot path, because reads vastly outnumber writes.</li>
+      <li><b>302, not 301.</b> A 301 is cached by browsers and cannot be taken back.</li>
+      <li><b>400 against 409:</b> could this exact request have succeeded a minute ago?</li>
+      <li>One <code>sendError</code>. <code>code</code> is stable, <code>message</code> is free, <code>details</code> is structured.</li>
+      <li><code>req</code> is a real <code>Readable</code>. <code>res</code> is <b>not</b> a <code>Writable</code>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>they are checking whether the drawing survives two questions, not whether it is impressive.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — "http" and "events". The route table, the error shape and the status-code choices come from your own spine API, built in week 21. Four things were measured on <b>Node v24.14.0</b>, 2026-08-28. They are the two prototype chains, the synchronous <code>emit</code>, the throw with no listener, and <code>defaultMaxListeners</code> of 10.</p>
+
+  <div class="ask">
+    Want to be pushed on it? Say <b>"interview me on my service"</b> and you will get the follow-up chain in interviewer voice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0009-kata-03-errors-per-hour-in-a-50gb-log.html">← Kata 3 — errors per hour</a></span>
+    <span><a href="0011-two-bugs-you-fixed.html">Next: Two bugs you fixed →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A client asks for a custom short code that another user already took. Which status is right?",
+      options: [
+        "409, because the request itself is valid and only conflicts with the state that exists now",
+        "400, because the client has sent a field value that this server is not able to accept",
+        "403, because the client holds no permission to make use of a code another user owns",
+        "422, because the body parsed correctly but then failed a check on its actual meaning"
+      ],
+      answer: 0,
+      why: "Use the test question: could this exact request have succeeded a minute ago? It could have, because the code was free then. So the failure is about current state, not about a malformed request, and that is 409. A 400 tells the client to fix its request, which is misleading here. The difference is actionable: a 409 means pick another code and try again."
+    },
+    {
+      q: "Why does the spine API redirect with 302 rather than 301?",
+      options: [
+        "A 301 is cached hard by browsers, so the destination can never be changed afterwards",
+        "A 301 is only valid when the redirect target sits on the very same origin as the link",
+        "A 302 lets the browser keep the original request method, and a 301 always rewrites it",
+        "A 302 is required whenever the response carries no body, which is true of a redirect"
+      ],
+      answer: 0,
+      why: "301 means permanent, and browsers cache it aggressively, sometimes until the user clears history. For a shortener, changing or deleting a link is a normal operation, so a cached 301 is a link you have lost control of. A 302 costs one round trip every time and keeps the destination yours to change. Naming what you gave up shows it was a decision rather than a default."
+    },
+    {
+      q: "Inside your handler, which statement about req and res is the accurate one?",
+      options: [
+        "req really is a Readable stream, while res only implements the writable interface",
+        "Both req and res are real stream instances, and both extend the Writable base class",
+        "req is a plain parsed object, while res is a genuine Writable stream of body bytes",
+        "Neither is a stream at all, since both are ordinary EventEmitter objects with methods"
+      ],
+      answer: 0,
+      why: "Measured on Node v24.14.0: req instanceof Readable is true, and res instanceof Writable is false. The res chain runs ServerResponse to OutgoingMessage to Stream to EventEmitter, so it has write and end but is not a Writable instance. Both do end at EventEmitter, which is why on and emit work on them. Knowing the res detail proves you checked rather than assumed."
+    },
+    {
+      q: "What makes an architecture drawing survive an interviewer's follow-up questions?",
+      options: [
+        "Each box holds one job, and at least one arrow is labelled with the thing that fails",
+        "Every box names the exact library used, so the interviewer can judge your tool choices",
+        "The drawing mirrors the folder layout, so you can walk through the code file by file",
+        "It shows every route and every field, so no follow-up question can find a missing part"
+      ],
+      answer: 0,
+      why: "The interviewer cannot read your code, so they test whether your description stays consistent under questions. One job per box makes the answers unambiguous. The failure arrow is what proves you have run the thing in anger rather than only drawn it. Folder tours describe your editor, not your system, and listing every field makes the drawing unreadable without making it truer."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Tell me about a system you built.”",
+      answer: "It is a link shortener. Someone posts a long URL to POST /links, gets back a short code with a 201 and a Location header, and anyone following GET on that code gets a 302 to the original. I will draw it in five layers: the client, the edge that terminates TLS and holds a timeout I do not control, my Node process, the store, and the things behind it. Inside my process there are five routes and one sendError helper, so every failure has the same shape. Behind the store there is a cache, because reads vastly outnumber writes, and a queue, because counting a click must not slow the redirect. The arrow I would label is the store call: with no timeout there, the pool empties and even /health stops answering. <br>Why: they are listening for shape and for one failure. A feature list cannot be checked, but a shape can be poked at, and the failure shows you have run it in production rather than only drawn it."
+    },
+    {
+      prompt: "Interviewer: “Walk me through what happens on a redirect request.”",
+      answer: "The bytes arrive on a socket and Node parses the request line and headers. My handler is then called, and at that moment the body has not necessarily arrived, because req is a real Readable stream. For a redirect there is no body to read, so I take the code from the path. I look it up in the cache first, and fall back to the store on a miss. If there is no such code I return 404 through sendError, so the body shape matches every other failure. If there is one, I write a 302 with a Location header and call res.end, which is what releases the socket. The click count does not block that reply: it goes onto a queue and is written later. <br>Why: the sentence they are waiting for is that the body has not arrived yet. It proves you know req is a stream rather than a parcel."
+    },
+    {
+      prompt: "Interviewer: “What would you change about it today?”",
+      answer: "Three things, in order of how much they would buy. First, an explicit timeout on every outbound call, because right now a store that hangs takes down routes that never touch it — that is the arrow I labelled. Second, I would move the click counting fully onto the queue, since the first version wrote it on the hot path and that put a database write in front of a redirect. Third, I would add a real unique index rather than relying on a check in my code, because two requests can pass the same check at the same time and only the index is safe under concurrency. I would not rewrite it. The old numbers are the only baseline I have to measure against. <br>Why: they want to know whether you can criticise your own work with specifics. Naming what you would not change, and why, is the part that reads as senior."
+    }
+  ]);
+</script>

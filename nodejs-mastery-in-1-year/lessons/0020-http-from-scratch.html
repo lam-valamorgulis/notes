@@ -1,0 +1,544 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP from scratch — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 20 of 52 · Lesson 20 · Events &amp; servers</p>
+  <h1>HTTP from scratch</h1>
+  <p class="subtitle">No framework. Learn the request lifecycle once, and every framework becomes readable.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 20 of 52.</span> This lesson builds one domain-expert ability: <b>debug a problem that has no ready answer online</b>. A hung request has no error message anywhere. <a href="../reference/52-week-plan.html#w20">Week 20 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a router with no framework, and three failure modes you have caused on purpose: a request that hangs forever, a body that fills your memory, and a response you cannot take back.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0018-eventemitter-the-pattern-under-everything.html">Week 18</a> showed that <code>req</code> and <code>res</code> are both <code>EventEmitter</code>s underneath. This week you use that. Next week the <b>spine API</b> starts, and you keep it for the rest of the year.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what is a request, to Node?</h2>
+  <p>A framework hands you <code>req.body</code> as an object, and it feels like the body was always there. It was not. HTTP arrives as bytes on a socket, over time.</p>
+  <p>So Node cannot give you an object. It gives you the two things it actually has:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What you get</th><th>What it really is</th><th>Verified prototype chain</th></tr></thead>
+    <tbody>
+      <tr><td><code>req</code></td><td>A <b>Readable stream</b> of body bytes, with the headers already parsed</td><td><code>IncomingMessage → Readable → Stream → EventEmitter</code></td></tr>
+      <tr><td><code>res</code></td><td>A writable-<em>shaped</em> object you push bytes into</td><td><code>ServerResponse → OutgoingMessage → Stream → EventEmitter</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">A precise detail that catches people</span>
+    <code>req instanceof Readable</code> is <code>true</code>. But <code>res instanceof Writable</code> is
+    <b><code>false</code></b> — verified. <code>ServerResponse</code> goes through
+    <code>OutgoingMessage</code>, not <code>stream.Writable</code>. It has <code>write</code>,
+    <code>end</code> and <code>cork</code>, so it behaves like one and works in <code>pipeline</code>. A
+    type check against <code>Writable</code> will still fail.
+  </div>
+
+  <p>Once you accept that <code>req</code> is a stream, everything else this week follows. The headers arrived; <b>the body has not</b>. It is still coming, and you decide what to do about that.</p>
+
+  <h2>Routing is just two strings</h2>
+  <p>There is no magic in a router. It reads two properties and decides:</p>
+
+  <pre><code>const http = require('node:http');
+
+const server = http.createServer((req, res) =&gt; {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const route = `${req.method} ${url.pathname}`;
+
+  if (route === 'GET /health')      return sendJson(res, 200, { ok: true });
+  if (route === 'GET /items')       return listItems(req, res, url.searchParams);
+  if (route === 'POST /items')      return createItem(req, res);
+
+  sendJson(res, 404, { error: 'not found' });
+});
+
+function sendJson(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(text),   <span class="cmt">// bytes, not characters — week 14</span>
+  });
+  res.end(text);
+}</code></pre>
+
+  <p><code>Buffer.byteLength</code>, not <code>text.length</code>. Week 14's rule reaches all the way here. One Vietnamese character is three bytes, and a wrong <code>content-length</code> truncates the response.</p>
+
+  <!-- ============ FAILURE 1 ============ -->
+  <h2>Failure 1 — the request that never ends</h2>
+  <p>Write to the response and forget <code>end()</code>:</p>
+  <pre><code>const server = http.createServer((req, res) =&gt; {
+  res.write('partial');
+  <span class="cmt">// no res.end()</span>
+});</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>What the client sees</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">client hung, then: AbortError — the response never completed</span></code></pre>
+
+  <p>The server logs nothing. No error, no warning, no slow query. The connection is simply <b>held open forever</b>, and the client waits until something else gives up.</p>
+
+  <div class="trap">
+    <span class="label">Why this is the hardest bug in the lesson</span>
+    Every other failure leaves a trace. This one leaves <b>nothing</b> — the request is not slow, it is
+    unfinished. Every early <code>return</code> in a handler is a chance to create it, which is exactly why
+    frameworks end the response for you. Writing this by hand once teaches you what they are doing.
+  </div>
+
+  <!-- ============ FAILURE 2 ============ -->
+  <h2>Failure 2 — the body you accepted without asking how big it was</h2>
+  <p>The obvious way to read a body:</p>
+  <pre><code><span class="cmt">// WRONG — the client decides how much memory you use</span>
+let body = '';
+req.on('data', (c) =&gt; { body += c; });
+req.on('end', () =&gt; handle(JSON.parse(body)));</code></pre>
+
+  <p>Nothing limits that. A client can send a gigabyte and you will hold a gigabyte. The fix is to count as you go and refuse early:</p>
+
+  <pre><code>const LIMIT = 1_000_000;                       <span class="cmt">// 1 MB</span>
+let size = 0;
+const chunks = [];
+
+req.on('data', (c) =&gt; {
+  size += c.length;                            <span class="cmt">// bytes, from week 14</span>
+  if (size &gt; LIMIT) {
+    res.writeHead(413).end('too large');
+    req.destroy();                             <span class="cmt">// stop reading, cut the connection</span>
+    return;
+  }
+  chunks.push(c);
+});
+req.on('end', () =&gt; {
+  if (res.writableEnded) return;               <span class="cmt">// we already refused</span>
+  handle(Buffer.concat(chunks).toString('utf8'));
+});</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real behaviour</b> (Node v24.14.0):</p>
+  <pre><code>POST 500 KB  <span class="out">-> received 500000 bytes</span>
+POST 3 MB    <span class="out">-> connection cut: EPIPE</span></code></pre>
+
+  <p>The 3 MB request never finished uploading. <code>req.destroy()</code> stopped it partway, and the client
+  saw the connection close. That is the point: you refused <b>before</b> holding the data, not after.</p>
+
+  <div class="tip">
+    <span class="label">Read the check carefully</span>
+    <code>res.writableEnded</code> in the <code>end</code> handler is not decoration. Without it, a request
+    that trips the limit tries to respond <em>twice</em>, and the second attempt throws
+    <code>ERR_STREAM_WRITE_AFTER_END</code>. Every early exit in a handler needs an answer to
+    &ldquo;has this response already been sent?&rdquo;
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 270" role="img" aria-labelledby="fig20-title" width="640" height="270">
+      <title id="fig20-title">The lifecycle of one HTTP request, and the two places it can go wrong</title>
+
+      <text x="20" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">ONE REQUEST, FROM SOCKET TO RESPONSE</text>
+
+      <rect x="18" y="38" width="104" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="70" y="56" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">bytes arrive</text>
+      <text x="70" y="70" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">on the socket</text>
+
+      <line x1="126" y1="58" x2="156" y2="58" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a20)"></line>
+
+      <rect x="160" y="38" width="104" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.8;"></rect>
+      <text x="212" y="56" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">headers parsed</text>
+      <text x="212" y="70" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">your handler runs</text>
+
+      <line x1="268" y1="58" x2="298" y2="58" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a20)"></line>
+
+      <rect x="302" y="38" width="104" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="354" y="56" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">body streams in</text>
+      <text x="354" y="70" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">req is a Readable</text>
+
+      <line x1="410" y1="58" x2="440" y2="58" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a20)"></line>
+
+      <rect x="444" y="38" width="104" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 1.8;"></rect>
+      <text x="496" y="56" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">res.end()</text>
+      <text x="496" y="70" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">socket released</text>
+
+      <line x1="354" y1="84" x2="354" y2="118" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <rect x="230" y="120" width="250" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="355" y="138" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">no size limit → the client picks your memory</text>
+      <text x="355" y="153" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">count bytes as they arrive, refuse at the limit</text>
+
+      <line x1="496" y1="84" x2="496" y2="182" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <rect x="230" y="184" width="250" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="355" y="202" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">no end() → the socket is never released</text>
+      <text x="355" y="217" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">no error, no log, no slow query — just silence</text>
+
+      <text x="320" y="252" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Both failures are things you did not do. Neither one produces a message.</text>
+
+      <defs>
+        <marker id="a20" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Verified on Node v24.14.0: a missing <code>end()</code> hangs the client until it aborts; a 3 MB body with a 1 MB limit is cut with <code>EPIPE</code>.</figcaption>
+  </div>
+
+  <!-- ============ HEADERS ============ -->
+  <h2>Headers go out once, and then they are gone</h2>
+  <p>You can change a status code and headers freely — right up until the first byte of the body leaves. After that, they are on the wire and cannot be taken back.</p>
+
+  <pre><code>res.writeHead(200);
+res.write('some data');       <span class="cmt">// headers are now SENT</span>
+<span class="cmt">// something fails here</span>
+res.writeHead(500);           <span class="out">// ERR_HTTP_HEADERS_SENT</span></code></pre>
+
+  <p>This is why an error handler must always ask <code>res.headersSent</code> first. If they are already gone, the only honest move is to destroy the socket. The client then sees a broken response, rather than a successful one containing an error.</p>
+
+  <div class="tip">
+    <span class="label">The rule that avoids the whole problem</span>
+    <b>Do all the work that can fail <em>before</em> you write anything.</b> Build the whole response in
+    memory, then send it in one go. Stream the response only when the body is genuinely too big to hold —
+    and then accept that a mid-stream failure cannot be turned into a clean 500.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A request is not a parcel that arrives complete. The label arrives first — the method, the path, the headers — and your code starts running immediately.</p>
+    <p class="part cont">The contents are still being delivered while you work. You decide how much of it you are willing to accept. You must also say clearly when you have finished replying. If you never say you have finished, the other side waits forever.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A phone call. The caller says who they are and why they rang — that is the headers. Then they start telling you the long story, which is the body. You have to say &ldquo;goodbye&rdquo; and put the phone down, or the line stays open.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      On a real call, silence is obvious. Somebody says &ldquo;hello? are you there?&rdquo; and hangs up. Here nothing does.</p>
+    <p class="part limit cont">A handler that forgets <code>res.end()</code> produces <b>no error, no log line, and no slow query</b>. The request is not slow — it is unfinished, which monitoring built around latency cannot see. And unlike a phone, you cannot interrupt a caller who talks too long.</p>
+    <p class="part limit cont"><b>You have to count the words as they arrive</b> and hang up yourself. Otherwise the caller chooses how much of your memory to use.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think <code>res</code> is like a return value: build it, send it, done. It is not. It is a <b>stream that opens the moment you first write to it</b>.</p>
+    <p class="part cont">That single misunderstanding causes two bugs at once. An early <code>return</code> that skips <code>end()</code> leaves the connection open forever. And a failure after the first <code>write</code> cannot become a 500, because the <code>200</code> is already on the wire. The rule that avoids both: <b>finish all the work that can fail before you write one byte.</b></p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why forgetting <code>res.end()</code> is harder to find than a slow query. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — a router, then break it three ways</h2>
+  <p>No framework. Weeks 18 and 14 are both in here.</p>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Routes on <code>method</code> plus <code>pathname</code>. Query strings parsed with <code>URL</code>, never by hand.</li>
+    <li>JSON responses with a correct <code>content-length</code>, using <code>Buffer.byteLength</code>.</li>
+    <li>A <b>1 MB body limit</b> that refuses with <code>413</code> and calls <code>req.destroy()</code>.</li>
+    <li>A <code>GET /download</code> route that <b>streams</b> a large file with <code>pipeline</code>, never <code>readFileSync</code>.</li>
+    <li>One error handler that checks <code>res.headersSent</code> before deciding what to do.</li>
+    <li>Correct status codes throughout: <code>200</code>; <code>201</code> with a <code>Location</code> header; <code>400</code>, <code>404</code>, <code>409</code>, <code>413</code> and <code>500</code>.</li>
+  </ol>
+
+  <p><b>Then cause all three failures on purpose</b> and watch what the client and the logs do:</p>
+  <pre><code><span class="cmt"># 1 · the hang — comment out res.end() in one route</span>
+curl -m 5 http://localhost:3000/broken      <span class="out"># curl times out. Server logs NOTHING.</span>
+
+<span class="cmt"># 2 · the oversized body</span>
+head -c 3000000 /dev/zero | curl -X POST --data-binary @- http://localhost:3000/items
+
+<span class="cmt"># 3 · headers already sent — throw after the first write</span>
+curl -v http://localhost:3000/late-error    <span class="out"># a 200 that is cut off mid-body</span></code></pre>
+
+  <p><b>Now count your open sockets while the hang is running:</b></p>
+  <pre><code>lsof -p $(pgrep -f "node server.js") | grep -c TCP</code></pre>
+  <p>Fire ten hung requests and watch that number climb and never come down. <b>That is the leak</b>, and it is the reason the missing <code>end()</code> matters more than it looks.</p>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    The socket count before and after ten hung requests. One pair of numbers explains why this failure kills
+    a server slowly instead of quickly.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A service becomes unresponsive after about six hours. CPU is near zero, memory is flat, and no request in the logs took longer than 40 ms. Restarting fixes it for another six hours.</p>
+    Say what you would measure first, what you expect to find, and which line of code you would go looking for.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Keep-alive and connection reuse</b> matter for performance and are a tuning subject, not a first-principles one.
+    <b>Chunked transfer encoding</b> is what happens when you write without a <code>content-length</code>, and is worth reading about in the docs.
+    <b>TLS and HTTP/2</b> are not in this course — they change the transport, not the lifecycle you learned here.
+    <b>Cookies, sessions and authentication</b> wait for <a href="../reference/52-week-plan.html#w37">week 37</a>, where there is a real service to attack.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: Node.js docs — <a href="https://nodejs.org/api/http.html">http</a>. Read
+    <code>ServerResponse</code> and <code>IncomingMessage</code> in particular.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a handler and I'll find every path through it that can return without calling <code>end()</code>.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Headers arrive first and your handler runs. <b>The body is still coming.</b></li>
+      <li><code>req</code> is a real <code>Readable</code>. <code>res</code> is <b>not</b> a <code>Writable</code> — it goes through <code>OutgoingMessage</code> and only implements the interface.</li>
+      <li>Forgetting <code>res.end()</code> holds the socket open forever, with <b>no error and no log line</b>.</li>
+      <li>An unlimited body means the client chooses your memory. Count bytes and refuse with <code>413</code> plus <code>req.destroy()</code>.</li>
+      <li>Check <code>res.writableEnded</code> before responding twice, or you get <code>ERR_STREAM_WRITE_AFTER_END</code>.</li>
+      <li>Headers cannot be recalled after the first body byte. Check <code>res.headersSent</code> in every error handler.</li>
+      <li>Use <code>Buffer.byteLength</code> for <code>content-length</code>, never <code>string.length</code>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>do all the work that can fail before you write one byte.</b> After that, you cannot change your mind.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "http". Four results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the two prototype chains and <code>res instanceof Writable === false</code>. Also the client abort when <code>end()</code> is missing. And the <code>EPIPE</code> on a 3 MB body against a 1 MB limit. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0019-raw-tcp-with-net.html">← Lesson 19</a>
+    <a href="./0021-build-the-spine-api-version-1.html">Next: Lesson 21 — Build — the spine API, version 1 →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A handler writes to res but never calls res.end(). What does the server log?",
+      options: [
+        "Nothing at all — the request is unfinished rather than slow",
+        "A timeout error, once the default request timeout has elapsed",
+        "A warning about an open handle, printed when the process idles",
+        "A slow-request entry, because the duration keeps on increasing"
+      ],
+      answer: 0,
+      why: "The connection is simply held open. There is no error, no warning and no slow query, because the request never completes and so never reports a duration. Monitoring built on latency cannot see it. The visible symptom is the socket count climbing and never falling."
+    },
+    {
+      q: "Why is reading a request body into a string without a limit dangerous?",
+      options: [
+        "The client decides how much of your memory the request consumes",
+        "String concatenation is slow, so large bodies block the event loop",
+        "Node buffers the body twice, once as bytes and once as characters",
+        "The body arrives out of order, so the string has to be reassembled"
+      ],
+      answer: 0,
+      why: "Nothing in that code caps the size, so whoever sends the request chooses how much memory you use. Count bytes as chunks arrive, and refuse with 413 plus req.destroy() before you have held the data. Refusing after you have buffered it defeats the purpose."
+    },
+    {
+      q: "A route throws after res.write() has already sent some body. What can you still do?",
+      options: [
+        "Nothing useful — destroy the socket so the client sees a broken reply",
+        "Call res.writeHead(500), because the status is sent with the last byte",
+        "Clear the response buffer and start again with a fresh set of headers",
+        "Set res.statusCode to 500, which Node applies when the stream closes"
+      ],
+      answer: 0,
+      why: "The status line and headers left with the first body byte, so writeHead now throws ERR_HTTP_HEADERS_SENT. The only honest option is to destroy the socket, so the client sees a truncated response rather than a successful one containing an error. Check res.headersSent first."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Walk me through what happens to an HTTP request in Node.”",
+      answer: "The bytes arrive on a socket. Node parses the request line and headers, then calls my handler — and at that moment <b>the body has not arrived yet</b>. <code>req</code> is a real <code>Readable</code> stream of body bytes, so I decide how much I am willing to accept. <code>res</code> is a writable-shaped object, though not actually a <code>Writable</code> instance. The exchange is only finished when I call <code>res.end()</code>, which is what releases the socket. <br>Why: saying &ldquo;the body has not arrived yet&rdquo; is the sentence that shows you know it is a stream, not a parcel."
+    },
+    {
+      prompt: "Interviewer: “A server stops responding after a few hours. CPU and memory are fine.”",
+      answer: "Flat CPU and flat memory rule out a leak in the usual sense, so I would suspect <b>sockets, not bytes</b>. I would count open file descriptors over time — if that climbs and never falls, some requests are never being completed. The usual cause is a handler path that returns without calling <code>res.end()</code>, often an early <code>return</code> in an error branch. It leaves no log line, because the request never finishes and so never reports a duration. <br>Why: naming the file-descriptor count as the measurement is what turns this into a method rather than a guess."
+    },
+    {
+      prompt: "Interviewer: “How do you handle an error that happens halfway through a response?”",
+      answer: "First I check <code>res.headersSent</code>. If they have not gone, I can still send a clean 500. If they have, the status is already on the wire and <code>writeHead</code> will throw <code>ERR_HTTP_HEADERS_SENT</code> — so the only honest move is to destroy the socket, giving the client a broken response instead of a successful one full of errors. The way to avoid the problem is to <b>do all the work that can fail before writing a single byte</b>, and only stream when the body is genuinely too large to hold. <br>Why: giving the avoidance rule after the handling rule is what a senior answer sounds like."
+    }
+  ]);
+</script>

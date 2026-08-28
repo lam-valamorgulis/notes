@@ -1,0 +1,533 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — the full suite and the security pass — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 38 of 52 · Lesson 38 · Testing &amp; security · <b>Build week</b></p>
+  <h1>Build — the full suite and the security pass</h1>
+  <p class="subtitle">The spine becomes something you would let a stranger deploy without watching them.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 38 of 52.</span> This lesson builds one domain-expert ability: <b>defend your own work under questioning, and judge someone else's</b>. <a href="../reference/52-week-plan.html#w38">Week 38 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> two documents nobody assigned you, and a green build from a clean checkout. The documents are the part that changes how people treat you.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 35 to 37 gave you tests, reliable tests, and attacks. This week joins them into something a
+    stranger can run, and adds the skill none of the previous weeks taught: <b>writing down what you
+    checked and what you chose not to.</b>
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what does &ldquo;ready&rdquo; mean?</h2>
+  <p>&ldquo;It works&rdquo; is not a claim anybody can check. Ready means something narrower and much harder:</p>
+
+  <div class="soundbite">
+    <span class="label">The three questions behind &ldquo;ready&rdquo;</span>
+    <p><b>1.</b> Can somebody who has never seen this get it green, first try?<br>
+    <b>2.</b> Can you say what the tests prove, and what they do not?<br>
+    <b>3.</b> Can you name the risks you accepted <b>on purpose</b>, and why?</p>
+  </div>
+
+  <p>Question 3 is the one that separates a professional from a careful person. A careful person fixes what they find. A professional writes down what they decided not to fix. The next person then inherits a decision, not a surprise.</p>
+
+  <!-- ============ CI ============ -->
+  <h2>Part 1 — green from a clean checkout</h2>
+  <p>Your suite passing on your machine proves your machine works. The only test that counts is a fresh clone, on a machine that has none of your history.</p>
+
+  <pre><code>cd $(mktemp -d)
+git clone &lt;your repo&gt; spine &amp;&amp; cd spine
+npm ci                      <span class="cmt"># ci, not install — obeys the lockfile exactly</span>
+node --test</code></pre>
+
+  <div class="trap">
+    <span class="label">The five reasons this fails the first time</span>
+    A file you never committed — check <code>git status</code> in the clone, not in your working folder.
+    A dependency you installed <b>globally</b> months ago. A <code>.env</code> file that is correctly
+    ignored and quietly required. A path that only exists on your machine. A different <b>Node version</b>,
+    which is why <code>engines</code> and a version file belong in the repo.
+  </div>
+
+  <p>The runner already speaks the language continuous integration needs. Verified on Node v24.14.0:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Need</th><th>Flag</th><th>Verified behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>Fail the build</td><td>&mdash;</td><td>A failing run exits <b>1</b>; a passing run exits <b>0</b></td></tr>
+      <tr><td>Machine-readable output</td><td><code>--test-reporter=junit</code></td><td>Prints <code>&lt;testsuites&gt;</code> XML most CI tools display natively</td></tr>
+      <tr><td>Quiet log</td><td><code>--test-reporter=dot</code></td><td>Prints <code>....</code> — one character per test</td></tr>
+      <tr><td>A coverage floor</td><td><code>--test-coverage-lines=N</code></td><td>Exits <b>1</b> when coverage is below N</td></tr>
+      <tr><td>Reproduce a flake</td><td><code>--test-concurrency=1</code></td><td>Serial: two 400 ms files took 916 ms, not 464 ms</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The coverage floor is worth setting up properly. It turns a number people argue about into a rule the machine enforces:</p>
+
+  <pre><code>node --test --experimental-test-coverage --test-coverage-lines=90
+
+<span class="out">ℹ  lib.js   |  66.67 |   100.00 |   50.00 | 2
+ℹ all files |  66.67 |   100.00 |   50.00 |</span>
+<span class="cmt"># exit code 1 — the build fails. Without the flag, the same run exits 0.</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Set the floor at what you have today</span>
+    Not at 90 because 90 sounds good. Measure, then set the floor <b>one point below the current number</b>.
+    Now coverage can never fall, and nobody has to write pointless tests this afternoon. Raise it when you
+    genuinely raise coverage.
+  </div>
+
+  <p>Read that measured row once more, because it is <a href="./0035-node-test-the-built-in-runner.html">week 35</a>'s lesson in one line. <b>Branch coverage 100%, function coverage 50%.</b> The file has no branches, so branch coverage is perfect and meaningless, while half the functions have never been called. One number is never the answer. The <b>uncovered lines</b> column — here, line 2 — is.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>A workflow that does the whole thing</b></p>
+  <pre><code>name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24', cache: 'npm' }
+      - run: npm ci
+      - run: node --test --experimental-test-coverage --test-coverage-lines=NN
+      - run: npm audit --audit-level=high</code></pre>
+
+  <!-- ============ THE SECURITY PASS ============ -->
+  <h2>Part 2 — the security pass</h2>
+  <p>This is a document, and it is the real deliverable of the week. Most engineers never write one, which is exactly why writing one is noticed.</p>
+
+  <p>It has three columns, and the third is the important one:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Risk</th><th>Status</th><th>Reasoning</th></tr></thead>
+    <tbody>
+      <tr><td>Dangerous URL scheme (<code>javascript:</code>, <code>data:</code>)</td><td><b>Closed</b></td><td>Protocol allow-list, <code>http:</code>/<code>https:</code> only. Test: <code>rejects-javascript-scheme</code>.</td></tr>
+      <tr><td>Prototype pollution via request body</td><td><b>Closed</b></td><td>Merge target is <code>Object.create(null)</code>. Test asserts <code>({}).isAdmin</code> stays <code>undefined</code>.</td></tr>
+      <tr><td>Regex denial of service</td><td><b>Closed</b></td><td>Codes limited to 32 characters before matching; pattern has no nested repeat.</td></tr>
+      <tr><td>Unbounded request body</td><td><b>Closed</b></td><td>Bytes counted as received; socket destroyed past 1 MB. <code>content-length</code> not trusted.</td></tr>
+      <tr><td>Redirect to a private address (<code>169.254.169.254</code>)</td><td><b>Accepted</b></td><td>We send a 302; the <b>browser</b> fetches, not us. Revisit the moment we add link previews.</td></tr>
+      <tr><td>No rate limiting</td><td><b>Accepted</b></td><td>Behind a gateway that limits per IP. If that ever changes, this becomes the top item.</td></tr>
+      <tr><td>No authentication on <code>POST /links</code></td><td><b>Accepted</b></td><td>Internal service, private network. Not safe to expose publicly without auth.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">What makes an &ldquo;Accepted&rdquo; row good</span>
+    Every one names <b>the condition that would change the answer</b>. &ldquo;Behind a gateway&rdquo; is a fact
+    that can stop being true. Writing the trigger means the decision expires by itself instead of quietly
+    rotting into a hole nobody remembers choosing.
+  </div>
+
+  <p>Notice what the table is not. It is not a promise the service is secure. It is a record of what a specific person checked on a specific day, with the reasoning attached. That is a far more useful thing to hand someone, and a far more honest one.</p>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig38-title" width="640" height="250">
+      <title id="fig38-title">Three states a risk can be in, and only one of them is bad</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">EVERY RISK IS IN ONE OF THREE STATES</text>
+
+      <rect x="20" y="38" width="190" height="96" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="115" y="60" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">CLOSED</text>
+      <text x="115" y="82" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">fixed, and a test</text>
+      <text x="115" y="96" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">keeps it fixed</text>
+      <text x="115" y="120" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">name the test in the row</text>
+
+      <rect x="225" y="38" width="190" height="96" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="60" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-weight: 700;">ACCEPTED</text>
+      <text x="320" y="82" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">known, not fixed,</text>
+      <text x="320" y="96" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">reason written down</text>
+      <text x="320" y="120" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">name what would change it</text>
+
+      <rect x="430" y="38" width="190" height="96" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="525" y="60" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700;">UNKNOWN</text>
+      <text x="525" y="82" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">nobody has looked</text>
+      <text x="525" y="96" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">and nobody knows</text>
+      <text x="525" y="120" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px; font-weight: 700;">this is the only bad one</text>
+
+      <rect x="20" y="154" width="600" height="42" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="172" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">The security pass does not move risks to Closed. It moves them out of Unknown.</text>
+      <text x="320" y="188" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">A row that says &#8220;Accepted, because we are behind a gateway&#8221; is a finished job.</text>
+
+      <text x="320" y="222" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">An accepted risk is a decision. An unknown risk is a surprise waiting.</text>
+      <text x="320" y="242" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Write the trigger that would move a row from Accepted back to open.</text>
+    </svg>
+    <figcaption>Most security work is not fixing. It is emptying the third column.</figcaption>
+  </div>
+
+  <!-- ============ REVIEW SOMEONE ELSE ============ -->
+  <h2>Part 3 — judge a repository you did not write</h2>
+  <p>This is the week's hardest exercise, and the closest thing to the job. Pick a real open-source Node service. Give yourself <b>30 minutes</b> and write <b>three specific findings</b>.</p>
+
+  <p>You are not looking for style. You are answering one question: <b>what breaks first, and who notices?</b></p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Look at</th><th>Ask</th><th>From</th></tr></thead>
+    <tbody>
+      <tr><td>The shutdown path</td><td>Is there a <code>SIGTERM</code> handler? Does it drain, or just stop?</td><td><a href="./0027-signals-and-graceful-shutdown.html">week 27</a></td></tr>
+      <tr><td>The error handler</td><td>Does an unexpected error keep the process alive? Should it?</td><td><a href="./0028-operational-versus-programmer-errors.html">week 28</a></td></tr>
+      <tr><td>Any <code>await</code> in a loop</td><td>Is this serial on purpose, or by accident?</td><td><a href="./0007-many-things-at-once-promise-combinators-and-concurrency.html">week 7</a></td></tr>
+      <tr><td>The body parser</td><td>Is there a size limit? Is <code>content-length</code> trusted?</td><td><a href="./0020-http-from-scratch.html">week 20</a></td></tr>
+      <tr><td>Any merge of request data</td><td>Can <code>__proto__</code> get through?</td><td><a href="./0037-the-inspector-and-hardening-your-input.html">week 37</a></td></tr>
+      <tr><td>The tests</td><td>Is there a <code>sleep</code>? A hard-coded port? An <code>async</code> test with no <code>await</code>?</td><td><a href="./0036-async-tests-that-do-not-flake.html">week 36</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>A finding is only useful in a particular shape. Compare:</p>
+
+  <pre><code><span class="cmt">// useless</span>
+"Error handling could be improved."
+
+<span class="cmt">// a finding</span>
+"src/server.js:88 — the catch block logs and returns 500 for every error,
+ including a validation failure. A client cannot tell a bad request from
+ an outage, so retries hammer a server that will never accept the input.
+ Split operational from programmer errors and map validation to 400."</code></pre>
+
+  <div class="soundbite">
+    <span class="label">The shape of a finding</span>
+    <p><b>Where</b> (file and line) · <b>what</b> (the specific behaviour) · <b>what it costs</b> (who is hurt, and when) · <b>what to do</b>. Missing the third part is what makes a review sound like nagging.</p>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A risk you have written down and decided not to fix is safe, in the way that matters. The next person inherits your decision instead of your blind spot.</p>
+    <p class="part cont">So the job of a security pass is not to fix everything. It is to shorten the list of things nobody has looked at. Then to say why each remaining item is acceptable.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A pre-flight checklist. The pilot is not repairing the aircraft. They are confirming that every item has been looked at by somebody, and signing their name to that.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A pre-flight checklist is fixed. Somebody else wrote it, and it is the same every flight. Your list has to be written by you, for this service, and it goes out of date.</p>
+    <p class="part limit cont">That is why every &ldquo;Accepted&rdquo; row must name <b>the condition that would change the answer</b>. &ldquo;We only redirect, we never fetch the URL&rdquo; is fine today and wrong the day someone adds link previews. Without that trigger written down, an old decision quietly turns into a hole nobody remembers choosing.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People read &ldquo;Accepted&rdquo; as &ldquo;we were lazy&rdquo;, so they leave the row out. That is backwards. A risk in the table is being managed; the same risk left out is invisible.</p>
+    <p class="part cont">Only one of the three states is actually bad, and it is <b>Unknown</b> — nobody looked, so nobody knows. Everything you move out of that column is real work, even when you fixed nothing.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain this. Writing down a risk you chose not to fix is safer than fixing it quietly. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — the whole week's deliverable</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li><b>Clean checkout, green first try.</b> Clone into a temporary folder, <code>npm ci</code>, <code>node --test</code>. If it fails, that is the most valuable thing you will find this week. Fix the repo, not your machine.</li>
+    <li><b>Continuous integration</b> running the suite plus <code>npm audit --audit-level=high</code>.</li>
+    <li><b>A coverage floor</b> set one point below today's number, enforced with <code>--test-coverage-lines</code>. Confirm it fails when you lower a test.</li>
+    <li><b>A coverage number you can defend.</b> Write one paragraph: what the suite proves, and what it does not.</li>
+    <li><b>SECURITY.md</b> — the three-column table. Every Accepted row names its trigger.</li>
+    <li><b>Ten clean runs</b> of the suite in a row. Any failure is a flake to fix, not a retry to add.</li>
+    <li><b>Three findings</b> on somebody else's Node repository, each in the four-part shape.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">The trap in requirement 4</span>
+    &ldquo;We have 88% coverage&rdquo; is not defending a number, it is repeating one. Defending it sounds like:
+    <em>&ldquo;88%. The redirect path, the 409 and the size limit are covered by integration tests. The
+    uncovered lines are the fatal-error branch, which I could only test by killing the process, and the
+    metrics endpoint. I judged both low risk, and here is why.&rdquo;</em>
+    <p style="margin:.6rem 0 0;">One of those answers ends the conversation. The other starts a good one.</p>
+  </div>
+
+  <div class="drill">
+    <span class="label">Judge a stranger's project out loud</span>
+    <p class="situation">Open a Node service you have never seen. Talk for five minutes, out loud, recorded.</p>
+    Say what will break first, who notices, and what you would fix in the first week. Then listen back.
+    Count how many times you said something that was true of <b>any</b> project. Those sentences are the
+    ones an interviewer discounts entirely.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Threat modelling</b> as a formal method — STRIDE and the like — is genuinely useful once a system has
+    several parts. <b>Dependency scanning beyond <code>npm audit</code></b>, and lockfile and install-script
+    risk, deserve their own reading. <b>Secret scanning</b> in CI catches the mistake this lesson cannot.
+    <b>Penetration testing</b> is a profession, not a checklist.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://github.com/goldbergyoni/nodebestpractices">Node.js Best Practices</a>,
+    used as a checklist rather than a reading list, and the Node docs for
+    <a href="https://nodejs.org/api/cli.html#--test-reporterreporter">--test-reporter</a> and
+    <a href="https://nodejs.org/api/cli.html#--test-coverage-linesthreshold">--test-coverage-lines</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your SECURITY.md and I'll argue with one of your Accepted rows.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Ready means three things. Green from a <b>clean checkout</b>, you can say what the tests prove, and you can name what you accepted.</li>
+      <li>A failing <code>node --test</code> exits <b>1</b> — the whole CI contract. <code>--test-coverage-lines=N</code> exits 1 below N too.</li>
+      <li>Measured: <code>66.67 line / 100.00 branch / 50.00 funcs</code> — perfect branch coverage, half the functions never called.</li>
+      <li>Three states for a risk: <b>Closed</b>, <b>Accepted</b>, <b>Unknown</b>. Only Unknown is bad.</li>
+      <li>Every Accepted row names <b>the condition that would change the answer</b>, so it expires by itself.</li>
+      <li>A finding is <b>where · what · what it costs · what to do</b>. Drop the cost and it reads as nagging.</li>
+      <li>Defending a coverage number means naming the uncovered lines and why they are acceptable.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the security pass does not move risks to Closed — it moves them out of Unknown.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "--test-reporter", "--test-coverage-lines", "Security best practices". Node.js Best Practices (goldbergyoni). The exit codes, the junit and dot reporter output, and the <code>66.67 / 100.00 / 50.00</code> coverage row were all measured. They came from running the code on <b>Node v24.14.0</b>, on 2026-08-28. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0037-the-inspector-and-hardening-your-input.html">← Lesson 37</a>
+    <a href="./0040-postgres-pools-transactions-and-n-plus-one.html">Next: Lesson 40 — Postgres — pools, transactions, and N+1 →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A coverage report reads: 66.67% lines, 100% branches, 50% functions. What should you conclude?",
+      options: [
+        "Branch coverage is perfect because the file has no branches, and half the functions are untested",
+        "The report is inconsistent, since branch coverage can never exceed line coverage",
+        "The suite is in good shape, because the branch number is the one that matters most",
+        "Two thirds of the file runs, so the untested third is dead code that can be deleted"
+      ],
+      answer: 0,
+      why: "Measured on a file with two functions and no conditionals. With nothing to branch on, branch coverage is 100% and says nothing. Function coverage of 50% is the real signal — one function has never been called. No single coverage number is the answer; the uncovered lines column is."
+    },
+    {
+      q: "What makes an “Accepted” row in a security pass a finished piece of work rather than an excuse?",
+      options: [
+        "It names the condition that would change the answer, so the decision expires by itself",
+        "It has been signed off by someone more senior than the person who wrote it",
+        "It links to an open ticket, which keeps the risk visible in the team's backlog",
+        "It is reviewed on a fixed schedule, so no accepted risk survives more than a quarter"
+      ],
+      answer: 0,
+      why: "“Accepted because we only redirect and never fetch the URL” is correct today and wrong the day someone adds link previews. Writing the trigger means the decision cannot quietly rot. Without it, an old, reasonable choice becomes a hole nobody remembers making."
+    },
+    {
+      q: "Your suite passes locally but fails on the first clean checkout. What have you actually learned?",
+      options: [
+        "The repository is incomplete — a file, a version or a dependency lives only on your machine",
+        "The CI runner is slower, so a timing-sensitive test needs a longer timeout there",
+        "npm ci is stricter than npm install and rejects packages the lockfile permits",
+        "Test files run in parallel on CI but serially on a developer machine by default"
+      ],
+      answer: 0,
+      why: "That is the failure worth having. The usual causes are an uncommitted file, a globally installed dependency, an ignored .env that is quietly required, a machine-specific path, or a different Node version. Each one means the repo is not self-contained, and the fix belongs in the repo rather than on the machine."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you know a service is ready to ship?”",
+      answer: "Three things. It goes green from a <b>clean checkout</b> — a fresh clone in a temporary folder, <code>npm ci</code>, one command — because passing on my machine only proves my machine works. I can say what the tests prove and what they do not, naming the uncovered lines rather than quoting a percentage. And I can list the risks I <b>accepted on purpose</b>, with the reason and the condition that would change each answer. The third one is the difference between careful and finished: the next person inherits a decision instead of my blind spot. <br>Why: the third point is the one almost nobody says, and it is the one that sounds senior."
+    },
+    {
+      prompt: "Interviewer: “We have 88% coverage. Defend it.”",
+      answer: "88% means 88% of lines were executed, not verified — a test with no assertion still counts. So I would say what is actually covered: the redirect path, the 409 on a duplicate, and the body size limit, all by integration tests against a real server. Then the uncovered lines, which are the fatal-error branch and the metrics endpoint. I judged both low risk and I can say why. I also set the floor in CI one point below the current number, so coverage can never fall, without anybody writing filler tests to hit a round number. <br>Why: naming what is uncovered, and the floor mechanism, turns a number into an argument you can win."
+    },
+    {
+      prompt: "Interviewer: “Look at this repo and tell us what is wrong with it.”",
+      answer: "I would give findings in one shape: <b>where, what, what it costs, and what to do</b>. For example — &ldquo;<code>src/server.js:88</code>, the catch block returns 500 for every error including validation failures, so a client cannot tell a bad request from an outage and retries hammer a server that will never accept the input; split operational from programmer errors and map validation to 400.&rdquo; The cost sentence is the part people leave out, and without it a review reads as nagging. I look first at shutdown, the error handler, body limits, and any <code>await</code> inside a loop. <br>Why: giving the template and then filling it in beats listing complaints, and the four checkpoints show you have a system rather than instincts."
+    }
+  ]);
+</script>

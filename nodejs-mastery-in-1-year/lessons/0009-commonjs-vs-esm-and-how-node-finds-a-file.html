@@ -1,0 +1,607 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CommonJS vs ESM, and how Node finds a file — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 9 of 52 · Lesson 9 · Modules &amp; a real CLI</p>
+  <h1>CommonJS vs ESM, and how Node finds a file</h1>
+  <p class="subtitle">Two module systems, one real difference — and it is not the syntax.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 9 of 52.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/52-week-plan.html#w9">Week 9 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will stop guessing at module errors. Given <code>ERR_REQUIRE_ESM</code>, <code>ERR_MODULE_NOT_FOUND</code> or <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>, you will <b>read the message and know what happened</b> — because you will know exactly when Node goes looking for a file, and where it looks.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 1–8 were about <b>time</b>: when your code runs. Weeks 9–12 are about <b>place</b>: where your code lives and how Node finds it. Same skill, different axis. Both are things you can trace instead of guess.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem, not the syntax</h2>
+  <p>One file gets too big. You want to split it. That is the whole problem.</p>
+  <p>To split code across files, a language needs to answer four questions. Nothing else. Read them and notice that three are easy:</p>
+  <ol>
+    <li><b>How do I name another file?</b> Some kind of string.</li>
+    <li><b>How does that file say what is public?</b> Some kind of export.</li>
+    <li><b>How does a name become a real file on disk?</b> A set of lookup rules.</li>
+    <li><b>When does that lookup happen?</b> While the program runs, or before it runs?</li>
+  </ol>
+
+  <div class="soundbite">
+    <span class="label">The one choice that makes everything else</span>
+    <p>CommonJS looks up files <b>while the program is running</b>. ESM looks up every <em>static</em> import <b>before any of your code runs</b>. <b>Almost</b> everything you have to memorise follows from that one difference. There are exactly two exceptions: two lookup rules ESM changed on purpose. Both are labelled as conventions when they arrive, not smuggled in as logic.</p>
+  </div>
+
+  <p>That claim is worth testing rather than believing. Take the two systems in turn and see whether the differences really do fall out of the timing.</p>
+
+  <h2>CommonJS — look it up while running</h2>
+  <p>In CommonJS, <code>require()</code> is <b>an ordinary function</b>. Node wraps every file in a function before running it, roughly like this:</p>
+
+  <pre><code><span class="cmt">// What Node actually does to your .cjs file, simplified.</span>
+function (exports, require, module, __filename, __dirname) {
+  <span class="cmt">// ...your file's code goes here...</span>
+}</code></pre>
+
+  <p>That wrapper explains a lot at once. <code>require</code>, <code>module</code> and <code>__dirname</code> are not magic globals. They are <b>arguments</b>. That is why <code>__dirname</code> and <code>__filename</code> do not exist in the REPL, where there is no file. (<code>require</code> and <code>module</code> <em>are</em> there. The REPL sets them up for you.) </p>
+  <p>It also explains <code>var</code>. A top-level <code>var</code> in a Node file is not on <code>globalThis</code>. It is a local variable inside that function.</p>
+
+  <p>Now derive the rest. <code>require()</code> is a function call, so:</p>
+  <ul>
+    <li>It can sit <b>anywhere</b> — inside an <code>if</code>, inside a loop, inside a function.</li>
+    <li>Its argument can be <b>computed</b>: <code>require('./plugins/' + name)</code>.</li>
+    <li>It must be <b>synchronous</b>, because a function call has to return a value now. So it reads the file from disk and blocks while it does. On a server, that is fine only because it happens at start-up.</li>
+    <li>It returns <b>whatever <code>module.exports</code> was at that moment</b> — a snapshot.</li>
+  </ul>
+
+  <p>That last point is the one that catches people out, so prove it rather than accept it:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>counter.cjs</b></p>
+  <pre><code>let n = 1;
+setTimeout(() =&gt; { n = 99; }, 10);
+module.exports = { n, get live() { return n; } };</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>use.cjs</b></p>
+  <pre><code>const m = require('./counter.cjs');
+setTimeout(() =&gt; console.log(m.n, m.live), 50);
+<span class="out">// prints: 1 99</span></code></pre>
+
+  <p>The value <code>1</code> was copied into the object when the file ran. Changing <code>n</code> later does nothing to it. The getter still sees the new value, because a getter runs when you read it. So CommonJS hands you <b>an object</b>, and normal JavaScript copying rules apply. There is no special "module" behaviour at all.</p>
+
+  <h2>ESM — look everything up first, then run</h2>
+  <p>ESM makes the opposite choice, and pays for it with restrictions you have probably felt without knowing why.</p>
+  <p>Node reads an ES module in <b>three separate passes</b>:</p>
+  <ol>
+    <li><b>Parse.</b> Find every <code>import</code> in the file without running anything. Load those files. Repeat until the whole graph is known.</li>
+    <li><b>Link.</b> Connect each imported name to the exact <em>slot</em> in the file that exports it. No values yet — just wiring.</li>
+    <li><b>Evaluate.</b> Now run the code, deepest file first.</li>
+  </ol>
+
+  <p>Pass 1 has to find the imports <em>without running the file</em>. That requirement forces the <b>first two</b> rules below on its own. The last two come from a separate design choice. ESM was built to work in a browser, over URLs. The table says so rather than pretending otherwise:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>ESM rule</th><th>Why it must be that way</th></tr></thead>
+    <tbody>
+      <tr><td><code>import</code> must be at the top level</td><td>An <code>import</code> inside an <code>if</code> could not be found without running the <code>if</code>.</td></tr>
+      <tr><td>The path must be a literal string</td><td><code>'./' + name</code> has no value until the code runs. Pass 1 has not run anything.</td></tr>
+      <tr><td>File extensions are required</td><td><b>Convention, not a consequence.</b> Nothing about parsing first stops Node guessing — CommonJS is resolved statically too, and it guesses happily. ESM refuses because it is specified over <b>URLs</b>, to match the browser, where every guess is a network round trip. Remember this one.</td></tr>
+      <tr><td>No <code>__dirname</code></td><td><b>Convention, not a consequence.</b> Same reason: an ES module is named by a URL, and a URL need not be a file. Use <code>import.meta.dirname</code>.</td></tr>
+      <tr><td>…unless you use <code>import()</code></td><td>Dynamic <code>import()</code> is a function call, not a declaration. It runs during evaluation, like <code>require()</code>, so its path may be computed and it may sit anywhere. It returns a promise instead of a value.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The one escape hatch — and it proves the rule</span>
+    <code>import('./x.mjs')</code>, with brackets, like a function call, is a <b>run-time</b> load. So it
+    may sit inside an <code>if</code>, and its path may be computed. It returns a <b>promise</b>, because
+    loading is asynchronous. That is the whole trade: run-time freedom costs you the static graph and the
+    live binding. Use it for a plugin you choose at start-up, and for nothing else.
+  </div>
+
+  <p>Pass 2 is where the famous difference appears. Linking connects a name to a <b>slot</b>, not to a value. So when the other file changes what is in the slot, you see it:</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>counter.mjs</b> and <b>use.mjs</b></p>
+  <pre><code><span class="cmt">// counter.mjs</span>
+export let n = 1;
+setTimeout(() =&gt; { n = 99; }, 10);
+
+<span class="cmt">// use.mjs</span>
+import { n } from './counter.mjs';
+setTimeout(() =&gt; console.log(n), 50);
+<span class="out">// prints: 99</span></code></pre>
+
+  <p>Same shape as the CommonJS example. Different answer. This is called a <b>live binding</b>. Nobody added it as an extra feature. You get it as soon as you decide to link before running.</p>
+
+  <div class="trap">
+    <span class="label">A live binding is read-only for you</span>
+    You can see <code>n</code> change. You cannot write to it. <code>n = 5</code> in the importing file is a <code>TypeError</code>. Only the file that owns the variable may change it.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 330" role="img" aria-labelledby="fig9-title" width="640" height="330">
+      <title id="fig9-title">CommonJS resolves each file while running; ESM resolves the whole graph before running</title>
+
+      <text x="20" y="24" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">COMMONJS — find it while running</text>
+
+      <line x1="26" y1="96" x2="614" y2="96" style="stroke: var(--rule); stroke-width: 2;"></line>
+      <text x="620" y="100" text-anchor="end" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">time →</text>
+
+      <rect x="26" y="60" width="104" height="30" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="78" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">run line 1</text>
+
+      <rect x="138" y="60" width="104" height="30" rx="5" style="fill: var(--accent-2); stroke: var(--accent-2); stroke-width: 1.5;"></rect>
+      <text x="190" y="80" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px; font-weight: 700;">require → disk</text>
+
+      <rect x="250" y="60" width="104" height="30" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="302" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">run line 3</text>
+
+      <rect x="362" y="60" width="104" height="30" rx="5" style="fill: var(--accent-2); stroke: var(--accent-2); stroke-width: 1.5;"></rect>
+      <text x="414" y="80" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px; font-weight: 700;">require → disk</text>
+
+      <rect x="474" y="60" width="104" height="30" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="526" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">run line 7</text>
+
+      <text x="26" y="122" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-style: italic;">Lookups are mixed into execution — so the path can be computed, and it must block.</text>
+
+      <line x1="20" y1="150" x2="620" y2="150" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="182" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">ESM — find everything first, then run</text>
+
+      <line x1="26" y1="254" x2="614" y2="254" style="stroke: var(--rule); stroke-width: 2;"></line>
+      <text x="620" y="258" text-anchor="end" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">time →</text>
+
+      <rect x="26" y="218" width="160" height="30" rx="5" style="fill: var(--accent); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="106" y="238" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px; font-weight: 700;">1 · parse, find all</text>
+
+      <rect x="194" y="218" width="160" height="30" rx="5" style="fill: var(--accent); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="274" y="238" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px; font-weight: 700;">2 · link name → slot</text>
+
+      <rect x="362" y="218" width="252" height="30" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="488" y="238" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">3 · evaluate — your code finally runs</text>
+
+      <text x="26" y="280" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-style: italic;">No lookup happens during step 3 — so the path must be a literal, and a name can stay live.</text>
+
+      <text x="320" y="312" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">Live bindings and top-level-only imports fall out of this one difference. Required extensions and the missing __dirname come from ESM being designed for URLs.</text>
+    </svg>
+    <figcaption>The only real difference is <em>when</em> the lookup happens. Every rule you have to remember is a consequence of it.</figcaption>
+  </div>
+
+  <!-- ============ RESOLUTION ============ -->
+  <h2>How a name becomes a file</h2>
+  <p>Three kinds of name, three different rules:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>You write</th><th>Called</th><th>Node does</th></tr></thead>
+    <tbody>
+      <tr><td><code>'./util.js'</code></td><td>relative</td><td>Joins it to the current file's folder. One place, no searching.</td></tr>
+      <tr><td><code>'/opt/app/x.js'</code></td><td>absolute</td><td>Uses it exactly. No searching.</td></tr>
+      <tr><td><code>'lodash'</code></td><td><b>bare specifier</b></td><td>Searches. This is the one worth understanding.</td></tr>
+      <tr><td><code>'node:fs'</code></td><td><b>builtin</b></td><td>Answered from inside Node. No disk is touched at all.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Why <code>node:fs</code> and not just <code>fs</code></span>
+    They load the same object — <code>require('node:fs') === require('fs')</code> is <code>true</code>.
+    But the prefix is not decoration. <b>Newer built-in modules only exist with it.</b> Verified on
+    Node v24.14.0:
+    <pre style="margin:.6rem 0;"><code>require('test')        <span class="out">// MODULE_NOT_FOUND</span>
+require('node:test')   <span class="out">// works</span></code></pre>
+    The same is true of <code>node:sqlite</code> and <code>node:sea</code>. You will need
+    <code>node:test</code> in <a href="../reference/52-week-plan.html#w35">week 35</a>, so learn the
+    prefix now. Use it in new code; expect the bare form in anything written before Node 16.
+  </div>
+
+  <p>For a bare specifier, Node looks in <code>node_modules</code> in the current folder. Not there? It goes up one folder and looks again. It keeps going up to <code>/node_modules</code> — and then checks three <b>legacy global folders</b>: <code>~/.node_modules</code>, <code>~/.node_libraries</code>, and <code>&lt;node install&gt;/lib/node</code>. So the last folder in the list lives inside your Node installation, not at the root of the disk.</p>
+
+  <p>You do not have to believe that. Node will show you the list:</p>
+  <pre><code>NODE_DEBUG=module node -e "require('lodash')"</code></pre>
+  <p>The output prints the exact folders it checked, in order — up to <code>/node_modules</code>, then the three legacy global folders. Run it once inside a real project. It turns "module not found" into a list you can read instead of a mystery.</p>
+
+  <div class="tip">
+    <span class="label">This is why a deep project can find a package it never installed</span>
+    A package in a parent folder's <code>node_modules</code> is visible to every folder below it. That is convenient, and it is also how a build works on your machine and fails in CI — where the parent folder does not exist.
+  </div>
+
+  <h2>The <code>exports</code> field blocks any path it does not list</h2>
+  <p>Once Node has found the package folder, <code>package.json</code> decides what you may reach. The <code>exports</code> field lists the allowed entry points. Anything not listed is blocked, even though the file is right there on disk:</p>
+
+  <pre><code><span class="cmt">// node_modules/toy/package.json</span>
+{ "name": "toy", "exports": { ".": "./lib/main.js" } }</code></pre>
+
+  <pre><code>require('toy')             <span class="out">// works</span>
+require('toy/lib/secret')  <span class="out">// ERR_PACKAGE_PATH_NOT_EXPORTED</span></code></pre>
+
+  <p>This applies to <code>require</code> as well as <code>import</code>. Before <code>exports</code> existed, every file in a package was public. The author had no say in it. So no file could ever be renamed safely. The field is the package author drawing a line around what they promise to keep.</p>
+
+  <h2>Which system is this file? One line decides</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>File</th><th>Treated as</th></tr></thead>
+    <tbody>
+      <tr><td><code>.mjs</code></td><td>Always ESM. No exceptions.</td></tr>
+      <tr><td><code>.cjs</code></td><td>Always CommonJS. No exceptions.</td></tr>
+      <tr><td><code>.js</code></td><td>Depends on the nearest <code>package.json</code>: ESM if it has <code>"type": "module"</code>, otherwise CommonJS.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The rule that surprises everyone</span>
+    <code>"type": "module"</code> is not a switch for your project. It is a switch for <b>every <code>.js</code> file under that <code>package.json</code></b>. Add it to an existing project and files you never touched change meaning. That is why the safe move in a mixed codebase is to rename the file to <code>.mjs</code> or <code>.cjs</code>, where the extension answers the question and nothing can override it.
+  </div>
+
+  <h2>Can <code>require()</code> load an ES module?</h2>
+  <p>Yes — in modern Node, and this is a change worth knowing, because most tutorials still say no.</p>
+  <p>Verified on <b>Node v24.14.0</b>:</p>
+  <pre><code>require('./m.mjs')     <span class="out">// works — returns the module</span>
+require('./tla.mjs')   <span class="out">// ERR_REQUIRE_ASYNC_MODULE</span></code></pre>
+
+  <p>The rule is about <b>timing</b> again, exactly as you would now predict. <code>require()</code> must return a value immediately. Node can do that for an ES module as long as the whole graph is synchronous. Then one file in that graph uses <b>top-level <code>await</code></b>. The module cannot finish synchronously. <code>require()</code> gives up with <code>ERR_REQUIRE_ASYNC_MODULE</code>.</p>
+
+  <div class="note">
+    <span class="label">Say the version out loud</span>
+    This changed. Older Node threw <code>ERR_REQUIRE_ESM</code> for <em>any</em> ES module. Synchronous <code>require()</code> of ESM arrived in Node 22.0 and was backported to 20.17, both behind <code>--experimental-require-module</code>. It is on by default from 20.19, 22.12 and 23.0. If Break 2 gives you <code>ERR_REQUIRE_ESM</code>, your Node is older than 20.19. If you are reading an answer online that says it is impossible, check the date before you believe it. <b>Always check which Node version an answer was written for.</b>
+    You will still meet <code>ERR_REQUIRE_ESM</code> in two places: Node 18 and older, and bundlers that
+    resolve modules themselves. When you see it, the first question is always <em>which Node produced
+    this?</em>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A module system answers one question. You write the name of another file. <b>When</b> does the computer go and get it? CommonJS goes and gets each file at the moment it reaches that line. ESM reads your whole program first, collects every file it will need, fetches them all, and only then starts running. </p>
+    <p class="part cont">Everything else people tell you to memorise comes from that one choice.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Two ways to cook from a recipe. <b>CommonJS</b> is reading the recipe one line at a time and walking to the shop whenever an ingredient is named. <b>ESM</b> is reading the whole recipe first. You write one shopping list and go to the shop once. Only then do you start to cook.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      The shopping picture makes ESM sound merely faster. Speed is the least interesting part. The real prize is what you come home with. </p>
+    <p class="part cont">ESM knew the whole list in advance. So it can hand you <b>a shelf</b> instead of <b>a bag</b>. When the other file puts something new on that shelf, you see it. CommonJS handed you a bag holding whatever existed at the moment you asked. That is the live binding, and it is a difference in <em>meaning</em>, not in speed.</p>
+
+    <p class="part limit"><span class="h">…and a second thing the picture hides</span>
+      The shopping trip sounds instant. It is not — ESM loading is <b>asynchronous</b>. So an ES module
+      may not be finished at the moment somebody asks for it <em>right now</em>. That is exactly why <code>require()</code> of a top-level-<code>await</code> module fails. <code>require</code> has to return a value immediately. The shop is not next door.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People believe the difference is syntax — <code>require</code> or <code>import</code>, pick the one your project uses. It is not syntax. It is <b>timing</b>. Once you hold that, three confusing rules become obvious at the same moment.</p>
+      <ul>
+        <li>You cannot put <code>import</code> inside an <code>if</code>. Nothing has run yet, so nothing could find it.</li>
+        <li><code>require()</code> of a top-level-<code>await</code> module still fails. It cannot finish in time.</li>
+        <li>One line in <code>package.json</code> changes the meaning of files you never opened.</li>
+      </ul>
+      <p class="part"></p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say when CommonJS goes looking for a file. Say when ESM does. Then name one rule that follows from that difference. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — break it four ways, on purpose</h2>
+  <p>Reading error messages is the actual skill this week. So produce them yourself, in a scratch folder, and write down what each one means. Six minutes each.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Set-up</b></p>
+  <pre><code>mkdir -p mod-lab &amp;&amp; cd mod-lab
+npm init -y
+printf 'export const hello = () =&gt; "hi";\n' &gt; lib.mjs
+printf 'export const slow = await Promise.resolve(1);\n' &gt; tla.mjs</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Break 1 — a bare specifier that does not exist</b></p>
+  <pre><code>node -e "require('not-a-real-package')"
+<span class="cmt">// then run it again and read the folder list:</span>
+NODE_DEBUG=module node -e "require('not-a-real-package')"</code></pre>
+  <p>Write down: how many folders did it check, and what was the last one?</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Break 2 — <code>require</code> a module that cannot finish in time</b></p>
+  <pre><code>node -e "require('./tla.mjs')"
+<span class="out">// ERR_REQUIRE_ASYNC_MODULE</span></code></pre>
+  <p>Now delete the <code>await</code> from <code>tla.mjs</code> and run it again. It works. You have just shown that the error is about timing, not about ESM.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Break 3 — a missing file extension in ESM</b></p>
+  <pre><code>printf 'import { hello } from "./lib";\n' &gt; main.mjs
+node main.mjs
+<span class="out">// ERR_MODULE_NOT_FOUND — the message names the exact path it looked for</span></code></pre>
+  <p>Then add <code>.mjs</code> to the import and watch it work. CommonJS would have guessed for you. ESM will not.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>Break 4 — the <code>exports</code> door</b></p>
+  <pre><code>mkdir -p node_modules/toy/lib
+printf '{"name":"toy","exports":{".":"./lib/main.js"}}\n' &gt; node_modules/toy/package.json
+printf 'module.exports = "main";\n'   &gt; node_modules/toy/lib/main.js
+printf 'module.exports = "secret";\n' &gt; node_modules/toy/lib/secret.js
+node -e "console.log(require('toy'))"
+node -e "console.log(require('toy/lib/secret'))"
+<span class="out">// ERR_PACKAGE_PATH_NOT_EXPORTED — the file exists and is still refused</span></code></pre>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    A file called <code>module-errors.md</code> with four headings — one per error code. Under each, one sentence saying what happened and one saying how you fixed it. That file is worth more in six months than re-reading this lesson.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate adds <code>"type": "module"</code> to <code>package.json</code> to use <code>import</code> in one new file. The build now fails in eleven other files nobody edited.</p>
+    Explain what happened, and give two different fixes — one fast, one correct.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    Three things belong to later weeks, not this one. <b>Publishing</b> a package — the <code>exports</code> map you write as an author, <code>bin</code>, and semver — is <a href="../reference/52-week-plan.html#w11">week 11</a>, and it is tagged <b>depth</b> because you do it a few times a year, not weekly. <b>Loader hooks</b> and <code>module.register()</code> are not in this course at all. And <b>circular dependencies</b> are left out because the honest advice is to remove the cycle, not to learn the rules for surviving one.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/api/esm.html">ECMAScript modules</a>, <a href="https://nodejs.org/api/modules.html">CommonJS modules</a>, and <a href="https://nodejs.org/api/packages.html">Modules: Packages</a> for the <code>exports</code> field.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — paste me any module error you get this week and I'll show you <b>which of the four questions</b> it came from. That is faster than searching, and you keep the method.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A module system answers four questions. CommonJS and ESM differ on <b>only one</b>: when the lookup happens.</li>
+      <li><b>CommonJS</b> looks up while running. So the path can be computed, <code>require</code> can sit anywhere, it blocks, and it gives you a <b>copy</b>.</li>
+      <li><b>ESM</b> looks up before running, in three passes: parse, link, evaluate. So imports must be top level and literal, extensions are required, and you get a <b>live binding</b>.</li>
+      <li>A <b>bare specifier</b> like <code>lodash</code> searches <code>node_modules</code> upward to the root. See it with <code>NODE_DEBUG=module</code>.</li>
+      <li>The <code>exports</code> field blocks any path it does not list — <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code> — for <code>require</code> too.</li>
+      <li><code>.mjs</code> and <code>.cjs</code> always win. A plain <code>.js</code> is decided by <code>"type"</code> in the nearest <code>package.json</code>, which affects files you never opened.</li>
+      <li>Modern Node <b>can</b> <code>require()</code> an ES module, unless the graph uses top-level <code>await</code>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the difference is not <code>require</code> versus <code>import</code>. It is whether Node looks for the file while running or before running.</b> Every rule follows from that.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "ECMAScript modules", "CommonJS modules", "Modules: Packages". Three results here were run on <b>Node v24.14.0</b> on 2026-08-28, not quoted from memory. They are the <code>require()</code>-of-ESM behaviour, <code>ERR_REQUIRE_ASYNC_MODULE</code>, and <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0008-build-a-concurrent-multi-api-aggregator.html">← Lesson 8</a>
+    <a href="./0010-the-process-argv-streams-and-exit-codes.html">Next: Lesson 10 — The process — argv, streams and exit codes →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why can an ESM import path not be built from a variable, like './' + name?",
+      options: [
+        "Node finds every import before running any code, so no variable has a value yet",
+        "Node blocks computed paths to stop packages loading files that are unsafe",
+        "Node needs the literal string to write the correct entry into the module cache",
+        "Node cannot read a folder whose name was joined together from two pieces"
+      ],
+      answer: 0,
+      why: "ESM resolves the whole graph in a parse pass, before evaluation. At that point your code has not run, so a variable holds nothing. CommonJS allows a computed path precisely because require() runs during evaluation, when the variable does have a value."
+    },
+    {
+      q: "You require('./thing.mjs') and get ERR_REQUIRE_ASYNC_MODULE. What is the cause?",
+      options: [
+        "Something in that module's graph uses top-level await, so it cannot finish now",
+        "Node never allows require of an ES module and this is the standard error",
+        "The file is missing the type field in the closest package.json above it",
+        "The module exports a promise and require cannot unwrap a promise value"
+      ],
+      answer: 0,
+      why: "Modern Node can require() an ES module, but require() has to return a value immediately. Top-level await makes the module finish later, so the synchronous contract cannot be met. Remove the top-level await, or import() it instead."
+    },
+    {
+      q: "A package file exists on disk, but importing it gives ERR_PACKAGE_PATH_NOT_EXPORTED. Why?",
+      options: [
+        "The package's exports field does not list that path, so Node refuses it",
+        "The package was installed in a parent folder rather than the current one",
+        "The file uses CommonJS syntax inside a package marked as type module",
+        "The package has no main field, so only its index file can be reached"
+      ],
+      answer: 0,
+      why: "The exports field in package.json is a list of allowed entry points. Anything not listed is blocked even though it exists. This lets the author rename internal files without breaking users, and it applies to require() as well as import."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is the real difference between CommonJS and ESM?”",
+      answer: "The difference is <b>when the lookup happens</b>, and everything else follows from it. CommonJS resolves a file at the moment it runs the <code>require()</code> call, so the path can be computed, the call can sit anywhere, it blocks while it reads, and it hands back a copy of <code>module.exports</code>. ESM resolves the whole graph before any code runs — parse, link, evaluate — so imports must be at the top level with a literal path and a real file extension, and an imported name is a live binding into the other module rather than a copy. <br>Why: naming the timing first shows you understand the design, not just the two syntaxes."
+    },
+    {
+      prompt: "Interviewer: “How does Node turn the string 'lodash' into a file?”",
+      answer: "That is a <b>bare specifier</b>, so Node searches. It looks for <code>node_modules/lodash</code> in the current folder, then in the parent folder, then its parent, up to <code>/node_modules</code>, and finally three legacy global folders inside your Node installation. When it finds the package folder, <code>package.json</code> decides which file it actually loads — the <code>exports</code> field first, and anything not listed there is refused with <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>. I can print the exact folder list with <code>NODE_DEBUG=module</code>. <br>Why: mentioning <code>NODE_DEBUG=module</code> shows you debug this instead of guessing at it."
+    },
+    {
+      prompt: "Interviewer: “Someone added \"type\": \"module\" and the build broke. What happened?”",
+      answer: "That field does not apply to one file. It changes how Node reads <b>every <code>.js</code> file</b> under that <code>package.json</code>, so files nobody edited are suddenly parsed as ES modules and their <code>require</code> calls fail. The fast fix is to rename the broken files to <code>.cjs</code>, because an explicit extension always wins over the <code>type</code> field. The correct fix is to migrate the package deliberately, one folder at a time, with the tests green at each step. <br>Why: giving a fast fix and a correct fix separately is what a senior answer sounds like."
+    }
+  ]);
+</script>

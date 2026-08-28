@@ -1,0 +1,534 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EventEmitter — the pattern under everything — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 18 of 52 · Lesson 18 · Events &amp; servers</p>
+  <h1>EventEmitter — the pattern under everything</h1>
+  <p class="subtitle">Learn one small object properly, and four things you already use stop being magic.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 18 of 52.</span> This lesson builds one domain-expert ability: <b>explain it from first principles, with no jargon and no notes</b>. <a href="../reference/52-week-plan.html#w18">Week 18 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will write your own <code>EventEmitter</code> in about thirty lines. Then you will see that streams, sockets, servers and the process itself are all the same object underneath — proven by printing their prototype chains.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 14&ndash;17 used streams and never asked what a stream <em>is</em>. It is this. Everything in weeks 18&ndash;21 is built on the small object below, so this is the highest-leverage hour in the module.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — who calls your function?</h2>
+  <p>Week 1 established that Node does not wait. It registers a callback and gets called back. That works when there is exactly <b>one</b> answer coming.</p>
+  <p>A socket is not like that. It produces data, then more data, then maybe an error, then a close. Several kinds of thing, several times each, in an order nobody knows in advance.</p>
+  <p>A single callback cannot express that. So you need three things:</p>
+  <ol>
+    <li>A way to say <b>which</b> kind of thing you care about — a name.</li>
+    <li>A way to register a function for that name.</li>
+    <li>A way for the producer to say &ldquo;this happened&rdquo; and run everyone who asked.</li>
+  </ol>
+  <p>That is the entire design. Node calls it <code>EventEmitter</code>, and it is small enough to write yourself.</p>
+
+  <h2>Write it yourself — the whole thing</h2>
+  <pre><code>class MyEmitter {
+  constructor() { this.listeners = new Map(); }
+
+  on(name, fn) {
+    if (!this.listeners.has(name)) this.listeners.set(name, []);
+    this.listeners.get(name).push(fn);
+    return this;                              <span class="cmt">// so calls can chain</span>
+  }
+
+  off(name, fn) {
+    const list = this.listeners.get(name) || [];
+    const i = list.indexOf(fn);
+    if (i !== -1) list.splice(i, 1);
+    return this;
+  }
+
+  once(name, fn) {
+    const wrapper = (...args) =&gt; { this.off(name, wrapper); fn(...args); };
+    return this.on(name, wrapper);            <span class="cmt">// remove first, then call</span>
+  }
+
+  emit(name, ...args) {
+    const list = this.listeners.get(name);
+    if (!list || list.length === 0) return false;
+    for (const fn of [...list]) fn(...args);  <span class="cmt">// copy: a listener may remove itself</span>
+    return true;
+  }
+}</code></pre>
+
+  <p>Two lines in there are the ones that matter, and both are there because of a bug:</p>
+  <ul>
+    <li><code>once</code> removes the wrapper <b>before</b> calling <code>fn</code>. Do it the other way round and a listener that emits the same event again recurses forever.</li>
+    <li><code>emit</code> loops over a <b>copy</b> of the list. Without the copy, a listener that removes itself shifts the array while you walk it. The next listener is then skipped.</li>
+  </ul>
+
+  <!-- ============ SYNCHRONOUS ============ -->
+  <h2>The fact that surprises people — <code>emit</code> is synchronous</h2>
+  <p>Look at your own <code>emit</code>. It is a <code>for</code> loop. There is no timer, no queue, no promise. So every listener runs to completion <b>before <code>emit</code> returns</b>.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0):</p>
+  <pre><code>console.log('before emit');
+e.emit('go');
+console.log('after emit');
+
+<span class="out">before emit
+  listener ran
+after emit</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Why this matters more than it looks</span>
+    &ldquo;Event&rdquo; sounds asynchronous. It is not. A slow listener blocks the emitter, and a listener that
+    throws propagates the throw straight back into whoever called <code>emit</code> — often deep inside
+    Node's own code, which is why those stack traces look so strange. This is week 1's rule again: an
+    event handler runs on the same one thread as everything else.
+  </div>
+
+  <!-- ============ ERROR ============ -->
+  <h2>The <code>error</code> event is not an ordinary event</h2>
+  <p>One name is special. If you emit <code>'error'</code> and nobody is listening, Node does not shrug — it <b>throws the error</b>:</p>
+
+  <pre><code>const e = new EventEmitter();
+e.emit('error', new Error('boom'));
+<span class="out">// throws: Error: boom</span></code></pre>
+
+  <p>Verified. Uncaught, that ends the process.</p>
+  <p>This looks harsh, and it is the same reasoning as week 6's unhandled rejection. An error nobody agreed to handle means the program is in a state its author never planned for. Crashing loudly beats continuing quietly.</p>
+
+  <div class="tip">
+    <span class="label">The rule this gives you</span>
+    <b>Attach an <code>error</code> listener to every emitter you keep.</b> Every socket, every stream, every
+    child process. A missing one turns a recoverable network hiccup into a dead server, and the stack trace
+    will point at Node's internals rather than at your code.
+  </div>
+
+  <!-- ============ LEAK ============ -->
+  <h2>The warning that is usually a real bug</h2>
+  <p>Add eleven listeners for one event and Node prints:</p>
+  <pre><code><span class="out">MaxListenersExceededWarning: Possible EventEmitter memory leak detected.
+11 x listeners added to [EventEmitter]. MaxListeners is 10.</span></code></pre>
+
+  <p>Verified: <code>defaultMaxListeners</code> is <b>10</b>, and the warning fires when the eleventh is added.</p>
+
+  <p>Ten is <b>a convention, not a law</b>. Nothing breaks at eleven. The number was chosen because almost no correct program needs more than ten listeners on one event. So passing it is usually evidence of a real leak. Something adds a listener per request and never removes it.</p>
+
+  <div class="trap">
+    <span class="label">The wrong fix, and why people reach for it</span>
+    <code>setMaxListeners(100)</code> makes the warning go away. It does not make the leak go away. Ask
+    <b>&ldquo;what adds a listener, and what removes it?&rdquo;</b> first. Raise the limit only when you can
+    say why a number above ten is correct here — for example, a long-lived emitter with a genuinely fixed
+    set of twenty subscribers.
+  </div>
+
+  <!-- ============ THE PAYOFF ============ -->
+  <h2>The payoff — four things are the same thing</h2>
+  <p>Print the prototype chain of an HTTP request and response. Verified on Node v24.14.0:</p>
+
+  <pre><code>req: IncomingMessage -&gt; Readable -&gt; Stream -&gt; <b>EventEmitter</b> -&gt; Object
+res: ServerResponse  -&gt; OutgoingMessage -&gt; Stream -&gt; <b>EventEmitter</b> -&gt; Object</code></pre>
+
+  <p>Both end at <code>EventEmitter</code>. So do sockets, so do file streams, and so does <code>process</code> itself. That is why <code>process.on('SIGTERM')</code>, <code>stream.on('data')</code>, <code>server.on('connection')</code> and <code>socket.on('error')</code> all feel the same. <b>They are the same method.</b></p>
+
+  <div class="tip">
+    <span class="label">A detail worth having, because it catches people out</span>
+    Notice that <code>res</code> is <b>not</b> a <code>Writable</code>. Its chain goes through
+    <code>OutgoingMessage</code>, not <code>stream.Writable</code>, so
+    <code>res instanceof Writable</code> is <code>false</code>. It has <code>write</code>,
+    <code>end</code> and <code>cork</code>, so it <em>behaves</em> like one and works in
+    <code>pipeline</code>. But a type check against <code>Writable</code> will fail, and that surprises
+    people who trusted the name.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig18-title" width="640" height="250">
+      <title id="fig18-title">Streams, sockets, servers and the process all inherit from EventEmitter</title>
+
+      <text x="20" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">FOUR THINGS YOU ALREADY USE — ONE OBJECT UNDERNEATH</text>
+
+      <rect x="18" y="40" width="140" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="88" y="64" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">IncomingMessage</text>
+
+      <rect x="172" y="40" width="140" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="242" y="64" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">ServerResponse</text>
+
+      <rect x="326" y="40" width="140" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="396" y="64" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">net.Socket</text>
+
+      <rect x="480" y="40" width="140" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="550" y="64" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">process</text>
+
+      <line x1="88" y1="82" x2="88" y2="106" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="242" y1="82" x2="242" y2="106" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="396" y1="82" x2="396" y2="106" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="550" y1="82" x2="550" y2="106" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+
+      <rect x="18" y="106" width="140" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="88" y="127" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">Readable</text>
+
+      <rect x="172" y="106" width="140" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 1.5;"></rect>
+      <text x="242" y="127" text-anchor="middle" style="fill: var(--accent-2); font-family: monospace; font-size: 10px;">OutgoingMessage</text>
+
+      <rect x="326" y="106" width="140" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="396" y="127" text-anchor="middle" style="fill: var(--accent); font-family: monospace; font-size: 10px;">Duplex</text>
+
+      <line x1="88"  y1="144" x2="290" y2="176" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="242" y1="144" x2="300" y2="176" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="396" y1="144" x2="340" y2="176" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+      <line x1="550" y1="82"  x2="360" y2="176" style="stroke: var(--ink-faint); stroke-width: 1.5;"></line>
+
+      <rect x="230" y="180" width="180" height="42" rx="8" style="fill: var(--accent); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="200" text-anchor="middle" style="fill: #fff; font-family: monospace; font-size: 13px; font-weight: 700;">EventEmitter</text>
+      <text x="320" y="215" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px;">on · once · off · emit</text>
+
+      <text x="320" y="242" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Learn these four methods once, and all four objects stop being magic.</text>
+    </svg>
+    <figcaption>Prototype chains printed on Node v24.14.0. Note that <code>ServerResponse</code> does not go through <code>Writable</code>.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Sometimes you want to be told when something happens. It can happen many times, in many different ways. So you leave your phone number next to a label: &ldquo;ring me on <em>data</em>&rdquo;.</p>
+    <p class="part cont">Anyone can leave a number. When the thing happens, the owner rings every number on that label, one after another. That is all an <code>EventEmitter</code> is: a list of names, and a list of functions under each name.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A noticeboard in an office. You pin your name under a heading you care about. When something happens, whoever is announcing it reads the names under that heading and tells each person in turn.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A real announcer would carry on down the list. One person talking at length would not stop them. Node does not. <b><code>emit</code> is a <code>for</code> loop.</b> Each listener runs to the end before the next one starts. The announcer is stuck until the last one finishes.</p>
+    <p class="part limit cont">So one slow listener holds up every other listener <em>and</em> the code that emitted. And if a listener throws, the throw travels back to whoever called <code>emit</code>. That is usually a line inside Node itself. It is why the stack trace looks like it has nothing to do with you.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      The word &ldquo;event&rdquo; makes people expect something asynchronous. It is not. There is no queue and no timer anywhere in <code>emit</code>.</p>
+    <p class="part cont">That single wrong expectation causes two real bugs. People put slow work in a handler and wonder why throughput dropped. The handler blocks the event loop like any other function. And people write <code>emitter.emit('x'); doNext();</code> expecting <code>doNext</code> to run first — it never does.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain what <code>emit</code> actually does when it is called. Then say what happens if one listener is slow. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — your own emitter, then three proofs</h2>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>1 · Write it</b></p>
+  <p>Type the class above from scratch — do not copy it. Then check it against Node's:</p>
+  <pre><code>const e = new MyEmitter();
+e.once('go', () =&gt; console.log('once fired'));
+e.emit('go'); e.emit('go');          <span class="out">// must print once, not twice</span>
+
+const f = () =&gt; { e.off('x', f); console.log('removed myself'); };
+e.on('x', f); e.on('x', () =&gt; console.log('I must still run'));
+e.emit('x');                          <span class="out">// both lines must print</span></code></pre>
+
+  <p>That second test is the one people fail. If your <code>emit</code> does not copy the array, the second listener is skipped.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>2 · Prove it is synchronous</b></p>
+  <pre><code>console.log('A'); e.emit('go'); console.log('C');
+<span class="cmt">// listener prints 'B'. Predict the order, then run it.</span></code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>3 · Make the leak, then find it</b></p>
+  <pre><code>const server = http.createServer((req, res) =&gt; {
+  process.on('SIGTERM', () =&gt; res.end());   <span class="cmt">// a listener per request, never removed</span>
+  res.end('ok');
+});</code></pre>
+  <p>Send eleven requests and watch the warning appear. Then run it again with
+  <code>node --trace-warnings</code> and read the stack — it names the line that added the listener. That
+  is how you find one of these in a real service.</p>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Your <code>MyEmitter</code>, with both tests passing, and the <code>--trace-warnings</code> stack from
+    the leak. The second one is the artefact — it is the technique, not the bug, that you keep.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A service that has run for months starts logging <code>MaxListenersExceededWarning</code> after a deploy. Throughput is unchanged. A colleague proposes <code>setMaxListeners(50)</code> to clear the logs.</p>
+    Say whether that is right, what you would ask before agreeing, and how you would find the cause in one command.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b><code>events.once()</code></b>, the promise version that lets you <code>await</code> a single event, is
+    genuinely useful and is two lines to learn once you have the idea.
+    <b><code>captureRejections</code></b>, which routes a rejected async listener to the <code>error</code>
+    event, is a footnote. <b>Raw TCP sockets</b> are <a href="../reference/52-week-plan.html#w19">week 19</a>
+    and are tagged <b>depth</b> — real, but not something a backend engineer touches weekly. The
+    <code>http</code> server built on all of this is <a href="../reference/52-week-plan.html#w20">week 20</a>.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: Node.js docs — <a href="https://nodejs.org/api/events.html">events</a>. Read the
+    &ldquo;Error events&rdquo; and &ldquo;Capture rejections&rdquo; sections in particular.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your <code>MyEmitter</code> and I'll try to break it with the two cases that catch most people.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>An <code>EventEmitter</code> is a map from a <b>name</b> to a <b>list of functions</b>. That is the whole design.</li>
+      <li><code>emit</code> is a <code>for</code> loop, so it is <b>synchronous</b>. Listeners finish before it returns.</li>
+      <li>A slow listener blocks the emitter. A throwing listener throws into whoever called <code>emit</code>.</li>
+      <li><code>once</code> must remove the wrapper <b>before</b> calling. <code>emit</code> must loop over a <b>copy</b>.</li>
+      <li>Emitting <code>'error'</code> with no listener <b>throws</b>. Attach an error listener to every emitter you keep.</li>
+      <li><code>defaultMaxListeners</code> is <b>10</b> — a convention. The warning at eleven usually means a real leak.</li>
+      <li>Streams, sockets, servers and <code>process</code> all inherit from it. One object explains all four.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>&ldquo;event&rdquo; does not mean asynchronous. <code>emit</code> is a <code>for</code> loop on the same one thread.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "events". Four results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the synchronous print order, the throw from an unlistened <code>error</code> event, and the two prototype chains. Also <code>defaultMaxListeners</code> of 10, with the warning at eleven. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0017-build-a-file-too-big-for-memory.html">← Lesson 17</a>
+    <a href="./0019-raw-tcp-with-net.html">Next: Lesson 19 — Raw TCP with <code>net</code> →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What happens when you call emitter.emit('go') and two listeners are attached?",
+      options: [
+        "Both run to completion, in order, before emit returns to the caller",
+        "Both are queued as microtasks and run after the current code finishes",
+        "Both run on a timer, so the caller continues before either of them",
+        "The first runs at once and the second is deferred to the next tick"
+      ],
+      answer: 0,
+      why: "emit is a plain for loop over the listener array. There is no queue and no timer. So a slow listener blocks the emitter, and a throwing listener throws back into whoever called emit — often a line inside Node itself, which is why those stack traces look unfamiliar."
+    },
+    {
+      q: "You emit an 'error' event and no listener is attached. What does Node do?",
+      options: [
+        "It throws the error, which ends the process if nothing catches it",
+        "It logs a warning to stderr and carries on running as if nothing failed",
+        "It stores the error and re-emits it once a listener is finally added",
+        "It ignores the emit entirely, because no listener asked for that name"
+      ],
+      answer: 0,
+      why: "'error' is the one special name. An unhandled one throws, for the same reason an unhandled promise rejection kills the process: nobody agreed to handle it, so the program is in a state its author never planned for. Attach an error listener to every emitter you keep."
+    },
+    {
+      q: "A MaxListenersExceededWarning appears after a deploy. What is the right first move?",
+      options: [
+        "Ask what adds a listener and what removes it, before changing any limit",
+        "Call setMaxListeners with a higher number, since ten is only a default",
+        "Add a try/catch around the emit, so the warning cannot reach the logs",
+        "Restart the process on a schedule, so the listener count never builds up"
+      ],
+      answer: 0,
+      why: "Ten is a convention, not a law, and nothing breaks at eleven. But passing it usually means something adds a listener per request and never removes it. Raising the limit hides the evidence and keeps the leak. node --trace-warnings prints the stack that added it."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What is an EventEmitter?”",
+      answer: "A map from an event <b>name</b> to a <b>list of functions</b>, with four methods: <code>on</code>, <code>once</code>, <code>off</code> and <code>emit</code>. It exists because a single callback only works when exactly one answer is coming. A socket produces data many times, then maybe an error, then a close, in an order nobody knows in advance. The important detail is that <code>emit</code> is a plain <code>for</code> loop, so it is <b>synchronous</b> — listeners finish before <code>emit</code> returns. <br>Why: naming the problem it solves, and then the synchronous detail, is what separates this from reciting the API."
+    },
+    {
+      prompt: "Interviewer: “Why does the whole standard library feel the same?”",
+      answer: "Because most of it <b>is</b> the same object. I printed the prototype chains: <code>req</code> is <code>IncomingMessage → Readable → Stream → EventEmitter</code>, and <code>res</code> is <code>ServerResponse → OutgoingMessage → Stream → EventEmitter</code>. Sockets, file streams and <code>process</code> all end there too. So learning <code>on</code> and <code>emit</code> once explains <code>stream.on('data')</code>, <code>socket.on('error')</code> and <code>process.on('SIGTERM')</code> at the same time. One useful detail: <code>res</code> is <b>not</b> a <code>Writable</code> — it only implements the interface. <br>Why: the <code>res</code> detail proves you checked rather than assumed."
+    },
+    {
+      prompt: "Interviewer: “We get MaxListenersExceededWarning. Should we just raise the limit?”",
+      answer: "Not first. Ten is a convention, not a law, and nothing actually breaks at eleven — but almost no correct program needs more than ten listeners on one event. So the warning is usually evidence that something adds a listener per request and never removes it, which is a slow memory leak. I would run it with <code>node --trace-warnings</code>, which prints the stack that added the eleventh listener, and fix the missing <code>off</code>. I would raise the limit only when I can say why a higher number is correct there. <br>Why: naming the exact command turns this from an opinion into a method."
+    }
+  ]);
+</script>

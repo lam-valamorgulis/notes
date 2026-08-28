@@ -1,0 +1,499 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two bugs you fixed — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 4 of 7 · Lesson 11 · Your own service</p>
+  <h1>Two bugs you fixed</h1>
+  <p class="subtitle">The strongest thing you own. Nobody can copy a bug you actually chased, and nobody can fake the mechanism.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 4 of 7.</span> This lesson builds one domain-expert ability: <b>debug a problem in it that has no ready answer online</b>. <a href="../reference/7-day-plan.html#d4">Day 4 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you have two bug stories, ninety seconds each, in your own words. Each one names a measurement, a mechanism, a fix and a guard. You can survive two levels of follow-up on both.
+  </div>
+
+  <h2>Start from the problem — why most bug stories earn nothing</h2>
+
+  <p>Almost every candidate tells the same story. "It was broken, I looked into it, then I fixed it."</p>
+
+  <p>Ask yourself what an interviewer learns from that. Nothing at all.</p>
+
+  <p>The story has no test in it. Anyone can say those words about any bug, real or invented.</p>
+
+  <p>So what <em>can</em> be tested in a spoken story? Only one thing: <b>the mechanism</b>.</p>
+
+  <p>A mechanism is a chain of causes. Each link has to fit the previous one. That is why it cannot be faked.</p>
+
+  <div class="soundbite">
+    <span class="label">The one sentence to remember</span>
+    <p>A bug story is graded on the part between the symptom and the fix. Most people delete exactly that part.</p>
+  </div>
+
+  <h2>Derive the four parts</h2>
+
+  <p>Work backwards from what has to be checkable. Four parts fall out, in this order.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Part</th><th>What it must contain</th><th>Why it is there</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 · Symptom</b></td><td>What a person saw, in one sentence</td><td>Gives the interviewer a place to stand</td></tr>
+      <tr><td><b>2 · Measurement</b></td><td>A number, and the tool that produced it</td><td>Separates debugging from guessing</td></tr>
+      <tr><td><b>3 · Mechanism</b></td><td>The chain of causes, each link named</td><td>The only part that cannot be faked</td></tr>
+      <tr><td><b>4 · Fix and guard</b></td><td>The change, plus what stops it returning</td><td>Shows you finished, not just patched</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Part 4 has two halves on purpose. A fix without a guard is a bug waiting to come back.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 260" role="img" aria-labelledby="fig11-title">
+      <title id="fig11-title">The four-part bug story, and the two parts most candidates delete</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WHAT MOST PEOPLE SAY</text>
+
+      <rect x="20" y="30" width="140" height="36" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="90" y="53" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">it was broken</text>
+
+      <line x1="162" y1="48" x2="474" y2="48" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 6 4;"></line>
+      <text x="318" y="42" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-style: italic;">everything the interviewer wanted, deleted</text>
+
+      <rect x="480" y="30" width="140" height="36" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="550" y="53" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">then I fixed it</text>
+
+      <text x="20" y="102" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WHAT YOU SAY</text>
+
+      <rect x="20" y="114" width="140" height="58" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="90" y="134" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-weight: 700;">1 · SYMPTOM</text>
+      <text x="90" y="151" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">what a person</text>
+      <text x="90" y="164" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">actually saw</text>
+
+      <line x1="162" y1="143" x2="176" y2="143" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="176,138 184,143 176,148" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="190" y="114" width="140" height="58" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="260" y="134" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">2 · MEASUREMENT</text>
+      <text x="260" y="151" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">a number and</text>
+      <text x="260" y="164" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">the tool for it</text>
+
+      <line x1="332" y1="143" x2="346" y2="143" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="346,138 354,143 346,148" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="360" y="114" width="140" height="58" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></rect>
+      <text x="430" y="134" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">3 · MECHANISM</text>
+      <text x="430" y="151" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">the chain of</text>
+      <text x="430" y="164" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">causes, named</text>
+
+      <line x1="502" y1="143" x2="516" y2="143" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="516,138 524,143 516,148" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="530" y="114" width="90" height="58" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="575" y="134" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px; font-weight: 700;">4 · FIX</text>
+      <text x="575" y="151" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">and the</text>
+      <text x="575" y="164" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">guard</text>
+
+      <rect x="190" y="192" width="310" height="30" rx="6" style="fill: var(--paper); stroke: var(--accent-2); stroke-width: 1.8;"></rect>
+      <text x="345" y="211" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">these two are the whole grade</text>
+
+      <text x="320" y="248" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px; font-style: italic;">A story with no number is an opinion. A story with no mechanism is a guess.</text>
+    </svg>
+    <figcaption>The middle two boxes are the ones that get deleted, and they are the ones being graded.</figcaption>
+  </figure>
+
+  <h2>Bug A — memory that went up and never came down</h2>
+
+  <p>This is your leak story, from the spine API. Rewrite every line in your own words.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Part</th><th>Say this</th></tr></thead>
+    <tbody>
+      <tr><td><b>Symptom</b></td><td>The service was restarted every night. Memory climbed all day and never fell back.</td></tr>
+      <tr><td><b>Measurement</b></td><td>I watched <code>used_heap_size</code>, not RSS, because RSS is noisy. It went from <b>3.4 MB to 43.5 MB</b> with 200,000 objects retained.</td></tr>
+      <tr><td><b>Not yet a leak</b></td><td>Rising memory is normal. The signal is memory that does not return across two collections.</td></tr>
+      <tr><td><b>Mechanism</b></td><td>Two heap snapshots, compared and sorted by delta. The <b>retainer path</b> named a <code>Map</code> used as a cache with no eviction. Every new short code added an entry and nothing ever removed one.</td></tr>
+      <tr><td><b>Fix</b></td><td>A bounded cache with an eviction policy and a size limit.</td></tr>
+      <tr><td><b>Guard</b></td><td>An alert on heap that does not return after a collection. And a review rule: any long-lived <code>Map</code> must say how entries leave.</td></tr>
+      <tr><td><b>Proof</b></td><td>After the release the heap came back to <b>3.4 MB</b>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The sentence that makes this story land</span>
+    <b>"The collector asks whether an object is reachable. It never asks whether it is needed."</b> That is the mechanism in one line. The cache was reachable, so nothing was ever freed. The collector was working correctly the whole time.
+  </div>
+
+  <p>Interviewers love this story for a reason. Four shapes cover nearly every Node leak.</p>
+
+  <ul>
+    <li>A <b>growing collection</b> — a <code>Map</code> or array with no eviction.</li>
+    <li>A <b>forgotten listener</b> — one added per request, never removed.</li>
+    <li>A <b>fat closure</b> — a small callback keeping a large buffer alive.</li>
+    <li>An <b>uncleared timer</b> — a <code>setInterval</code> nobody stops.</li>
+  </ul>
+
+  <h2>Bug B — requests dropped on every deploy</h2>
+
+  <p>This is your shutdown story. It has a first fix that was wrong, which makes it better.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Part</th><th>Say this</th></tr></thead>
+    <tbody>
+      <tr><td><b>Symptom</b></td><td>Every deploy produced a small burst of failed redirects. Nothing in the logs explained it.</td></tr>
+      <tr><td><b>First attempt</b></td><td>Someone had added <code>process.exit(0)</code> on <code>SIGTERM</code>, to make shutdown fast.</td></tr>
+      <tr><td><b>Measurement</b></td><td>I proved it was wrong. Writing 300,000 lines into a slow pipe and then calling <code>process.exit(0)</code> delivered only <b>320 of 300,000</b> lines. The exit code was still <b>0</b>.</td></tr>
+      <tr><td><b>Mechanism</b></td><td><code>process.exit</code> does not flush. Anything still queued is simply lost, and the process reports success anyway. So the platform saw a healthy deploy.</td></tr>
+      <tr><td><b>Second measurement</b></td><td>The correct handler used <code>server.close()</code>, but it took <b>3540 ms</b>. Keep-alive sockets were idle and still open.</td></tr>
+      <tr><td><b>Mechanism</b></td><td><code>server.close()</code> stops new connections and waits for existing ones. An idle keep-alive socket counts as existing. <code>keepAliveTimeout</code> is <b>5000 ms</b>, so it waits.</td></tr>
+      <tr><td><b>Fix</b></td><td>Call <code>server.closeIdleConnections()</code> as well. Shutdown dropped to <b>538 ms</b>.</td></tr>
+      <tr><td><b>Guard</b></td><td>A load test that sends <code>SIGTERM</code> at full traffic and asserts <b>zero</b> failed requests.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the story with no measurement</span>
+    "I noticed memory was high so I added a cache limit" is a guess that happened to work. Say the tool and the number. <b>Two heap snapshots and a retainer path</b>, or <b>3540 ms down to 538 ms</b>. Without a number, the interviewer cannot tell you apart from someone who changed things until the symptom went away.
+  </div>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A good bug story is a chain. Each link explains the next one, and the whole chain reaches the symptom.</p>
+    <p class="part cont">If any link is missing, the listener notices at once. That is why a real story is hard to invent on the spot.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A doctor explaining an illness. Not "you were ill, now you are better".</p>
+    <p class="part cont">Instead: here is the test result. Here is what the result means. Here is why that produced your symptom. Here is what stops it returning.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A doctor can order the same test again. You often cannot.</p>
+    <p class="part limit cont">Production evidence disappears. The process restarts, the logs roll over, the load goes away. So the measurement must be taken while the problem is happening, and written down. A story you never measured is a story you can no longer tell.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People pick their hardest bug. That is the wrong filter.</p>
+    <p class="part cont">Pick the bug whose <b>mechanism you can still explain</b>. A simple bug told with a full chain beats a hard one told as "it was some race condition somewhere".</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why the mechanism is the part that cannot be faked. Then say what a story with no number sounds like. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>The follow-up chain — they will always go two levels deeper</h2>
+
+  <p>Expect this shape. Prepare each level once and you never get cornered.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Level</th><th>They ask</th><th>You have ready</th></tr></thead>
+    <tbody>
+      <tr><td><b>1</b></td><td>"Tell me about the system."</td><td>The five-layer drawing from <a href="0010-draw-your-service.html">Lesson 10</a>.</td></tr>
+      <tr><td><b>2</b></td><td>"Tell me about a hard bug in it."</td><td>Bug A or Bug B, four parts, ninety seconds.</td></tr>
+      <tr><td><b>3</b></td><td>"How did you know that was the cause?"</td><td>The tool and the number. Snapshots and the retainer path, or 3540 to 538.</td></tr>
+      <tr><td><b>4</b></td><td>"What would you change now?"</td><td>One concrete change, and one thing you would deliberately leave.</td></tr>
+      <tr><td><b>5</b></td><td>"Has it happened again?"</td><td>The guard. The alert, or the load test that asserts zero failures.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · write both, then record both</span>
+    <p class="situation">Write Bug A and Bug B in your own words. Four parts each. Then say each one out loud and record it.</p>
+    Listen back once. Check three things only.
+    <ul>
+      <li>Is it under ninety seconds?</li>
+      <li>Did you say a number, and the tool that gave it?</li>
+      <li>Can a listener repeat the mechanism back to you?</li>
+    </ul>
+    If the answer to the third is no, the mechanism is still missing. Rewrite that part and record it again.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/en/learn/diagnostics/memory">Node — Memory diagnostics</a>, the heap snapshot section. Then <a href="https://nodejs.org/api/process.html">Node — <code>process</code></a>, the signal events section.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0032-memory-and-heap-snapshots.html">Week 32 · Memory and heap snapshots</a> ·
+    <a href="../../lessons/0034-build-find-and-fix-a-real-leak.html">Week 34 · Find and fix a real leak</a> ·
+    <a href="../../lessons/0027-signals-and-graceful-shutdown.html">Week 27 · Signals and graceful shutdown</a> ·
+    <a href="../../lessons/0030-build-harden-the-spine-api.html">Week 30 · Harden the spine API</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Four parts: <b>symptom, measurement, mechanism, fix and guard</b>. Never drop the middle two.</li>
+      <li>The <b>mechanism</b> is the only part that cannot be faked. It is the whole grade.</li>
+      <li>Pick the bug you can still explain, not the hardest one you ever met.</li>
+      <li>Leak story: heap <b>3.4 MB to 43.5 MB</b>, two snapshots, the retainer path named a <code>Map</code>.</li>
+      <li>The collector asks whether an object is <b>reachable</b>, never whether it is needed.</li>
+      <li>Shutdown story: <code>process.exit(0)</code> delivered <b>320 of 300,000</b> lines, and still exited 0.</li>
+      <li><code>server.close()</code> took <b>3540 ms</b>; adding <code>closeIdleConnections()</code> made it <b>538 ms</b>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>no number means an opinion. No mechanism means a guess.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — "Memory diagnostics" and "process". Four figures were measured in the parent course on <b>Node v24.14.0</b>, 2026-08-28. They are the heap sizes, the 320 of 300,000 lines, and the two shutdown times. They are measurements, not memories.</p>
+
+  <div class="ask">
+    Want your stories graded? Say <b>"grade my bug story"</b> and paste it. You will be told which of the four parts is missing.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0010-draw-your-service.html">← Draw your service</a></span>
+    <span><a href="0012-the-ninety-second-story.html">Next: The 90-second story →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Which part of a bug story is the one an interviewer cannot check any other way?",
+      options: [
+        "The mechanism, because every link in the chain has to fit the one before it",
+        "The symptom, because only someone who was there could describe what users saw",
+        "The fix, because the interviewer can ask you to write out the exact patch made",
+        "The guard, because a test that asserts the failure is gone is easy to describe"
+      ],
+      answer: 0,
+      why: "A symptom, a fix and a guard can all be described plausibly by someone who read about the problem. A mechanism cannot, because it is a chain of causes and a missing link is audible immediately. That is why the middle of the story carries the grade. Candidates delete exactly that part, usually because they never worked it out."
+    },
+    {
+      q: "Memory rises through the day and never falls back. What makes this a leak rather than normal use?",
+      options: [
+        "The heap does not return to its earlier size across two garbage collections",
+        "The resident set size of the process keeps rising while the machine has free memory",
+        "The number of objects on the heap is larger than it was when the process started",
+        "The service has to be restarted each night to keep its response times acceptable"
+      ],
+      answer: 0,
+      why: "Rising memory on its own is normal, because caches fill and the collector runs lazily. The signal is memory that does not come back after collection, and used_heap_size is the number to watch rather than RSS, which is noisy. A nightly restart hides the symptom and proves nothing about the cause. More objects than at startup is expected in any warm service."
+    },
+    {
+      q: "Why did calling process.exit(0) on SIGTERM lose data while still reporting success?",
+      options: [
+        "It stops the process at once and never flushes anything still queued for writing",
+        "It sends a second signal to the process, and the default handler discards buffers",
+        "It closes the event loop first, so queued callbacks run but their writes are undone",
+        "It returns before the exit code is set, so the platform reads a stale zero value"
+      ],
+      answer: 0,
+      why: "Measured on Node v24.14.0: 300,000 lines written into a slow pipe, then process.exit(0), delivered only 320 lines, and the exit code was still 0. Exit is immediate and does nothing about pending writes. The dangerous half is the zero, because the deployment platform sees a clean shutdown and reports a healthy release. The correct approach sets process.exitCode and lets the loop drain."
+    },
+    {
+      q: "server.close() took 3540 ms during shutdown. What was holding it open?",
+      options: [
+        "Idle keep-alive sockets, which count as existing connections it must wait for",
+        "In-flight database queries, which the HTTP server waits on before it can finish",
+        "The operating system, which holds the listening port for a fixed cooling period",
+        "Pending timers in the event loop, which server.close waits for before resolving"
+      ],
+      answer: 0,
+      why: "server.close() stops accepting new connections and waits for the existing ones to end. A keep-alive socket with no request in flight still counts as existing, and keepAliveTimeout is 5000 ms, so it waits. Calling server.closeIdleConnections() as well ends exactly those sockets and nothing else, which brought the measured shutdown down to 538 ms. In-flight requests are the thing you do want to wait for."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Tell me about a hard bug you fixed.”",
+      answer: "The service had to be restarted every night, because memory climbed all day and never fell back. First I decided whether it really was a leak: rising memory is normal, so I watched used_heap_size rather than RSS, and looked for memory that did not return across two collections. It did not. Then I took two heap snapshots, one before and one after doing the suspect work many times, and compared them sorted by delta. Heap used went from 3.4 megabytes to 43.5 megabytes, with about two hundred thousand objects retained. The retainer path pointed at a Map I was using as a cache with no eviction, so every new short code added an entry and nothing ever removed one. The fix was a bounded cache with a size limit and an eviction policy, and after the release the heap came back to 3.4 megabytes. The guard was an alert on heap that does not return after a collection. <br>Why: they are listening for the retainer path. It is the step that separates finding a leak from noticing one."
+    },
+    {
+      prompt: "Interviewer: “How did you know that was actually the cause?”",
+      answer: "Because I did not read the code first, I read the evidence. One snapshot tells you what exists, which is not useful on its own. Two snapshots tell you what grew, and sorting the comparison by delta puts the growing thing at the top. Then the retainer path names the chain of references keeping those objects alive, and read backwards it becomes a sentence that points at one line of my code. That is the part that cannot be guessed. I also confirmed it the other way: after the fix, the heap returned to its starting size under the same load, so the change addressed the cause rather than the symptom. <br>Why: this is the level-three question, and it is where invented stories fail. Naming the tool and the direction you read it in is the proof."
+    },
+    {
+      prompt: "Interviewer: “Tell me about a time your first fix was wrong.”",
+      answer: "Every deploy dropped a small burst of redirects, and nothing in the logs explained it. Someone had added process.exit(0) on SIGTERM to make shutdown fast, and that was the bug rather than the fix. I proved it with a small test: writing three hundred thousand lines into a slow pipe and then calling process.exit(0) delivered only three hundred and twenty of them, and the exit code was still zero. So work was being thrown away and the platform was told the deploy went perfectly. The correct handler used server.close, but that took three and a half seconds, because idle keep-alive sockets count as existing connections and keepAliveTimeout is five seconds. Adding server.closeIdleConnections brought it down to about half a second. The guard is a load test that sends SIGTERM at full traffic and asserts zero failed requests. <br>Why: the story is stronger because the first fix was wrong. It shows you measure your own changes rather than trusting them."
+    }
+  ]);
+</script>

@@ -1,0 +1,524 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  .term {
+    background: var(--card-bg); border: 1.5px solid var(--rule); border-radius: 8px;
+    padding: .85rem 1.05rem; margin: .8rem 0;
+  }
+  .term dt {
+    font-family: var(--font-sans); font-weight: 700; font-size: 1rem; color: var(--accent);
+    margin: 0 0 .3rem;
+  }
+  .term dd { margin: 0; font-size: .97rem; }
+  .term .plain {
+    font-family: var(--font-sans); font-size: .86rem; color: var(--ink-soft);
+    margin-top: .45rem; padding-top: .45rem; border-top: 1px dashed var(--rule);
+  }
+  .term .plain b { color: var(--accent-2); }
+  .term .avoid {
+    font-family: var(--font-sans); font-size: .8rem; color: var(--ink-faint);
+    margin-top: .35rem; font-style: italic;
+  }
+  .term .week {
+    font-family: var(--font-sans); font-size: .66rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; padding: .1rem .45rem; border-radius: 999px;
+    background: var(--rule); color: var(--ink-soft); margin-left: .4rem; vertical-align: middle;
+  }
+  .group {
+    font-family: var(--font-sans); font-size: .72rem; font-weight: 700;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--accent-2);
+    margin: 2.4rem 0 .6rem; padding-bottom: .25rem; border-bottom: 2px solid var(--rule);
+  }
+  dl { margin: 0; }
+</style>
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · Nomenclature</p>
+  <h1>Glossary</h1>
+  <p class="subtitle">Node's own vocabulary, defined once and used the same way in every lesson. Each entry gives the precise definition, then a plain-English line, then the week where it starts to matter.</p>
+
+  <div class="win">
+    <strong>Why a glossary matters here:</strong> a lot of Node confusion is vocabulary confusion. "Blocking", "async", "stream" and "worker" all mean something narrower than they sound. Definitions here follow the <a href="https://nodejs.org/api/">official Node.js API docs</a>. Where this course picks one word over a common alternative, the alternative is listed as <em>avoid</em>.
+  </div>
+
+  <div class="note">
+    <span class="label">Honest note</span>
+    This glossary covers the whole 52 weeks, not only the weeks already written. Terms marked with a later week are here so the vocabulary stays consistent from week 1 — not because they have been taught yet.
+  </div>
+
+  <!-- ============================================ -->
+  <p class="group">The runtime — what Node is made of</p>
+  <dl>
+    <div class="term">
+      <dt>Runtime <span class="week">Week 1</span></dt>
+      <dd>The program that runs your JavaScript outside a browser. Node.js is a runtime: it bundles the <b>V8</b> engine, the <b>libuv</b> library, and a standard library of built-in modules.</dd>
+      <dd class="plain"><b>Plain English:</b> Node is not a language and not a framework. It is the thing that runs your file.</dd>
+      <dd class="avoid">Avoid: "Node is a framework", "the Node language".</dd>
+    </div>
+    <div class="term">
+      <dt>V8 <span class="week">Week 1</span></dt>
+      <dd>Google's JavaScript engine. It compiles and runs your JavaScript, and it owns the heap where your objects live. V8 knows nothing about files, sockets, or timers.</dd>
+      <dd class="plain"><b>Plain English:</b> V8 does the thinking. It does not do the waiting.</dd>
+    </div>
+    <div class="term">
+      <dt>libuv <span class="week">Week 1</span></dt>
+      <dd>The C library that gives Node its <b>event loop</b>, its <b>thread pool</b>, and its non-blocking access to the operating system. Network I/O uses the OS's own event notification; file I/O and some crypto use the thread pool.</dd>
+      <dd class="plain"><b>Plain English:</b> libuv does the waiting, so V8 never has to.</dd>
+    </div>
+    <div class="term">
+      <dt>Thread pool <span class="week">Week 1</span></dt>
+      <dd>A small fixed set of background threads inside libuv (four by default) used for work the OS cannot do without blocking — file system calls, DNS lookups, and some crypto. <b>Network sockets do not use it.</b></dd>
+      <dd class="plain"><b>Plain English:</b> a few helpers for jobs the operating system will not do asynchronously by itself.</dd>
+      <dd class="avoid">Avoid: "Node is multi-threaded" — the thread pool does not run your JavaScript.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">The event loop and async</p>
+  <dl>
+    <div class="term">
+      <dt>Event loop <span class="week">Week 3</span></dt>
+      <dd>The loop that decides what runs next. It moves through fixed <b>phases</b> — timers, pending callbacks, poll, check, close — and runs the callbacks queued in each. Your JavaScript runs on this one thread.</dd>
+      <dd class="plain"><b>Plain English:</b> a to-do list the runtime works through in a fixed order, forever.</dd>
+    </div>
+    <div class="term">
+      <dt>Blocking <span class="week">Week 1</span></dt>
+      <dd>Occupying the event-loop thread so no other callback can run. Any long synchronous computation blocks, and so does every <code>fs.*Sync</code> call. Blocking is measured, not guessed — see <b>event-loop delay</b>.</dd>
+      <dd class="plain"><b>Plain English:</b> if your code is busy, nobody else gets served. Not slow — stopped.</dd>
+      <dd class="avoid">Avoid: "slow" as a synonym. A slow database query does not block; a slow <code>for</code> loop does.</dd>
+    </div>
+    <div class="term">
+      <dt>Macrotask <span class="week">Week 3</span></dt>
+      <dd>A callback scheduled into one of the event loop's phases — a timer, an I/O completion, a <code>setImmediate</code>. One macrotask runs to completion before the next is taken.</dd>
+      <dd class="plain"><b>Plain English:</b> a normal item on the to-do list.</dd>
+    </div>
+    <div class="term">
+      <dt>Microtask <span class="week">Week 3</span></dt>
+      <dd>A callback queued by a promise (<code>.then</code>, <code>await</code>) or by <code>queueMicrotask</code>. The whole microtask queue is drained <b>between</b> macrotasks, so microtasks always run before the next timer.</dd>
+      <dd class="plain"><b>Plain English:</b> a jump-the-queue item. All of them get done before the next normal item starts.</dd>
+    </div>
+    <div class="term">
+      <dt><code>process.nextTick</code> <span class="week">Week 3</span></dt>
+      <dd>A queue that runs before the microtask queue, and is drained completely each time. Because it is drained completely, a <code>nextTick</code> callback that schedules another one can starve the loop forever.</dd>
+      <dd class="plain"><b>Plain English:</b> even more urgent than a promise. That is exactly why it is dangerous.</dd>
+    </div>
+    <div class="term">
+      <dt>Event-loop delay <span class="week">Weeks 4, 22</span></dt>
+      <dd>How late a timer fires compared with when it was due. It is the honest measure of whether something is blocking. Measured with <code>perf_hooks.monitorEventLoopDelay</code>.</dd>
+      <dd class="plain"><b>Plain English:</b> how far behind the to-do list has fallen.</dd>
+    </div>
+    <div class="term">
+      <dt>Unhandled rejection <span class="week">Week 6</span></dt>
+      <dd>A rejected promise with no rejection handler attached by the time the microtask queue drains. Modern Node treats this like an uncaught exception and terminates the process.</dd>
+      <dd class="plain"><b>Plain English:</b> an error nobody agreed to catch. Node stops rather than pretend it is fine.</dd>
+    </div>
+    <div class="term">
+      <dt>Bounded concurrency <span class="week">Week 7</span></dt>
+      <dd>Running at most N asynchronous tasks at the same time, with the rest queued. The opposite of passing a 5,000-item array straight to <code>Promise.all</code>.</dd>
+      <dd class="plain"><b>Plain English:</b> ten at a time, not all at once.</dd>
+      <dd class="avoid">Avoid: "throttling" (that is about rate over time) and "rate limiting" (usually enforced by the other side).</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Streams and data</p>
+  <dl>
+    <div class="term">
+      <dt>Buffer <span class="week">Week 14</span></dt>
+      <dd>Node's fixed-length container for raw bytes, outside the V8 heap. It is a subclass of <code>Uint8Array</code>. Every byte that enters or leaves the process — a file, a socket, a request body — is a Buffer before it is anything else.</dd>
+      <dd class="plain"><b>Plain English:</b> a box of bytes. A string is what you get after deciding how to read those bytes.</dd>
+    </div>
+    <div class="term">
+      <dt>Stream <span class="week">Week 15</span></dt>
+      <dd>An object that moves data in <b>chunks</b> over time, instead of all at once. Four kinds: Readable, Writable, Duplex, and Transform. Every stream is an <b>EventEmitter</b>.</dd>
+      <dd class="plain"><b>Plain English:</b> a hose, not a bucket. You never hold the whole thing.</dd>
+    </div>
+    <div class="term">
+      <dt>Backpressure <span class="week">Week 15</span></dt>
+      <dd>The signal a slow consumer sends back to a fast producer, telling it to stop. In Node this is <code>writable.write()</code> returning <code>false</code>, and the producer waiting for the <code>drain</code> event. Ignore it and data piles up in memory until the process dies.</dd>
+      <dd class="plain"><b>Plain English:</b> "stop pouring, my glass is full." If nobody listens, the floor gets wet.</dd>
+    </div>
+    <div class="term">
+      <dt><code>highWaterMark</code> <span class="week">Week 15</span></dt>
+      <dd>The buffer size at which a stream says it has had enough — the point where <code>write()</code> starts returning <code>false</code>. It is a threshold, not a hard limit.</dd>
+      <dd class="plain"><b>Plain English:</b> the line on the glass that means "full".</dd>
+    </div>
+    <div class="term">
+      <dt><code>pipeline</code> <span class="week">Week 16</span></dt>
+      <dd>The function that connects streams and cleans every one of them up when any stage fails. This course uses <code>pipeline</code> and not <code>pipe</code>, because <code>pipe</code> leaves the other streams open on error.</dd>
+      <dd class="plain"><b>Plain English:</b> <code>pipe</code> with the clean-up that <code>pipe</code> forgot.</dd>
+      <dd class="avoid">Avoid: reaching for <code>.pipe()</code> in production code.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Events, servers, and processes</p>
+  <dl>
+    <div class="term">
+      <dt>EventEmitter <span class="week">Week 18</span></dt>
+      <dd>The object that lets other code register callbacks for named events. Emitting is <b>synchronous</b>: every listener runs before <code>emit()</code> returns. Streams, servers, sockets and the process itself are all emitters.</dd>
+      <dd class="plain"><b>Plain English:</b> "tell me when X happens." Learn it once and four other things stop being mysterious.</dd>
+    </div>
+    <div class="term">
+      <dt>Framing <span class="week">Week 19</span></dt>
+      <dd>Deciding where one message ends and the next begins in a byte stream. TCP does not do this for you — two <code>write()</code> calls can arrive as one chunk. HTTP solves it with <code>Content-Length</code> and chunked encoding.</dd>
+      <dd class="plain"><b>Plain English:</b> TCP gives you letters, not words. Framing is where you put the spaces.</dd>
+    </div>
+    <div class="term">
+      <dt>Operational error <span class="week">Week 28</span></dt>
+      <dd>An expected failure in a correct program — a network timeout, a 404, invalid user input, a full disk. You handle these and keep running.</dd>
+      <dd class="plain"><b>Plain English:</b> something went wrong out there. Deal with it and carry on.</dd>
+    </div>
+    <div class="term">
+      <dt>Programmer error <span class="week">Week 28</span></dt>
+      <dd>A bug — reading a property of <code>undefined</code>, a broken assumption, corrupt internal state. You do <b>not</b> handle these. You crash and restart, because continuing with unknown state is how data gets corrupted.</dd>
+      <dd class="plain"><b>Plain English:</b> the program is wrong. Restarting it is safer than trusting it.</dd>
+      <dd class="avoid">Avoid: catching <code>uncaughtException</code> and continuing.</dd>
+    </div>
+    <div class="term">
+      <dt>Graceful shutdown <span class="week">Week 27</span></dt>
+      <dd>On <code>SIGTERM</code>: stop accepting new connections, finish the requests already in flight, close the server and the database pool, then exit — with a hard timeout so shutdown cannot hang forever.</dd>
+      <dd class="plain"><b>Plain English:</b> finish what you started before you leave.</dd>
+    </div>
+    <div class="term">
+      <dt><code>SIGTERM</code> <span class="week">Week 27</span></dt>
+      <dd>The signal a process manager sends to ask a process to stop. It can be handled. <code>SIGKILL</code> cannot be handled — the kernel ends the process immediately, which is why the work must be done on <code>SIGTERM</code>.</dd>
+      <dd class="plain"><b>Plain English:</b> "please stop." <code>SIGKILL</code> is "you are stopped."</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">More than one thread</p>
+  <dl>
+    <div class="term">
+      <dt>CPU-bound <span class="week">Week 22</span></dt>
+      <dd>Work limited by processor time — hashing, image resizing, parsing something huge. This is the work that blocks the event loop, and the reason worker threads exist.</dd>
+      <dd class="plain"><b>Plain English:</b> the computer is thinking hard, so nothing else gets a turn.</dd>
+    </div>
+    <div class="term">
+      <dt>I/O-bound <span class="week">Week 22</span></dt>
+      <dd>Work limited by waiting on something else — a network call, a disk read, a database query. Node is built for this, and it does not block the loop.</dd>
+      <dd class="plain"><b>Plain English:</b> the computer is waiting, not working. Node is very good at waiting.</dd>
+    </div>
+    <div class="term">
+      <dt>Worker thread <span class="week">Week 23</span></dt>
+      <dd>A separate thread with its own V8 instance and its own event loop, created with <code>worker_threads</code>. Data is <b>copied</b> between threads unless you transfer it or use a <code>SharedArrayBuffer</code>. Use it for CPU-bound work only.</dd>
+      <dd class="plain"><b>Plain English:</b> a second Node inside the same process, for the heavy thinking.</dd>
+      <dd class="avoid">Avoid: using a worker thread for I/O — it makes things slower, not faster.</dd>
+    </div>
+    <div class="term">
+      <dt><code>cluster</code> <span class="week">Week 24</span></dt>
+      <dd>A built-in module that forks the whole process once per CPU core, with all forks sharing one listening port. Each fork is a separate process with separate memory — so any in-memory state stops working the moment you cluster.</dd>
+      <dd class="plain"><b>Plain English:</b> run several copies of your server so all the cores get used.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Modules and the command line</p>
+  <dl>
+    <div class="term">
+      <dt>CommonJS <span class="week">Week 9</span></dt>
+      <dd>Node's original module system. <code>require()</code> is an ordinary function, so it resolves a file <b>while the program runs</b>. Everything else follows from that: the path can be computed, the call can sit anywhere, it blocks while reading, and it returns a <b>copy</b> of <code>module.exports</code>.</dd>
+      <dd class="plain"><b>Plain English:</b> it goes and fetches each file at the moment it reaches that line.</dd>
+      <dd class="avoid">Avoid: "CJS" in prose. Write it out.</dd>
+    </div>
+    <div class="term">
+      <dt>ESM <span class="week">Week 9</span></dt>
+      <dd>The JavaScript language's own module system — <code>import</code> and <code>export</code>. It resolves the <b>whole graph before any code runs</b>, in three passes: parse, link, evaluate. That is why imports must be at the top level with a literal path, and why an imported name is a <b>live binding</b> and not a copy.</dd>
+      <dd class="plain"><b>Plain English:</b> it reads the whole shopping list first, then goes once.</dd>
+      <dd class="avoid">Avoid: "ES modules" and "ESM" used interchangeably in one page. This workspace says <b>ESM</b>.</dd>
+    </div>
+    <div class="term">
+      <dt>Specifier <span class="week">Week 9</span></dt>
+      <dd>The string you put in a <code>require()</code> or <code>import</code>. Three kinds, three rules: <b>relative</b> (<code>./util.js</code>), <b>absolute</b> (<code>/opt/app/x.js</code>), and <b>bare</b> (<code>lodash</code>). Only a bare specifier makes Node search.</dd>
+      <dd class="plain"><b>Plain English:</b> the name you write for the other file.</dd>
+    </div>
+    <div class="term">
+      <dt>Bare specifier <span class="week">Week 9</span></dt>
+      <dd>A specifier with no <code>./</code> and no leading slash. Node looks for it in <code>node_modules</code> in the current folder, then the parent folder, and up to the root of the disk. <code>NODE_DEBUG=module</code> prints the exact list it checked.</dd>
+      <dd class="plain"><b>Plain English:</b> a package name. It is the only kind Node has to hunt for.</dd>
+    </div>
+    <div class="term">
+      <dt><code>argv</code> <span class="week">Week 10</span></dt>
+      <dd>The command line, already split into words, as <code>process.argv</code>. Entry 0 is the Node binary and entry 1 is your script, so your own arguments start at <code>process.argv.slice(2)</code>.</dd>
+      <dd class="plain"><b>Plain English:</b> the words the user typed after your program's name.</dd>
+    </div>
+    <div class="term">
+      <dt>stdout and stderr <span class="week">Week 10</span></dt>
+      <dd>The two output channels every program is given. <b>stdout carries the answer</b> — the data another program would read. <b>stderr carries everything else</b>: progress, warnings, errors. A pipeline reads stdout only, which is exactly why the split exists.</dd>
+      <dd class="plain"><b>Plain English:</b> stdout is the result; stderr is you talking to the human.</dd>
+      <dd class="avoid">Avoid: printing a progress message to stdout. It corrupts the data for whatever reads it next.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Surviving a real network</p>
+  <dl>
+    <div class="term">
+      <dt><code>AbortController</code> <span class="week">Week 8</span></dt>
+      <dd>The standard way to <b>cancel</b> work that is already running. You pass its <code>AbortSignal</code> to <code>fetch</code>; when the signal fires, the request is cancelled and its socket is released. <code>AbortSignal.timeout(ms)</code> is the short form.</dd>
+      <dd class="plain"><b>Plain English:</b> the switch that actually stops the request, not just your waiting.</dd>
+      <dd class="avoid">Avoid: calling a <code>Promise.race</code> against a timer a "timeout". That stops you waiting; the request carries on.</dd>
+    </div>
+    <div class="term">
+      <dt>Exponential backoff <span class="week">Week 8</span></dt>
+      <dd>Waiting longer before each retry — 200&nbsp;ms, then 400, then 800. A failing server is usually a <b>busy</b> server, so retrying immediately adds load at the worst possible moment.</dd>
+      <dd class="plain"><b>Plain English:</b> if it failed, wait a bit. If it failed again, wait longer.</dd>
+    </div>
+    <div class="term">
+      <dt>Jitter <span class="week">Week 8</span></dt>
+      <dd>A small random amount added to each backoff wait. Without it, every client that failed at the same moment retries at the same moment, and the recovering server is knocked over again — the <b>thundering herd</b>.</dd>
+      <dd class="plain"><b>Plain English:</b> everyone waits a slightly different amount, so they do not all come back together.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Production</p>
+  <dl>
+    <div class="term">
+      <dt>Retainer <span class="week">Week 32</span></dt>
+      <dd>The reference that stops an object being garbage collected. Finding a memory leak means finding the retainer path in a heap snapshot — not just noticing that memory grew.</dd>
+      <dd class="plain"><b>Plain English:</b> whoever is still holding on. Until they let go, the memory stays.</dd>
+    </div>
+    <div class="term">
+      <dt>Heap snapshot <span class="week">Week 32</span></dt>
+      <dd>A dump of every object V8 is holding, at one moment. Leaks are found by diffing two snapshots taken some time apart and reading what grew.</dd>
+      <dd class="plain"><b>Plain English:</b> a photo of memory. Two photos show what is piling up.</dd>
+    </div>
+    <div class="term">
+      <dt>p99 <span class="week">Week 31</span></dt>
+      <dd>The latency that 99% of requests came in under. This course reports p50, p95 and p99 — never an average alone, because an average hides the requests that made a user leave.</dd>
+      <dd class="plain"><b>Plain English:</b> how slow it is for your unluckiest users.</dd>
+      <dd class="avoid">Avoid: "average response time" as the headline number.</dd>
+    </div>
+    <div class="term">
+      <dt>Idempotency <span class="week">Week 42</span></dt>
+      <dd>The property that doing an operation twice has the same effect as doing it once. It is required with a job queue, because queues deliver <b>at least once</b> — so a retry can and will run a job a second time.</dd>
+      <dd class="plain"><b>Plain English:</b> pressing the button twice must not charge the customer twice.</dd>
+    </div>
+    <div class="term">
+      <dt>Cache stampede <span class="week">Week 41</span></dt>
+      <dd>What happens when a popular cache key expires and every waiting request hits the database at the same instant. Also called a thundering herd.</dd>
+      <dd class="plain"><b>Plain English:</b> the cache empties and everyone runs at the database at once.</dd>
+    </div>
+    <div class="term">
+      <dt>Connection pool <span class="week">Week 40</span></dt>
+      <dd>A fixed set of open database connections shared by all requests. When every connection is busy, new requests <b>wait</b> — which looks like a hang with an idle CPU.</dd>
+      <dd class="plain"><b>Plain English:</b> a small set of phone lines to the database. When they are all in use, you queue.</dd>
+    </div>
+  </dl>
+
+  <!-- ============================================ -->
+  <p class="group">Course words — used with one fixed meaning here</p>
+  <dl>
+    <div class="term">
+      <dt>The spine <span class="week">Week 21 →</span></dt>
+      <dd>The one API built in week 21 and hardened every week after. In this workspace "the spine" always means that service, never a general idea.</dd>
+      <dd class="plain"><b>Plain English:</b> the project you keep. Do not start a new one.</dd>
+    </div>
+    <div class="term">
+      <dt>core <span class="week">All weeks</span></dt>
+      <dd>One of the twelve items in <a href="../MISSION.md">the 20% core</a>. A core week is never skipped, and no depth week starts while a core week is untaught.</dd>
+      <dd class="plain"><b>Plain English:</b> the part you must have.</dd>
+    </div>
+    <div class="term">
+      <dt>depth <span class="week">All weeks</span></dt>
+      <dd>Real and useful, but not touched weekly by a Node backend engineer. Queued, never deleted. Shown with a dashed border on the plan.</dd>
+      <dd class="plain"><b>Plain English:</b> worth learning, later.</dd>
+      <dd class="avoid">Avoid: treating depth as "optional forever". It is scheduled, not dropped.</dd>
+    </div>
+    <div class="term">
+      <dt>Review week <span class="week">13, 26, 39, 52</span></dt>
+      <dd>A week with no new material. Retrieval practice from memory, questions interleaved across earlier weeks, and one mock interview. The spacing is the point.</dd>
+      <dd class="plain"><b>Plain English:</b> no new pages. Prove you still remember the old ones.</dd>
+    </div>
+  </dl>
+
+  <div class="ask">
+    A term missing, or a definition that does not sit right? Tell me and I will fix it here — the glossary is the course's shared language, so it has to be correct.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../index.html">← The Map</a>
+    <a href="52-week-plan.html">The 52-Week Plan →</a>
+  </div>
+</div>

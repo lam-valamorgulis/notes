@@ -1,0 +1,572 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres — pools, transactions, and N+1 — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 40 of 52 · Lesson 40 · The data layer</p>
+  <h1>Postgres — pools, transactions, and N+1</h1>
+  <p class="subtitle">Most Node latency lives in the database. Learn the pool before you learn an ORM.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 40 of 52.</span> This lesson builds one domain-expert ability: <b>find where the time actually goes when a service is slow</b>. <a href="../reference/52-week-plan.html#w40">Week 40 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will make a service where the queries are fast, the CPU is idle, and users still wait half a second. Then you will find the queue that did it.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    The spine has kept its data in memory since <a href="./0021-build-the-spine-api-version-1.html">week 21</a>.
+    That was on purpose — it kept the HTTP, concurrency and reliability lessons clean. Now it gets real
+    persistence, and a new place for time to disappear.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what is a connection?</h2>
+  <p>A database connection is a TCP socket plus a session on the server. That session holds memory, a transaction state, and often a whole process on the Postgres side. It is expensive to make and it is not free to hold.</p>
+  <p>So you cannot open one per request. And you cannot share one, because a transaction on it belongs to whoever started it. That leaves one answer:</p>
+
+  <div class="soundbite">
+    <span class="label">What a pool actually is</span>
+    <p>A small, fixed set of connections, and <b>a queue of people waiting for one</b>. It is the bounded-concurrency limiter from <a href="./0008-build-a-concurrent-multi-api-aggregator.html">week 8</a>, applied to sockets.</p>
+  </div>
+
+  <p>That is the whole idea, and it means the pool has the same failure mode as any queue. When the queue is long, the wait is long — and none of that wait appears in your query timings.</p>
+
+  <!-- ============ POOL MEASUREMENTS ============ -->
+  <h2>Watch a fast query become a slow request</h2>
+  <p>Twenty requests arrive together. Each one needs a connection for 100 ms. Measured:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Setup</th><th>Total time</th><th>Average wait</th><th>Worst wait</th><th>Failed</th></tr></thead>
+    <tbody>
+      <tr><td>Pool of <b>20</b>, query 100 ms</td><td>103 ms</td><td>0 ms</td><td>0 ms</td><td>0</td></tr>
+      <tr><td>Pool of <b>4</b>, query 100 ms</td><td>509 ms</td><td><b>203 ms</b></td><td>407 ms</td><td>0</td></tr>
+      <tr><td>Pool of <b>4</b>, query 500 ms</td><td>2,511 ms</td><td><b>1,004 ms</b></td><td>2,008 ms</td><td>0</td></tr>
+      <tr><td>Pool of 4, query 500 ms, <b>1 s connect timeout</b></td><td>1,004 ms</td><td>252 ms</td><td>503 ms</td><td><b>12 of 20</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Row 2 is the one that ruins an afternoon</span>
+    The query still takes <b>100 ms</b>. Your database dashboard is calm. Your query log says 100 ms. The
+    user waited <b>507 ms</b>, and 407 ms of that is not in any log you are reading.
+    <p style="margin:.6rem 0 0;">This is why &ldquo;the database is fine, it must be Node&rdquo; is such a
+    common wrong conclusion. The database <em>is</em> fine. The <b>queue in front of it</b> is not.</p>
+  </div>
+
+  <p>Row 3 shows the amplification. The query got 5x slower, and the worst wait got 5x worse on top of that. A queue does not add the extra time — it multiplies it across everyone still waiting.</p>
+
+  <p>Row 4 is the trade you get to choose. With <code>connectionTimeoutMillis</code>, 12 of 20 requests <b>failed in one second</b> instead of every request waiting two. That is usually the better outcome, and it is never the default.</p>
+
+  <div class="tip">
+    <span class="label">Why <code>connectionTimeoutMillis</code> is not optional</span>
+    Without it, a slow database turns into an unbounded queue in your process. Requests pile up, memory
+    grows, and your health check still passes because the event loop is idle. With it, you fail fast,
+    return 503, and let the load balancer route around you.
+    <p style="margin:.6rem 0 0;">This is <a href="./0028-operational-versus-programmer-errors.html">week 28</a>
+    again: an operational error you report is far better than an operational error you absorb.</p>
+  </div>
+
+  <div class="drill" style="margin-top:1.2rem;">
+    <span class="label">The drill, answered by the table above</span>
+    <p class="situation">&ldquo;The API hangs under load, but CPU is idle.&rdquo;</p>
+    Idle CPU means nothing is computing. So everything is <b>waiting</b>. The pool queue is the first
+    suspect, and the check is one line: log <code>pool.totalCount</code>, <code>pool.idleCount</code> and
+    <code>pool.waitingCount</code> every few seconds. A non-zero <code>waitingCount</code> ends the argument.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig40-title" width="640" height="250">
+      <title id="fig40-title">The wait for a connection is invisible in query timings</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">ONE REQUEST, POOL OF 4, 20 ARRIVE AT ONCE</text>
+
+      <text x="20" y="48" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">what the user experiences — 507 ms</text>
+      <rect x="20" y="56" width="480" height="28" rx="4" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="230" y="74" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">waiting for a connection — 407 ms</text>
+      <rect x="404" y="56" width="96" height="28" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="452" y="74" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">query 100ms</text>
+
+      <text x="20" y="116" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">what the query log shows — 100 ms</text>
+      <rect x="404" y="124" width="96" height="28" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="452" y="142" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">query 100ms</text>
+      <text x="212" y="142" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-style: italic;">— nothing is recorded here —</text>
+
+      <rect x="20" y="170" width="600" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="188" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">The database is fast. The dashboard is calm. The CPU is idle.</text>
+      <text x="320" y="203" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Four fifths of the user's wait happened before a query was ever sent.</text>
+
+      <text x="320" y="232" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">Log pool.waitingCount, or you will never see this.</text>
+      <text x="320" y="246" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured: pool of 4, 20 concurrent requests, 100 ms each — worst wait 407 ms.</text>
+    </svg>
+    <figcaption>Every number here was measured. The pool has the same shape as node-postgres's: N slots and a queue of waiters.</figcaption>
+  </div>
+
+  <!-- ============ TRANSACTIONS ============ -->
+  <h2>Transactions — and the one mistake everybody makes</h2>
+  <p>A transaction is not on the pool. It is on <b>one connection</b>. That single fact is the source of the most common Postgres bug in Node code:</p>
+
+  <pre><code><span class="cmt">// BROKEN — three different connections, three separate transactions</span>
+await pool.query('BEGIN');
+await pool.query('INSERT ...');      <span class="cmt">// probably a different connection</span>
+await pool.query('COMMIT');          <span class="cmt">// commits nothing you inserted</span></code></pre>
+
+  <p>Each <code>pool.query</code> takes a connection, runs, and gives it back. Your <code>BEGIN</code> and your <code>INSERT</code> can land on different sessions. The right shape checks out one connection and keeps it:</p>
+
+  <pre><code>const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  const { rows } = await client.query(
+    'INSERT INTO links(code, url) VALUES($1, $2) RETURNING id', [code, url]);
+  await client.query('INSERT INTO audit(link_id) VALUES($1)', [rows[0].id]);
+  await client.query('COMMIT');
+} catch (err) {
+  await client.query('ROLLBACK');     <span class="cmt">// the path people forget to test</span>
+  throw err;
+} finally {
+  client.release();                   <span class="cmt">// finally, ALWAYS. a leak here empties the pool</span>
+}</code></pre>
+
+  <p>Rollback really does undo the work. Measured on PostgreSQL 18.3:</p>
+
+  <pre><code><span class="out">  inside the transaction : 101
+  after rollback         : 100</span></code></pre>
+
+  <div class="trap">
+    <span class="label">The missing <code>finally</code> is a slow-motion outage</span>
+    A path that returns without <code>release()</code> loses one connection permanently. With a pool of 10,
+    the tenth time that path runs your service stops answering — hours after the deploy, with no error and
+    no crash, and every request waiting on <code>waitingCount</code>.
+  </div>
+
+  <!-- ============ CONSTRAINTS ============ -->
+  <h2>Let the database enforce what matters</h2>
+  <p>The spine's rule from week 21 is that a code is unique. You could check with a <code>SELECT</code> first. That check is a lie under load: two requests can both read &ldquo;free&rdquo; before either writes.</p>
+  <p>A unique constraint cannot be raced. Measured:</p>
+
+  <pre><code>create table links (..., code text not null unique, ...);
+
+<span class="cmt">// insert a code that already exists:</span>
+<span class="out">  code       : 23505
+  constraint : links_code_key
+  message    : duplicate key value violates unique constraint "links_code_key"</span></code></pre>
+
+  <p><code>23505</code> is the Postgres code for a unique violation. That is your 409, and now it is exact:</p>
+
+  <pre><code>catch (err) {
+  if (err.code === '23505' &amp;&amp; err.constraint === 'links_code_key') {
+    return conflict('code_taken');          <span class="cmt">// 409, the week 21 decision</span>
+  }
+  throw err;                                 <span class="cmt">// anything else is not yours to swallow</span>
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">Check <code>err.constraint</code>, not just <code>err.code</code></span>
+    A table can have several unique constraints. Matching only <code>23505</code> means a duplicate on a
+    different column also returns &ldquo;code taken&rdquo;, which sends the client to fix the wrong field.
+  </div>
+
+  <!-- ============ N+1 ============ -->
+  <h2>N+1 — the bug that hides inside clean code</h2>
+  <pre><code>const users = await db.query('select id, name from users limit 100');
+for (const u of users.rows) {
+  u.links = await db.query('select code from links where user_id = $1', [u.id]);
+}</code></pre>
+
+  <p>It reads perfectly. It is 101 queries. Measured against PostgreSQL 18.3 with 200,000 rows:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Approach</th><th>Queries</th><th>Time</th><th>Plus 1 ms network each way</th></tr></thead>
+    <tbody>
+      <tr><td>The loop</td><td><b>100</b></td><td>22.3 ms</td><td><b>122.3 ms</b></td></tr>
+      <tr><td>One query with <code>= ANY($1)</code></td><td><b>1</b></td><td>1.7 ms</td><td>2.7 ms</td></tr>
+      <tr><td>Difference</td><td></td><td>13.3x</td><td><b>45.7x</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Read the last column, not the middle one</span>
+    Those timings came from Postgres running <b>in the same process</b>, so the round trip was free. Add
+    just 1 ms of network — a generous number for the same data centre — and the gap goes from 13x to
+    <b>46x</b>. On a database in another region, every one of those 100 round trips costs 20 ms or more.
+    <p style="margin:.6rem 0 0;">N+1 is not mainly a database problem. It is a <b>round-trip</b> problem,
+    and the fix is always the same: fetch the set in one query.</p>
+  </div>
+
+  <p>Turn on query logging and the shape is unmistakable — the same statement, a hundred times, with only the parameter changing. That is the whole detection method, and it is faster than any profiler.</p>
+
+  <!-- ============ EXPLAIN ============ -->
+  <h2>Read a query plan, and learn what an index is worth</h2>
+  <p>The same query, on 200,000 rows, before and after adding an index. Measured:</p>
+
+  <pre><code>explain analyze select code from links where user_id = 777;
+
+<span class="cmt">-- no index</span>
+<span class="out">Seq Scan on links  (cost=0.00..4166.00 rows=10) (actual time=0.105..13.822 rows=10)
+  Filter: (user_id = 777)
+  Rows Removed by Filter: 199990
+  Buffers: shared hit=1666
+Execution Time: 13.927 ms</span>
+
+<span class="cmt">-- after: create index links_user_id_idx on links(user_id);</span>
+<span class="out">Bitmap Heap Scan on links  (cost=4.37..42.17 rows=10) (actual time=0.091..0.106 rows=10)
+  Recheck Cond: (user_id = 777)
+  -&gt;  Bitmap Index Scan on links_user_id_idx  (actual time=0.075..0.075 rows=10)
+        Index Cond: (user_id = 777)
+  Buffers: shared read=2
+Execution Time: 0.130 ms</span></code></pre>
+
+  <p><b>13.927 ms to 0.130 ms — 107 times faster.</b> You do not need to read the whole plan to get value from it. Three lines tell you almost everything:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Line</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>Seq Scan</code></td><td>Every row was read. Fine on a small table, fatal on a large one.</td></tr>
+      <tr><td><code>Rows Removed by Filter: 199990</code></td><td>Work done and thrown away. This is the number to hate.</td></tr>
+      <tr><td><code>Index Scan</code> / <code>Bitmap Index Scan</code></td><td>The index was used.</td></tr>
+      <tr><td><code>actual time</code></td><td>What really happened. <code>cost</code> is only the planner's guess.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">An index does not mean the index is used</span>
+    The same query on a <b>100-row</b> table kept its <code>Seq Scan</code> after the index was created. The
+    planner was right: reading 100 rows is cheaper than reading an index and then the rows.
+    <p style="margin:.6rem 0 0;">So an index you added on a nearly-empty development database may do
+    nothing, and prove nothing. Test query plans against realistic data volumes, or you are testing the
+    wrong system entirely.</p>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A database connection is expensive, so you keep a small fixed number of them and share. That means there is a <b>queue</b>: when all of them are busy, the next request waits.</p>
+    <p class="part cont">The waiting happens <b>before</b> any query is sent, so it appears in no query log and no database dashboard. Your queries stay fast while your users get slow, and nothing in the obvious places explains it.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Four checkouts in a shop. Each one still takes two minutes. Twenty people arrive at once, and the last person waits eight minutes for a two-minute checkout.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      In a shop you can see the line. In a service the line is invisible. It is a list of promises inside your own process, and every part of your monitoring says things are healthy.</p>
+    <p class="part limit cont">The CPU is idle, the event loop is free, the health check passes, and the query log reports 100 ms. Measured: a pool of 4 with 20 requests gave a worst wait of <b>407 ms</b>. The query itself took <b>100 ms</b>. You have to log <code>pool.waitingCount</code> on purpose, because nothing else will ever show you that queue.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People make the pool bigger. Sometimes that is right. Often it just moves the queue to the database. That has its own connection limit, and gets slower with every session it keeps alive.</p>
+    <p class="part cont">The real question is why a connection is held so long. A 500 ms query made the worst wait <b>2,008 ms</b>. Five times slower held the queue five times longer, on top of the slowdown itself. Fix the query, or fail fast with a connect timeout, before you raise the pool size.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain how every query can be fast and every request still slow. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — give the spine a database</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Move the spine's storage to Postgres with <code>node-postgres</code>. One pool for the whole process, created once — <b>never</b> per request.</li>
+    <li>Set <code>max</code> and <code>connectionTimeoutMillis</code> explicitly, and write down why you chose each number.</li>
+    <li>A <code>unique</code> constraint on <code>code</code>. Map <code>23505</code> plus the constraint name to your 409, and keep the week 35 test that proves it.</li>
+    <li>One real transaction with a tested <b>rollback</b> path. Prove the row count returns to what it was.</li>
+    <li>Log <code>totalCount</code>, <code>idleCount</code> and <code>waitingCount</code> every 5 seconds.</li>
+    <li><b>Create an N+1 on purpose.</b> See it in the query log, then fix it with one query, and record both timings.</li>
+    <li>Run <code>explain analyze</code> on your slowest query, against <b>realistic data volume</b>. Add the index and record the before and after.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">Do not reach for an ORM yet</span>
+    An ORM is a good tool that hides exactly the three things this week is about: how many queries ran, when
+    a connection was held, and what the plan was. Learn to see them first. Then an ORM is a convenience
+    rather than a blindfold — and you will be able to tell when it is generating an N+1 for you.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Isolation levels</b> and the anomalies they prevent are genuinely important and deserve their own
+    study. <b>Migrations</b> and how to change a schema with no downtime is a whole discipline.
+    <b>Prepared statements</b>, <b>connection poolers like PgBouncer</b>, <b>read replicas</b>, and
+    <b>partial and composite indexes</b> all matter at scale. <b>SQL injection</b> is handled here by
+    always using <code>$1</code> parameters and never string concatenation — that rule has no exceptions.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://node-postgres.com/">node-postgres</a> — especially the
+    <a href="https://node-postgres.com/features/pooling">pooling</a> and
+    <a href="https://node-postgres.com/features/transactions">transactions</a> pages — and the PostgreSQL
+    docs on <a href="https://www.postgresql.org/docs/current/using-explain.html">EXPLAIN</a> and
+    <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html">error codes</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your slowest <code>explain analyze</code> output and I'll tell you what to fix first.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A pool is <b>N connections and a queue</b> — week 8's bounded concurrency, applied to sockets.</li>
+      <li>Measured: pool of 4, 20 requests, a <b>100 ms</b> query → <b>407 ms</b> worst wait, invisible in every query log.</li>
+      <li>Log <code>waitingCount</code>. Idle CPU plus a hanging API means a queue, and this is the first one to check.</li>
+      <li>Set <code>connectionTimeoutMillis</code>. Measured: 12 of 20 failed in 1 s instead of everyone waiting 2 s.</li>
+      <li>A transaction lives on <b>one client</b>, never the pool, and <code>release()</code> goes in <code>finally</code>. A unique constraint cannot be raced: <code>23505</code> plus <code>err.constraint</code> is your 409.</li>
+      <li>N+1 is a <b>round-trip</b> problem: 13.3x in-process, <b>45.7x</b> with 1 ms of network.</li>
+      <li><code>Rows Removed by Filter: 199990</code> is the line to hate. An index took it from 13.9 ms to 0.130 ms.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>your users spend that time waiting for a connection, and no query log records it.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> node-postgres documentation ("Pooling", "Transactions"); PostgreSQL documentation ("Using EXPLAIN", "PostgreSQL Error Codes"). The SQL measurements are error <code>23505</code>, the rollback count, the N+1 timings and both query plans. They came from running the code against <b>PostgreSQL 18.3</b> via PGlite 0.5.8, on <b>Node v24.14.0</b>, on 2026-08-28. PGlite runs Postgres in the same process, so the round trip is free. That is why the network column is shown separately, and why it matters more. The pool table came from a pool of the same shape as node-postgres's: N slots and a queue of waiters. It was measured the same day. All are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0038-build-the-full-suite-and-the-security-pass.html">← Lesson 38</a>
+    <a href="./0041-redis-and-the-three-ways-a-cache-lies.html">Next: Lesson 41 — Redis, and the three ways a cache lies →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Every query logs at 100 ms, CPU is idle, and users wait half a second. What is happening?",
+      options: [
+        "Requests are queueing for a pool connection, which no query log records",
+        "The event loop is blocked by a slow synchronous handler before the query runs",
+        "The database is returning cached plans that are stale for the current data",
+        "Keep-alive is off, so each request pays a new TCP handshake before querying"
+      ],
+      answer: 0,
+      why: "Measured: a pool of 4 with 20 concurrent requests and a 100 ms query produced a 407 ms worst wait. That waiting happens before a query is sent, so it appears in no query log and no database dashboard. Idle CPU means nothing is computing, so everything is waiting — and the pool queue is the first place to look."
+    },
+    {
+      q: "Why is pool.query('BEGIN') then pool.query('INSERT') then pool.query('COMMIT') broken?",
+      options: [
+        "Each pool.query may use a different connection, so the statements are separate sessions",
+        "BEGIN is not a valid statement to send through node-postgres's query method",
+        "The pool serialises writes, so the INSERT runs after the COMMIT has been sent",
+        "Transactions require an explicit isolation level when started through a pool"
+      ],
+      answer: 0,
+      why: "A transaction lives on one connection, not on the pool. Each pool.query checks a connection out, runs, and returns it, so BEGIN and INSERT can land on different sessions and the COMMIT commits nothing. You must pool.connect(), keep that client for every statement, and release it in a finally block."
+    },
+    {
+      q: "An index made a query 107x faster on 200,000 rows but changed nothing on 100 rows. Why?",
+      options: [
+        "The planner judged that reading 100 rows directly is cheaper than using the index",
+        "Indexes are only built once a table passes a row threshold set by autovacuum",
+        "The small table was fully cached, so the index existed but was never written to disk",
+        "ANALYZE had not run, so the planner had no statistics for the smaller table"
+      ],
+      answer: 0,
+      why: "Measured: the 100-row table kept its Seq Scan after the index was created, and the planner was right — reading 100 rows is cheaper than reading an index and then fetching the rows. This is why an index tested on a nearly-empty development database proves nothing. Test query plans against realistic data volumes."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “The API is hanging under load, but CPU is idle. Where do you look?”",
+      answer: "Idle CPU means nothing is computing, so everything is <b>waiting</b>. My first suspect is the connection pool queue. I would log <code>pool.totalCount</code>, <code>idleCount</code> and <code>waitingCount</code> — a non-zero <code>waitingCount</code> settles it immediately. I have measured this: a pool of 4 with 20 concurrent requests and a 100 ms query gave a 407 ms worst wait, and none of that appears in the query log, so the database dashboard looks perfectly calm. The fix is usually not a bigger pool. It is finding why a connection is held so long, or setting <code>connectionTimeoutMillis</code> so requests fail fast instead of piling up. <br>Why: naming the specific counter to log, and resisting the bigger-pool reflex, is what makes this an experienced answer."
+    },
+    {
+      prompt: "Interviewer: “What is an N+1, and how do you find one?”",
+      answer: "It is one query to fetch a list, then one more per item — so a hundred users becomes a hundred and one queries. I find it in the <b>query log</b>: the same statement repeated with only the parameter changing is unmistakable, and it is faster than any profiler. The important part is that it is a <b>round-trip</b> problem more than a database problem. I measured 13x with the database in the same process, and 46x once I added just 1 ms of network per round trip. On a database in another region it is far worse. The fix is one query for the whole set, with <code>= ANY($1)</code> or a join. <br>Why: framing it as round trips rather than as slow SQL is the insight that also tells you why it is worse in production than in development."
+    },
+    {
+      prompt: "Interviewer: “How do you enforce that a value is unique?”",
+      answer: "With a <b>unique constraint in the database</b>, never a SELECT before the INSERT. The check-then-write version is a race: two requests can both read &ldquo;free&rdquo; before either one writes. The constraint cannot be raced. Postgres then raises error <code>23505</code>, and I match on both <code>err.code</code> and <code>err.constraint</code>, because a table can have several unique constraints and matching only the code would send the client to fix the wrong field. That maps to a 409 with a stable error code in the body, which is the decision I made when I designed the API. <br>Why: the race argument is the reason, and checking <code>err.constraint</code> as well as <code>err.code</code> is the detail that shows you have actually hit this."
+    }
+  ]);
+</script>

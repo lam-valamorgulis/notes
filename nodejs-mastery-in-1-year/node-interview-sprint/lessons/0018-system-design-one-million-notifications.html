@@ -1,0 +1,551 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System design — one million notifications an hour — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 6 of 7 · Lesson 18 · Scale and design</p>
+  <h1>System design — one million notifications an hour</h1>
+  <p class="subtitle">The design round has no right answer. It has a method, and the method is what they grade.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 6 of 7.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/7-day-plan.html#d6">Day 6 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can take a one-line design brief and run a five-step method on it. Questions, arithmetic, a drawing, the failure modes, and the trade-off you chose. Twenty minutes, out loud, with a pen.
+  </div>
+
+  <h2>Start from the problem — the brief is deliberately empty</h2>
+
+  <div class="drill">
+    <span class="label">The brief, exactly as they will give it</span>
+    <p class="situation">"Design a service that sends one million notifications an hour."</p>
+    That is the whole brief. It is short on purpose. What you do in the next two minutes is the test.
+  </div>
+
+  <p>Most candidates start drawing boxes. That is the mistake.</p>
+
+  <p>The brief is missing everything that decides the design. Channel, latency, duplicates, failure behaviour.</p>
+
+  <p>So the first move is not a box. It is a question.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this before you draw anything</span>
+    <p><b>"Before I draw, I want four things. What channel is this — email, push, or SMS? How fast must one notification arrive? Is a duplicate acceptable, or must it be exactly once? And what should happen when the provider is down?"</b></p>
+  </div>
+
+  <p>Every one of those four changes the answer. Say why, briefly, as you ask.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The question</th><th>Why the answer changes the design</th></tr></thead>
+    <tbody>
+      <tr><td>Which channel?</td><td>Push is fast and cheap. SMS is slow, costly and rate limited.</td></tr>
+      <tr><td>How fast?</td><td>Seconds means a queue. Milliseconds means no queue, and a much harder problem.</td></tr>
+      <tr><td>Duplicates allowed?</td><td>This decides whether you need idempotency keys and a sent log.</td></tr>
+      <tr><td>Provider down?</td><td>This decides retries, backoff, and whether you drop or hold.</td></tr>
+      <tr><td>Is it a burst?</td><td>One million spread evenly is easy. One million in five minutes is not.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>For the rest of this lesson, assume these answers. Push notifications. A few seconds is fine. A rare duplicate is acceptable. The provider does go down.</p>
+
+  <h2>Step two — do the arithmetic out loud</h2>
+
+  <p>Numbers turn a vague brief into a real one. Divide in front of them.</p>
+
+  <div class="diagram">1,000,000 per hour
+  ÷ 3600 seconds
+  = about 278 per second, on average
+
+peak is not average — assume 5x
+  = about 1,400 per second at peak
+
+one provider call takes about 100 ms (I would measure this)
+  one worker with 50 in flight → about 500 per second
+  so about 3 workers at peak, plus headroom</div>
+
+  <p>Say plainly which of those numbers is an assumption. That honesty scores.</p>
+
+  <div class="tip">
+    <span class="label">Say the assumption out loud</span>
+    <b>278 per second is arithmetic</b>, and it is certain. The <b>5x peak</b> is an assumption I am choosing. The <b>100 ms provider call</b> is a guess I would replace with a measurement on day one. Naming which is which is the difference between an engineer and a guess.
+  </div>
+
+  <p>278 per second is a small number. Say that too.</p>
+
+  <p>It tells the interviewer that the volume is not the hard part. The failures are.</p>
+
+  <h2>Step three — draw it</h2>
+
+  <p>Five boxes. Keep it small, and add only what a question forces you to add.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig18-title">
+      <title id="fig18-title">Producer to queue to worker pool to provider, with a database and a cache</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">THE WHOLE DESIGN — FIVE BOXES</text>
+
+      <rect x="20" y="32" width="104" height="44" rx="7" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="72" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">producer</text>
+      <text x="72" y="65" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">API or scheduler</text>
+
+      <line x1="124" y1="54" x2="150" y2="54" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="150,49 160,54 150,59" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="164" y="32" width="104" height="44" rx="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="216" y="52" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">QUEUE</text>
+      <text x="216" y="65" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">absorbs the peak</text>
+
+      <line x1="268" y1="54" x2="294" y2="54" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="294,49 304,54 294,59" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="308" y="32" width="104" height="44" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="360" y="52" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">WORKERS</text>
+      <text x="360" y="65" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">bounded, ~50 each</text>
+
+      <line x1="412" y1="54" x2="438" y2="54" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="438,49 448,54 438,59" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="452" y="32" width="104" height="44" rx="7" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="504" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">provider</text>
+      <text x="504" y="65" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 8.5px;">rate limited</text>
+
+      <line x1="360" y1="76" x2="360" y2="104" style="stroke: var(--ink-faint); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <polygon points="355,104 360,114 365,104" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="240" y="118" width="112" height="40" rx="7" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="296" y="136" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">database</text>
+      <text x="296" y="149" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">sent log, idempotency</text>
+
+      <rect x="368" y="118" width="112" height="40" rx="7" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="424" y="136" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">cache</text>
+      <text x="424" y="149" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">templates, tokens</text>
+
+      <line x1="216" y1="76" x2="216" y2="180" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <polygon points="211,180 216,190 221,180" style="fill: var(--warn);"></polygon>
+      <rect x="150" y="194" width="132" height="34" rx="6" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="216" y="215" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9.5px;">dead-letter queue</text>
+
+      <text x="20" y="256" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px;">278 per second average · about 1,400 at a 5x peak · 3 workers plus headroom</text>
+      <text x="20" y="276" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-style: italic;">The queue is the whole design. Everything else is a detail hanging off it.</text>
+    </svg>
+    <figcaption>Producer, queue, workers, provider. The database and cache hang off the workers, not off the request.</figcaption>
+  </figure>
+
+  <p>Say why the queue is the centre. It does three jobs at once.</p>
+
+  <ul>
+    <li>It absorbs the peak, so a 5x burst becomes a longer drain, not a failure.</li>
+    <li>It gives retries with backoff for free when the provider fails.</li>
+    <li>It lets you add workers without touching the producer at all.</li>
+  </ul>
+
+  <h2>Step four — name the failures before they ask</h2>
+
+  <p>This is the step that wins the round. Volunteer the failure modes.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Failure</th><th>What actually happens</th><th>What you do</th></tr></thead>
+    <tbody>
+      <tr><td><b>Provider rate limit</b></td><td>It returns 429, and naive retries make it worse.</td><td>Respect the limit, back off, and slow the workers down.</td></tr>
+      <tr><td><b>Provider down</b></td><td>Jobs fail and retry. The queue grows fast.</td><td>Backoff with jitter, plus a circuit breaker so you stop hammering.</td></tr>
+      <tr><td><b>Duplicates</b></td><td>Delivery is at least once, so a crash after sending re-sends.</td><td>An idempotency key and a sent log. Check before you send.</td></tr>
+      <tr><td><b>Poison message</b></td><td>One bad job fails forever and blocks a retry slot.</td><td>Cap the attempts, then move it to the dead-letter queue.</td></tr>
+      <tr><td><b>Queue grows</b></td><td>You are producing faster than you drain. It never recovers alone.</td><td>Alarm on queue <b>depth</b> and on age. Add workers, or shed load.</td></tr>
+      <tr><td><b>Thundering restart</b></td><td>Every worker reconnects at once after a deploy.</td><td>Stagger the start, and warm the cache slowly.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — retrying a 4xx</span>
+    A 429 means slow down. A 400 means the request is wrong, and it will be wrong every time. Retrying a 400 burns the queue and never succeeds. <b>Retry on 5xx, on timeouts, and on 429 with backoff. Never on other 4xx.</b> Say that rule out loud — it is short and it lands.
+  </div>
+
+  <h2>Step five — the Node part, and the trade you chose</h2>
+
+  <p>Now make it a <em>Node</em> answer. Two facts from this week carry the whole thing.</p>
+
+  <p>First, a worker sending notifications is <b>I/O-bound</b>. It waits on the network almost the whole time.</p>
+
+  <p>So one Node process holds many calls in flight cheaply. That is exactly what the runtime is good at.</p>
+
+  <p>Second, in flight must be <b>bounded</b>. An unbounded <code>Promise.all</code> over the batch would flood the provider.</p>
+
+  <p>So each worker uses the pool pattern from <a href="0006-kata-02-500-urls-ten-at-a-time.html">Kata 2</a>, with a limit you can tune.</p>
+
+  <p>For more throughput, add processes: <code>cluster</code> or more containers, as in <a href="0016-worker-threads-versus-cluster.html">Lesson 16</a>.</p>
+
+  <div class="soundbite">
+    <span class="label">Close with the trade — say this</span>
+    <p><b>"I chose at-least-once delivery with idempotency keys. That gives up exactly-once, so a user can very rarely see a duplicate. I took that because exactly-once needs a distributed transaction with the provider, and no provider offers one. A rare duplicate is cheaper than a lost notification."</b></p>
+  </div>
+
+  <h2>How would you know it is working?</h2>
+
+  <p>They almost always ask this last. A design with no way to watch it is not finished.</p>
+
+  <p>Name <b>three graphs</b>, and say what each one tells you. Three is enough, and it sounds decided.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Graph</th><th>What it tells you</th><th>The alarm</th></tr></thead>
+    <tbody>
+      <tr><td><b>Queue depth and age</b></td><td>Whether workers keep up with producers</td><td>Depth rising for several minutes in a row</td></tr>
+      <tr><td><b>Send outcome rate</b></td><td>Success, retry and dead-letter counts per minute</td><td>Any dead-letter arrivals at all</td></tr>
+      <tr><td><b>Provider latency</b></td><td>p50 and p99 of the outgoing call</td><td>p99 rising while the success rate holds</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Queue <b>age</b> matters more than depth. A short queue that is not moving is worse than a long one that is.</p>
+
+  <div class="tip">
+    <span class="label">The sentence that closes this question</span>
+    <b>"Queue age is my main alarm, because it turns 'the system is behind' into a number with a threshold."</b> Then add the honest part: a dead-letter queue nobody reads is the same as no dead-letter queue.
+  </div>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Do not send a million things one by one from the place that asks for them. Write them all on a list.</p>
+    <p class="part cont">Then a small number of helpers read the list at a steady pace. If a helper fails, the item goes back on the list and is tried again later.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A post office. Letters go into sacks, and a few vans do rounds all day at a fixed pace.</p>
+    <p class="part cont">A busy morning fills the sacks faster than the vans empty them. Nothing is lost. Everything simply arrives later.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A letter is delivered once. A queued job can be delivered twice, and that is normal.</p>
+    <p class="part limit cont">If a worker sends the notification and then crashes before saying "done", the job comes back and is sent again. That is why every job needs an idempotency key and a sent log. The post office never has this problem.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People size the design for the average and stop. One million an hour is only 278 per second.</p>
+    <p class="part cont">That number is easy, and it is not the question. The real question is what happens at a 5x peak. And what happens when the provider returns 429 for ten minutes.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why the queue is the centre of this design. Then say what at-least-once delivery costs you. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>The five steps, on one line each</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Step</th><th>What you do</th><th>Time</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 · Ask</b></td><td>Four questions before any box. Channel, latency, duplicates, failure.</td><td>2 min</td></tr>
+      <tr><td><b>2 · Count</b></td><td>Divide out loud. Say which numbers are assumptions.</td><td>2 min</td></tr>
+      <tr><td><b>3 · Draw</b></td><td>Five boxes. Producer, queue, workers, provider, storage.</td><td>5 min</td></tr>
+      <tr><td><b>4 · Break it</b></td><td>Name six failure modes before they ask for one.</td><td>7 min</td></tr>
+      <tr><td><b>5 · Trade</b></td><td>Say what you chose and what you gave up.</td><td>2 min</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the design with no cost in it</span>
+    A candidate who lists only benefits sounds like a brochure. Every choice here costs something. The queue costs latency and duplicates. The cache costs staleness. More workers cost provider pressure. <b>Name the cost of your own design, unprompted.</b> Interviewers use that single habit to sort seniors from mid-level engineers.
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 20 minutes, out loud, with a pen</span>
+    <p class="situation">Set a timer for twenty minutes. Design it from the empty brief, alone, out loud, on paper.</p>
+    Then score yourself against the five steps above. Anything you skipped is tomorrow's warm-up.
+    <ul>
+      <li>I asked at least four questions before drawing anything.</li>
+      <li>I divided out loud and said 278 per second.</li>
+      <li>I labelled the peak multiple as my own assumption.</li>
+      <li>I drew five boxes, not fifteen.</li>
+      <li>I named six failure modes without being prompted.</li>
+      <li>I gave the retry rule: 5xx, timeouts and 429 only.</li>
+      <li>I closed by naming the trade-off and what it gives up.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://docs.bullmq.io/">BullMQ</a>, the sections on retries, backoff and failed jobs. Thirty minutes. It is the Node-shaped version of everything above.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../reference/52-week-plan.html#w51">Week 51 · System design</a> ·
+    <a href="../../reference/52-week-plan.html#w42">Week 42 · The job queue</a> ·
+    <a href="../../lessons/0022-cpu-bound-versus-io-bound.html">Week 22 · CPU-bound versus I/O-bound</a> ·
+    <a href="../../lessons/0030-build-harden-the-spine-api.html">Week 30 · Harden the spine API</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Ask four questions before you draw. Channel, latency, duplicates, and provider failure.</li>
+      <li>Divide out loud. One million an hour is about <b>278 per second</b>, which is a small number.</li>
+      <li>Say which numbers are arithmetic and which are your own assumptions.</li>
+      <li>The <b>queue</b> is the centre. It absorbs the peak, retries for you, and lets you add workers.</li>
+      <li>Retry on 5xx, timeouts and 429 with backoff. <b>Never retry other 4xx.</b></li>
+      <li>Workers are I/O-bound, so one Node process holds many calls in flight — but <b>bounded</b>.</li>
+      <li>At-least-once delivery is the normal choice, so every job needs an idempotency key.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the volume is never the hard part. The failures are.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> BullMQ documentation on retries and failed jobs, checked live on 2026-08-28. The rate figures are arithmetic shown in full, not measurements. The 100 ms provider call is stated as a guess to be replaced by a measurement.</p>
+
+  <div class="ask">
+    Stuck on any of this? <b>Ask your teacher.</b> Say <b>"run a design round on me"</b> and you get a brief, a clock, and follow-ups in interviewer voice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0017-the-data-layer.html">← The data layer</a></span>
+    <span><a href="0019-the-full-mock.html">Next: Day 7 — the full mock →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "You are given the one-line brief. What should you do in the first two minutes?",
+      options: [
+        "Ask about channel, latency, duplicates and provider failure, because each one changes the design",
+        "Draw the producer, the queue and the workers, then refine the boxes as questions arrive",
+        "Work out the storage needed per notification and size the database before anything else",
+        "Choose the message broker first, since every later decision depends on which one you pick"
+      ],
+      answer: 0,
+      why: "The brief is deliberately empty, and the questions are the graded part. Channel decides cost and rate limits. Latency decides whether a queue is allowed at all. Duplicates decide whether you need idempotency keys and a sent log. Provider failure decides retries and backoff. Drawing first means you commit to a design before you know the constraints, and the interviewer will then watch you undo it. Broker choice is a detail that follows from the answers, not a starting point."
+    },
+    {
+      q: "One million an hour works out at about 278 per second. What is the right thing to say about that?",
+      options: [
+        "It is a small number, so the volume is not the hard part and the failures are the design",
+        "It is a large number, so the design needs sharding across several independent regions",
+        "It is meaningless until you know the payload size, so no design is possible from it yet",
+        "It is the peak rate, so three workers at fifty in flight will always be more than enough"
+      ],
+      answer: 0,
+      why: "Doing the division out loud is what turns a vague brief into a real one, and the answer is deliberately unimpressive. 278 per second is well within one Node process, so capacity is not the interesting question. What is interesting is the peak, the provider rate limit, retries, and duplicates. Calling it large invents a problem you do not have. And 278 is the average, not the peak — treating it as the peak is exactly the mistake the lesson warns about."
+    },
+    {
+      q: "The provider starts returning 429 for ten minutes. What is the correct worker behaviour?",
+      options: [
+        "Back off with jitter, slow the workers, and open a circuit breaker rather than retrying hard",
+        "Retry immediately with more workers, so the backlog is cleared as soon as the limit lifts",
+        "Drop the failing jobs into the dead-letter queue at once, then replay them by hand later",
+        "Ignore the 429 and keep the same send rate, because the provider will queue them for you"
+      ],
+      answer: 0,
+      why: "A 429 means you are already sending too fast, so retrying harder makes the outage longer and can get you blocked. Backoff with jitter spreads the retries out instead of synchronising them into a new spike. A circuit breaker stops the pointless calls entirely for a while. Sending failures straight to the dead-letter queue throws away work that would have succeeded in a minute. And no provider silently queues traffic you were told to slow down."
+    },
+    {
+      q: "Why does this design accept at-least-once delivery instead of aiming for exactly-once?",
+      options: [
+        "Exactly-once needs a shared transaction with the provider, and no provider offers one",
+        "At-least-once is faster to implement, and duplicates are simply too rare to matter here",
+        "Exactly-once is only available on paid brokers, and the budget does not allow for one",
+        "At-least-once removes the need for a sent log, which keeps the database much smaller"
+      ],
+      answer: 0,
+      why: "The crash window is the reason. A worker can send the notification and die before recording that it did, and no amount of care inside your system closes that gap without the provider taking part in a transaction. Since providers do not offer that, you design for repeats: an idempotency key and a sent log make a second attempt harmless. It is not about speed or cost. And at-least-once needs the sent log more, not less, so the last option has it backwards."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Design a service that sends one million notifications an hour.”",
+      answer: "Before I draw, I want four things. Which channel, because push and SMS have very different costs and rate limits. How fast one notification must arrive, because seconds allows a queue and milliseconds does not. Whether a duplicate is acceptable. And what should happen when the provider is down. Assuming push, a few seconds, rare duplicates allowed: one million an hour is about 278 per second, which is a small number, so volume is not the hard part. The shape is producer, queue, a small pool of workers with bounded concurrency, then the provider, with a database for the sent log and a cache for templates. The queue is the centre because it absorbs the peak, retries with backoff, and lets me add workers without touching the producer. <br>Why: they grade the method, not the boxes. Asking first and dividing out loud is most of the score, before a single line is drawn."
+    },
+    {
+      prompt: "Interviewer: “What goes wrong with this design in production?”",
+      answer: "Six things, and I would name them before being asked. The provider rate limits me and returns 429, so I back off with jitter and open a circuit breaker instead of retrying harder. The provider goes down completely, the queue grows, and I alarm on queue depth and job age rather than on error count. Delivery is at least once, so a crash after sending re-sends, which is why every job carries an idempotency key and I check a sent log. A poison message fails forever, so attempts are capped and it moves to a dead-letter queue that somebody actually reads. A deploy restarts every worker at once, so I stagger the starts. And my retry rule is narrow: 5xx, timeouts, and 429 with backoff, never any other 4xx, because a 400 will be wrong every time. <br>Why: volunteering the failure list is the single strongest move in a design round. It shows you have run something, not just drawn one."
+    },
+    {
+      prompt: "Interviewer: “Why is Node a reasonable choice for the workers here?”",
+      answer: "Because the work is almost entirely waiting. A worker builds a small payload and then waits on a network call to the provider, so it is I/O-bound, and that is exactly what one Node thread is good at. One process can hold many calls in flight for very little memory. The important detail is that in flight must be bounded: an unbounded Promise.all over a batch would flood the provider and trigger its rate limit. So each worker runs a small pool with a fixed limit I can tune. For more throughput I add processes with cluster or more containers, not more threads, because there is no CPU work to move. If the notification needed heavy rendering per message, I would say so and move that part to a worker thread or a separate service. <br>Why: they want to hear that you matched the runtime to the workload, and that you know where Node would have been the wrong answer."
+    }
+  ]);
+</script>

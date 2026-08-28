@@ -1,0 +1,574 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>package.json in full, and publishing — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 11 of 52 · Lesson 11 · Modules &amp; a real CLI</p>
+  <h1>package.json in full, and publishing</h1>
+  <p class="subtitle">Four fields decide whether a stranger can use your code. Then one number decides whether they can trust it.</p>
+  <p class="expertise"><span class="tag depth">depth</span><span class="wk">Week 11 of 52.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/52-week-plan.html#w11">Week 11 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will publish a real package that a stranger can install, and you will be able to defend every field in its <code>package.json</code>. You will also know <b>what a version number actually promises</b>, and the exact place that promise breaks.
+  </div>
+
+  <div class="note">
+    <span class="label">Why this week is tagged <b>depth</b>, not core</span>
+    You publish a package a few times a year, not weekly. So this is queued material, and it is honest to
+    say so. It is here anyway for one reason: <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">week 9</a>
+    showed you <code>exports</code> from the <em>consumer</em> side, where it only blocks you. This week you stand on the other side and see why the author locked it. That change of view is worth a week.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — a stranger has your folder</h2>
+  <p>Your code works. Now someone you have never met has to run it. What do they need that a folder of
+  files does not give them?</p>
+  <p>Four things, and each one is a field:</p>
+  <ol>
+    <li><b>A way to refer to it.</b> Not a path — a name. → <code>name</code></li>
+    <li><b>A way to know which file to start at.</b> Your folder has forty. → <code>exports</code></li>
+    <li><b>A way to know what they are allowed to touch.</b> → also <code>exports</code></li>
+    <li><b>A way to know whether an upgrade will break them.</b> → <code>version</code></li>
+  </ol>
+  <p>That is the whole subject. Everything else in <code>package.json</code> is either settings for other tools or an old field kept for compatibility.</p>
+
+  <h2>Identity — <code>name</code> and <code>version</code></h2>
+  <p>Together these are the primary key of the whole ecosystem. Once you publish
+  <code>my-tool@1.0.0</code>, that exact pair is <b>permanent and immutable</b>. You cannot change what
+  it contains, ever. You can only publish a new version.</p>
+  <p>npm did not make that rule to be strict. It is the only thing that makes a <b>lockfile</b> mean anything. A lockfile — <code>package-lock.json</code> — records the exact version of every package an install chose. It is a record of what ran, not a wish about what should run. </p>
+  <p>Say <code>1.0.0</code> could change under you. Then a lockfile would record a promise nobody keeps. A build that passed on Monday could fail on Tuesday, with no commit in between.</p>
+
+  <div class="tip">
+    <span class="label">Publish under a scope while you are learning</span>
+    A scoped name like <code>@yourname/word-freq</code> is yours alone, so you cannot collide with an
+    existing package and you will not spend twenty minutes inventing a free name. Scoped packages are
+    private by default, so the first publish needs
+    <code>npm publish --access public</code>.
+  </div>
+
+  <h2><code>exports</code> — the door, now from the inside</h2>
+  <p>In week 9 this field blocked you with <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>. Here is why an
+  author wants that.</p>
+  <p>Before <code>exports</code> existed, <b>every file in a package was public</b>. Not by intent — by
+  accident, because nothing could stop <code>require('some-pkg/lib/internal/helper')</code>. So the
+  moment anyone did that, the author could never rename <code>helper.js</code> again without breaking a
+  stranger's build. Whole packages froze their internal structure because of files they never meant to
+  publish.</p>
+  <p><code>exports</code> is the author drawing a line around what they promise to keep:</p>
+
+  <pre><code>{
+  "name": "@you/word-freq",
+  "version": "1.0.0",
+  "exports": {
+    ".":          "./src/index.js",     <span class="cmt">// import '@you/word-freq'</span>
+    "./counters": "./src/counters.js"   <span class="cmt">// import '@you/word-freq/counters'</span>
+  }
+}</code></pre>
+
+  <p>Everything else in <code>src/</code> is now unreachable, even though it ships. You can rename it,
+  split it, or delete it, and nobody's build breaks.</p>
+
+  <h2>One package, two module systems</h2>
+  <p>Some of your users write <code>require()</code>. Some write <code>import</code>. You can serve both
+  from one package, because <code>exports</code> accepts <b>conditions</b>:</p>
+
+  <pre><code>{
+  "exports": {
+    ".": {
+      "require": "./index.cjs",
+      "import":  "./index.mjs"
+    }
+  }
+}</code></pre>
+
+  <p>Node picks the branch that matches how it was loaded. Verified on Node v24.14.0:</p>
+  <pre><code>require('dual').who   <span class="out">// 'CommonJS build'</span>
+import { who } from 'dual'   <span class="out">// 'ESM build'</span></code></pre>
+
+  <div class="trap">
+    <span class="label">The dual-package hazard</span>
+    Ship both builds and a user can end up with <b>both loaded at once</b> — one through
+    <code>require</code>, one through <code>import</code>. They are two separate module instances. Any
+    module-level state, any <code>instanceof</code> check, any cache is now duplicated and quietly wrong.
+    The safe shapes are: ship <b>ESM only</b>, or keep all state in the CommonJS build and make the ESM
+    file a thin re-export. Shipping two independent implementations is the shape that goes wrong.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 290" role="img" aria-labelledby="fig11-title" width="640" height="290">
+      <title id="fig11-title">files decides what is uploaded; exports decides what is reachable</title>
+
+      <text x="20" y="24" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">TWO DIFFERENT GATES — THEY ARE OFTEN CONFUSED</text>
+
+      <text x="105" y="56" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px; font-weight: 700;">your folder</text>
+      <rect x="20" y="66" width="170" height="150" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="36" y="90" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/index.js</text>
+      <text x="36" y="110" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/counters.js</text>
+      <text x="36" y="130" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/internal.js</text>
+      <text x="36" y="150" style="fill: var(--ink-faint); font-family: monospace; font-size: 11px;">test/big.spec.js</text>
+      <text x="36" y="170" style="fill: var(--ink-faint); font-family: monospace; font-size: 11px;">NOTES.md</text>
+      <text x="36" y="190" style="fill: var(--warn); font-family: monospace; font-size: 11px;">.env</text>
+
+      <line x1="192" y1="140" x2="242" y2="140" style="stroke: var(--accent); stroke-width: 2;" marker-end="url(#a11)"></line>
+      <text x="217" y="132" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">files</text>
+
+      <text x="330" y="56" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px; font-weight: 700;">what is uploaded</text>
+      <rect x="245" y="66" width="170" height="150" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="261" y="90" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/index.js</text>
+      <text x="261" y="110" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/counters.js</text>
+      <text x="261" y="130" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">src/internal.js</text>
+      <text x="261" y="162" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px; font-style: italic;">tests, notes and .env</text>
+      <text x="261" y="178" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px; font-style: italic;">never left your machine</text>
+
+      <line x1="417" y1="140" x2="467" y2="140" style="stroke: var(--accent-2); stroke-width: 2;" marker-end="url(#a11o)"></line>
+      <text x="442" y="132" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">exports</text>
+
+      <text x="555" y="56" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px; font-weight: 700;">what is reachable</text>
+      <rect x="470" y="66" width="150" height="150" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="486" y="90" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">'@you/pkg'</text>
+      <text x="486" y="110" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">'@you/pkg/counters'</text>
+      <text x="486" y="146" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-style: italic;">internal.js shipped</text>
+      <text x="486" y="162" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-style: italic;">but cannot be imported</text>
+
+      <text x="320" y="252" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">A file can ship and still be unreachable. That is not a mistake — it is usually the point.</text>
+      <text x="320" y="274" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">files protects your secrets. exports protects your freedom to refactor.</text>
+
+      <defs>
+        <marker id="a11" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a11o" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent-2);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Two gates, two jobs. Confusing them is how a <code>.env</code> reaches npm.</figcaption>
+  </div>
+
+  <h2><code>files</code> — what actually leaves your machine</h2>
+  <p><code>files</code> is an allow-list. Anything not listed is not uploaded. Verified: a package with
+  <code>"files": ["index.cjs"]</code> and a <code>SECRET.txt</code> sitting next to it packs
+  <b>2 files</b> — <code>index.cjs</code> and <code>package.json</code>. The secret never left. You may see 3: npm always adds <code>README</code>, <code>LICENSE</code> and <code>CHANGELOG</code>, and the <code>main</code> file, whatever <code>files</code> says. <code>files</code> cannot exclude those.</p>
+  <p>Always look before you publish:</p>
+  <pre><code>npm pack --dry-run</code></pre>
+  <p>It prints the exact tarball contents without uploading anything. Run it every single time. It costs
+  two seconds and it is the only step between you and a permanently published credential.</p>
+
+    <h2><code>main</code> — the field <code>exports</code> replaced</h2>
+  <p><code>main</code> names one entry file and nothing else. So it answers &ldquo;where do I
+  start&rdquo; and it cannot answer &ldquo;what may you touch&rdquo;. That is the whole reason it is not enough on its own any more. A package with only <code>main</code> still leaves every other file reachable. That is the freeze described above.</p>
+  <p>Keep it for consumers on old Node. When both fields are present, <b><code>exports</code> wins</b>.</p>
+
+  <h2><code>bin</code> — turning a file into a command</h2>
+  <pre><code>{ "bin": { "wordfreq": "./cli.js" } }</code></pre>
+  <p>On install, npm puts <code>wordfreq</code> on the user's <code>PATH</code>. Two things must be true
+  or it fails in a confusing way:</p>
+  <ul>
+    <li>The file starts with <code>#!/usr/bin/env node</code>. Without it the shell has no idea it is JavaScript.</li>
+    <li>The file is executable. <code>npm</code> handles this on install, but not when you run it straight from a clone.</li>
+  </ul>
+
+  <h2>Semver — the promise, and where it lies</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Change</th><th>Bump</th><th>What you are promising</th></tr></thead>
+    <tbody>
+      <tr><td>Fixed a bug</td><td><code>1.0.<b>1</b></code> patch</td><td>Upgrade freely. Nothing you use has changed.</td></tr>
+      <tr><td>Added a feature</td><td><code>1.<b>1</b>.0</code> minor</td><td>Upgrade freely. Old code still works.</td></tr>
+      <tr><td>Removed or changed something</td><td><code><b>2</b>.0.0</code> major</td><td>Read the notes. Your code may break.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Where the promise breaks</span>
+    Semver is a claim about <b>intent</b>, not a fact the tooling can check. Nothing verifies it. Three
+    ways a patch release breaks you anyway:
+    <ul>
+      <li><b>The author did not know it was breaking.</b> A bug fix is a behaviour change to anyone who
+      had worked around the bug.</li>
+      <li><b>You depended on something not in the contract</b> — an internal file, or the exact wording of
+      an error message.</li>
+      <li><b>A transitive dependency moved.</b> Their patch pulled a new minor of something three levels
+      down.</li>
+    </ul>
+    This is why a <b>lockfile</b> exists. Semver says what an upgrade <em>should</em> be safe to do; the
+    lockfile records what you <em>actually</em> ran. Trust the second one.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Publishing is writing a short contract with people you will never meet. The contract says four things.</p>
+      <ul>
+        <li>what your code is called</li>
+        <li>which file to open first</li>
+        <li>which parts they are allowed to touch</li>
+        <li>what the version number promises about the next upgrade</li>
+      </ul>
+      <p class="part"> Nothing else in the file matters as
+      much as those four.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A shop. <code>name</code> is the sign above the door. <code>files</code> is what you actually load
+      into the van — leave the staff room and the safe behind. <code>exports</code> is which doors you
+      unlock for customers. <code>version</code> is the label promising that this month's product works
+      like last month's.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A shop can rearrange its back rooms any night it likes. <b>You cannot.</b> A stranger builds a habit around any door you leave unlocked, even once. Locking it later is a <em>breaking change</em>. So the lock has to go on before the first customer arrives. </p>
+    <p class="part cont">And the label lies more often than a shop label would. Nothing checks a version number. It is one person's honest guess about their own code, and honest people are sometimes wrong.</p>
+
+    <p class="part limit"><span class="h">…and one more thing no shop does</span>
+      A shop is one building. Your package is not. One project can end up with <b>two copies of it open
+      at once</b> — one reached through <code>require</code>, one through <code>import</code>. </p>
+    <p class="part cont">Each copy has its own counters and its own private memory. A value set in one is invisible to the other.
+      Nothing in a shop behaves like that. So the dual-package hazard feels impossible, right up until it happens to you.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think <code>files</code> and <code>exports</code> do the same job. Both sound like &ldquo;what is in my package&rdquo;. </p>
+    <p class="part cont">They are completely different gates. <code>files</code> decides
+      what gets <b>uploaded</b>. <code>exports</code> decides what can be <b>reached</b> from what was
+      uploaded. A file can ship and still be unreachable. That is usually exactly what you want. It ships so the code works. It stays unreachable so you can still rename it. </p>
+    <p class="part cont">Get them confused and one of two things happens. You publish your <code>.env</code>. Or you freeze your own folder structure forever.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain the difference between <code>files</code> and <code>exports</code>. Then say what goes wrong if you get each one wrong.
+      <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — publish something today</h2>
+  <p>Small on purpose. The point is the whole loop, end to end, not the package.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>1 · Make it</b></p>
+  <pre><code>mkdir -p hello &amp;&amp; cd hello        <span class="cmt"># plain folder name — the scope is added by npm</span>
+npm init --scope=@yourname -y
+printf 'export const hello = (n) =&gt; `hello ${n}`;\n' &gt; index.mjs
+printf 'nothing to see\n' &gt; SECRET.txt        <span class="cmt"># deliberate — see step 3</span></code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>2 · Write the contract</b></p>
+  <pre><code>{
+  "name": "@yourname/hello",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": { ".": "./index.mjs" },
+  "files": ["index.mjs"]
+}</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>3 · Check the file list — do this before every publish</b></p>
+  <pre><code>npm pack --dry-run</code></pre>
+  <p>Confirm <code>SECRET.txt</code> is <b>not</b> in the list. Then delete the <code>files</code> field
+  and run it again. Watch the secret appear. <b>That difference is the lesson.</b> Put the field back.</p>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>4 · Ship it</b></p>
+  <pre><code>npm login
+npm publish --access public</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>5 · Be your own user</b></p>
+  <pre><code>cd /tmp &amp;&amp; mkdir user &amp;&amp; cd user &amp;&amp; npm init -y
+npm install @yourname/hello
+node --input-type=module -e "import {hello} from '@yourname/hello'; console.log(hello('world'))"</code></pre>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Not the package — the <b>two <code>npm pack --dry-run</code> outputs</b>, with and without
+    <code>files</code>, saved side by side. That pair is the thing you will remember in six months, and
+    it is what stops you publishing a credential one tired evening.
+  </div>
+
+  <div class="note">
+    <span class="label">You can undo this, within 72 hours</span>
+    <code>npm unpublish @yourname/hello --force</code> always works in the first 72 hours. After that it still works while three things are true: nothing depends on it, it has under 300 downloads a week, and it has one owner — which a learning package easily meets. What is <b>permanent</b> is the exact <code>name@version</code> pair; that pair can never be published again. The name itself becomes free 24 hours after you remove every version.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">Your team's internal package ships <code>src/utils/format.js</code>. Nobody documented it, but three services now import it directly. You need to rename the file.</p>
+    Say what has actually gone wrong here, name the one field that would have prevented it, and say why
+    adding that field <em>now</em> is a major version bump rather than a patch.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    This is a <b>depth</b> lesson and it still skipped things. <b>Monorepos and workspaces</b> are a
+    different subject and not in this course. <b>Peer dependencies</b> matter mostly to plugin authors,
+    which you are not yet. <b>Provenance and signed publishes</b> are worth knowing when you publish
+    something people depend on — not on your first package. And the <code>engines</code> field is
+    advisory, not enforced, so it teaches less than it looks like it does.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/api/packages.html">Modules: Packages</a>
+    (the <code>exports</code> field and its conditions), and
+    <a href="https://nodejs.org/en/learn/modules/publishing-node-api-modules">Publishing a package</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — paste me your <code>package.json</code> before you publish and I'll tell you what a
+    stranger can reach that you did not mean to give them.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A package answers four questions. What is it called? Where do you start? What may be touched, and is upgrading safe?</li>
+      <li><code>name</code> + <code>version</code> are <b>permanent and immutable</b> once published. That is what makes a lockfile mean anything.</li>
+      <li><code>exports</code> lists the reachable entry points, so you stay free to rename internals. Its <b>conditions</b> serve <code>require</code> and <code>import</code> from one package — watch the <b>dual-package hazard</b>.</li>
+      <li><code>files</code> is an allow-list for the <b>upload</b>. Different gate, different job from <code>exports</code>.</li>
+      <li><code>bin</code> maps a command name to a file, and that file needs <code>#!/usr/bin/env node</code> on its first line.</li>
+      <li><code>npm pack --dry-run</code> before every publish. It is the only step between you and a published secret.</li>
+      <li>Semver is a <b>promise about intent</b>. Nothing verifies it, so the lockfile is what you actually trust.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b><code>files</code> decides what is uploaded; <code>exports</code> decides what is reachable. Confusing them either leaks a secret or freezes your folder structure forever.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "Modules: Packages", "Publishing a package". Two results here came from running them on <b>Node v24.14.0</b> on 2026-08-28. </p>
+  <p class="small">Two things were measured. The conditional-<code>exports</code> result: <code>require</code> gets the CommonJS file, <code>import</code> gets the ESM file. And <code>npm pack --dry-run</code>: 2 files packed, <code>SECRET.txt</code> excluded. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0010-the-process-argv-streams-and-exit-codes.html">← Lesson 10</a>
+    <a href="./0012-build-ship-the-cli.html">Next: Lesson 12 — Build — ship the CLI →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A file is listed in `files` but not in `exports`. What happens to it?",
+      options: [
+        "It is uploaded to npm, but nobody can import it from the package",
+        "It is left out of the upload, so installing the package misses it",
+        "It is uploaded and importable, because files overrides exports",
+        "It causes npm publish to fail with a package configuration error"
+      ],
+      answer: 0,
+      why: "The two fields are different gates. `files` decides what is uploaded; `exports` decides what can be reached from what was uploaded. A shipped-but-unreachable file is usually exactly what you want: the code works, and you stay free to rename it later."
+    },
+    {
+      q: "Why does npm refuse to let you republish a different 1.0.0 of the same package?",
+      options: [
+        "So a lockfile pinning 1.0.0 keeps meaning the same thing forever",
+        "So the registry does not have to store more than one copy of it",
+        "So the author is forced to write release notes for every change",
+        "So a package name cannot be claimed by two different publishers"
+      ],
+      answer: 0,
+      why: "Immutability is what makes a lockfile a real promise. If 1.0.0 could change underneath you, a build that passed on Monday could fail on Tuesday with no commit in between, and pinning a version would guarantee nothing."
+    },
+    {
+      q: "Three services import your-pkg/src/utils/format.js directly. Why can you not rename it?",
+      options: [
+        "Nothing blocked that path, so renaming it now is a breaking change",
+        "Renaming any file inside a published package is refused by the registry",
+        "The file is in the lockfile, which pins the exact path that was used",
+        "A rename needs a matching change in every service's package.json first"
+      ],
+      answer: 0,
+      why: "Before `exports`, every file in a package was public by accident. Once someone depends on a deep path, the author has frozen their own folder structure. Adding an `exports` field now would block those imports, so it is a major version bump, not a patch."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What does the exports field in package.json actually do?”",
+      answer: "It lists the <b>entry points a consumer is allowed to reach</b>, and blocks everything else with <code>ERR_PACKAGE_PATH_NOT_EXPORTED</code>. Before it existed, every file in a package was public by accident, so authors could never rename an internal file without breaking somebody. It also takes <b>conditions</b> — a <code>require</code> branch and an <code>import</code> branch — so one package can serve both module systems. It is not the same as <code>files</code>: <code>exports</code> controls what is reachable, <code>files</code> controls what is uploaded. <br>Why: naming the problem it solved shows you understand the design, not just the syntax."
+    },
+    {
+      prompt: "Interviewer: “A patch release broke our build. Whose fault is it?”",
+      answer: "Usually nobody's, and that is the honest answer. <b>Semver is a promise about intent, and nothing verifies it.</b> A patch breaks you when the author did not realise a bug fix was a behaviour change, or when we depended on something outside the contract — an internal file, or the wording of an error message — or when a transitive dependency moved underneath their patch. I would find the actual cause with the lockfile diff first. Then I would stop it recurring with a committed lockfile and <code>npm ci</code> in CI, so builds install exactly what we tested. <br>Why: blaming the author is the weak answer; naming the lockfile as the real defence is the strong one."
+    },
+    {
+      prompt: "Interviewer: “How do you make sure you never publish a secret?”",
+      answer: "I put an allow-list in the <code>files</code> field, so only the paths I named are uploaded, and I run <code>npm pack --dry-run</code> before every publish to read the exact tarball contents. I tested this: with <code>\"files\": [\"index.cjs\"]</code>, a <code>SECRET.txt</code> sitting in the same folder was not packed. I never rely on <code>.npmignore</code> alone, because a deny-list fails whenever somebody adds a new file nobody thought to exclude. An allow-list fails closed; a deny-list fails open. <br>Why: the allow-list versus deny-list reasoning is the part that makes this a senior answer."
+    }
+  ]);
+</script>

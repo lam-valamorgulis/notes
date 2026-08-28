@@ -1,0 +1,524 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Readable, Writable and backpressure — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 15 of 52 · Lesson 15 · Streams</p>
+  <h1>Readable, Writable and backpressure</h1>
+  <p class="subtitle">The one signal that stops a fast producer drowning a slow consumer — and what happens when you ignore it.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 15 of 52.</span> This lesson builds one domain-expert ability: <b>explain it from first principles, with no jargon and no notes</b>. <a href="../reference/52-week-plan.html#w15">Week 15 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will explain backpressure without saying &ldquo;Node just handles it&rdquo;. You will also measure the cost of ignoring it: <b>172 MB against 84 MB</b> of memory, for exactly the same work.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0014-buffers-and-binary.html">Week 14</a> was what a chunk <em>is</em>. This week is where chunks come from, and why the thing producing them has to be told to slow down.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — the two sides run at different speeds</h2>
+  <p>You are copying a file to a network socket. Reading from a local disk is fast. Writing to a network is slow. Say the disk gives you 100 MB a second and the network takes 10 MB a second.</p>
+  <p>What happens to the other 90 MB, every second?</p>
+  <p>There are only three possible answers. There is no fourth:</p>
+  <ol>
+    <li><b>Throw it away.</b> Correct programs cannot do this.</li>
+    <li><b>Keep it in memory.</b> Works for a second. After ten seconds you are holding 900 MB.</li>
+    <li><b>Tell the reader to stop reading.</b></li>
+  </ol>
+
+  <div class="soundbite">
+    <span class="label">This is the whole idea</span>
+    <p><b>Backpressure is answer 3.</b> It is the slow side telling the fast side to wait. Every stream API in Node exists to make that message travel.</p>
+  </div>
+
+  <p>So streams are not really about &ldquo;reading a file in pieces&rdquo;. They are about <b>the message that travels backwards</b>, from the slow end to the fast end.</p>
+
+  <h2>How Node sends that message</h2>
+  <p>Node had to put the signal somewhere. It chose the return value of <code>write</code>:</p>
+
+  <pre><code>const ok = writable.write(chunk);
+<span class="cmt">// true  = keep going</span>
+<span class="cmt">// false = stop. I will tell you when I am ready.</span></code></pre>
+
+  <p>When it returns <code>false</code>, you wait for the <code>drain</code> event, then carry on. That is the entire protocol. Two things: a boolean, and an event.</p>
+
+  <p>The threshold is <code>highWaterMark</code>. Verified on Node v24.14.0:</p>
+  <pre><code>createWriteStream('/dev/null').writableHighWaterMark   <span class="out">// 65536</span>
+
+w.write(Buffer.alloc(1000))     <span class="out">// true   — under the mark</span>
+w.write(Buffer.alloc(100000))   <span class="out">// false  — over it</span>
+w.writableLength                <span class="out">// 101000 — bytes now waiting</span></code></pre>
+
+  <div class="trap">
+    <span class="label">The return value is advice, not a lock</span>
+    Node does <b>not</b> stop you writing after <code>false</code>. The write still succeeds. The data still queues. <code>highWaterMark</code> is not a limit — it is the point at which the stream starts asking you to stop. Whether anything listens is entirely up to your code.
+  </div>
+
+  <!-- ============ MEASURE ============ -->
+  <h2>Measure the cost of not listening</h2>
+  <p>Write 128 MB into a sink that takes 5 ms per chunk. Once ignoring the signal, once honouring it.</p>
+
+  <pre><code>const slow = new Writable({
+  highWaterMark: 64 * 1024,
+  write(chunk, enc, cb) { setTimeout(cb, 5); },   <span class="cmt">// a slow network, in one line</span>
+});
+
+<span class="cmt">// A — ignore the signal</span>
+for (let i = 0; i &lt; 2000; i++) slow.write(fresh64KB());
+
+<span class="cmt">// B — honour it</span>
+(function pump() {
+  while (i &lt; 2000) {
+    i++;
+    if (!slow.write(fresh64KB())) return slow.once('drain', pump);
+  }
+})();</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">ignore  -> peak RSS 172 MB | queued 125 MB
+honour  -> peak RSS  84 MB | queued   0 MB</span></code></pre>
+
+  <p>Same data, same sink, same result on the other end. Twice the memory, and <b>125 MB sitting in a queue</b> that did nothing but wait.</p>
+
+  <div class="tip">
+    <span class="label">Why this is worse than it looks</span>
+    128 MB is a small file. The queue grows with the <em>input</em>, so the same code on a 10 GB file tries to hold most of 10 GB. The program does not slow down first and crash later. It looks completely fine, and then the process is killed for using too much memory.
+  </div>
+
+  <div class="trap">
+    <span class="label">A trap I fell into while measuring this</span>
+    My first version of that benchmark wrote the <b>same</b> Buffer object 2000 times. Memory barely moved, and I nearly wrote down the wrong conclusion. The queue was holding 2000 <em>references</em> to one 64 KB buffer, not 2000 copies. A fresh buffer per write is what makes the measurement real. <b>When a benchmark tells you something surprising, suspect the benchmark first.</b>
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 280" role="img" aria-labelledby="fig15-title" width="640" height="280">
+      <title id="fig15-title">Backpressure is the message that travels backwards from the slow side to the fast side</title>
+
+      <text x="20" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">DATA GOES FORWARD. THE SIGNAL GOES BACK.</text>
+
+      <rect x="20" y="44" width="130" height="54" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="85" y="66" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">READABLE</text>
+      <text x="85" y="83" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">disk: 100 MB/s</text>
+
+      <line x1="156" y1="60" x2="244" y2="60" style="stroke: var(--accent); stroke-width: 2.5;" marker-end="url(#a15)"></line>
+      <text x="200" y="52" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">chunks</text>
+
+      <rect x="250" y="44" width="140" height="54" rx="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="63" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">THE QUEUE</text>
+      <text x="320" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">highWaterMark = 64 KB</text>
+
+      <line x1="396" y1="60" x2="484" y2="60" style="stroke: var(--ink-faint); stroke-width: 2.5;" marker-end="url(#a15)"></line>
+
+      <rect x="490" y="44" width="130" height="54" rx="7" style="fill: var(--card-bg); stroke: var(--ink-faint); stroke-width: 2;"></rect>
+      <text x="555" y="66" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px; font-weight: 700;">WRITABLE</text>
+      <text x="555" y="83" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">network: 10 MB/s</text>
+
+      <path d="M 320 106 L 320 126 L 85 126 L 85 106" style="fill: none; stroke: var(--warn); stroke-width: 2.5;" marker-end="url(#a15w)"></path>
+      <text x="205" y="142" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">write() returned false — stop, I will send drain</text>
+
+      <line x1="20" y1="162" x2="620" y2="162" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="188" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">ignore the signal</text>
+      <rect x="20" y="198" width="288" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="164" y="216" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700;">172 MB peak · 125 MB queued</text>
+      <text x="164" y="232" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">the queue grows with the input, not the output</text>
+
+      <text x="332" y="188" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">honour the signal</text>
+      <rect x="332" y="198" width="288" height="44" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="476" y="216" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 12px; font-weight: 700;">84 MB peak · 0 MB queued</text>
+      <text x="476" y="232" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">memory stays flat whatever the file size</text>
+
+      <text x="320" y="266" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">Measured on Node v24.14.0. Same data, same sink, same result at the far end.</text>
+
+      <defs>
+        <marker id="a15" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--accent);"></path></marker>
+        <marker id="a15w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--warn);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>The data flows one way. The permission to send flows the other way. That is a stream.</figcaption>
+  </div>
+
+  <!-- ============ MODES ============ -->
+  <h2>Two ways to read, and why both exist</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Mode</th><th>You write</th><th>Who decides the pace</th></tr></thead>
+    <tbody>
+      <tr><td><b>Flowing</b></td><td><code>r.on('data', fn)</code></td><td>The <b>source</b>. Chunks arrive as fast as it can produce them. You must call <code>r.pause()</code> yourself to slow it.</td></tr>
+      <tr><td><b>Paused</b></td><td><code>r.read()</code>, or <code>for await…of</code></td><td><b>You</b>. Nothing arrives until you ask.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Adding a <code>'data'</code> listener switches a stream into flowing mode immediately. That is why the naive copy loop leaks memory: the source starts pushing and nothing is telling it to stop.</p>
+
+  <div class="tip">
+    <span class="label">What to write in real code</span>
+    Neither of those, most of the time. Use <code>pipeline</code>, which wires the signal for you, or
+    <code>for await…of</code>, which is paused mode with pleasant syntax:
+    <pre style="margin:.6rem 0 0;"><code>for await (const chunk of readable) {
+  <span class="cmt">// the loop body IS the backpressure — nothing is read until you come round again</span>
+}</code></pre>
+    You learn <code>pipeline</code> properly in <a href="../reference/52-week-plan.html#w16">week 16</a>. Know the manual protocol first, so the helper is a convenience and not a mystery.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Two people are moving boxes. One takes them off a fast truck. The other carries them slowly up the stairs.</p>
+    <p class="part cont">If the fast one never looks up, boxes pile up in the hallway. Nothing is lost, but the hallway fills. Backpressure is the slow one saying &ldquo;wait&rdquo;, and the fast one actually stopping.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A tap and a bucket with a small hole. Open the tap fully and the bucket overflows. The right amount to open the tap is however much the hole lets out. Only the bucket knows that number.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      An overflowing bucket makes a mess you can see, and the water goes away. Here nothing spills and nothing goes away.</p>
+    <p class="part limit cont">The extra data stays inside your process, in memory, forever growing. It is silent right up to the moment the operating system kills you for using too much. And the bucket does not get bigger when the file does. <b>The queue grows with the input.</b> So the same code that survives a 100 MB file dies on a 10 GB one.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People believe <code>highWaterMark</code> is a <em>limit</em>. It is not. Node never refuses a write.</p>
+    <p class="part cont">It is the point where <code>write()</code> starts returning <code>false</code> — a request, not a rule. The queue keeps growing however many times it is ignored. That is why &ldquo;I used streams&rdquo; does not mean &ldquo;my memory is safe&rdquo;. Using a stream and honouring its signal are two different things, and only the second one saves you.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain what <code>write()</code> returning <code>false</code> means. Then say what happens if you ignore it. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — see your own memory climb</h2>
+  <p>One file, two runs, two numbers. Save as <code>bp.js</code>.</p>
+
+  <pre><code>const { Writable } = require('node:stream');
+const mode = process.argv[2];              <span class="cmt">// 'ignore' or 'honour'</span>
+
+const slow = new Writable({
+  highWaterMark: 64 * 1024,
+  write(_chunk, _enc, cb) { setTimeout(cb, 5); },
+});
+
+const TOTAL = 2000;
+let i = 0, peak = 0;
+const track = () =&gt; {
+  const mb = process.memoryUsage().rss / 1048576;
+  if (mb &gt; peak) peak = mb;
+};
+const fresh = () =&gt; Buffer.alloc(64 * 1024, 0x61);   <span class="cmt">// a NEW buffer each time</span>
+
+if (mode === 'ignore') {
+  for (; i &lt; TOTAL; i++) { slow.write(fresh()); track(); }
+  console.log(`ignore -&gt; peak ${peak.toFixed(0)} MB | queued ${(slow.writableLength/1048576).toFixed(0)} MB`);
+} else {
+  (function pump() {
+    while (i &lt; TOTAL) {
+      i++; track();
+      if (!slow.write(fresh())) return slow.once('drain', pump);
+    }
+    console.log(`honour -&gt; peak ${peak.toFixed(0)} MB | queued ${(slow.writableLength/1048576).toFixed(1)} MB`);
+  })();
+}</code></pre>
+
+  <p><b>Predict both numbers before you run it.</b> Write them down. Then:</p>
+  <pre><code>node bp.js ignore
+node bp.js honour</code></pre>
+
+  <p><b>Then change one thing.</b> Set <code>TOTAL</code> to 8000 and run both again. The
+  <code>honour</code> number should barely move. The <code>ignore</code> number should roughly
+  quadruple. That is the whole point: <b>one of them scales with the input and one does not.</b></p>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    A four-cell table: ignore and honour, at 2000 and at 8000 chunks. The shape of those four numbers is the lesson.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A service exports customer data to an external API. It has run nightly for a year. The customer base grew. Now the job is killed by the container's memory limit, but only for the three largest customers.</p>
+    Say what the code almost certainly looks like, why it worked for a year, and the one line that would fix it.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Object mode</b> streams carry JavaScript values instead of bytes, and <code>highWaterMark</code>
+    then counts objects, not bytes. Useful, and a footnote once you have the idea.
+    <b>Duplex and Transform</b> are <a href="../reference/52-week-plan.html#w16">week 16</a>, next.
+    <b>Web Streams</b> — the <code>ReadableStream</code> from the browser, which Node also has — are left
+    out because two stream APIs at once teaches neither.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs —
+    <a href="https://nodejs.org/en/learn/modules/backpressuring-in-streams">Backpressuring in Streams</a>
+    (read this one properly, it is the best page Node has written) and
+    <a href="https://nodejs.org/api/stream.html">stream</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — paste me any copy loop and I'll tell you whether the signal actually reaches the source, or is being dropped somewhere in the middle.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Two sides of a stream run at different speeds. There are only three options, and only one is correct: <b>tell the fast side to wait</b>.</li>
+      <li>The signal is <code>write()</code> returning <code>false</code>, and the <code>drain</code> event saying you may continue.</li>
+      <li><code>highWaterMark</code> (64 KB by default) is <b>the point where asking starts</b>, not a limit. Node never refuses a write.</li>
+      <li>Ignoring it queues data in your process. Measured: <b>172 MB against 84 MB</b>, with 125 MB stuck in the queue.</li>
+      <li>The queue grows with the <b>input</b>, so the same code survives a small file and dies on a big one.</li>
+      <li>Adding a <code>'data'</code> listener starts the source immediately. <code>for await…of</code> and <code>pipeline</code> do not.</li>
+      <li>Using a stream and honouring its signal are two different things.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the data goes forward, and the permission to send goes backwards. A stream is that second arrow.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "Backpressuring in Streams", "stream". Three results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the default <code>highWaterMark</code> of 65536, the <code>true</code>/<code>false</code> return values, and the 172 MB against 84 MB peaks. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0014-buffers-and-binary.html">← Lesson 14</a>
+    <a href="./0016-transform-streams-and-pipeline.html">Next: Lesson 16 — Transform streams and <code>pipeline</code> →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What does it mean when writable.write(chunk) returns false?",
+      options: [
+        "The queue is over its mark, so you should wait for the drain event",
+        "The chunk was rejected, so you have to send that same chunk again",
+        "The stream has closed, and any further writes will throw an error",
+        "The data reached the far end, but the far end refused to accept it"
+      ],
+      answer: 0,
+      why: "The write always succeeds and the chunk is always queued. The false is a request to pause, not a rejection. Wait for the drain event, then continue. Node never refuses a write, which is why ignoring the signal grows memory rather than causing an error."
+    },
+    {
+      q: "A copy loop ignores backpressure. Why does memory grow with the input file size?",
+      options: [
+        "Data arrives faster than it leaves, so the difference stays in the queue",
+        "Node keeps a copy of every chunk in case the write has to be retried",
+        "The garbage collector cannot run at all while a stream is still open",
+        "Each chunk is copied once per listener attached to the data event"
+      ],
+      answer: 0,
+      why: "The queue holds whatever the slow side has not taken yet. If the fast side never pauses, that difference accumulates for the whole file. So the same code survives a small file and is killed on a large one — memory tracks the input, not the output."
+    },
+    {
+      q: "Why does adding a 'data' listener change how a readable stream behaves?",
+      options: [
+        "It switches the stream to flowing mode, so the source starts pushing",
+        "It makes the stream buffer every chunk until the listener is removed",
+        "It doubles the highWaterMark, because two consumers may now exist",
+        "It disables the drain event, since data is delivered directly to you"
+      ],
+      answer: 0,
+      why: "A 'data' listener puts the stream in flowing mode at once, and the source produces as fast as it can. Nothing pauses it unless you call pause() yourself. This is why the naive on('data') copy loop leaks: the source was told to go and never told to stop."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Explain backpressure.”",
+      answer: "Two sides of a stream run at different speeds. If the producer is faster than the consumer, the extra data has to go somewhere. There are only three options: drop it, hold it in memory, or tell the producer to wait. <b>Backpressure is the third one.</b> In Node the signal is <code>write()</code> returning <code>false</code> when the queue passes <code>highWaterMark</code>, and the <code>drain</code> event saying you may continue. <br>Why: framing it as three options, with two of them clearly wrong, shows you derived it rather than memorised it."
+    },
+    {
+      prompt: "Interviewer: “I used streams, so my memory is safe. Right?”",
+      answer: "Not by itself. <code>highWaterMark</code> is not a limit — Node never refuses a write. It is the point where <code>write()</code> starts returning <code>false</code>, and that is a request. If the code ignores it, the queue keeps growing for the whole file. I measured this: 128 MB into a slow sink peaked at 172 MB when ignoring the signal and 84 MB when honouring it, with 125 MB left sitting in the queue. Using a stream and honouring its signal are two different things. <br>Why: the measured pair is what makes this answer land; without numbers it is just an opinion."
+    },
+    {
+      prompt: "Interviewer: “A nightly export is killed by the memory limit, but only for big customers.”",
+      answer: "That pattern says <b>the memory grows with the input</b>, which is the signature of ignored backpressure. I would look for an <code>on('data')</code> loop that writes without checking the return value, or an <code>await</code> that collects everything into an array before sending. The fix is usually one line: use <code>pipeline</code>, or <code>for await…of</code>, so the source is paused between chunks. Then memory stays flat whatever the customer size. <br>Why: reading &ldquo;only for big customers&rdquo; as evidence about scaling, rather than asking for logs, is what the interviewer is testing."
+    }
+  ]);
+</script>

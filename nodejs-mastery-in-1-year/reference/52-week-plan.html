@@ -1,0 +1,1141 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The 52-Week Plan — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+<style>
+  /* Page-specific layout for the week-by-week checklist.
+     Colours all come from base.css so this looks like the rest of the course. */
+
+  .phase-band {
+    margin: 3rem 0 1rem; padding: .9rem 1.1rem; border-radius: 10px;
+    background: var(--card-bg); border-left: 5px solid var(--accent);
+  }
+  .phase-band .label {
+    font-family: var(--font-sans); font-size: .7rem; font-weight: 700;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+    display: block; margin-bottom: .2rem;
+  }
+  .phase-band h2 {
+    font-size: 1.25rem; margin: 0 0 .3rem; padding: 0; border: none;
+  }
+  .phase-band p { font-family: var(--font-sans); font-size: .88rem; color: var(--ink-soft); margin: 0; }
+
+  .mod-head {
+    font-family: var(--font-sans); font-size: .72rem; font-weight: 700;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint);
+    margin: 2rem 0 .4rem; padding-bottom: .25rem; border-bottom: 1px solid var(--rule);
+  }
+
+  .wk {
+    background: var(--card-bg); border: 1.5px solid var(--rule);
+    border-radius: 10px; padding: 1rem 1.2rem; margin: .9rem 0;
+  }
+  .wk.depth { border-style: dashed; }
+  .wk.review { border-left: 5px solid var(--accent-2); background: var(--paper); }
+  .wk.spine { border-left: 5px solid var(--accent); }
+
+  .wk h3 { margin: 0 0 .4rem; font-size: 1.04rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; }
+  .wk .num {
+    font-family: var(--font-sans); font-size: .7rem; font-weight: 700; color: #fff;
+    background: var(--accent); border-radius: 999px; padding: .14rem .6rem;
+    flex: none; letter-spacing: .04em;
+  }
+  .wk.depth .num { background: var(--ink-faint); }
+  .wk.review .num { background: var(--accent-2); }
+
+  .wk .goal {
+    font-family: var(--font-sans); font-size: .88rem; color: var(--ink-soft);
+    margin: .2rem 0 .7rem;
+  }
+  .wk .build-line {
+    font-family: var(--font-sans); font-size: .88rem; margin: .3rem 0 .7rem;
+    padding: .55rem .8rem; border-left: 4px solid var(--accent-2);
+    background: var(--paper); border-radius: 0 6px 6px 0; font-weight: 600;
+  }
+  .wk.review .build-line { background: var(--card-bg); }
+  .wk .drill-line, .wk .res {
+    font-family: var(--font-sans); font-size: .84rem; margin: .6rem 0 0;
+    padding: .5rem .7rem; border-left: 3px solid var(--accent);
+    background: var(--paper); border-radius: 0 5px 5px 0;
+  }
+  .wk.review .drill-line, .wk.review .res { background: var(--card-bg); }
+  .wk .res { border-left-color: var(--ink-faint); color: var(--ink-soft); }
+
+  ul.skills { list-style: none; padding: 0; margin: .6rem 0 0; font-family: var(--font-sans); font-size: .88rem; }
+  ul.skills li { display: flex; gap: .55rem; align-items: flex-start; margin: .35rem 0; }
+  ul.skills input { margin-top: .3rem; flex: none; width: 1rem; height: 1rem; accent-color: var(--accent); }
+  ul.skills label { cursor: pointer; }
+  ul.skills input:checked + label { color: var(--ink-faint); text-decoration: line-through; }
+
+  /* Sticky progress + filter bar */
+  .bar {
+    position: sticky; top: 0; z-index: 5; background: var(--paper);
+    border-bottom: 2px solid var(--rule); padding: .7rem 0 .6rem; margin: 0 0 1rem;
+    font-family: var(--font-sans); font-size: .84rem;
+    display: flex; flex-wrap: wrap; gap: .8rem; align-items: center; justify-content: space-between;
+  }
+  .bar .prog { font-weight: 700; color: var(--accent); }
+  .bar .track { flex: 1 1 8rem; height: 7px; background: var(--rule); border-radius: 999px; overflow: hidden; min-width: 6rem; }
+  .bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .bar button {
+    font: inherit; font-size: .78rem; font-weight: 700; cursor: pointer;
+    background: var(--card-bg); color: var(--ink); border: 1.5px solid var(--rule);
+    border-radius: 999px; padding: .25rem .7rem;
+  }
+  .bar button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* Week index grid */
+  .weekgrid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(2.6rem, 1fr));
+    gap: .3rem; margin: 1rem 0 2rem; font-family: var(--font-sans);
+  }
+  .weekgrid a {
+    display: block; text-align: center; font-size: .74rem; font-weight: 700;
+    padding: .3rem 0; border-radius: 6px; border: 1px solid var(--rule);
+    background: var(--card-bg); color: var(--ink-soft); text-decoration: none;
+  }
+  .weekgrid a:hover { border-color: var(--accent); color: var(--accent); }
+  .weekgrid a.rv { background: var(--accent-2); color: #fff; border-color: var(--accent-2); }
+  .weekgrid a.dp { border-style: dashed; }
+
+  body.core-only .wk.depth { display: none; }
+</style>
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Reference · The Master Checklist</p>
+  <h1>The 52-Week Plan</h1>
+  <p class="subtitle">One page that holds the whole year, one week at a time. Four phases, thirteen modules, fifty-two weeks. Tick a skill when you can <em>do</em> it — not when you have read about it.</p>
+
+  <div class="win">
+    <strong>How a week works, at ~10 hours:</strong> about <b>2 hours</b> on the lesson, <b>1 hour</b> on the primary source, and <b>6–7 hours</b> building the week's thing and running the drill. The build is the point. Reading without building produces someone who can talk about Node and not fix it.
+  </div>
+
+  <div class="bar">
+    <span class="prog" id="progress">0 / 0</span>
+    <span class="track"><span class="fill" id="fill"></span></span>
+    <button id="coreToggle" aria-pressed="false">Show core only</button>
+  </div>
+
+  <div class="note">
+    <span class="label">The three tags</span>
+    <b>core</b> — one of the 12 items in <a href="../MISSION.md">the 20% core</a>. Never skipped.
+    <b>depth</b> — real, useful, but not touched weekly by a Node backend engineer. It waits, and it is shown with a dashed border.
+    <b>review</b> — no new material. Retrieval practice, interleaved drills, and a mock interview. Weeks 13, 26, 39 and 52. Which weeks serve which core item is in the <a href="#coverage">coverage table</a> below — the 80/20 split is checkable, not just claimed.
+  </div>
+
+  <div class="tip">
+    <span class="label">The spine</span>
+    From <a href="#w21">week 21</a> there is <b>one API</b>, and every later week hardens that same service. Do not restart it in week 30 because the code has become ugly. Making an ugly real service good is the exercise.
+  </div>
+
+  <h2>Jump to a week</h2>
+  <nav class="weekgrid" aria-label="Week index">
+    <a href="#w1">1</a><a href="#w2">2</a><a href="#w3">3</a><a href="#w4">4</a>
+    <a href="#w5">5</a><a href="#w6">6</a><a href="#w7">7</a><a href="#w8">8</a>
+    <a href="#w9">9</a><a href="#w10">10</a><a class="dp" href="#w11">11</a><a href="#w12">12</a>
+    <a class="rv" href="#w13">13</a>
+    <a href="#w14">14</a><a href="#w15">15</a><a href="#w16">16</a><a href="#w17">17</a>
+    <a href="#w18">18</a><a class="dp" href="#w19">19</a><a href="#w20">20</a><a href="#w21">21</a>
+    <a href="#w22">22</a><a href="#w23">23</a><a href="#w24">24</a><a href="#w25">25</a>
+    <a class="rv" href="#w26">26</a>
+    <a href="#w27">27</a><a href="#w28">28</a><a class="dp" href="#w29">29</a><a href="#w30">30</a>
+    <a href="#w31">31</a><a href="#w32">32</a><a class="dp" href="#w33">33</a><a href="#w34">34</a>
+    <a href="#w35">35</a><a href="#w36">36</a><a href="#w37">37</a><a href="#w38">38</a>
+    <a class="rv" href="#w39">39</a>
+    <a href="#w40">40</a><a href="#w41">41</a><a href="#w42">42</a><a href="#w43">43</a>
+    <a href="#w44">44</a><a class="dp" href="#w45">45</a><a href="#w46">46</a>
+    <a href="#w47">47</a><a href="#w48">48</a><a href="#w49">49</a><a href="#w50">50</a>
+    <a href="#w51">51</a><a class="rv" href="#w52">52</a>
+  </nav>
+
+  <h2 id="coverage">Coverage — which weeks serve which core item</h2>
+  <p class="small" style="font-family:var(--font-sans);">
+    The <b>20%</b> is <b>twelve ideas</b>, not twelve weeks. This table is how you check
+    that: <b>all 52 weeks appear below</b>, so no week is in the year merely because it
+    seemed interesting. The twelve items account for <b>42</b> of the weeks; <a href="#w51">week 51</a> is a 43rd core week that belongs to all twelve at once. So <b>43 of 52 weeks are core</b> —
+    the year goes narrow and deep on purpose.
+  </p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Core item</th><th>Weeks</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>The event loop, and the one rule</td><td><a href="#w1">1</a>, <a href="#w2">2</a>, <a href="#w3">3</a>, <a href="#w4">4</a>, <a href="#w22">22</a></td></tr>
+      <tr><td>2</td><td>The async model end to end</td><td><a href="#w5">5</a>, <a href="#w6">6</a></td></tr>
+      <tr><td>3</td><td>Bounded concurrency</td><td><a href="#w7">7</a>, <a href="#w8">8</a></td></tr>
+      <tr><td>4</td><td>The module system</td><td><a href="#w9">9</a>, <a href="#w10">10</a>, <a href="#w11">11</a>, <a href="#w12">12</a></td></tr>
+      <tr><td>5</td><td>Streams and backpressure</td><td><a href="#w14">14</a>, <a href="#w15">15</a>, <a href="#w16">16</a>, <a href="#w17">17</a></td></tr>
+      <tr><td>6</td><td>EventEmitter, and the server built on it</td><td><a href="#w18">18</a>, <a href="#w20">20</a>, <a href="#w21">21</a></td></tr>
+      <tr><td>7</td><td>Beyond one thread</td><td><a href="#w22">22</a>, <a href="#w23">23</a>, <a href="#w24">24</a>, <a href="#w25">25</a></td></tr>
+      <tr><td>8</td><td>Process lifecycle</td><td><a href="#w27">27</a>, <a href="#w28">28</a>, <a href="#w29">29</a>, <a href="#w30">30</a></td></tr>
+      <tr><td>9</td><td>Measure before you fix</td><td><a href="#w31">31</a>, <a href="#w32">32</a>, <a href="#w33">33</a>, <a href="#w34">34</a></td></tr>
+      <tr><td>10</td><td>Evidence — tests that do not flake, and input you hardened</td><td><a href="#w35">35</a>, <a href="#w36">36</a>, <a href="#w37">37</a>, <a href="#w38">38</a></td></tr>
+      <tr><td>11</td><td>The data layer</td><td><a href="#w40">40</a>, <a href="#w41">41</a>, <a href="#w42">42</a>, <a href="#w43">43</a></td></tr>
+      <tr><td>12</td><td>TypeScript, then NestJS</td><td><a href="#w44">44</a>, <a href="#w45">45</a>, <a href="#w46">46</a>, <a href="#w47">47</a>, <a href="#w48">48</a>, <a href="#w49">49</a>, <a href="#w50">50</a></td></tr>
+      <tr><td>—</td><td><b>Synthesis</b> — all twelve at once, under pressure</td><td><a href="#w51">51</a></td></tr>
+      <tr><td>—</td><td><b>Depth</b> — real, but not touched weekly</td><td><a href="#w11">11</a>, <a href="#w19">19</a>, <a href="#w29">29</a>, <a href="#w33">33</a>, <a href="#w45">45</a></td></tr>
+      <tr><td>—</td><td><b>Review</b> — no new material</td><td><a href="#w13">13</a>, <a href="#w26">26</a>, <a href="#w39">39</a>, <a href="#w52">52</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Some weeks appear twice — that is correct</span>
+    Weeks 11, 29, 33 and 45 are inside a core item's week range <em>and</em> in the depth row.
+    Week 22 appears under item 1 and item 7, because one week can serve two ideas. Neither
+    is a mistake — a four-week module can carry one depth week without stopping. Week 45's
+    TypeScript build setup sits inside items 12's range, and it is still depth: you pay
+    that cost once, not weekly. The <b>Show core only</b> button above hides all five.
+  </div>
+
+  <!-- ================= PHASE 1 ================= -->
+  <div class="phase-band">
+    <span class="label">Phase 1 · Weeks 1–13</span>
+    <h2>The runtime</h2>
+    <p>What Node actually is, and how async really works. Everything later stands on this.</p>
+  </div>
+
+  <p class="mod-head">Module 1 · Weeks 1–4 · The event loop</p>
+
+  <div class="wk" id="w1">
+    <h3><span class="num">W1</span>What Node really is <span class="pill">core</span></h3>
+    <p class="goal">Goal: stop calling Node a framework. It is V8 plus libuv plus a standard library — and libuv is where the "never waits" comes from.</p>
+    <p class="build-line"><b>Build:</b> a script that proves the two halves are separate — a tight <code>for</code> loop that freezes everything, next to an <code>fs</code> read that does not.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w1a"><label for="w1a">Explain out loud what Node is: V8 runs your JavaScript, libuv does the waiting.</label></li>
+      <li><input type="checkbox" id="w1b"><label for="w1b">Say which work goes to libuv's thread pool and which does not (file I/O yes, network I/O no).</label></li>
+      <li><input type="checkbox" id="w1c"><label for="w1c">Show one line of code that freezes the whole process, and say why.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Node is single-threaded — so how does it serve 10,000 connections?" Answer in 60 seconds, no notes.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/getting-started/introduction-to-nodejs">Introduction to Node.js</a> · <a href="https://docs.libuv.org/en/v1.x/design.html">libuv design</a>. Lesson: <a href="../lessons/0001-what-is-node-one-thread-that-never-waits.html">0001</a>.</p>
+  </div>
+
+  <div class="wk" id="w2">
+    <h3><span class="num">W2</span>The JavaScript Node leans on — an audit <span class="pill">core</span></h3>
+    <p class="goal">Goal: this is a check, not a course. You already write JavaScript. Confirm the four things Node uses constantly, and move on. If it is easy, this is a short week — that is the intended result.</p>
+    <p class="build-line"><b>Build:</b> five small snippets — a closure that holds memory alive, <code>this</code> in four call shapes, a prototype chain, and module scope versus global.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w2a"><label for="w2a">Predict <code>this</code> correctly in a method, a bare call, an arrow, and a callback.</label></li>
+      <li><input type="checkbox" id="w2b"><label for="w2b">Show a closure that keeps a large object from being collected, and fix it.</label></li>
+      <li><input type="checkbox" id="w2c"><label for="w2c">Explain why a top-level <code>var</code> in a Node file is not on <code>globalThis</code>.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Given a callback that lost its <code>this</code>, name three fixes and say which one you would ship.</p>
+    <p class="res">Primary: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript">MDN JavaScript</a>. Lesson: <a href="../lessons/0002-the-javascript-you-need-for-node.html">0002</a>.</p>
+  </div>
+
+  <div class="wk" id="w3">
+    <h3><span class="num">W3</span>The event loop, up close <span class="pill">core</span></h3>
+    <p class="goal">Goal: know the phase order, and know that microtasks run between phases — not inside one.</p>
+    <p class="build-line"><b>Build:</b> a print-order quiz you write yourself — ten files mixing sync, <code>setTimeout</code>, <code>setImmediate</code>, <code>process.nextTick</code> and <code>Promise.then</code>. Predict, then run.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w3a"><label for="w3a">Name the loop phases in order: timers, pending, poll, check, close.</label></li>
+      <li><input type="checkbox" id="w3b"><label for="w3b">Predict the output of any mix of macrotasks and microtasks, and be right.</label></li>
+      <li><input type="checkbox" id="w3c"><label for="w3c">Explain why <code>process.nextTick</code> can starve the loop and <code>queueMicrotask</code> is safer.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Whiteboard the print order for sync + <code>setTimeout(fn,0)</code> + <code>setImmediate(fn)</code> + <code>Promise.resolve().then(fn)</code>, and justify each position.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick">Event Loop, Timers and nextTick</a>; talk — <a href="https://www.youtube.com/watch?v=zphcsoSJMvM">Bert Belder on the event loop</a>. Lesson: <a href="../lessons/0003-callbacks-and-the-event-loop-up-close.html">0003</a>.</p>
+  </div>
+
+  <div class="wk" id="w4">
+    <h3><span class="num">W4</span>Build — a web server that never blocks <span class="pill">core</span></h3>
+    <p class="goal">Goal: turn the theory into a measurement. Prove, with numbers, that one blocking route ruins every other route.</p>
+    <p class="build-line"><b>Build:</b> a raw <code>http</code> server with a fast route and a slow route, plus a small latency tester that hits the fast route while the slow one runs. Then make the slow route async and measure again.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w4a"><label for="w4a">Build a server whose slow route does not stall its fast route, and show the two latency numbers.</label></li>
+      <li><input type="checkbox" id="w4b"><label for="w4b">Name the golden rule, and show the one line that broke it before the fix.</label></li>
+      <li><input type="checkbox" id="w4c"><label for="w4c">Explain what "event-loop delay" is and how you measured it.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Your p99 latency jumped and CPU is at 100% on one core. What is your first hypothesis?"</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop">Don't Block the Event Loop</a>. Lesson: <a href="../lessons/0004-build-a-web-server-that-never-blocks.html">0004</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 2 · Weeks 5–8 · The async model</p>
+
+  <div class="wk" id="w5">
+    <h3><span class="num">W5</span>The async ladder <span class="pill">core</span></h3>
+    <p class="goal">Goal: move between callbacks, promises and <code>async</code>/<code>await</code> in either direction, without thinking about it.</p>
+    <p class="build-line"><b>Build:</b> take one callback-style API and write it three ways — raw callback, hand-built promise, and async/await. Keep all three in one file and compare.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w5a"><label for="w5a">Wrap a callback API in a promise by hand, without <code>util.promisify</code>.</label></li>
+      <li><input type="checkbox" id="w5b"><label for="w5b">Explain what <code>await</code> compiles to, and why it does not block the loop.</label></li>
+      <li><input type="checkbox" id="w5c"><label for="w5c">Say when a callback is still the right choice (events that fire many times).</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Convert a three-level callback nest to async/await live, in under five minutes.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/asynchronous-work/asynchronous-flow-control">Asynchronous flow control</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises">MDN: Using promises</a>. Lesson: <a href="../lessons/0005-the-async-ladder-callbacks-promises-async-await.html">0005</a>.</p>
+  </div>
+
+  <div class="wk" id="w6">
+    <h3><span class="num">W6</span>Async errors and unhandled rejections <span class="pill">core</span></h3>
+    <p class="goal">Goal: understand why a <code>try/catch</code> can sit right there and still miss the error. This is the most common silent failure in production Node.</p>
+    <p class="build-line"><b>Build:</b> reproduce an unhandled rejection on purpose, three different ways, then catch each one. Add an <code>unhandledRejection</code> handler and watch what it does and does not save.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w6a"><label for="w6a">Show a <code>try/catch</code> that misses an async error, and explain exactly why.</label></li>
+      <li><input type="checkbox" id="w6b"><label for="w6b">Explain what Node does on an unhandled rejection now, and why that changed.</label></li>
+      <li><input type="checkbox" id="w6c"><label for="w6c">Say why swallowing an error in a <code>catch</code> is worse than crashing.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "A request sometimes returns 200 with an empty body and nothing is logged." Walk through how you would find it.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/errors.html">Errors</a> · <a href="https://github.com/goldbergyoni/nodebestpractices">Node Best Practices §2</a>. Lesson: <a href="../lessons/0006-async-errors-and-unhandled-rejections.html">0006</a>.</p>
+  </div>
+
+  <div class="wk" id="w7">
+    <h3><span class="num">W7</span>Many things at once, with a limit <span class="pill">core</span></h3>
+    <p class="goal">Goal: <code>Promise.all</code> over a big array is a way to kill your own service. Learn the combinators, then write the limiter yourself.</p>
+    <p class="build-line"><b>Build:</b> your own <code>pLimit</code> in under 40 lines — a queue plus a running count. Then read <a href="https://github.com/sindresorhus/p-limit">p-limit</a> and compare.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w7a"><label for="w7a">Say when <code>all</code>, <code>allSettled</code>, <code>race</code> and <code>any</code> each fail you.</label></li>
+      <li><input type="checkbox" id="w7b"><label for="w7b">Cap concurrency to N with code you wrote, not a library.</label></li>
+      <li><input type="checkbox" id="w7c"><label for="w7c">Explain what breaks first when you fire 5,000 requests at once.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Write a concurrency limiter live, from an empty file, in ten minutes.</p>
+    <p class="res">Primary: <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise">MDN: Promise</a> · <a href="https://github.com/nodejs/undici">undici</a>. Lesson: <a href="../lessons/0007-many-things-at-once-promise-combinators-and-concurrency.html">0007</a>.</p>
+  </div>
+
+  <div class="wk" id="w8">
+    <h3><span class="num">W8</span>Build — the concurrent multi-API aggregator <span class="pill">core</span></h3>
+    <p class="goal">Goal: put the whole async model into one tool that survives a flaky network.</p>
+    <p class="build-line"><b>Build:</b> fetch 500 URLs, 10 at a time, with retry-and-backoff, a per-request timeout, and a final report of what succeeded, what failed, and why.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w8a"><label for="w8a">Add retry with exponential backoff, and say why jitter matters.</label></li>
+      <li><input type="checkbox" id="w8b"><label for="w8b">Time out a request with <code>AbortController</code>, not a dangling timer.</label></li>
+      <li><input type="checkbox" id="w8c"><label for="w8c">Report partial failure without throwing away the successes.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "500 URLs, 10 at a time, retries, timeouts" — write it live, no notes. This is a real interview question.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/globals.html#class-abortcontroller">AbortController</a>. Lesson: <a href="../lessons/0008-build-a-concurrent-multi-api-aggregator.html">0008</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 3 · Weeks 9–12 · Modules, packages, and a real CLI</p>
+
+  <div class="wk" id="w9">
+    <h3><span class="num">W9</span>CommonJS versus ESM, and how Node finds a file <span class="pill">core</span></h3>
+    <p class="goal">Goal: this is the error message that ruins evenings. Understand resolution well enough to read the error instead of guessing.</p>
+    <p class="build-line"><b>Build:</b> one small package that works from both <code>require()</code> and <code>import</code>. Then break the resolution four ways on purpose and write down each error message.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w9a"><label for="w9a">Explain the real difference: CommonJS resolves at run time, ESM resolves before running.</label></li>
+      <li><input type="checkbox" id="w9b"><label for="w9b">Trace how Node resolves a bare specifier like <code>lodash</code>, step by step.</label></li>
+      <li><input type="checkbox" id="w9c"><label for="w9c">Say what <code>"type": "module"</code> changes, and what it does not.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "<code>ERR_REQUIRE_ESM</code> — explain what happened and give two fixes."</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/esm.html">ESM</a> · <a href="https://nodejs.org/api/modules.html">CommonJS modules</a>. Lesson: <a href="../lessons/0009-commonjs-vs-esm-and-how-node-finds-a-file.html">0009</a>.</p>
+  </div>
+
+  <div class="wk" id="w10">
+    <h3><span class="num">W10</span>The process — argv, streams, exit codes <span class="pill">core</span></h3>
+    <p class="goal">Goal: a program that behaves properly in a shell. Right stream, right exit code, works in a pipe.</p>
+    <p class="build-line"><b>Build:</b> a tool that reads from stdin when piped, reads a file when given a path, writes results to stdout and errors to stderr, and exits non-zero on failure. Test it inside a real pipeline.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w10a"><label for="w10a">Parse <code>argv</code> with <code>util.parseArgs</code>, no library.</label></li>
+      <li><input type="checkbox" id="w10b"><label for="w10b">Explain why results go to stdout and messages go to stderr.</label></li>
+      <li><input type="checkbox" id="w10c"><label for="w10c">Set a correct exit code, and say why <code>process.exit()</code> can lose output.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Your CLI works alone but prints nothing through <code>| head</code>." Name the cause.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/process.html">process</a> · <a href="https://nodejs.org/api/util.html#utilparseargsconfig">util.parseArgs</a>. Lesson: <a href="../lessons/0010-the-process-argv-streams-and-exit-codes.html">0010</a>.</p>
+  </div>
+
+  <div class="wk depth" id="w11">
+    <h3><span class="num">W11</span>package.json in full, and publishing <span class="pill soft">depth</span></h3>
+    <p class="goal">Goal: depth, not core — you will do this a few times a year, not weekly. But shipping one package teaches what reading about it cannot.</p>
+    <p class="build-line"><b>Build:</b> publish a small scoped package to npm. Scoped, so you can unpublish it without shame.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w11a"><label for="w11a">Write an <code>exports</code> map that serves both CommonJS and ESM consumers.</label></li>
+      <li><input type="checkbox" id="w11b"><label for="w11b">Explain <code>bin</code>, <code>files</code>, and why <code>main</code> is not enough any more.</label></li>
+      <li><input type="checkbox" id="w11c"><label for="w11c">Say what semver actually promises, and where it lies.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "A minor version bump broke our build. Whose fault, and how do you stop it happening again?"</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/packages.html">packages</a> · <a href="https://nodejs.org/en/learn/modules/publishing-node-api-modules">Publishing a package</a>. Lesson: <a href="../lessons/0011-package-json-in-full-and-publishing.html">0011</a>.</p>
+  </div>
+
+  <div class="wk" id="w12">
+    <h3><span class="num">W12</span>Build — ship the CLI <span class="pill">core</span></h3>
+    <p class="goal">Goal: one finished, installable tool. Finished means someone else can install it and it does not surprise them.</p>
+    <p class="build-line"><b>Build:</b> a bulk file renamer with <code>--dry-run</code>, <code>--help</code>, colour-free output when not a TTY, and a real README. Install it globally and use it on your own files.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w12a"><label for="w12a">Ship a <code>--dry-run</code> that is genuinely safe, and prove it.</label></li>
+      <li><input type="checkbox" id="w12b"><label for="w12b">Detect a TTY and change output accordingly.</label></li>
+      <li><input type="checkbox" id="w12c"><label for="w12c">Handle a partial failure halfway through a rename batch without corrupting the folder.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Demo the tool in 90 seconds and name one thing you deliberately left out.</p>
+    <p class="res">Primary: your own README. Lesson: <a href="../lessons/0012-build-ship-the-cli.html">0012</a>. Post the tool to <a href="https://www.reddit.com/r/node/">r/node</a> for review.</p>
+  </div>
+
+  <div class="wk review" id="w13">
+    <h3><span class="num">W13</span>Review — the runtime and the async model <span class="pill alt">review</span></h3>
+    <p class="goal">Goal: no new material. Pull weeks 1–12 back out of memory, mixed up on purpose. Retrieval is what makes it stick; re-reading is not.</p>
+    <p class="build-line"><b>Do:</b> close every tab. Write, from memory: the loop phases, a concurrency limiter, and a promise wrapper around a callback. Then check.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w13a"><label for="w13a">Re-do the week 3 print-order quiz cold. Score 10/10 or find the gap.</label></li>
+      <li><input type="checkbox" id="w13b"><label for="w13b">Explain the event loop out loud in 90 seconds, recorded, no notes.</label></li>
+      <li><input type="checkbox" id="w13c"><label for="w13c">Run mock interview 1 with your teacher — async and the event loop only.</label></li>
+    </ul>
+    <p class="drill-line"><b>Community:</b> ask one real question in the <a href="https://discord.com/invite/nodejs">Node.js Discord</a>. Not a lurk — a question.</p>
+    <p class="res">Ask your teacher: <em>"Run mock interview 1."</em></p>
+  </div>
+
+  <!-- ================= PHASE 2 ================= -->
+  <div class="phase-band">
+    <span class="label">Phase 2 · Weeks 14–26</span>
+    <h2>The hard core</h2>
+    <p>Streams, servers built from raw sockets, and using more than one thread. The parts people avoid.</p>
+  </div>
+
+  <p class="mod-head">Module 4 · Weeks 14–17 · Streams, buffers and backpressure</p>
+
+  <div class="wk" id="w14">
+    <h3><span class="num">W14</span>Buffers and binary <span class="pill">core</span></h3>
+    <p class="goal">Goal: understand why Node needed its own byte type, and what a string really costs.</p>
+    <p class="build-line"><b>Build:</b> read a file byte-range by hand. Decode a multi-byte UTF-8 character split across two chunks — get the mojibake on purpose, then fix it with <code>StringDecoder</code>.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w14a"><label for="w14a">Explain what a <code>Buffer</code> is and how it relates to <code>Uint8Array</code>.</label></li>
+      <li><input type="checkbox" id="w14b"><label for="w14b">Show a chunk boundary corrupting a UTF-8 character, and fix it.</label></li>
+      <li><input type="checkbox" id="w14c"><label for="w14c">Say why <code>Buffer.allocUnsafe</code> exists and when it is a security problem.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Your file upload works for English and corrupts Vietnamese." Name the cause in one sentence.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/buffer.html">buffer</a>. Lesson: <a href="../lessons/0014-buffers-and-binary.html">0014</a>.</p>
+  </div>
+
+  <div class="wk" id="w15">
+    <h3><span class="num">W15</span>Readable, Writable, and backpressure <span class="pill">core</span></h3>
+    <p class="goal">Goal: backpressure is the whole reason streams exist. A fast producer must not be able to drown a slow consumer.</p>
+    <p class="build-line"><b>Build:</b> a file copier that <em>ignores</em> the return value of <code>write()</code> and watch memory climb. Then honour it with <code>drain</code> and watch memory stay flat. Two graphs.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w15a"><label for="w15a">Explain what <code>write()</code> returning <code>false</code> means, and what happens if you ignore it.</label></li>
+      <li><input type="checkbox" id="w15b"><label for="w15b">Explain <code>highWaterMark</code> in plain words, and what raising it costs.</label></li>
+      <li><input type="checkbox" id="w15c"><label for="w15c">Say why flowing mode and paused mode both exist, and which one <code>pipe</code> uses.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "A worker copying S3 files runs out of memory on big files only." Explain and fix.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/modules/backpressuring-in-streams">Backpressuring in Streams</a> · <a href="https://nodejs.org/api/stream.html">stream</a>. Lesson: <a href="../lessons/0015-readable-writable-and-backpressure.html">0015</a>.</p>
+  </div>
+
+  <div class="wk" id="w16">
+    <h3><span class="num">W16</span>Transform streams and <code>pipeline</code> <span class="pill">core</span></h3>
+    <p class="goal">Goal: chain stages safely. <code>pipe</code> leaks on error; <code>pipeline</code> is the one you actually use.</p>
+    <p class="build-line"><b>Build:</b> a three-stage pipeline — parse, transform, write. Throw from the middle stage on purpose, and prove with <code>pipe</code> that the file handle leaks, then prove with <code>pipeline</code> that it does not.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w16a"><label for="w16a">Write a <code>Transform</code> stream from scratch, including <code>_flush</code>.</label></li>
+      <li><input type="checkbox" id="w16b"><label for="w16b">Explain exactly what <code>pipeline</code> cleans up that <code>pipe</code> does not.</label></li>
+      <li><input type="checkbox" id="w16c"><label for="w16c">Use an async generator as a stream stage, and say when that is clearer.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Why is <code>pipeline</code> preferred over <code>pipe</code>?" Answer with the failure it prevents, not with "it is better".</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/stream.html#streampipelinestreams-callback">stream.pipeline</a>. Lesson: <a href="../lessons/0016-transform-streams-and-pipeline.html">0016</a>.</p>
+  </div>
+
+  <div class="wk" id="w17">
+    <h3><span class="num">W17</span>Build — a processor for a file too big for memory <span class="pill">core</span></h3>
+    <p class="goal">Goal: constant memory over a multi-GB input. This is the stream lesson that cannot be faked.</p>
+    <p class="build-line"><b>Build:</b> generate a 4 GB CSV or log file. Process it — parse, filter, aggregate, write — while resident memory stays flat. Chart the memory over the run.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w17a"><label for="w17a">Process a file larger than RAM with flat memory, and show the chart.</label></li>
+      <li><input type="checkbox" id="w17b"><label for="w17b">Handle a line split across two chunks correctly.</label></li>
+      <li><input type="checkbox" id="w17c"><label for="w17c">Resume from a crash halfway without reprocessing everything.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Process a 50 GB log and count errors by hour. Sketch it." Ten minutes, out loud.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/modules/how-to-use-streams">How to use streams</a>. Lesson: <a href="../lessons/0017-build-a-file-too-big-for-memory.html">0017</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 5 · Weeks 18–21 · Events and servers from scratch</p>
+
+  <div class="wk" id="w18">
+    <h3><span class="num">W18</span>EventEmitter — the pattern under everything <span class="pill">core</span></h3>
+    <p class="goal">Goal: streams, servers, sockets and processes are all emitters. Learn it once and four things become obvious.</p>
+    <p class="build-line"><b>Build:</b> write your own <code>EventEmitter</code> in about 30 lines. Then add a listener in a loop until Node prints the max-listeners warning, and explain what that warning is really telling you.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w18a"><label for="w18a">Implement <code>on</code>, <code>once</code>, <code>off</code> and <code>emit</code> from nothing.</label></li>
+      <li><input type="checkbox" id="w18b"><label for="w18b">Explain why an <code>error</code> event with no listener crashes the process.</label></li>
+      <li><input type="checkbox" id="w18c"><label for="w18c">Say why emitters are synchronous, and what that means for ordering.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "MaxListenersExceededWarning in production." Is it a leak? How do you tell?</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/events.html">events</a>. Lesson: <a href="../lessons/0018-eventemitter-the-pattern-under-everything.html">0018</a>.</p>
+  </div>
+
+  <div class="wk depth" id="w19">
+    <h3><span class="num">W19</span>Raw TCP with <code>net</code> <span class="pill soft">depth</span></h3>
+    <p class="goal">Goal: depth on purpose. You will rarely write raw TCP. But writing it once is how message framing stops being a mystery.</p>
+    <p class="build-line"><b>Build:</b> a TCP chat server. Send two messages fast and watch them arrive glued together. Then fix it with length-prefix framing.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w19a"><label for="w19a">Explain why TCP is a stream of bytes with no message boundaries.</label></li>
+      <li><input type="checkbox" id="w19b"><label for="w19b">Implement length-prefix framing and handle a partial header.</label></li>
+      <li><input type="checkbox" id="w19c"><label for="w19c">Say what HTTP does about framing, and why that answer matters.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Two JSON messages arrived as one string." Explain the cause in 30 seconds.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/net.html">net</a>. Lesson: <a href="../lessons/0019-raw-tcp-with-net.html">0019</a>.</p>
+  </div>
+
+  <div class="wk" id="w20">
+    <h3><span class="num">W20</span>HTTP from scratch <span class="pill">core</span></h3>
+    <p class="goal">Goal: know the request and response lifecycle before a framework hides it. Then a framework bug is readable instead of magic.</p>
+    <p class="build-line"><b>Build:</b> a router with no framework — method and path matching, body parsing with a size limit, JSON responses, correct status codes, and keep-alive handled.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w20a"><label for="w20a">Explain that <code>req</code> is a Readable and <code>res</code> is a Writable, and use both as streams.</label></li>
+      <li><input type="checkbox" id="w20b"><label for="w20b">Reject an oversized request body before it reaches memory.</label></li>
+      <li><input type="checkbox" id="w20c"><label for="w20c">Say what happens if you never call <code>res.end()</code>.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Write a route handler that streams a large file to the client without buffering it."</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/http.html">http</a>. Lesson: <a href="../lessons/0020-http-from-scratch.html">0020</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w21">
+    <h3><span class="num">W21</span>Build — the spine API, version 1 <span class="pill">core</span></h3>
+    <p class="goal">Goal: the service you will keep for the next 30 weeks starts here. Raw <code>http</code>, no framework, small on purpose.</p>
+    <p class="build-line"><b>Build:</b> a REST API on raw <code>http</code> — a handful of resources, in-memory storage for now, real status codes, one consistent error shape. <b>Do not restart this project later.</b></p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w21a"><label for="w21a">Ship CRUD routes with correct status codes, including 404 and 409.</label></li>
+      <li><input type="checkbox" id="w21b"><label for="w21b">Define one error response shape and use it everywhere.</label></li>
+      <li><input type="checkbox" id="w21c"><label for="w21c">Write the README that says what this service is and is not.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Draw your API's request lifecycle on paper — socket to response — in five minutes.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/http.html">http</a> · <a href="https://github.com/goldbergyoni/nodebestpractices">Node Best Practices</a>. Lesson: <a href="../lessons/0021-build-the-spine-api-version-1.html">0021</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 6 · Weeks 22–25 · Concurrency and scale</p>
+
+  <div class="wk" id="w22">
+    <h3><span class="num">W22</span>CPU-bound versus I/O-bound <span class="pill">core</span></h3>
+    <p class="goal">Goal: know which problem you have before choosing a tool. Most "Node is slow" claims are one CPU-bound function.</p>
+    <p class="build-line"><b>Build:</b> measure event-loop delay under an I/O-heavy load and under a CPU-heavy load. Two very different graphs from the same server.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w22a"><label for="w22a">Measure event-loop delay with <code>perf_hooks.monitorEventLoopDelay</code>.</label></li>
+      <li><input type="checkbox" id="w22b"><label for="w22b">Classify a workload as CPU-bound or I/O-bound from its delay graph.</label></li>
+      <li><input type="checkbox" id="w22c"><label for="w22c">Say honestly when the right answer is "do not use Node for this".</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Our image-resize endpoint makes the health check fail." Diagnose before touching code.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop">Don't Block the Event Loop</a> · <a href="https://docs.libuv.org/en/v1.x/design.html">libuv design</a>. Lesson: <a href="../lessons/0022-cpu-bound-versus-io-bound.html">0022</a>.</p>
+  </div>
+
+  <div class="wk" id="w23">
+    <h3><span class="num">W23</span>Worker threads and a worker pool <span class="pill">core</span></h3>
+    <p class="goal">Goal: move CPU work off the main thread, and understand what crossing that boundary costs.</p>
+    <p class="build-line"><b>Build:</b> your own worker pool — a fixed set of workers, a task queue, and a promise per task. Measure the cost of transferring data versus copying it.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w23a"><label for="w23a">Explain what is shared between workers and what is copied.</label></li>
+      <li><input type="checkbox" id="w23b"><label for="w23b">Use <code>SharedArrayBuffer</code> or a transfer list, and say when it is worth it.</label></li>
+      <li><input type="checkbox" id="w23c"><label for="w23c">Handle a worker that crashes mid-task without hanging the caller.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "When would a worker thread make things slower?" Give a concrete case.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/worker_threads.html">worker_threads</a>. Lesson: <a href="../lessons/0023-worker-threads-and-a-worker-pool.html">0023</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w24">
+    <h3><span class="num">W24</span>Child processes and <code>cluster</code> <span class="pill">core</span></h3>
+    <p class="goal">Goal: use every core on the machine, and know the difference between a thread and a process here.</p>
+    <p class="build-line"><b>Build:</b> cluster the spine API across all cores. Prove every worker is serving. Kill one worker under load and watch it come back with no dropped connections.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w24a"><label for="w24a">Explain how <code>cluster</code> shares one port across processes.</label></li>
+      <li><input type="checkbox" id="w24b"><label for="w24b">Say why in-memory state breaks the moment you cluster.</label></li>
+      <li><input type="checkbox" id="w24c"><label for="w24c">Compare <code>cluster</code> with running N containers, and pick one with a reason.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Sessions work locally and log users out randomly in production." Name the cause.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/cluster.html">cluster</a> · <a href="https://nodejs.org/api/child_process.html">child_process</a>. Lesson: <a href="../lessons/0024-child-processes-and-cluster.html">0024</a>.</p>
+  </div>
+
+  <div class="wk" id="w25">
+    <h3><span class="num">W25</span>Build — an image-thumbnail service <span class="pill">core</span></h3>
+    <p class="goal">Goal: one service that is genuinely CPU-heavy, made responsive. This is the story you tell in an interview.</p>
+    <p class="build-line"><b>Build:</b> upload an image, get thumbnails back. Worker pool for the resizing, cluster for the cores, and a health check that stays green under load. Measure before and after.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w25a"><label for="w25a">Keep the health check responding while every worker is busy.</label></li>
+      <li><input type="checkbox" id="w25b"><label for="w25b">Apply backpressure when the queue is full instead of accepting forever.</label></li>
+      <li><input type="checkbox" id="w25c"><label for="w25c">Show a before/after latency table with real numbers.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Present the before/after numbers in 90 seconds, and say what you would do next with more time.</p>
+    <p class="res">Primary: <a href="https://github.com/mcollina/autocannon">autocannon</a>. Lesson: <a href="../lessons/0025-build-an-image-thumbnail-service.html">0025</a>. Post the repo to <a href="https://www.reddit.com/r/node/">r/node</a> for review.</p>
+  </div>
+
+  <div class="wk review" id="w26">
+    <h3><span class="num">W26</span>Review — the mid-year gate <span class="pill alt">review</span></h3>
+    <p class="goal">Goal: half the year is gone. This week decides whether the second half is built on something solid or on gaps.</p>
+    <p class="build-line"><b>Do:</b> from an empty file, rebuild three things from memory — a Transform stream, a worker pool, and a concurrency limiter. No looking.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w26a"><label for="w26a">Explain backpressure out loud in 90 seconds, no notes, recorded.</label></li>
+      <li><input type="checkbox" id="w26b"><label for="w26b">Interleaved drill: 20 mixed questions from weeks 1–25, shuffled.</label></li>
+      <li><input type="checkbox" id="w26c"><label for="w26c">Run mock interview 2 — streams, events, and concurrency.</label></li>
+    </ul>
+    <p class="drill-line"><b>Gate:</b> if you cannot explain backpressure and worker threads without notes, repeat weeks 14–17 before going on. Feelings do not count here.</p>
+    <p class="res">Ask your teacher: <em>"Run mock interview 2."</em></p>
+  </div>
+
+  <!-- ================= PHASE 3 ================= -->
+  <div class="phase-band">
+    <span class="label">Phase 3 · Weeks 27–39</span>
+    <h2>Production</h2>
+    <p>Turning a program that works into a service that survives real traffic — and proving it with numbers.</p>
+  </div>
+
+  <p class="mod-head">Module 7 · Weeks 27–30 · Reliability</p>
+
+  <div class="wk spine" id="w27">
+    <h3><span class="num">W27</span>Signals and graceful shutdown <span class="pill">core</span></h3>
+    <p class="goal">Goal: this is the line between a script and a service. A deploy must not drop a single in-flight request.</p>
+    <p class="build-line"><b>Build:</b> handle <code>SIGTERM</code> on the spine API — stop accepting, finish in-flight work, close the server, exit. Then send <code>SIGTERM</code> while autocannon is running and prove zero errors.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w27a"><label for="w27a">Explain the difference between <code>SIGTERM</code> and <code>SIGKILL</code>, and why one cannot be handled.</label></li>
+      <li><input type="checkbox" id="w27b"><label for="w27b">Drain in-flight requests, with a hard timeout so shutdown cannot hang forever.</label></li>
+      <li><input type="checkbox" id="w27c"><label for="w27c">Say what a readiness check should return during shutdown, and why.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Every deploy produces a spike of 502s." Explain the cause and the fix.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/process.html#signal-events">process signal events</a>. Lesson: <a href="../lessons/0027-signals-and-graceful-shutdown.html">0027</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w28">
+    <h3><span class="num">W28</span>Operational errors versus programmer errors <span class="pill">core</span></h3>
+    <p class="goal">Goal: one of these you handle. The other you crash on. Mixing them up is how services corrupt data quietly.</p>
+    <p class="build-line"><b>Build:</b> an error taxonomy for the spine API — a base <code>AppError</code>, an operational flag, and a top-level handler that restarts on programmer errors and responds on operational ones.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w28a"><label for="w28a">Classify any error as operational or programmer, and justify it.</label></li>
+      <li><input type="checkbox" id="w28b"><label for="w28b">Explain why "crash and restart" is safer than continuing in an unknown state.</label></li>
+      <li><input type="checkbox" id="w28c"><label for="w28c">Preserve the original stack when wrapping an error with <code>cause</code>.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Should you catch <code>uncaughtException</code> and keep running?" Argue both sides, then commit.</p>
+    <p class="res">Primary: <a href="https://github.com/goldbergyoni/nodebestpractices">Node Best Practices — Error Handling</a> · <a href="https://nodejs.org/api/errors.html">errors</a>. Lesson: <a href="../lessons/0028-operational-versus-programmer-errors.html">0028</a>.</p>
+  </div>
+
+  <div class="wk depth" id="w29">
+    <h3><span class="num">W29</span>Observability — logs you can trace <span class="pill soft">depth</span></h3>
+    <p class="goal">Goal: depth, but the useful kind. A log line you cannot tie to a request is nearly worthless during an incident.</p>
+    <p class="build-line"><b>Build:</b> structured JSON logging with <a href="https://getpino.io/">pino</a>, a request id carried through every async hop with <code>AsyncLocalStorage</code>, and one <code>diagnostics_channel</code> subscriber.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w29a"><label for="w29a">Trace one request end to end through the logs by its id.</label></li>
+      <li><input type="checkbox" id="w29b"><label for="w29b">Explain what <code>AsyncLocalStorage</code> does and what it costs.</label></li>
+      <li><input type="checkbox" id="w29c"><label for="w29c">Say why JSON logs beat pretty logs in production, and keep both.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "One user reports an error, no stack trace, 40 requests a second." Find it.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/async_context.html">AsyncLocalStorage</a> · <a href="https://nodejs.org/api/diagnostics_channel.html">diagnostics_channel</a>. Lesson: <a href="../lessons/0029-observability-logs-you-can-trace.html">0029</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w30">
+    <h3><span class="num">W30</span>Build — harden the spine API <span class="pill">core</span></h3>
+    <p class="goal">Goal: attack your own service and make it survive. Numbers, not confidence.</p>
+    <p class="build-line"><b>Build:</b> load-test with autocannon, then kill the process mid-load, restart it, run out of memory, and drop the database. Write down what happened each time and fix the worst one.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w30a"><label for="w30a">Survive a <code>SIGTERM</code> under full load with zero failed requests.</label></li>
+      <li><input type="checkbox" id="w30b"><label for="w30b">Add a timeout to every outbound call — no unbounded waits anywhere.</label></li>
+      <li><input type="checkbox" id="w30c"><label for="w30c">Write a one-page runbook: what breaks, how you would know, what you do.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Walk me through what happens to an in-flight request when the pod is killed."</p>
+    <p class="res">Primary: <a href="https://github.com/mcollina/autocannon">autocannon</a>. Lesson: <a href="../lessons/0030-build-harden-the-spine-api.html">0030</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 8 · Weeks 31–34 · Performance and memory</p>
+
+  <div class="wk spine" id="w31">
+    <h3><span class="num">W31</span>Measure first <span class="pill">core</span></h3>
+    <p class="goal">Goal: a performance claim with no measurement behind it is an opinion. Learn the tools before touching any code.</p>
+    <p class="build-line"><b>Build:</b> profile one slow route on the spine API with <code>--cpu-prof</code> and a Clinic flame graph. Find the hot function. Fix it. Profile again and show both graphs.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w31a"><label for="w31a">Read a flame graph and name the hot path out loud.</label></li>
+      <li><input type="checkbox" id="w31b"><label for="w31b">Explain the difference between event-loop delay and slow I/O in a profile.</label></li>
+      <li><input type="checkbox" id="w31c"><label for="w31c">Show a before/after with p50, p95 and p99 — never an average alone.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "The service is slow." What are the first three things you measure, in order?</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/getting-started/profiling">Profiling a Node.js app</a> · <a href="https://clinicjs.org/">Clinic.js</a>. Lesson: <a href="../lessons/0031-measure-first.html">0031</a>.</p>
+  </div>
+
+  <div class="wk" id="w32">
+    <h3><span class="num">W32</span>Memory and heap snapshots <span class="pill">core</span></h3>
+    <p class="goal">Goal: find a leak and name the thing that held the reference. This is the debugging skill that has no ready answer online.</p>
+    <p class="build-line"><b>Build:</b> plant a leak on purpose — a growing <code>Map</code>, a listener never removed, a closure holding a big buffer. Take two heap snapshots, diff them, and name the retainer for each.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w32a"><label for="w32a">Take and diff two heap snapshots, and read the retainer path.</label></li>
+      <li><input type="checkbox" id="w32b"><label for="w32b">Explain why "memory goes up" is not the same as "memory leak".</label></li>
+      <li><input type="checkbox" id="w32c"><label for="w32c">Say what <code>--max-old-space-size</code> does, and why raising it is usually hiding.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "RSS grows 40 MB an hour and never comes down." Walk through your investigation.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/diagnostics/memory">Memory diagnostics</a> · <a href="https://v8.dev/docs">V8 docs</a>. Lesson: <a href="../lessons/0032-memory-and-heap-snapshots.html">0032</a>.</p>
+  </div>
+
+  <div class="wk depth" id="w33">
+    <h3><span class="num">W33</span>The costs you can actually control <span class="pill soft">depth</span></h3>
+    <p class="goal">Goal: depth, and a discipline. Micro-optimisation is mostly a waste — so every change this week must be justified by a measurement.</p>
+    <p class="build-line"><b>Build:</b> benchmark three candidate changes — JSON handling, buffer reuse, an in-process cache. Keep only the ones that measured better. Write down the ones you threw away.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w33a"><label for="w33a">Benchmark honestly — warm-up, repeats, and variance reported.</label></li>
+      <li><input type="checkbox" id="w33b"><label for="w33b">Show one "optimisation" that measured worse, and say why you kept the old code.</label></li>
+      <li><input type="checkbox" id="w33c"><label for="w33c">Explain when caching creates a correctness bug rather than a speed win.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Is <code>JSON.parse</code> your bottleneck?" Say how you would find out, not whether it is.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/perf_hooks.html">perf_hooks</a>. Lesson: <a href="../lessons/0033-the-costs-you-can-actually-control.html">0033</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w34">
+    <h3><span class="num">W34</span>Build — find and fix a real leak, and write it up <span class="pill">core</span></h3>
+    <p class="goal">Goal: the write-up is the deliverable. An engineer who can explain a leak they fixed beats one who fixed it silently.</p>
+    <p class="build-line"><b>Build:</b> run the spine API under sustained load for an hour. Find whatever actually leaks or slows down. Fix it. Write a one-page report: symptom, hypothesis, evidence, fix, proof.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w34a"><label for="w34a">Produce a report with before and after numbers, not adjectives.</label></li>
+      <li><input type="checkbox" id="w34b"><label for="w34b">Name one hypothesis you had that turned out wrong, and how you ruled it out.</label></li>
+      <li><input type="checkbox" id="w34c"><label for="w34c">Tell the whole story out loud in three minutes.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Tell the leak story as an interview answer. Symptom, investigation, fix, proof, lesson.</p>
+    <p class="res">Primary: your own report. Lesson: <a href="../lessons/0034-build-find-and-fix-a-real-leak.html">0034</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 9 · Weeks 35–38 · Testing, debugging and security</p>
+
+  <div class="wk spine" id="w35">
+    <h3><span class="num">W35</span><code>node:test</code> — the built-in runner <span class="pill">core</span></h3>
+    <p class="goal">Goal: Node ships a test runner now. Use it, and understand what a test is actually proving.</p>
+    <p class="build-line"><b>Build:</b> cover the spine API's core paths with <code>node:test</code> — the happy path, the 404, the 409, and the validation failures. Turn on coverage and read it critically.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w35a"><label for="w35a">Write unit and integration tests with <code>node:test</code>, no external runner.</label></li>
+      <li><input type="checkbox" id="w35b"><label for="w35b">Explain why 90% coverage can still miss the bug that matters.</label></li>
+      <li><input type="checkbox" id="w35c"><label for="w35c">Test an error path as carefully as a success path.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "What would you test first on a service you did not write?"</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/test.html">node:test</a> · <a href="https://nodejs.org/en/learn/test-runner/introduction">Test runner intro</a>. Lesson: <a href="../lessons/0035-node-test-the-built-in-runner.html">0035</a>.</p>
+  </div>
+
+  <div class="wk" id="w36">
+    <h3><span class="num">W36</span>Async tests without flakes <span class="pill">core</span></h3>
+    <p class="goal">Goal: a flaky test is worse than no test, because it teaches the team to ignore a red build.</p>
+    <p class="build-line"><b>Build:</b> delete every <code>setTimeout</code> from your test suite. Replace waiting with fake timers, mocks, and real signals. Run the suite 50 times and require 50 passes.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w36a"><label for="w36a">Replace a <code>sleep</code> in a test with a deterministic wait.</label></li>
+      <li><input type="checkbox" id="w36b"><label for="w36b">Mock a module and a timer with <code>node:test</code>'s built-in mocking.</label></li>
+      <li><input type="checkbox" id="w36c"><label for="w36c">Explain the three usual causes of a flaky async test.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "This test passes locally and fails in CI one time in ten." Name three suspects.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/api/test.html#mocking">node:test mocking</a>. Lesson: <a href="../lessons/0036-async-tests-that-do-not-flake.html">0036</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w37">
+    <h3><span class="num">W37</span>The inspector, and hardening your input <span class="pill">core</span></h3>
+    <p class="goal">Goal: debug with a real debugger, not <code>console.log</code>. Then attack your own API before somebody else does.</p>
+    <p class="build-line"><b>Build:</b> attack the spine API yourself — injection, prototype pollution, an unbounded request body, a ReDoS regex, a path traversal. Fix each one. Debug the fixes with <code>--inspect</code>, not logs.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w37a"><label for="w37a">Set a conditional breakpoint in a running Node process and inspect the scope.</label></li>
+      <li><input type="checkbox" id="w37b"><label for="w37b">Validate every input at the boundary, and reject rather than coerce.</label></li>
+      <li><input type="checkbox" id="w37c"><label for="w37c">Explain prototype pollution and show the one line that stops it.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Name three ways a JSON body can hurt a Node service." Then fix all three.</p>
+    <p class="res">Primary: <a href="https://nodejs.org/en/learn/getting-started/security-best-practices">Security best practices</a> · <a href="https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html">OWASP Node.js Cheat Sheet</a>. Lesson: <a href="../lessons/0037-the-inspector-and-hardening-your-input.html">0037</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w38">
+    <h3><span class="num">W38</span>Build — the full suite and the security pass <span class="pill">core</span></h3>
+    <p class="goal">Goal: the spine API becomes something you would let a stranger deploy.</p>
+    <p class="build-line"><b>Build:</b> a complete test suite that runs in CI, a documented coverage number you can defend, and a written security pass listing what you checked and what you accepted.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w38a"><label for="w38a">Get the suite green in CI, from a clean checkout, first try.</label></li>
+      <li><input type="checkbox" id="w38b"><label for="w38b">List the risks you accepted on purpose, and say why.</label></li>
+      <li><input type="checkbox" id="w38c"><label for="w38c">Review someone else's Node repo and write three specific findings.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Judge a stranger's Node project out loud. What is wrong, and why does it matter?</p>
+    <p class="res">Primary: <a href="https://github.com/goldbergyoni/nodebestpractices">Node Best Practices</a> as a checklist. Lesson: <a href="../lessons/0038-build-the-full-suite-and-the-security-pass.html">0038</a>.</p>
+  </div>
+
+  <div class="wk review" id="w39">
+    <h3><span class="num">W39</span>Review — production readiness <span class="pill alt">review</span></h3>
+    <p class="goal">Goal: pull weeks 27–38 back out cold, and interleave them with phase 1 and 2 material so nothing has quietly rotted.</p>
+    <p class="build-line"><b>Do:</b> from memory, write the graceful-shutdown handler and the error taxonomy. Then re-do one week-13 drill and one week-26 drill.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w39a"><label for="w39a">Explain operational versus programmer errors out loud in 90 seconds.</label></li>
+      <li><input type="checkbox" id="w39b"><label for="w39b">Interleaved drill: 25 mixed questions from weeks 1–38.</label></li>
+      <li><input type="checkbox" id="w39c"><label for="w39c">Run mock interview 3 — reliability, performance, and debugging.</label></li>
+    </ul>
+    <p class="drill-line"><b>Gate:</b> you should now be able to take a Node service you have never seen and say what will break first. If not, name the gap and spend the week on it.</p>
+    <p class="res">Ask your teacher: <em>"Run mock interview 3."</em></p>
+  </div>
+
+  <!-- ================= PHASE 4 ================= -->
+  <div class="phase-band">
+    <span class="label">Phase 4 · Weeks 40–52</span>
+    <h2>Professional</h2>
+    <p>The data layer, TypeScript, NestJS — then saying all of it out loud under pressure.</p>
+  </div>
+
+  <p class="mod-head">Module 10 · Weeks 40–43 · The data layer</p>
+
+  <div class="wk spine" id="w40">
+    <h3><span class="num">W40</span>Postgres — pools, transactions, and N+1 <span class="pill">core</span></h3>
+    <p class="goal">Goal: the database is where most Node latency actually lives. Learn the pool before the ORM.</p>
+    <p class="build-line"><b>Build:</b> give the spine API real persistence with <a href="https://node-postgres.com/">node-postgres</a>. Turn on query logging, create an N+1 on purpose, see it in the log, then fix it.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w40a"><label for="w40a">Explain what a connection pool is and what happens when it is exhausted.</label></li>
+      <li><input type="checkbox" id="w40b"><label for="w40b">Run a transaction correctly, including the rollback path.</label></li>
+      <li><input type="checkbox" id="w40c"><label for="w40c">Spot an N+1 in a query log and fix it with one query.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "The API hangs under load but CPU is idle." Name the most likely cause.</p>
+    <p class="res">Primary: <a href="https://node-postgres.com/">node-postgres</a>. Lesson: <a href="../lessons/0040-postgres-pools-transactions-and-n-plus-one.html">0040</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w41">
+    <h3><span class="num">W41</span>Redis, and the three ways a cache lies <span class="pill">core</span></h3>
+    <p class="goal">Goal: caching is easy to add and easy to get subtly wrong. Learn the failure modes with the win.</p>
+    <p class="build-line"><b>Build:</b> add Redis caching to the spine API. Then create a stale-read bug on purpose, a thundering-herd on cold start, and an unbounded key growth. Fix all three.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w41a"><label for="w41a">Pick a TTL with a reason, not a habit.</label></li>
+      <li><input type="checkbox" id="w41b"><label for="w41b">Explain cache stampede and show one way to stop it.</label></li>
+      <li><input type="checkbox" id="w41c"><label for="w41c">Say what your service does when Redis is down — and make that the tested path.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Users see old data 30 seconds after saving." Explain and fix.</p>
+    <p class="res">Primary: <a href="https://redis.io/docs/latest/develop/">Redis developer docs</a>. Lesson: <a href="../lessons/0041-redis-and-the-three-ways-a-cache-lies.html">0041</a>.</p>
+  </div>
+
+  <div class="wk" id="w42">
+    <h3><span class="num">W42</span>Background work — queues, retries, idempotency <span class="pill">core</span></h3>
+    <p class="goal">Goal: slow work does not belong in a request. Learn the queue, and learn why a retry can charge a customer twice.</p>
+    <p class="build-line"><b>Build:</b> move the slowest route to a <a href="https://docs.bullmq.io/">BullMQ</a> job. Add retries, a dead-letter path, and an idempotency key. Then run the same job twice on purpose and prove nothing broke.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w42a"><label for="w42a">Explain at-least-once delivery, and why idempotency is not optional with it.</label></li>
+      <li><input type="checkbox" id="w42b"><label for="w42b">Design a dead-letter path and say who looks at it.</label></li>
+      <li><input type="checkbox" id="w42c"><label for="w42c">Say what the user sees while a background job is still running.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "A retry sent the email twice." Design the fix in five minutes.</p>
+    <p class="res">Primary: <a href="https://docs.bullmq.io/">BullMQ</a>. Lesson: <a href="../lessons/0042-background-work-queues-retries-idempotency.html">0042</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w43">
+    <h3><span class="num">W43</span>Build — the spine API with a real data layer <span class="pill">core</span></h3>
+    <p class="goal">Goal: Postgres, Redis and a queue in one service, all three under load, all three with a tested failure path.</p>
+    <p class="build-line"><b>Build:</b> the full data layer, running together. Then take each dependency down in turn while load is running, and record what the API does each time.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w43a"><label for="w43a">Degrade gracefully when Redis dies; fail clearly when Postgres dies.</label></li>
+      <li><input type="checkbox" id="w43b"><label for="w43b">Draw the service's dependency diagram from memory.</label></li>
+      <li><input type="checkbox" id="w43c"><label for="w43c">Say which dependency you would remove first if you had to simplify.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Walk me through a request from socket to database and back." Five minutes, whiteboard.</p>
+    <p class="res">Primary: your own architecture diagram. Lesson: <a href="../lessons/0043-build-the-spine-with-a-real-data-layer.html">0043</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 11 · Weeks 44–46 · TypeScript for Node</p>
+
+  <div class="wk spine" id="w44">
+    <h3><span class="num">W44</span>The type system you actually need <span class="pill">core</span></h3>
+    <p class="goal">Goal: not all of TypeScript. The parts that catch real Node bugs: narrowing, generics, <code>unknown</code>, and discriminated unions.</p>
+    <p class="build-line"><b>Build:</b> type the trickiest function in the spine API — the one with an ambiguous return. Then type the error taxonomy from week 28 as a discriminated union.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w44a"><label for="w44a">Explain why <code>unknown</code> is safer than <code>any</code>, with an example.</label></li>
+      <li><input type="checkbox" id="w44b"><label for="w44b">Model a result-or-error with a discriminated union and narrow it correctly.</label></li>
+      <li><input type="checkbox" id="w44c"><label for="w44c">Write one generic function that is genuinely worth being generic.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Type a function that returns a user or a not-found error." No <code>any</code>, no throw.</p>
+    <p class="res">Primary: <a href="https://www.typescriptlang.org/docs/">TypeScript docs</a>. Lesson: <a href="../lessons/0044-the-type-system-you-actually-need.html">0044</a>.</p>
+  </div>
+
+  <div class="wk depth" id="w45">
+    <h3><span class="num">W45</span>The build setup <span class="pill soft">depth</span></h3>
+    <p class="goal">Goal: depth, and mostly a one-time cost. But a stack trace pointing at compiled JavaScript wastes hours, so it is worth one week.</p>
+    <p class="build-line"><b>Build:</b> a working <code>tsconfig.json</code> for Node ESM, <a href="https://tsx.is/">tsx</a> for development, a real build for production, and source maps so a stack trace names your <code>.ts</code> line.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w45a"><label for="w45a">Explain what <code>moduleResolution</code> does and pick the right value with a reason.</label></li>
+      <li><input type="checkbox" id="w45b"><label for="w45b">Get a production stack trace that points at TypeScript line numbers.</label></li>
+      <li><input type="checkbox" id="w45c"><label for="w45c">Say why type checking and transpiling are separate jobs.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "It compiles but crashes at run time with a module error." Name two causes.</p>
+    <p class="res">Primary: <a href="https://www.typescriptlang.org/tsconfig/">tsconfig reference</a> · <a href="https://nodejs.org/en/learn/typescript/introduction">Node + TypeScript</a>. Lesson: <a href="../lessons/0045-the-build-setup.html">0045</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w46">
+    <h3><span class="num">W46</span>Build — migrate the spine API to TypeScript <span class="pill">core</span></h3>
+    <p class="goal">Goal: the whole service, typed, with no <code>any</code> left that you cannot defend.</p>
+    <p class="build-line"><b>Build:</b> migrate file by file, keeping the tests green at every step. Keep a list of every place the compiler found a real bug — that list is the argument for TypeScript.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w46a"><label for="w46a">Migrate incrementally with the suite green at every commit.</label></li>
+      <li><input type="checkbox" id="w46b"><label for="w46b">Name at least two real bugs the compiler caught.</label></li>
+      <li><input type="checkbox" id="w46c"><label for="w46c">Justify every remaining <code>any</code>, or delete it.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Was TypeScript worth it here?" Answer with your bug list, not with an opinion.</p>
+    <p class="res">Primary: your own migration commits. Lesson: <a href="../lessons/0046-build-migrate-the-spine-to-typescript.html">0046</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 12 · Weeks 47–50 · NestJS</p>
+
+  <div class="wk" id="w47">
+    <h3><span class="num">W47</span>Modules and dependency injection <span class="pill">core</span></h3>
+    <p class="goal">Goal: understand what Nest is for before learning its syntax. DI is the whole point; decorators are packaging.</p>
+    <p class="build-line"><b>Build:</b> the same small service twice — once wired by hand, once with Nest's container. Then swap one dependency for a fake in both, and compare how much code moved.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w47a"><label for="w47a">Explain dependency injection without using the words "decorator" or "framework".</label></li>
+      <li><input type="checkbox" id="w47b"><label for="w47b">Say what a Nest module boundary buys you, and what it costs in indirection.</label></li>
+      <li><input type="checkbox" id="w47c"><label for="w47c">Trace how Nest resolves a provider, step by step.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Why NestJS and not Express?" Give a real trade-off, not a feature list.</p>
+    <p class="res">Primary: <a href="https://docs.nestjs.com/providers">NestJS providers</a>. Lesson: <a href="../lessons/0047-modules-and-dependency-injection.html">0047</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w48">
+    <h3><span class="num">W48</span>Controllers, pipes, guards, interceptors <span class="pill">core</span></h3>
+    <p class="goal">Goal: know which of the four to reach for, and in what order Nest runs them.</p>
+    <p class="build-line"><b>Build:</b> port the spine API's routes into Nest. Validation in a pipe, auth in a guard, logging in an interceptor, errors in a filter. Nothing in a controller that does not belong there.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w48a"><label for="w48a">Name the request lifecycle order: guard, interceptor, pipe, handler, filter.</label></li>
+      <li><input type="checkbox" id="w48b"><label for="w48b">Choose correctly between a pipe and a guard for a given requirement.</label></li>
+      <li><input type="checkbox" id="w48c"><label for="w48c">Map week 28's error taxonomy onto an exception filter.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Where does rate limiting go, and why not in the controller?"</p>
+    <p class="res">Primary: <a href="https://docs.nestjs.com/">NestJS docs</a>. Lesson: <a href="../lessons/0048-controllers-pipes-guards-interceptors.html">0048</a>.</p>
+  </div>
+
+  <div class="wk" id="w49">
+    <h3><span class="num">W49</span>Testing and data in Nest <span class="pill">core</span></h3>
+    <p class="goal">Goal: DI pays for itself in tests or it does not pay at all. Prove it here.</p>
+    <p class="build-line"><b>Build:</b> port the week 35–38 test suite to Nest's testing module. Swap the real database for a fake in one line. Then run the same suite against the real one.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w49a"><label for="w49a">Override a provider in a test with one line, and explain the mechanism.</label></li>
+      <li><input type="checkbox" id="w49b"><label for="w49b">Say when an end-to-end test is worth its slowness.</label></li>
+      <li><input type="checkbox" id="w49c"><label for="w49c">Wire Postgres and the queue into Nest without leaking framework types everywhere.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Show me a unit test where DI genuinely saved you work."</p>
+    <p class="res">Primary: <a href="https://docs.nestjs.com/fundamentals/testing">NestJS testing</a>. Lesson: <a href="../lessons/0049-testing-and-data-in-nest.html">0049</a>.</p>
+  </div>
+
+  <div class="wk spine" id="w50">
+    <h3><span class="num">W50</span>Build — the spine API, rebuilt in NestJS <span class="pill">core</span></h3>
+    <p class="goal">Goal: the same service, professionally shaped. Same tests, same load numbers, and an honest verdict on what Nest cost.</p>
+    <p class="build-line"><b>Build:</b> the complete rebuild — modules, DI, the data layer, the queue, the tests, graceful shutdown. Load-test it and compare with the week 30 numbers.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w50a"><label for="w50a">Match or beat the raw <code>http</code> version's p99, or explain the gap.</label></li>
+      <li><input type="checkbox" id="w50b"><label for="w50b">Say what Nest made easier and what it made harder. Both lists non-empty.</label></li>
+      <li><input type="checkbox" id="w50c"><label for="w50c">Keep graceful shutdown working through the framework.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> Present the rebuild in five minutes, including one thing you would do differently.</p>
+    <p class="res">Primary: <a href="https://docs.nestjs.com/">NestJS docs</a>. Post the repo for community review. Lesson: <a href="../lessons/0050-build-the-spine-rebuilt-in-nestjs.html">0050</a>.</p>
+  </div>
+
+  <p class="mod-head">Module 13 · Weeks 51–52 · The interview</p>
+
+  <div class="wk" id="w51">
+    <h3><span class="num">W51</span>System design, for Node specifically <span class="pill">core</span></h3>
+    <p class="goal">Goal: general system design is everywhere. The Node-specific judgement — when a worker pool, when a separate service, when not Node at all — is rare and is what gets you hired.</p>
+    <p class="build-line"><b>Build:</b> design one real system end to end on paper. "Send 1 million notifications an hour." Queues, workers, rate limits, retries, failure modes, and the cost. Then defend every box.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w51a"><label for="w51a">Design a Node system end to end and name every failure mode.</label></li>
+      <li><input type="checkbox" id="w51b"><label for="w51b">Say where Node is the wrong choice in your own design, and why you kept it anyway.</label></li>
+      <li><input type="checkbox" id="w51c"><label for="w51c">Estimate throughput with real arithmetic, not adjectives.</label></li>
+    </ul>
+    <p class="drill-line"><b>Drill:</b> "Design a service that sends 1M notifications an hour." 45 minutes, whiteboard, out loud.</p>
+    <p class="res">Primary: your own 12 builds. Ask your teacher for a design round. Lesson: <a href="../lessons/0051-system-design-for-node-specifically.html">0051</a>.</p>
+  </div>
+
+  <div class="wk review" id="w52">
+    <h3><span class="num">W52</span>Review — the final gate <span class="pill alt">review</span></h3>
+    <p class="goal">Goal: the year is over when you can say all of it out loud, under pressure, with no notes. Not when you have read all of it.</p>
+    <p class="build-line"><b>Do:</b> a full mock loop — one live-coding round, one debugging round, one system-design round, one "tell me about something you built" round. Recorded, then reviewed.</p>
+    <ul class="skills">
+      <li><input type="checkbox" id="w52a"><label for="w52a">Pass all five domain-expert tests: explain, predict, justify, debug, judge.</label></li>
+      <li><input type="checkbox" id="w52b"><label for="w52b">Tell the story of every build in this course in 90 seconds each.</label></li>
+      <li><input type="checkbox" id="w52c"><label for="w52c">Write the next year's plan — what is still weak, in your own words.</label></li>
+    </ul>
+    <p class="drill-line"><b>Final gate:</b> record yourself answering ten questions cold. Watch it back. The gaps you see are next year's syllabus.</p>
+    <p class="res">Ask your teacher: <em>"Run the final mock loop."</em></p>
+  </div>
+
+  <div class="ask">
+    I'm your teacher for this whole year. Ask me to <b>write the lesson for a week</b>, go deeper on any hard part, run a <b>live-coding drill</b>, or <b>mock-interview</b> you. The best learning happens when you ask.
+  </div>
+
+  <div class="footer-nav">
+    <a href="../index.html">← The Map</a>
+    <a href="glossary.html">Glossary →</a>
+  </div>
+</div>
+
+<script>
+  // Persist checkbox ticks in this browser so the plan is a living tracker.
+  // The key prefix is new ('node1y-w-'), so ticks from the old 12-month plan
+  // are not carried over. That is deliberate: the weeks are not the months.
+  (function () {
+    var boxes = Array.prototype.slice.call(document.querySelectorAll('input[type=checkbox]'));
+    var KEY = 'node1y-w-';
+    var prog = document.getElementById('progress');
+    var fill = document.getElementById('fill');
+
+    function refresh() {
+      var done = boxes.filter(function (b) { return b.checked; }).length;
+      prog.textContent = done + ' / ' + boxes.length + ' skills ticked';
+      fill.style.width = (boxes.length ? (done / boxes.length) * 100 : 0) + '%';
+    }
+
+    boxes.forEach(function (b) {
+      if (localStorage.getItem(KEY + b.id) === '1') b.checked = true;
+      b.addEventListener('change', function () {
+        localStorage.setItem(KEY + b.id, b.checked ? '1' : '0');
+        refresh();
+      });
+    });
+    refresh();
+
+    // "Show core only" hides the depth weeks. The 80/20 rule made visible:
+    // no depth week is started while a core week is untaught.
+    var btn = document.getElementById('coreToggle');
+    btn.addEventListener('click', function () {
+      var on = document.body.classList.toggle('core-only');
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      btn.textContent = on ? 'Show all weeks' : 'Show core only';
+    });
+  })();
+</script>

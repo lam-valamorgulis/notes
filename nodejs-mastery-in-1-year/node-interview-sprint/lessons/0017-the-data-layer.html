@@ -1,0 +1,552 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The data layer — pool, transaction, cache, queue — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 6 of 7 · Lesson 17 · Scale and design</p>
+  <h1>The data layer — pool, transaction, cache, queue</h1>
+  <p class="subtitle">Four pieces sit in almost every production Node service. Each one solves a real problem, and each one charges a price.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 6 of 7.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/7-day-plan.html#d6">Day 6 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can name all four pieces, say what problem each one solves, and say what it costs. You can also say what breaks when each one is set up wrong.
+  </div>
+
+  <h2>Start from the problem — connections are expensive</h2>
+
+  <p>A database connection is not cheap. Opening one means a TCP handshake, then authentication, then session setup.</p>
+
+  <p>That takes milliseconds. A request that reads one row should take much less.</p>
+
+  <p>So opening a connection per request is wasteful. The connection costs more than the query.</p>
+
+  <p>The obvious fix is to keep one connection open forever and reuse it. That fails too.</p>
+
+  <p>One connection serves one query at a time. Node has many requests in flight at once.</p>
+
+  <p>So you need a small, fixed set of open connections. That is a <b>pool</b>.</p>
+
+  <div class="soundbite">
+    <span class="label">The pool, in one sentence</span>
+    <p><b>"A pool keeps a fixed number of connections open, and puts a queue in front of them. When all of them are busy, the next request <em>waits</em>."</b></p>
+  </div>
+
+  <h2>The pool, and the failure that looks like a hang</h2>
+
+  <p>Read that last word again. The request <b>waits</b>. It does not fail.</p>
+
+  <p>That is the whole trap. An exhausted pool does not raise an error you can see.</p>
+
+  <p>It shows up as latency. Every request sits in the queue, waiting for a free connection.</p>
+
+  <p>From outside, the service looks hung. CPU is low. Memory is fine. Nothing is logged.</p>
+
+  <div class="trap">
+    <span class="label">Trap — the pool you never sized</span>
+    Three things exhaust a pool: a query that got slow, a connection that was never released, and a transaction held open across a slow network call. All three look identical from outside. Always <b>measure the wait time for a connection</b> as its own metric. Without it you cannot tell a slow database from an empty pool.
+  </div>
+
+  <p>Now the size. Instinct says a big pool serves more requests. Instinct is wrong here.</p>
+
+  <p>The database has a fixed number of cores and disks. Beyond that point, more connections only add contention.</p>
+
+  <p>Two hard limits also apply, and both matter in an interview.</p>
+
+  <ul>
+    <li>Your pool size times your process count must stay <b>under the database limit</b>.</li>
+    <li>Under <code>cluster</code>, eight workers with a pool of 10 open <b>80</b> connections, not 10.</li>
+  </ul>
+
+  <p>That second point connects straight to <a href="0016-worker-threads-versus-cluster.html">Lesson 16</a>. It is a favourite follow-up.</p>
+
+  <h2>Transactions — atomic, and therefore short</h2>
+
+  <p>Some work must happen completely or not at all. The spine API has one such case.</p>
+
+  <p>Creating a short link writes a row and reserves a code. A half-finished version is worse than a failure.</p>
+
+  <p>A transaction gives you that. Everything inside it commits together, or none of it does.</p>
+
+  <p>The price is a lock, and a connection held for the whole transaction.</p>
+
+  <div class="trap">
+    <span class="label">Trap — the transaction that waits on the network</span>
+    Never hold a transaction open across a call to another service. A payment API taking 800 ms means a row locked for 800 ms, and one pool connection gone for 800 ms. Under load, that alone empties the pool. <b>Do the network call first, then open a short transaction to write the result.</b>
+  </div>
+
+  <p>The rule is easy to say and easy to defend. <b>A transaction should touch the database and nothing else.</b></p>
+
+  <h2>Cache — the read you stop doing</h2>
+
+  <p>Look at the spine API's shape. A short link is written once and read many thousands of times.</p>
+
+  <p>Every read is the same query, for the same row, returning the same answer. That is waste.</p>
+
+  <p>So you keep the answer somewhere faster. That is a <b>cache</b>.</p>
+
+  <p>Redis is the usual choice in Node, because it is shared across every process.</p>
+
+  <p>An in-memory cache is faster but is not shared. Under <code>cluster</code> you get one cache per worker.</p>
+
+  <p>The cost is honest and you should say it plainly. <b>A cache can be wrong.</b></p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The question</th><th>The answer you can defend</th></tr></thead>
+    <tbody>
+      <tr><td>What do you cache?</td><td>Reads that repeat and change rarely. The redirect lookup, not the click count.</td></tr>
+      <tr><td>What TTL?</td><td>The longest you can accept being wrong. Say the number and the reason.</td></tr>
+      <tr><td>How do you invalidate?</td><td>Delete the key on write. TTL is the safety net, not the plan.</td></tr>
+      <tr><td>What if the cache is down?</td><td>Fall through to the database. A cache must never be required.</td></tr>
+      <tr><td>What is the real risk?</td><td>Stale data, and a cold cache after a restart hitting the database at once.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Queue — the work you move off the hot path</h2>
+
+  <p>Back to the spine API. Every redirect should also count a click.</p>
+
+  <p>Writing that count inside the redirect makes every read a write. The fast path now depends on the database.</p>
+
+  <p>But nobody is waiting for the count. The user wants the redirect.</p>
+
+  <p>So you push a message and return. Something else counts it later. That is a <b>queue</b>.</p>
+
+  <p>BullMQ on Redis is the usual answer in Node. Name it, then say what it costs.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What a queue buys</th><th>What it charges</th></tr></thead>
+    <tbody>
+      <tr><td>The hot path stops waiting for slow work</td><td>The answer is no longer instant, and you must say so in the API</td></tr>
+      <tr><td>Retries with backoff, handled for you</td><td>Delivery is <b>at least once</b>, so a job can run twice</td></tr>
+      <tr><td>A burst is absorbed instead of dropped</td><td>A growing queue is a real failure you must alarm on</td></tr>
+      <tr><td>A bad job is parked in a dead-letter queue</td><td>Somebody must look at that queue, or it is just a bin</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>At-least-once delivery is the part interviewers push on. Say the fix before they ask.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this, word for word</span>
+    <p><b>"Queues give at-least-once delivery, so I make the job idempotent. Each job carries a key. Running it twice with that key has the same effect as running it once."</b></p>
+  </div>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 320" role="img" aria-labelledby="fig17-title">
+      <title id="fig17-title">The four pieces of a data layer, and where each one sits on a request</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">ONE REDIRECT ON THE SPINE API</text>
+
+      <rect x="20" y="30" width="86" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="63" y="55" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">GET /:code</text>
+
+      <line x1="106" y1="50" x2="132" y2="50" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="132,45 142,50 132,55" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="146" y="30" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="194" y="49" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">CACHE</text>
+      <text x="194" y="62" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">hit → done</text>
+
+      <line x1="242" y1="50" x2="268" y2="50" style="stroke: var(--ink-faint); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <polygon points="268,45 278,50 268,55" style="fill: var(--ink-faint);"></polygon>
+      <text x="255" y="84" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">miss</text>
+
+      <rect x="282" y="30" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="330" y="49" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">POOL</text>
+      <text x="330" y="62" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">wait if full</text>
+
+      <line x1="378" y1="50" x2="404" y2="50" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="404,45 414,50 404,55" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="418" y="30" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="466" y="55" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">database</text>
+
+      <line x1="194" y1="70" x2="194" y2="126" style="stroke: var(--accent-2); stroke-width: 2;"></line>
+      <polygon points="189,126 194,136 199,126" style="fill: var(--accent-2);"></polygon>
+      <text x="204" y="104" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px;">click count — nobody is waiting for it</text>
+
+      <rect x="146" y="140" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="194" y="159" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10px; font-weight: 700;">QUEUE</text>
+      <text x="194" y="172" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">push and return</text>
+
+      <line x1="242" y1="160" x2="268" y2="160" style="stroke: var(--accent-2); stroke-width: 2;"></line>
+      <polygon points="268,155 278,160 268,165" style="fill: var(--accent-2);"></polygon>
+
+      <rect x="282" y="140" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="330" y="159" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">worker</text>
+      <text x="330" y="172" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">idempotent job</text>
+
+      <line x1="378" y1="160" x2="404" y2="160" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="404,155 414,160 404,165" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="418" y="140" width="96" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="466" y="159" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">TRANSACTION</text>
+      <text x="466" y="172" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 8.5px;">short, no network</text>
+
+      <text x="20" y="216" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WHAT EACH ONE LOOKS LIKE WHEN IT IS WRONG</text>
+
+      <rect x="20" y="226" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="242" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">POOL exhausted → latency, no error, low CPU. It looks exactly like a hang.</text>
+
+      <rect x="20" y="254" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="270" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">CACHE stale → users see an old answer. Restart → cold cache floods the database.</text>
+
+      <rect x="20" y="282" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="298" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">QUEUE growing → you are behind for good. A job can also run twice.</text>
+    </svg>
+    <figcaption>The four pieces on one request. The cache and the pool are on the hot path. The queue exists to keep work off it.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Four small ideas. Keep a few phone lines open instead of dialling every time. That is the pool.</p>
+    <p class="part cont">Do related writes together or not at all. That is the transaction. Remember popular answers. That is the cache. Write down slow jobs and do them later. That is the queue.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A small clinic. Four doctors, one waiting room, and a receptionist who remembers common answers.</p>
+    <p class="part cont">Anything that takes an hour goes into the afternoon list instead of holding the queue. Patients with quick questions keep moving.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A waiting room is visible. Everyone can see the queue growing, and someone reacts.</p>
+    <p class="part limit cont">An exhausted connection pool is invisible. It raises no error and writes no log. It only shows up as latency, which is why you must measure the connection wait time as its own number.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think a bigger pool means more speed. Past a small number it means less.</p>
+    <p class="part cont">The database has a fixed number of cores and disks. Extra connections add contention, not capacity. And under <code>cluster</code>, eight workers with a pool of 10 open 80 connections.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why an exhausted pool looks like a hang. Then say which one number you would measure to prove it. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>All four side by side</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Piece</th><th>The problem it solves</th><th>What it costs</th><th>What breaks when it is wrong</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Pool</b></td>
+        <td>Connections are slow to open, and one serves one query.</td>
+        <td>A fixed ceiling, and a queue in front of it.</td>
+        <td>Exhaustion shows as latency with no error and low CPU.</td>
+      </tr>
+      <tr>
+        <td><b>Transaction</b></td>
+        <td>Related writes must all happen, or none of them.</td>
+        <td>Locks, and one connection held for its whole life.</td>
+        <td>Held across a network call, it empties the pool.</td>
+      </tr>
+      <tr>
+        <td><b>Cache</b></td>
+        <td>The same read repeats thousands of times.</td>
+        <td>The answer can be stale, and you must invalidate it.</td>
+        <td>Wrong data, or a cold cache flooding the database.</td>
+      </tr>
+      <tr>
+        <td><b>Queue</b></td>
+        <td>Slow work sits on a path where nobody is waiting.</td>
+        <td>Delivery is at least once, so jobs must be idempotent.</td>
+        <td>A growing queue, duplicate work, or an ignored dead-letter queue.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 5 minutes, out loud</span>
+    <p class="situation">The interviewer says: "Your API gets slow every afternoon. CPU is at 20%, memory is flat, and no errors are logged. Where do you look?"</p>
+    Answer out loud before reading on. A good answer treats "slow with no errors" as a <b>waiting</b> problem. It names the pool first, then the number that proves it: the time a request spends waiting for a connection. It also names the usual causes — a slow query, a leaked connection, or a long transaction.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://node-postgres.com/">node-postgres</a>, the pooling section. Then <a href="https://docs.bullmq.io/">BullMQ</a> on retries and the dead-letter queue, and <a href="https://redis.io/docs/latest/develop/">Redis — develop</a> for TTL. About forty minutes in total.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../reference/52-week-plan.html#w40">Week 40 · The connection pool</a> ·
+    <a href="../../reference/52-week-plan.html#w41">Week 41 · Caching</a> ·
+    <a href="../../reference/52-week-plan.html#w42">Week 42 · The job queue</a> ·
+    <a href="../../lessons/0021-build-the-spine-api-version-1.html">Week 21 · The spine API</a> ·
+    <a href="../../lessons/0030-build-harden-the-spine-api.html">Week 30 · Harden the spine API</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A <b>pool</b> keeps a few connections open and queues the rest. Exhaustion looks like a hang, not an error.</li>
+      <li>Pool size must be <b>small</b>, and pool size times process count must stay under the database limit.</li>
+      <li>A <b>transaction</b> is atomic, so it holds a lock and a connection. Keep it short.</li>
+      <li>Never hold a transaction across a network call. That single mistake empties the pool.</li>
+      <li>A <b>cache</b> removes a repeated read. It costs staleness, so invalidate on write and keep a TTL.</li>
+      <li>A <b>queue</b> moves slow work off the hot path. Delivery is at least once, so jobs must be idempotent.</li>
+      <li>Measure the <b>connection wait time</b>. Without it you cannot tell a slow database from an empty pool.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>each of the four buys speed and charges correctness. Say the price out loud, unprompted.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> node-postgres pooling documentation, BullMQ documentation, and the Redis developer guide. All three were checked live on 2026-08-28. The spine API's read-heavy shape comes from week 21 of the parent course.</p>
+
+  <div class="ask">
+    Stuck on any of this? <b>Ask your teacher.</b> Say <b>"quiz me on the data layer"</b> and answer out loud, with the cost named each time.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0016-worker-threads-versus-cluster.html">← Worker threads versus cluster</a></span>
+    <span><a href="0018-system-design-one-million-notifications.html">Next: System design →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Latency triples under load. CPU is at 20%, memory is flat, and nothing is logged. What is the first suspect?",
+      options: [
+        "The connection pool is exhausted, so requests are queued and simply wait for a free slot",
+        "The event loop is blocked by a long synchronous loop somewhere inside a request handler",
+        "The garbage collector is running long pauses because the heap has grown close to its limit",
+        "The database has lost its index, so every single query is now doing a full table scan"
+      ],
+      answer: 0,
+      why: "Waiting with no error and low CPU is the signature of an exhausted pool. Requests are not failing, they are queued for a connection, so nothing is logged. A blocked event loop would push CPU up, not leave it at 20%. Long garbage collection pauses show as CPU too, and would move the memory graph. A missing index would make the database itself slow, which you would see in query time rather than in connection wait time. The number that separates these is the wait for a connection, measured on its own."
+    },
+    {
+      q: "Why must a transaction never stay open across a call to another service?",
+      options: [
+        "It holds a lock and one pool connection for that whole call, so load empties the pool",
+        "The database will roll the transaction back automatically once the call takes too long",
+        "Another service cannot join your transaction, so the writes would end up inconsistent",
+        "Node cannot await inside a transaction block, so the driver throws an error at runtime"
+      ],
+      answer: 0,
+      why: "A transaction owns a connection for its entire life. If it waits 800 ms on a payment API, that is 800 ms of a locked row and one connection removed from the pool. A few of those at once and the pool is empty, which then shows as latency across every endpoint. Databases do not roll back on their own at that point, and Node has no problem awaiting inside a transaction — which is exactly why the mistake is easy to make. The fix is to do the network call first, then open a short transaction to write the result."
+    },
+    {
+      q: "You run eight cluster workers, each with a pool size of 10. How many database connections can you open?",
+      options: [
+        "Eighty, because each process keeps its own pool and the processes share nothing at all",
+        "Ten, because the pool is created once and the cluster workers share the same connections",
+        "Eight, because the primary process opens one connection and hands it to each worker",
+        "Eighteen, because the primary keeps eight and each worker adds one more on demand"
+      ],
+      answer: 0,
+      why: "Cluster workers are separate processes and share only the listening socket. Each one builds its own pool, so eight workers with a pool of 10 open up to 80 connections. That number must stay under the database's own connection limit, or new connections are refused under load. This is the most common way a service that worked fine on one process falls over after cluster is switched on. The same multiplication applies to in-memory caches and rate limits."
+    },
+    {
+      q: "Your queue delivers at least once, so a job can run twice. What is the correct fix?",
+      options: [
+        "Make the job idempotent with a key, so a second run has the same effect as the first",
+        "Switch the queue to exactly-once delivery, which most modern brokers now support well",
+        "Delete each message immediately on receipt, before the job body has started running",
+        "Lock the job row in the database for the whole time the job is running its work"
+      ],
+      answer: 0,
+      why: "At-least-once is a property of the delivery model, so you design around it rather than trying to remove it. An idempotency key makes a repeat harmless: the second run sees the key, recognises the work is done, and stops. Exactly-once delivery is not something you should claim in an interview, because a crash between the work and the acknowledgement always leaves a gap. Deleting on receipt turns the problem into at-most-once and silently loses jobs on a crash. A lock stops two running at the same time but does nothing about a repeat an hour later."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Walk me through your data layer.”",
+      answer: "Four pieces, and each one buys speed and charges something. A connection pool, because opening a connection costs milliseconds and one connection serves one query at a time. It keeps a small fixed set open and queues the rest, so exhaustion appears as latency rather than as an error. Transactions, for writes that must all happen or none, kept short and never held across a network call. A cache for reads that repeat, with a TTL I can defend and invalidation on write, and the honest cost is stale data. And a queue for slow work nobody is waiting for, with idempotent jobs because delivery is at least once. <br>Why: they want the price, not the list. Naming what each piece gives up is what makes it sound like production experience rather than a tutorial."
+    },
+    {
+      prompt: "Interviewer: “How do you size a connection pool?”",
+      answer: "Smaller than instinct says. The database has a fixed number of cores and disks, so past a small number extra connections add contention rather than capacity. I start low, around the number of cores on the database, and I raise it only if the measured wait for a connection is the bottleneck. Two hard limits apply. Pool size times process count must stay under the database's own connection limit, which is easy to breach: eight cluster workers with a pool of ten open eighty connections. And I measure the connection wait time as its own metric, because without it I cannot tell a slow query from an empty pool. <br>Why: the wrong answer here is a big number. They are checking whether you know the database is the constraint, not your service."
+    },
+    {
+      prompt: "Interviewer: “When would you put something on a queue?”",
+      answer: "When the work is slow and nobody is waiting for the result. On my link shortener the redirect must be fast, but every redirect also counts a click. Counting inside the redirect turns every read into a write and puts the database on the fast path. So I push a message and return the redirect immediately, and a worker counts it later. The cost is real and I would say it before being asked. Delivery is at least once, so the job carries an idempotency key and running it twice has the same effect as once. A growing queue is a failure I alarm on, and the dead-letter queue needs someone to actually read it. <br>Why: they are listening for whether you can tell work that must be synchronous from work that only looks that way."
+    }
+  ]);
+</script>

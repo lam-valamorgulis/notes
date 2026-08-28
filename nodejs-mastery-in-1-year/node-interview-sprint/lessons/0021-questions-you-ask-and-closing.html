@@ -1,0 +1,525 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The questions you ask, and closing — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 7 of 7 · Lesson 21 · The rehearsal</p>
+  <h1>The questions you ask, and closing</h1>
+  <p class="subtitle">The last ten minutes are scored too. Most candidates give them away. This is the cheapest ground in the whole interview.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 7 of 7.</span> This lesson builds one domain-expert ability: <b>judge someone else's work in it, and say what is wrong and why</b>. Today the work you judge is their engineering culture. <a href="../reference/7-day-plan.html#d7">Day 7 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> six questions written down, a salary sentence you can say without flinching, and a closing that takes sixty seconds. Then you stop working.
+  </div>
+
+  <h2>Start from the problem</h2>
+
+  <p>Near the end, they say: "any questions for us?"</p>
+
+  <p>Most candidates hear that as the end of the interview. It is not. It is still the interview.</p>
+
+  <p>The common answers waste it. "No, I think you covered everything." Or a question about holiday. Or something already on the careers page.</p>
+
+  <p>None of those are punished. They simply score nothing, in a slot where scoring is easy.</p>
+
+  <h2>Derive what a good question is</h2>
+
+  <p>Start from what the interviewer can learn here. They cannot learn Node facts from your question.</p>
+
+  <p>What they learn is <b>what you think matters</b>. That is a strong signal about how you would work.</p>
+
+  <p>So the question is a claim about your priorities, whether you mean it as one or not.</p>
+
+  <p>Now ask what a backend engineer's priorities actually are. Not features. Not the roadmap.</p>
+
+  <p>A backend engineer cares about <b>what breaks, and who fixes it</b>. That is the job.</p>
+
+  <div class="soundbite">
+    <span class="label">The test for any question you plan to ask</span>
+    <p><b>"Does the answer change how I would do the work?" If yes, ask it. If no, it is small talk, and small talk scores nothing here.</b></p>
+  </div>
+
+  <p>There is a second benefit, and it is not a trick. You genuinely need these answers.</p>
+
+  <p>You are also deciding. A team with no rollback story and weekly 2am pages is a real thing to know about.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 270" role="img" aria-labelledby="fig21-title">
+      <title id="fig21-title">The shape of the last sixty seconds of an interview</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">THE LAST SIXTY SECONDS · THREE MOVES</text>
+
+      <rect x="20" y="30" width="188" height="76" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="114" y="52" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">1 · INTEREST</text>
+      <text x="114" y="72" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">specific, about this</text>
+      <text x="114" y="88" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">system — not generic</text>
+
+      <line x1="210" y1="68" x2="224" y2="68" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="224,63 234,68 224,73" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="238" y="30" width="188" height="76" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="332" y="52" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">2 · WHY YOU FIT</text>
+      <text x="332" y="72" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">one reason only,</text>
+      <text x="332" y="88" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">tied to their problem</text>
+
+      <line x1="428" y1="68" x2="442" y2="68" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <polygon points="442,63 452,68 442,73" style="fill: var(--ink-faint);"></polygon>
+
+      <rect x="456" y="30" width="164" height="76" rx="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="538" y="52" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">3 · NEXT STEP</text>
+      <text x="538" y="72" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">ask directly,</text>
+      <text x="538" y="88" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">then stop talking</text>
+
+      <line x1="20" y1="126" x2="620" y2="126" style="stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="150" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WHAT NOT TO PUT HERE</text>
+
+      <rect x="20" y="160" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="176" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">a summary of your own answers — they were there, and it reads as anxious</text>
+
+      <rect x="20" y="190" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="206" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">an apology for anything — the round you lost is already scored</text>
+
+      <rect x="20" y="220" width="600" height="24" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="32" y="236" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">a new topic — the last minute is for closing, never for opening</text>
+
+      <text x="320" y="262" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Three short moves, then silence. Silence at the end is confidence.</text>
+    </svg>
+    <figcaption>The last sixty seconds are the only part of the interview you fully control. Rehearse them like a kata.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      When you ask a question, you are telling them what you care about. You cannot avoid that.</p>
+    <p class="part cont">So choose questions about the things a backend engineer really lives with. What breaks, how often, and who gets woken up.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Someone viewing a house asks about the roof and the drains, not about the paint colour.</p>
+    <p class="part cont">The estate agent learns something from that question. This person has owned a house before, and knows what actually costs money.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A house survey is one-directional. You inspect, the house does not inspect you.</p>
+    <p class="part limit cont">Here both things happen at once. You are learning whether you want the job, and they are learning how you think. So a question asked only to look clever fails both jobs. <b>Ask things you genuinely want the answer to.</b></p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People prepare questions to impress, then ask them without listening to the answer.</p>
+    <p class="part cont">The answer is the point. If they say the last incident took six hours to roll back, that is real information. Follow it with one more question, and you are having a conversation between engineers.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why "any questions for us?" is still part of the scoring. Then name the one test for a good question. <b>Send it to me and I will tell you where the gap is.</b>
+      This is the last teach-back of the sprint. Say it out loud, then close the laptop.</p>
+    </div>
+  </div>
+
+  <h2>Six questions only a backend engineer asks</h2>
+
+  <p>Write these on one page. Take that page into the room.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Ask</th><th>What you are listening for</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>"What does on-call look like, and how often does it actually fire?"</td>
+        <td><b>Good:</b> a number, and a story about reducing it. <b>Bad:</b> "it is quiet", with no number.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>"What is the deploy story, and how long does a rollback take?"</td>
+        <td><b>Good:</b> minutes, and someone has done one recently. <b>Bad:</b> "we have never needed to."</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>"Where does the Node service sit, and what is behind it?"</td>
+        <td><b>Good:</b> a clear drawing in words. <b>Bad:</b> vagueness, which usually means nobody owns it.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>"What was the hardest production incident this year, and what changed after it?"</td>
+        <td><b>Good:</b> a real story with a fix. <b>Bad:</b> a blameful story, or "nothing much happens."</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>"How do you decide between fixing something and rewriting it?"</td>
+        <td><b>Good:</b> a rule, or an example. <b>Bad:</b> "we rewrite when it gets bad", with no test.</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>"What would a good first three months look like for this person?"</td>
+        <td><b>Good:</b> something concrete and owned. <b>Bad:</b> a list of onboarding tasks only.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Ask three, not six</span>
+    You will not have time for six, and asking all of them turns it into an interrogation. Prepare six, ask <b>two or three</b>, and follow the most interesting answer with one more question. That follow-up is worth more than a fourth prepared question.
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — the question you do not want answered</span>
+    Do not ask something to look clever. If they answer in depth and you have nothing to say back, the question is exposed as decoration. <b>Only ask what you would genuinely act on.</b> Every one of the six above changes whether you take the job.
+  </div>
+
+  <h2>Salary, in one sentence</h2>
+
+  <p>They will ask. Decide your range today, not in the room.</p>
+
+  <p>Say it in one sentence, then stop. The silence after it is not yours to fill.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this, then stop talking</span>
+    <p><b>"I am looking in the range of X to Y, depending on the whole package. Does that sit inside your band?"</b></p>
+  </div>
+
+  <p>Two things make this work. A range shows flexibility without giving ground.</p>
+
+  <p>And the question at the end hands the next move back to them. You are not negotiating yet, only checking the fit.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Do</th><th>Do not</th></tr></thead>
+    <tbody>
+      <tr><td>Decide the range before the interview.</td><td>Work it out live, out loud.</td></tr>
+      <tr><td>Give a range, then stop.</td><td>Keep talking to fill the silence.</td></tr>
+      <tr><td>Say it in a normal voice.</td><td>Apologise for the number.</td></tr>
+      <tr><td>Ask if it fits their band.</td><td>Refuse to name anything at all.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The last sixty seconds</h2>
+
+  <p>Three moves. Say them in order, then stop.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Move</th><th>Say something like</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 · Interest, specific</b></td><td>"This is the kind of backend I want to work on. Real traffic, and problems that only appear under load."</td></tr>
+      <tr><td><b>2 · One reason you fit</b></td><td>"What I would bring straight away is a habit of measuring before changing anything."</td></tr>
+      <tr><td><b>3 · Next step</b></td><td>"What are the next steps, and when should I expect to hear?"</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Then be quiet. Silence at the end reads as confidence, not as an awkward gap.</p>
+
+  <h2>The last ten minutes before the call</h2>
+
+  <div class="table-scroll">
+  <table>
+    <tbody>
+      <tr><td>☐ Camera angle and light</td><td>☐ Microphone tested</td><td>☐ Link and time zone confirmed</td></tr>
+      <tr><td>☐ Notifications off</td><td>☐ Water within reach</td><td>☐ Editor open, blank file ready</td></tr>
+      <tr><td>☐ Six questions on paper</td><td>☐ Salary range decided</td><td>☐ <a href="../reference/onepager.html">One-pager</a> open</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 15 minutes, then you are finished</span>
+    <p class="situation">This is the last exercise of the sprint. Do it, then stop working.</p>
+    <ul>
+      <li>Write your six questions on one sheet of paper, by hand.</li>
+      <li>Decide your salary range. Write both numbers down.</li>
+      <li>Say the salary sentence out loud three times, in a normal voice.</li>
+      <li>Say the three closing moves out loud, twice, in order.</li>
+      <li>Run the equipment checklist above, tonight and not tomorrow.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">The sprint ends here</span>
+    Seven days, twenty-one lessons, four katas and one full mock. <b>The work is done.</b> Tonight there is nothing left to learn, and reading more will not help. Read the <a href="../reference/onepager.html">one-pager</a>, say your three stories once, check your equipment, and sleep. A rested candidate who knows nine things beats an exhausted one who half-knows twenty.
+  </div>
+
+  <div class="tip">
+    <span class="label">Primary source — none, and that is deliberate</span>
+    There is no page to read for this lesson. The source is a sheet of paper with your six questions on it, and your own voice saying the closing three times. Do that instead of reading.
+  </div>
+
+  <div class="tip">
+    <span class="label">The rest of the sprint, if you want one last pass</span>
+    <a href="../index.html">The Map</a> ·
+    <a href="../reference/7-day-plan.html">The 7-day plan</a> ·
+    <a href="../reference/onepager.html">The night before</a> ·
+    <a href="0019-the-full-mock.html">L19 · the full mock</a> ·
+    <a href="0020-when-you-do-not-know.html">L20 · when you do not know</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>"Any questions for us?" is <b>still the interview</b>. It is easy ground, and most people give it away.</li>
+      <li>Your question shows what you think matters. A backend engineer asks <b>what breaks and who fixes it</b>.</li>
+      <li>The test: <b>does the answer change how I would do the work?</b> If not, it is small talk.</li>
+      <li>Prepare six questions. Ask two or three, then follow the best answer with one more.</li>
+      <li>Salary: one sentence, a range you decided today, then stop talking.</li>
+      <li>Closing: specific interest, one reason you fit, then ask the next step directly.</li>
+      <li>Then be quiet. <b>Silence at the end reads as confidence.</b></li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>you are not taking an exam. You are showing someone what it is like to work with you.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> this lesson introduces no measured number and no new Node behaviour. It is rehearsal only. Every technical claim referenced here is taught, with its measurement and date, in Days 1 to 6 of this sprint.</p>
+
+  <div class="ask">
+    One last rehearsal? Say <b>"play the interviewer for the last ten minutes"</b> and close it out loud, once.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0020-when-you-do-not-know.html">← When you do not know</a></span>
+    <span><a href="../reference/onepager.html">Next: the night before →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why is “any questions for us?” a scored part of the interview?",
+      options: [
+        "The questions you choose show what you think matters, which is a signal about your work",
+        "It is the last thing they hear, so it carries more weight than the technical rounds",
+        "They use it to check that you have researched the company website before arriving",
+        "It fills the remaining time, and a candidate with no questions seems uninterested"
+      ],
+      answer: 0,
+      why: "They cannot learn Node facts from your question, so what is left is your priorities. Asking about on-call, rollbacks and incidents says you have run software in production. Asking about holiday or the roadmap says something else. Being last does not add weight, and a careers-page question is not punished so much as simply worth nothing."
+    },
+    {
+      q: "Which question tells you most about how the team really works?",
+      options: [
+        "What did the hardest production incident this year look like, and what changed after it",
+        "How many engineers work on the backend team, and how is that team organised today",
+        "Which version of Node is the service running on, and when do you plan to upgrade",
+        "What does the interview process look like after this stage, and who else will I meet"
+      ],
+      answer: 0,
+      why: "An incident story reveals three things at once: what actually breaks, how the team talks about failure, and whether anything changes afterwards. A blameful answer, or 'nothing much happens', is real information about the culture. Team size and Node version are facts you can be told later. The process question is worth asking, but it tells you nothing about the engineering."
+    },
+    {
+      q: "They ask what salary you are looking for. What is the best answer shape?",
+      options: [
+        "Give a range you have decided beforehand, in one sentence, then stop talking and wait",
+        "Ask what the budgeted band is first, and refuse to name any number before they do",
+        "Give a single number slightly above your target, so there is room to be negotiated down",
+        "Say it depends on the whole package, and offer to discuss it at a later stage instead"
+      ],
+      answer: 0,
+      why: "A range shows flexibility without giving ground, and one sentence keeps your voice steady. The silence afterwards is not yours to fill; talking on is where people negotiate against themselves. Refusing outright turns a simple question into a standoff. Deferring reads as avoidance, and a single inflated number invites a haggle rather than a fit check."
+    },
+    {
+      q: "What belongs in the last sixty seconds of the interview?",
+      options: [
+        "Specific interest, one reason you fit, and a direct question about the next step",
+        "A summary of every round, so they remember your strongest answers most clearly",
+        "A thank you, a note about your availability, and your salary range once again",
+        "One question you forgot to ask earlier, plus a short apology for going over time"
+      ],
+      answer: 0,
+      why: "Three short moves, in that order, then silence. Summarising your own answers reads as anxious, and they were in the room for all of them. Repeating salary at the close makes it the last thing they remember. Opening a new topic in the final minute is the one thing the closing is not for, and apologising draws attention to a round already scored."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Do you have any questions for us?”",
+      answer: "Yes, three. First, what does on-call look like, and how often does it actually fire? I am interested in the number, and in whether anyone has been working to bring it down. Second, what is the deploy story, and how long does a rollback take when you need one? Third, what was the hardest production incident this year, and what changed afterwards? Those three tell me more about the work than anything on the job description. Then I would follow whichever answer is most interesting with one more question. <br>Why: they cannot learn Node from your question, so what they learn is your priorities. Asking what breaks and who fixes it says you have run software in production, not just written it."
+    },
+    {
+      prompt: "Interviewer: “What are your salary expectations?”",
+      answer: "I am looking in the range of X to Y, depending on the whole package. Does that sit inside your band? Then I stop and let them answer. I decide both numbers before the interview, so I am never working them out live and out loud. A range rather than a single number shows I am flexible without giving ground, and the question at the end hands the next move back to them. I do not apologise for the number and I do not keep talking to fill the pause. <br>Why: this is a composure test as much as a money question. They are watching whether you can say a number in a normal voice and then be quiet."
+    },
+    {
+      prompt: "Interviewer: “Anything you would like to add before we finish?”",
+      answer: "Three short things. This is the kind of backend I want to work on — real traffic, and the problems that only appear under load rather than in a test. What I would bring straight away is a habit of measuring before changing anything, which is how I found the leak and the shutdown problem in my own service. And practically: what are the next steps, and when should I expect to hear? Then I stop talking. <br>Why: the closing is the only part of the hour you fully control, so it should be rehearsed. Specific interest, one reason you fit, then a direct question — and the silence afterwards reads as confidence rather than as an awkward gap."
+    }
+  ]);
+</script>

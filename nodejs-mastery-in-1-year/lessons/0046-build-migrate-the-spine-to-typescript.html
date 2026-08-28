@@ -1,0 +1,542 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — migrate the spine to TypeScript — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 46 of 52 · Lesson 46 · TypeScript for Node · <b>Build week</b></p>
+  <h1>Build — migrate the spine to TypeScript</h1>
+  <p class="subtitle">The whole service, typed, with a list of the real bugs the compiler found.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 46 of 52.</span> This lesson builds one domain-expert ability: <b>justify a technical decision with evidence you collected</b>. <a href="../reference/52-week-plan.html#w46">Week 46 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a bug list. Seven real crashes, found without running the service — and the exact order to turn the compiler up so each one appears.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0044-the-type-system-you-actually-need.html">Week 44</a> taught the four parts of the type
+    system worth knowing. This week applies them to a whole service, and the deliverable is not the typed
+    code. It is <b>the evidence</b>.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — how do you migrate without stopping?</h2>
+  <p>The migration that fails is done as one branch, all at once, over three weeks. Meanwhile other people keep shipping. It ends in a merge nobody can review.</p>
+
+  <div class="soundbite">
+    <span class="label">The rule that makes this safe</span>
+    <p>Every commit compiles and every commit has a green suite. If a step cannot be done that way, it is <b>too big a step</b>.</p>
+  </div>
+
+  <p>That is possible because TypeScript can read JavaScript. You can turn the checker on before renaming a single file — and that is where the first surprise is.</p>
+
+  <!-- ============ TIER 1 ============ -->
+  <h2>Step 1 — check the JavaScript, rename nothing</h2>
+  <p>Two ordinary <code>.js</code> files from a link shortener: a store and an HTTP server. No types anywhere. Turn on <code>allowJs</code> and <code>checkJs</code> with <code>strict</code>, and compile. Measured with TypeScript 7.0.2:</p>
+
+  <pre><code><span class="out">server.js(4,23):  error TS2345: Argument of type 'string | undefined' is not assignable to
+                  parameter of type 'string'.
+server.js(15,15): error TS2532: Object is possibly 'undefined'.
+server.js(23,29): error TS18048: 'req.url' is possibly 'undefined'.
+server.js(24,16): error TS18048: 'req.url' is possibly 'undefined'.
+server.js(30,48): error TS2531: Object is possibly 'null'.
+server.js(30,65): error TS2339: Property 'port' does not exist on type 'string | AddressInfo'.
+store.js(4,58):   error TS2339: Property 'status' does not exist on type 'Error'.
+<span class="cmt">… plus 6 × TS7006 'implicitly has an any type'</span>
+
+13 errors, and not one file was renamed.</span></code></pre>
+
+  <p>Every one is a real crash waiting for the right request:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The code</th><th>When it breaks</th></tr></thead>
+    <tbody>
+      <tr><td><code>parseInt(process.env.PORT)</code></td><td><code>NaN</code> wherever <code>PORT</code> is not set</td></tr>
+      <tr><td><code>req.headers['content-length'].length</code></td><td>Any GET, because there is no body</td></tr>
+      <tr><td><code>req.url.slice(1)</code></td><td><code>req.url</code> is optional on the type</td></tr>
+      <tr><td><code>server.address().port</code></td><td><code>address()</code> is <code>null</code> before listening, and a string for a socket</td></tr>
+      <tr><td><code>e.status = 409</code> on an <code>Error</code></td><td>Silently ignored, so the status never reaches the response</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Do this first, on any JavaScript codebase</span>
+    Thirteen findings from a configuration file. No rename, no rewrite, no risk. If someone is unconvinced
+    that TypeScript is worth it, this is the demonstration — and it takes ten minutes.
+  </div>
+
+  <!-- ============ TIER 2 ============ -->
+  <h2>Step 2 — rename, and type your own data</h2>
+  <p>Now look at what those 13 errors have in common. Every single one comes from a type <b>somebody else wrote</b> — <code>http</code>, <code>process</code>, <code>Error</code>. The compiler knows those.</p>
+
+  <p>It knew nothing about the store's own data, because <code>new Map()</code> is <code>Map&lt;any, any&gt;</code>. So this code passed cleanly:</p>
+
+  <pre><code>function bump(code) {
+  const l = links.get(code);
+  l.hits += 1;                <span class="cmt">// l is any. no error. crashes on an unknown code.</span>
+  return l.hits;
+}</code></pre>
+
+  <p>Rename <code>store.js</code> to <code>store.ts</code> and give the Map a type — the only real change:</p>
+
+  <pre><code>type Link = { code: string; url: string; hits: number; createdAt: number };
+const links = new Map&lt;string, Link&gt;();
+
+<span class="out">store.ts(14,3):  error TS18048: 'l' is possibly 'undefined'.
+store.ts(15,10): error TS18048: 'l' is possibly 'undefined'.</span></code></pre>
+
+  <div class="trap">
+    <span class="label">This is the whole argument for actually migrating</span>
+    <code>checkJs</code> alone found <b>13 bugs in other people's types and 0 in your own logic</b>. The bug
+    in <code>bump</code> only became visible once <code>Map&lt;string, Link&gt;</code> told the compiler what
+    <code>get</code> returns.
+    <p style="margin:.6rem 0 0;">So &ldquo;we turned on <code>checkJs</code>, that is enough&rdquo; is a real
+    improvement and a fraction of the value. The compiler can only check the parts you have described.</p>
+  </div>
+
+  <!-- ============ TIER 3 ============ -->
+  <h2>Step 3 — the flag <code>strict</code> does not include</h2>
+  <p>One bug was still hiding, in a function that reads perfectly:</p>
+
+  <pre><code>const newest = all.sort((a, b) =&gt; b.createdAt - a.createdAt)[0];
+return { count: all.length, total, newestCode: newest.code };</code></pre>
+
+  <p>On an empty store, <code>all[0]</code> is <code>undefined</code>. Verified at run time:</p>
+
+  <pre><code><span class="out">TypeError: Cannot read properties of undefined (reading 'code')</span></code></pre>
+
+  <p>And <code>strict: true</code> does not catch it. Indexing an array gives you <code>Link</code>, not <code>Link | undefined</code>. There is a separate flag, and it is not in <code>strict</code>:</p>
+
+  <pre><code>"noUncheckedIndexedAccess": true
+
+<span class="out">store.ts(22,50): error TS18048: 'newest' is possibly 'undefined'.</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Turn it on, and expect noise</span>
+    Every <code>arr[i]</code> and every <code>obj[key]</code> becomes possibly undefined, which is honest
+    and occasionally tiresome. It catches the empty-array bug, which is one of the most common crashes in
+    any JavaScript service. Turn it on last, once the rest compiles.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 260" role="img" aria-labelledby="fig46-title" width="640" height="260">
+      <title id="fig46-title">Each step of the migration finds a different kind of bug</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">THREE STEPS, THREE DIFFERENT KINDS OF BUG</text>
+
+      <rect x="20" y="38" width="192" height="118" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="116" y="58" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">1 · checkJs</text>
+      <text x="116" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">nothing renamed</text>
+      <text x="116" y="100" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 16px;">13</text>
+      <text x="116" y="120" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">bugs in library types</text>
+      <text x="116" y="134" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">http · process · Error</text>
+      <text x="116" y="150" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px; font-weight: 700;">0 in your own logic</text>
+
+      <rect x="224" y="38" width="192" height="118" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="58" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">2 · rename + type</text>
+      <text x="320" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">Map&lt;string, Link&gt;</text>
+      <text x="320" y="100" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 16px;">+2</text>
+      <text x="320" y="120" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">bugs in YOUR data</text>
+      <text x="320" y="134" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">get() on a missing key</text>
+      <text x="320" y="150" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 9px; font-weight: 700;">invisible until step 2</text>
+
+      <rect x="428" y="38" width="192" height="118" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="524" y="58" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">3 · one more flag</text>
+      <text x="524" y="76" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">noUncheckedIndexedAccess</text>
+      <text x="524" y="100" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 16px;">+1</text>
+      <text x="524" y="120" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">the empty array</text>
+      <text x="524" y="134" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">all.sort()[0].code</text>
+      <text x="524" y="150" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">NOT part of strict</text>
+
+      <rect x="20" y="176" width="600" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="197" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">The compiler can only check the parts you have described to it.</text>
+
+      <text x="320" y="234" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">"We turned on checkJs" is a real win and a small fraction of the value.</text>
+      <text x="320" y="252" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">All three counts measured with TypeScript 7.0.2 on the same two files.</text>
+    </svg>
+    <figcaption>Same code throughout. Only the compiler's knowledge changed.</figcaption>
+  </div>
+
+  <!-- ============ THE BUG LIST ============ -->
+  <h2>The deliverable — the bug list</h2>
+  <p>Somebody will ask whether this was worth the week. Answer with the list, not an opinion:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Bug</th><th>Found by</th><th>Symptom in production</th></tr></thead>
+    <tbody>
+      <tr><td><code>PORT</code> missing → <code>NaN</code></td><td>Step 1</td><td>Listens on a random port; health checks fail after a config change</td></tr>
+      <tr><td><code>content-length</code> read on a GET</td><td>Step 1</td><td>Every GET throws before routing</td></tr>
+      <tr><td><code>req.url</code> assumed present</td><td>Step 1</td><td>Crash on a malformed request line</td></tr>
+      <tr><td><code>server.address()</code> may be <code>null</code></td><td>Step 1</td><td>Crash if read before <code>listening</code></td></tr>
+      <tr><td><code>e.status = 409</code> ignored</td><td>Step 1</td><td>Duplicates return 500 instead of 409 — the week 21 decision, lost</td></tr>
+      <tr><td><code>bump()</code> on an unknown code</td><td><b>Step 2</b></td><td>Any request for a deleted link crashes the handler</td></tr>
+      <tr><td><code>stats()</code> on an empty store</td><td><b>Step 3</b></td><td>The stats endpoint 500s on a fresh deploy, and only then</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Read the last column. Every row is a real incident. Three only happen in conditions your tests do not create. A missing environment variable, a deleted link, an empty database on the first morning.</p>
+
+  <div class="tip">
+    <span class="label">Keep this list as you go, not afterwards</span>
+    Write the row when you fix the error, while you still remember why the code was wrong. Reconstructing
+    it a week later produces &ldquo;various type errors&rdquo;, which persuades nobody and teaches you
+    nothing.
+  </div>
+
+  <!-- ============ ANY ============ -->
+  <h2>The <code>any</code> that gets you through the week</h2>
+  <p>Migrating produces pressure to silence the compiler. Three tools, in order of honesty:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Escape</th><th>What it means</th><th>Acceptable?</th></tr></thead>
+    <tbody>
+      <tr><td><code>// @ts-expect-error</code> + a reason</td><td>&ldquo;This is wrong, I know, here is why&rdquo;</td><td><b>Yes.</b> It also errors if the problem is ever fixed.</td></tr>
+      <tr><td><code>x!</code> non-null assertion</td><td>&ldquo;I promise this is not null&rdquo;</td><td>Only where you can point at the check.</td></tr>
+      <tr><td><code>as any</code></td><td>&ldquo;Stop checking, and everything downstream too&rdquo;</td><td>Almost never. Never at a boundary.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Why <code>@ts-expect-error</code> beats <code>@ts-ignore</code></span>
+    <code>@ts-ignore</code> silences the line forever, including after you fix the underlying problem.
+    <code>@ts-expect-error</code> <b>fails to compile when the error goes away</b>, so it cleans itself up
+    and tells you the workaround is no longer needed.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      TypeScript can check plain JavaScript. So the first step of a migration renames nothing — you turn the checker on and read what it says.</p>
+    <p class="part cont">On two small files it found <b>13 real problems</b> that way. Then you rename files and describe your own data, and it finds a different kind of problem. The compiler can only check the parts you have described to it.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A spelling checker knows every word in its dictionary. It cannot check a name it was never told. So it stays silent on the one spelled wrong.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A spelling checker is silent about the unknown name. TypeScript is worse than silent. It reports the file as <b>clean</b>, because <code>any</code> means &ldquo;stop checking&rdquo; rather than &ldquo;I do not know&rdquo;.</p>
+    <p class="part limit cont">I measured exactly that. With <code>checkJs</code> alone, <code>links.get(code).hits += 1</code> produced no error, because <code>new Map()</code> is <code>Map&lt;any, any&gt;</code>. Only after writing <code>Map&lt;string, Link&gt;</code> did the compiler say <code>'l' is possibly 'undefined'</code>. Same code, same flags — the only thing that changed was that I had told it what the Map holds.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People treat <code>strict: true</code> as the maximum setting. It is not. <code>noUncheckedIndexedAccess</code> is a separate flag, and without it <code>arr[0]</code> has the element type rather than &ldquo;element or undefined&rdquo;.</p>
+    <p class="part cont">So the empty-array crash — one of the most common in any JavaScript service — passes <code>strict</code> cleanly. I measured it: <code>all.sort()[0].code</code> compiled fine and threw <code>Cannot read properties of undefined</code> at run time.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain why turning on <code>checkJs</code> is a real win but not the same as migrating. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — migrate the spine</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li><b>Step 1 first.</b> <code>allowJs</code>, <code>checkJs</code>, <code>strict</code>, rename nothing. Record the error count and read every one.</li>
+    <li>Fix those without renaming. Commit. <b>Green suite, compiling, before any rename happens.</b></li>
+    <li>Migrate <b>leaf files first</b> — the ones nothing imports. Then work up. One file per commit.</li>
+    <li>Every commit compiles and every commit is green. If a step cannot be, split it.</li>
+    <li>Type <b>your own data</b>, not just the function signatures. That is where step 2's bugs live.</li>
+    <li>Turn on <code>noUncheckedIndexedAccess</code> <b>last</b>, and fix the array-index bugs it finds.</li>
+    <li>Keep the <b>bug list</b> as you go. Bug, how it was found, what it would have done in production.</li>
+    <li>Grep for <code>any</code>, <code>as</code>, <code>!</code> and <code>@ts-</code>. Each survivor gets a one-line defence in a comment, or gets deleted.</li>
+  </ol>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;Was TypeScript worth it here?&rdquo;</p>
+    Answer with the bug list, and for each row say <b>what it would have cost in production</b> and
+    <b>whether a test would have caught it</b>. That second question is the honest part. Some of them a
+    test would have caught easily — say so. The persuasive rows are the ones no reasonable test suite
+    would ever have reached.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>The build setup</b> — <code>tsconfig.json</code> in full, <code>tsx</code> for development, and source
+    maps so a stack trace names your <code>.ts</code> line — is
+    <a href="../reference/52-week-plan.html#w45">week 45</a>, tagged depth. <b>Typing a dependency that
+    ships no types</b> means writing a declaration file, and you will meet that. <b>Project references</b>
+    matter in a monorepo. <b>Type-only imports</b> and <code>verbatimModuleSyntax</code> affect what the
+    emitted JavaScript looks like.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: <b>your own migration commits</b>. Read the diff of each one and check that it is a
+    step somebody could review. Supporting: the TypeScript handbook on
+    <a href="https://www.typescriptlang.org/docs/handbook/migrating-from-javascript.html">migrating from JavaScript</a>
+    and the <a href="https://www.typescriptlang.org/tsconfig/#noUncheckedIndexedAccess">noUncheckedIndexedAccess</a> reference.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your bug list and I'll tell you which rows would not convince a sceptic.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Every commit compiles and every commit is green. If a step cannot be, it is too big.</li>
+      <li><b>Step 1: <code>checkJs</code>, rename nothing.</b> Measured 13 real bugs on two files, in ten minutes.</li>
+      <li>All 13 came from <b>library</b> types — <code>http</code>, <code>process</code>, <code>Error</code>. Zero from the service's own logic.</li>
+      <li><b>Step 2: type your own data.</b> <code>new Map()</code> is <code>Map&lt;any, any&gt;</code>; <code>Map&lt;string, Link&gt;</code> exposed the real bug.</li>
+      <li><b>Step 3: <code>noUncheckedIndexedAccess</code></b>, which <code>strict</code> does <b>not</b> include. It catches <code>arr[0]</code> on an empty array.</li>
+      <li>Migrate leaf files first, one per commit, working upward. Prefer <code>@ts-expect-error</code> to <code>@ts-ignore</code> — it fails once the problem is fixed, so it cleans itself up.</li>
+      <li>The deliverable is the <b>bug list</b> — bug, how found, and what it would have done in production.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the compiler checks only what you described, and <code>any</code> calls the rest clean.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> TypeScript handbook ("Migrating from JavaScript"); the <code>noUncheckedIndexedAccess</code> tsconfig reference. The counts here are the 13 from <code>checkJs</code>, the two that needed the Map typed, and the one needing <code>noUncheckedIndexedAccess</code>. All came from compiling a two-file link shortener. That ran with <b>TypeScript 7.0.2</b> on <b>Node v24.14.0</b>, on 2026-08-28. So did the run-time <code>TypeError</code> confirming the last is a genuine crash. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0045-the-build-setup.html">← Lesson 45</a>
+    <a href="./0047-modules-and-dependency-injection.html">Next: Lesson 47 — Modules and dependency injection →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "checkJs on two untyped .js files found 13 errors. What did all of them have in common?",
+      options: [
+        "They came from library types — http, process, Error — not from the service's own data",
+        "They were all implicit any parameters, which are reported before any other check",
+        "They were all in the server file, since the store had no external dependencies",
+        "They were all suppressed once the files were renamed, because .ts files are stricter"
+      ],
+      answer: 0,
+      why: "The compiler already knows what req.headers, process.env and Error look like. It knew nothing about the store's Map, because new Map() is Map<any, any>. So links.get(code).hits += 1 produced no error at all until the Map was typed. checkJs is a real win and a fraction of the value."
+    },
+    {
+      q: "Why does all.sort()[0].code compile cleanly under strict: true?",
+      options: [
+        "Indexing an array yields the element type; noUncheckedIndexedAccess is a separate flag",
+        "sort returns a non-empty tuple type, so the first element is always defined",
+        "Optional chaining is inferred automatically for array access in strict mode",
+        "strict only checks null, and an out-of-range index yields undefined rather than null"
+      ],
+      answer: 0,
+      why: "Measured: strict alone reported two errors in that file and missed this one entirely. Turning on noUncheckedIndexedAccess produced TS18048: 'newest' is possibly 'undefined'. And it is a real crash — the same code threw Cannot read properties of undefined (reading 'code') on an empty array. strict is not the maximum setting."
+    },
+    {
+      q: "Why prefer @ts-expect-error over @ts-ignore?",
+      options: [
+        "It fails to compile once the underlying error is fixed, so it removes itself from the code",
+        "It suppresses only type errors, while @ts-ignore also suppresses syntax errors",
+        "It is scoped to the expression, whereas @ts-ignore silences the whole enclosing block",
+        "It is recorded in the build output, so suppressions appear in the compiler's summary"
+      ],
+      answer: 0,
+      why: "@ts-ignore silences the line forever, including long after the real problem is gone. @ts-expect-error becomes an error itself when there is nothing left to suppress, so it tells you the workaround is no longer needed and cleans itself up. Pair it with a one-line reason."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How would you migrate a JavaScript service to TypeScript?”",
+      answer: "Incrementally, with a rule: <b>every commit compiles and every commit has a green suite</b>. If a step cannot be done that way, it is too big. I start without renaming anything — <code>allowJs</code>, <code>checkJs</code> and <code>strict</code> — because the checker reads JavaScript. On two small files that alone found 13 real bugs in ten minutes. Then I rename leaf files first, one per commit, working upward, and I type my own data rather than just the signatures. Last I turn on <code>noUncheckedIndexedAccess</code>, because <code>strict</code> does not include it and it catches the empty-array crash. <br>Why: the commit rule plus the step-1-before-renaming order is what makes this sound like a plan rather than a wish."
+    },
+    {
+      prompt: "Interviewer: “Was TypeScript worth it on that project?”",
+      answer: "I would answer with the bug list, not an opinion. Seven real bugs, each with what it would have done in production: <code>PORT</code> missing giving <code>NaN</code>, a <code>content-length</code> header read on every GET, <code>server.address()</code> being null, a <code>status</code> property set on an <code>Error</code> that was silently dropped so duplicates returned 500 instead of 409. And I would be honest about which ones a test would have caught anyway — some would. The convincing rows are the three that only happen in conditions a test suite does not create: a missing environment variable, a deleted link, an empty database on the first morning after a deploy. <br>Why: volunteering which rows a test would have caught is what makes the rest of the list credible."
+    },
+    {
+      prompt: "Interviewer: “Is turning on checkJs enough?”",
+      answer: "It is a real win and a small fraction of the value. The compiler can only check the parts it has been told about, so <code>checkJs</code> catches everything that touches a <b>library</b> type — <code>http</code>, <code>process</code>, <code>Error</code> — and nothing at all in your own data. I measured this: <code>links.get(code).hits += 1</code> passed cleanly, because <code>new Map()</code> is <code>Map&lt;any, any&gt;</code>, and <code>any</code> means stop checking rather than I do not know. Writing <code>Map&lt;string, Link&gt;</code> immediately produced &ldquo;'l' is possibly 'undefined'&rdquo;. Same code, same flags — only the description changed. <br>Why: the any-means-stop-checking point is the mechanism, and quoting the before-and-after on one line makes it concrete."
+    }
+  ]);
+</script>

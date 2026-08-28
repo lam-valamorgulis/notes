@@ -1,0 +1,496 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>node:test — the built-in runner — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 35 of 52 · Lesson 35 · Testing &amp; security</p>
+  <h1><code>node:test</code> — the built-in runner</h1>
+  <p class="subtitle">Node ships a test runner now. Use it, and understand what a test is actually proving.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 35 of 52.</span> This lesson builds one domain-expert ability: <b>judge someone else's work, and say what is wrong and why</b>. <a href="../reference/52-week-plan.html#w35">Week 35 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> the spine's core paths covered, with <b>no test dependency at all</b>. And a clear answer to the question that follows every coverage number: <em>what does 90% actually prove?</em>
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 27&ndash;34 made the spine survive and made it measurable. This module makes it <b>provable</b> — first that it works, then that it is not easy to attack.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what is a test for?</h2>
+  <p>Not &ldquo;to check the code works&rdquo;. You can check that by running it. A test earns its keep for one reason:</p>
+
+  <div class="soundbite">
+    <span class="label">The only thing a test is really for</span>
+    <p>A test tells you when a <b>future change</b> breaks something you already decided was correct. It is a message to whoever edits this code next — usually you, having forgotten.</p>
+  </div>
+
+  <p>That reframes what to test. Not every line, and not the things you are confident about. <b>The decisions</b> — the ones somebody might undo without noticing they were decisions.</p>
+
+  <h2>The runner is built in</h2>
+  <p>There is nothing to install. Verified on Node v24.14.0:</p>
+
+  <pre><code>const { test, describe, mock } = require('node:test');
+const assert = require('node:assert');
+
+describe('the built-in runner', () =&gt; {
+  test('plain assertion', () =&gt; {
+    assert.strictEqual(1 + 1, 2);
+  });
+
+  test('async test', async () =&gt; {              <span class="cmt">// just return a promise</span>
+    const v = await Promise.resolve(42);
+    assert.strictEqual(v, 42);
+  });
+});</code></pre>
+
+  <pre><code>node --test a.test.js
+
+<span class="out">▶ the built-in runner
+  ✔ plain assertion (0.703542ms)
+  ✔ async test (0.078917ms)
+ℹ tests 4
+ℹ pass 4
+ℹ fail 0</span></code></pre>
+
+  <p>Remember <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">week 9</a>: <code>node:test</code> is <b>prefix-only</b>. <code>require('test')</code> is <code>MODULE_NOT_FOUND</code>. That is not a typo people expect.</p>
+
+  <div class="tip">
+    <span class="label">Why this matters more than it sounds</span>
+    A test framework used to be a dependency, a config file and a transpiler step. Now it is a flag. That
+    removes the most common reason a project has no tests: <b>the setup was the hard part</b>, and the
+    setup no longer exists.
+  </div>
+
+  <!-- ============ WHAT TO TEST ============ -->
+  <h2>What to test on the spine, in order</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Test</th><th>Protects the decision</th><th>Made in</th></tr></thead>
+    <tbody>
+      <tr><td>A duplicate code returns <b>409</b>, not 400</td><td>The distinction you argued for</td><td><a href="./0021-build-the-spine-api-version-1.html">week 21</a></td></tr>
+      <tr><td>The error body has <code>code</code>, <code>message</code>, <code>details</code></td><td>The shape clients branch on</td><td>week 21</td></tr>
+      <tr><td>A 2 MB body returns <b>413</b> and is not buffered</td><td>The limit</td><td><a href="./0020-http-from-scratch.html">week 20</a></td></tr>
+      <tr><td>A redirect is <b>302</b>, never 301</td><td>The choice you would regret</td><td>week 21</td></tr>
+      <tr><td>An operational error does not kill the process</td><td>The taxonomy</td><td><a href="./0028-operational-versus-programmer-errors.html">week 28</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Every row is a <b>decision</b>, and every one is recorded in your <code>DECISIONS.md</code>. That is not a coincidence — it is the best list of what to test that you will ever have.</p>
+
+  <!-- ============ COVERAGE ============ -->
+  <h2>Coverage, and what it does not mean</h2>
+  <pre><code>node --test --experimental-test-coverage
+
+<span class="out">ℹ file      | line % | branch % | funcs % | uncovered lines
+ℹ all files | 100.00 |   100.00 |  100.00 |</span></code></pre>
+
+  <p>100% coverage. Now look at what that number actually claims:</p>
+
+  <div class="trap">
+    <span class="label">Coverage measures execution, not verification</span>
+    A line is &ldquo;covered&rdquo; if a test <b>ran</b> it. Not if a test <b>checked</b> it. This passes with
+    100% coverage and tests nothing:
+    <pre style="margin:.6rem 0 0;"><code>test('creates a link', async () =&gt; {
+  await createLink('https://example.com');    <span class="cmt">// every line ran</span>
+});                                            <span class="cmt">// nothing was asserted</span></code></pre>
+    So 90% coverage means &ldquo;90% of lines were executed by something&rdquo;. It is a floor, and a low one.
+  </div>
+
+  <p>Use coverage the way it is actually useful: look at the <b>uncovered lines</b> column. Those are lines no test has ever run, so nobody knows whether they work. That list is worth reading. The percentage is not worth arguing about.</p>
+
+  <div class="tip">
+    <span class="label">The number that means more than coverage</span>
+    <b>Branch</b> coverage, not line coverage. A line with an <code>if</code> is fully line-covered when
+    only the true side ever ran. Your <code>if (err.isOperational)</code> from week 28 is exactly that
+    shape, and the branch that crashes the process is the one nobody tests.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 230" role="img" aria-labelledby="fig35-title" width="640" height="230">
+      <title id="fig35-title">Coverage counts lines that ran; only assertions check that they were right</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">TWO DIFFERENT QUESTIONS ABOUT ONE LINE OF CODE</text>
+
+      <rect x="20" y="38" width="285" height="80" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="162" y="60" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">DID IT RUN?</text>
+      <text x="162" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">that is coverage</text>
+      <text x="162" y="100" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">a tool can answer this</text>
+
+      <rect x="335" y="38" width="285" height="80" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="477" y="60" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">WAS IT RIGHT?</text>
+      <text x="477" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">that is an assertion</text>
+      <text x="477" y="100" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">only you can answer this</text>
+
+      <rect x="20" y="136" width="600" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="320" y="154" text-anchor="middle" style="fill: var(--warn); font-family: monospace; font-size: 11px;">await createLink('https://example.com');   // no assert</text>
+      <text x="320" y="169" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">100% coverage · 0% verification</text>
+
+      <text x="320" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Read the <tspan style="font-family: monospace;">uncovered lines</tspan> column. Ignore the percentage.</text>
+      <text x="320" y="222" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">A coverage number is a floor, and it is a low one.</text>
+    </svg>
+    <figcaption>Both outputs measured on Node v24.14.0 with <code>--experimental-test-coverage</code>.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A test is not there to prove the code works today. You can see that by running it.</p>
+    <p class="part cont">It is a note left for whoever changes this code next, saying &ldquo;this behaviour was on purpose&rdquo;. If they break it, the note shouts. Most of the time that person is you, months later, having forgotten why.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A smoke alarm. It does nothing at all on a normal day. You are not paying for what it does today. You are paying for the one night it wakes you up.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A smoke alarm reacts to smoke, whatever caused it. A test only reacts to the exact thing you thought of.</p>
+    <p class="part limit cont">So a house full of alarms can still burn down through a door nobody put one on. That is what a coverage number hides. It counts <b>how many rooms have an alarm</b>, not whether any is switched on. A test can run every line and check nothing at all, and coverage reports that as 100%.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People treat coverage as a score to raise. It measures <b>execution</b>, not verification. A line counts as covered if a test <em>ran</em> it, never if a test <em>checked</em> it.</p>
+    <p class="part cont">So chasing 90% produces tests that call functions and assert nothing. The number goes up while the safety does not. The useful part of the report is the <b>uncovered lines</b> column, because those are lines nobody has ever run.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain how a test suite can have 100% coverage and still prove nothing. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — cover the spine's decisions</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Tests for the five rows in the table above. <b>Start from <code>DECISIONS.md</code></b>, not from the code.</li>
+    <li>Both an integration test (real HTTP against a server on port 0) and a unit test for validation.</li>
+    <li>Every test asserts something. <b>Grep your own tests for one with no <code>assert</code>.</b></li>
+    <li>Run coverage. Read the <b>uncovered lines</b> column and write down what is in it.</li>
+    <li>Pick the most dangerous uncovered line and test it. Say why you picked that one.</li>
+    <li>The suite runs from a clean checkout with one command: <code>node --test</code>.</li>
+  </ol>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The integration shape — port 0 is the trick</b></p>
+  <pre><code>test('duplicate code returns 409', async (t) =&gt; {
+  const server = createServer();
+  await new Promise(r =&gt; server.listen(0, r));      <span class="cmt">// 0 = any free port</span>
+  const port = server.address().port;
+  t.after(() =&gt; server.close());                     <span class="cmt">// always cleans up</span>
+
+  const body = JSON.stringify({ url: 'https://a.test', code: 'abc' });
+  await fetch(`http://localhost:${port}/links`, { method: 'POST', body });
+  const second = await fetch(`http://localhost:${port}/links`, { method: 'POST', body });
+
+  assert.strictEqual(second.status, 409);
+  const json = await second.json();
+  assert.strictEqual(json.error.code, 'code_taken');   <span class="cmt">// the stable code, not the message</span>
+});</code></pre>
+
+  <div class="trap">
+    <span class="label">Two details in there that stop this suite rotting</span>
+    <b><code>listen(0)</code></b> lets the operating system pick a free port. A hard-coded 3000 means two
+    test files cannot run at once, and the suite fails on a machine where something else is on 3000.
+    <p style="margin:.6rem 0 0;"><b>Assert on <code>json.error.code</code>, not the message.</b> Week 21
+    said clients must branch on the code and never the wording. A test <em>is</em> a client — assert on the
+    message and you have made your own error text impossible to improve.</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    The test file, the coverage output, and one line saying which uncovered line you chose and why.
+    That last one is the judgement being practised.
+  </div>
+
+  <div class="drill">
+    <span class="label">Review this test</span>
+    <p class="situation">A teammate opens this and points at the coverage report, which went from 71% to 88%.</p>
+    <pre style="margin:.6rem 0;"><code>test('handles all the routes', async () =&gt; {
+  await request('GET',  '/health');
+  await request('GET',  '/links/abc');
+  await request('POST', '/links', { url: 'https://a.test' });
+  await request('DELETE', '/links/abc');
+  assert.ok(true);
+});</code></pre>
+    Name three things wrong with it. Then say what the 17-point coverage rise actually measured.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Vitest and Jest</b> are excellent and you will meet both. Learn the built-in runner first, so you can
+    tell what is the framework and what is the idea. <b>Snapshot testing</b> is easy to abuse and worth a
+    careful read before adopting. <b>Property-based testing</b> is genuinely powerful and a subject of its
+    own. <b>Mocking and flaky async tests</b> are <a href="../reference/52-week-plan.html#w36">next week</a>.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/api/test.html">node:test</a> and
+    <a href="https://nodejs.org/en/learn/test-runner/introduction">the test runner introduction</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your uncovered-lines list and I'll tell you which one I would test first, and why.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A test exists to tell you when a <b>future change</b> breaks a decision you already made.</li>
+      <li>So test the <b>decisions</b>, not the lines. <code>DECISIONS.md</code> is your list.</li>
+      <li><code>node --test</code> is built in. No dependency, no config. It is <code>node:test</code> — the prefix is required.</li>
+      <li>Coverage measures <b>execution, not verification</b>. A test with no assertion still counts as covered.</li>
+      <li>Read the <b>uncovered lines</b> column. Do not argue about the percentage.</li>
+      <li><b>Branch</b> coverage beats line coverage. The untested branch is usually the error path.</li>
+      <li><code>listen(0)</code> for a free port, and assert on the error <code>code</code>, never the message.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>coverage counts the rooms with an alarm, never whether one is switched on.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "node:test", "Test runner introduction". The runner output and the coverage table came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0034-build-find-and-fix-a-real-leak.html">← Lesson 34</a>
+    <a href="./0036-async-tests-that-do-not-flake.html">Next: Lesson 36 — Async tests that do not flake →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A test suite reports 100% coverage. What has it actually proved?",
+      options: [
+        "That every line ran during a test, not that any line was checked",
+        "That every line ran and produced the value the tests expected of it",
+        "That every branch of every conditional was exercised at least once",
+        "That the code has no untested paths that a future change could break"
+      ],
+      answer: 0,
+      why: "Coverage counts execution. A test that calls a function and asserts nothing marks every line it touched as covered. So the number is a floor, and a low one. The useful part of the report is the uncovered lines column, because nobody has ever run those."
+    },
+    {
+      q: "Why should a test assert on error.code rather than on the error message?",
+      options: [
+        "A test is a client, and clients must never branch on wording that may change",
+        "Message strings are localised, so their text differs between environments",
+        "The code field is compared faster, which keeps a large suite running quickly",
+        "Node strips message text from error objects when they are serialised to JSON"
+      ],
+      answer: 0,
+      why: "Week 21 fixed the rule that code is stable and message is not. A test is just another client. Asserting on the wording makes your own error text impossible to improve without breaking the suite, which is exactly the trap the error shape was designed to avoid."
+    },
+    {
+      q: "Why does an integration test call server.listen(0) instead of a fixed port?",
+      options: [
+        "The operating system picks a free port, so parallel test files cannot clash",
+        "Port 0 disables the network layer, which makes the requests run much faster",
+        "It signals to Node that the server is temporary and should skip keep-alive",
+        "A fixed port would keep the socket open after the test process has exited"
+      ],
+      answer: 0,
+      why: "Port 0 asks the operating system for any free port. A hard-coded 3000 means two test files cannot run at the same time, and the whole suite fails on a machine where something else already holds that port. It is one of the commonest causes of a suite that only passes on one laptop."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “What do you test, and how do you decide?”",
+      answer: "I test the <b>decisions</b>, not the lines. Every real decision I made about a service is written down — that a duplicate returns 409 rather than 400, that the error body has a stable <code>code</code>, that a redirect is 302 not 301 — and each one is something a future change could quietly undo. So my test list comes from my decisions file, not from walking the code. A test is really a note to whoever edits this next, saying &ldquo;this was on purpose&rdquo;. <br>Why: sourcing the tests from decisions rather than from coverage is the part that sounds deliberate."
+    },
+    {
+      prompt: "Interviewer: “We have 90% coverage. Is that good?”",
+      answer: "It tells me 90% of lines were <b>executed</b> by something. It does not tell me anything was <b>checked</b> — a test that calls a function and asserts nothing counts as full coverage on every line it touched. So I treat the percentage as a floor and read the <b>uncovered lines</b> column instead, because those are lines nobody has ever run. I also look at <b>branch</b> coverage rather than line coverage, since the untested branch is usually the error path, and that is the one that matters at 3am. <br>Why: refusing to celebrate or dismiss the number, and naming what you read instead, is the useful answer."
+    },
+    {
+      prompt: "Interviewer: “Which test framework do you use?”",
+      answer: "For a Node service I start with the <b>built-in runner</b>, <code>node:test</code> with <code>node --test</code>. There is nothing to install and no config, which removes the most common reason a project has no tests at all — the setup used to be the hard part. It has assertions, mocking and coverage built in. I would move to Vitest or Jest when I need something specific from them, like a browser environment or their ecosystem. Knowing the built-in one first means I can tell what is the framework and what is the idea. <br>Why: having a default and a named reason to leave it is stronger than naming a favourite tool."
+    }
+  ]);
+</script>

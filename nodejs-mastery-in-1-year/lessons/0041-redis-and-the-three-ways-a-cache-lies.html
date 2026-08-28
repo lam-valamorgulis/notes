@@ -1,0 +1,553 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis, and the three ways a cache lies — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 41 of 52 · Lesson 41 · The data layer</p>
+  <h1>Redis, and the three ways a cache lies</h1>
+  <p class="subtitle">A cache is the easiest big win in this course, and the easiest thing to get subtly wrong.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 41 of 52.</span> This lesson builds one domain-expert ability: <b>add speed without adding a lie</b>. <a href="../reference/52-week-plan.html#w41">Week 41 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a cache that does <b>nothing at all</b> for the first hundred requests, and you will see exactly why. Then one line fixes it.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0040-postgres-pools-transactions-and-n-plus-one.html">Week 40</a> put the spine's data in
+    Postgres and showed where the time goes. A cache removes most of that time. It also introduces the only
+    hard problem in this module: <b>two copies of the truth</b>.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what have you actually done?</h2>
+  <p>A cache is a second copy of your data, in a faster place. Everything good and everything bad about caching comes from that one sentence.</p>
+
+  <div class="soundbite">
+    <span class="label">The trade you just made</span>
+    <p>You traded <b>correctness for speed</b>, and agreed to manage the gap. The question is never &ldquo;is the cache correct?&rdquo; It is <b>&ldquo;how wrong may it be, and for how long?&rdquo;</b></p>
+  </div>
+
+  <p>If you cannot answer that second question for a piece of data, you are not ready to cache it. That is also the answer to &ldquo;what TTL should I use?&rdquo;, which otherwise gets decided by habit.</p>
+
+  <!-- ============ LIE 1 ============ -->
+  <h2>Lie 1 — the stale read</h2>
+  <p>The simplest cache, and the bug in it. Measured against PostgreSQL 18.3:</p>
+
+  <pre><code>const get = async (code) =&gt;
+  cache.has(code) ? cache.get(code) : (cache.set(code, await db(code)), cache.get(code));
+
+<span class="out">  read 1 (fills cache) : https://first.test
+  database now holds   : https://SECOND.test      &lt;- somebody did an UPDATE
+  read 2 (from cache)  : https://first.test       &lt;- WRONG, and stays wrong forever</span></code></pre>
+
+  <p>Nothing crashed. No error was logged. The service is fast and confidently wrong, and it will stay that way until the process restarts.</p>
+
+  <p>There are exactly two ways out, and they are a real choice:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Strategy</th><th>How wrong, and for how long</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><b>TTL</b> — let it expire</td><td>Wrong for up to the TTL, every time</td><td>One line. Nothing to remember.</td></tr>
+      <tr><td><b>Invalidate on write</b></td><td>Wrong for milliseconds</td><td>Every write path must remember. Miss one and it is wrong forever.</td></tr>
+      <tr><td><b>Both</b></td><td>Wrong for milliseconds, and the TTL catches your mistakes</td><td>The one to use.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">Why &ldquo;both&rdquo; is the real answer</span>
+    Invalidation is correct and fragile — it depends on you remembering every write path, including the
+    one added next year by someone who has not read this. A TTL underneath turns &ldquo;wrong forever&rdquo;
+    into &ldquo;wrong for 60 seconds&rdquo;. It is a safety net for a mistake you will definitely make.
+  </div>
+
+  <p>So pick the TTL from the requirement, not from habit. Try this sentence: &ldquo;users may see a link's old target for up to 60 seconds after an edit&rdquo;. You can put that in front of a product owner. &ldquo;300, because that is what we always use&rdquo; is not.</p>
+
+  <!-- ============ LIE 2 ============ -->
+  <h2>Lie 2 — the cache that does nothing when you need it most</h2>
+  <p>Cold cache, one popular key, 100 requests arriving together. Measured:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Design</th><th>Database queries</th><th>Time</th></tr></thead>
+    <tbody>
+      <tr><td>The cache above</td><td><b>100</b></td><td>43 ms</td></tr>
+      <tr><td>With single-flight</td><td><b>1</b></td><td>22 ms</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">A hundred requests, a hundred queries, and the cache was working correctly</span>
+    Every request checked the cache. Every one missed, because none of the others had finished writing yet.
+    So all hundred went to the database. The cache does not help until the <b>first</b> answer comes back.
+    <p style="margin:.6rem 0 0;">This is <b>cache stampede</b>, also called the thundering herd. It happens on cold start, after a deploy, after a Redis restart, and every time a popular key expires. That is exactly when you are least able to absorb it.</p>
+  </div>
+
+  <p>The fix is <b>single-flight</b>: remember the in-progress lookup, not just the finished value.</p>
+
+  <pre><code>const cache = new Map(), inflight = new Map();
+
+async function get(code) {
+  if (cache.has(code)) return cache.get(code);
+  if (inflight.has(code)) return inflight.get(code);      <span class="cmt">// &lt;- the whole fix</span>
+
+  const p = db(code).then(v =&gt; {
+    cache.set(code, v);
+    inflight.delete(code);                                 <span class="cmt">// or it leaks, week 34</span>
+    return v;
+  });
+  inflight.set(code, p);
+  return p;
+}</code></pre>
+
+  <p>You already know why this works. A promise can have many <code>await</code>ers, from <a href="./0005-the-async-ladder-callbacks-promises-async-await.html">week 5</a>. The hundredth request does not start a hundredth query — it waits on the first one's promise.</p>
+
+  <div class="tip">
+    <span class="label">Two details that matter</span>
+    Delete from <code>inflight</code> on <b>failure</b> too, or a single failed lookup poisons that key for
+    the life of the process. And note this map is <b>per process</b> — with <code>cluster</code> from
+    <a href="./0024-child-processes-and-cluster.html">week 24</a>, eight workers means eight queries, not
+    one. That is still a hundredfold improvement, and worth knowing rather than discovering.
+  </div>
+
+  <!-- ============ TTL JITTER ============ -->
+  <h2>The stampede you build on purpose</h2>
+  <p>Now warm 1,000 keys at once — a deploy, or a cache rebuild — all with the same 60-second TTL. Count how many expire in the busiest single second:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>TTL</th><th>Busiest second</th></tr></thead>
+    <tbody>
+      <tr><td>Exactly 60 s, every key</td><td><b>1,000 expiries</b></td></tr>
+      <tr><td>60 s ± 10%</td><td>100</td></tr>
+      <tr><td>60 s ± 50%</td><td><b>23</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Warm them together and they expire together. Your traffic then arrives at the database in a spike, once a minute, forever. One line prevents it:</p>
+
+  <pre><code>const ttl = BASE_TTL * (0.5 + Math.random());     <span class="cmt">// ±50% jitter</span></code></pre>
+
+  <p>A 43-fold reduction in the worst second, from adding randomness. This is the same idea as jittered retry backoff in <a href="./0008-build-a-concurrent-multi-api-aggregator.html">week 8</a>: <b>anything synchronised becomes a spike.</b></p>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 260" role="img" aria-labelledby="fig41-title" width="640" height="260">
+      <title id="fig41-title">Identical TTLs make every key expire in the same second</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">1,000 KEYS WARMED TOGETHER — WHEN DO THEY EXPIRE?</text>
+
+      <text x="20" y="46" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">TTL exactly 60 s for every key</text>
+      <line x1="20" y1="92" x2="620" y2="92" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <rect x="308" y="56" width="24" height="36" style="fill: var(--warn);"></rect>
+      <text x="320" y="50" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">1000</text>
+      <text x="320" y="106" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">60 s</text>
+
+      <text x="20" y="140" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">TTL 60 s ± 50% jitter</text>
+      <line x1="20" y1="186" x2="620" y2="186" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <g style="fill: var(--accent);">
+        <rect x="128" y="180" width="14" height="6"></rect><rect x="152" y="179" width="14" height="7"></rect>
+        <rect x="176" y="180" width="14" height="6"></rect><rect x="200" y="178" width="14" height="8"></rect>
+        <rect x="224" y="179" width="14" height="7"></rect><rect x="248" y="178" width="14" height="8"></rect>
+        <rect x="272" y="179" width="14" height="7"></rect><rect x="296" y="178" width="14" height="8"></rect>
+        <rect x="320" y="179" width="14" height="7"></rect><rect x="344" y="178" width="14" height="8"></rect>
+        <rect x="368" y="179" width="14" height="7"></rect><rect x="392" y="180" width="14" height="6"></rect>
+        <rect x="416" y="179" width="14" height="7"></rect><rect x="440" y="180" width="14" height="6"></rect>
+        <rect x="464" y="179" width="14" height="7"></rect><rect x="488" y="180" width="14" height="6"></rect>
+      </g>
+      <text x="320" y="170" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">23 in the busiest second</text>
+      <text x="320" y="200" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">30 s ————————————— 90 s</text>
+
+      <text x="320" y="230" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">Anything synchronised becomes a spike. Add randomness on purpose.</text>
+      <text x="320" y="250" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured: 1,000 → 23 in the busiest second, from one line of jitter.</text>
+    </svg>
+    <figcaption>The same idea as jittered retry backoff in week 8. Identical timers are a load generator.</figcaption>
+  </div>
+
+  <!-- ============ LIE 3 ============ -->
+  <h2>Lie 3 — the cache that never gives anything back</h2>
+  <p>A cache with no TTL and no eviction is not a cache. It is a leak with a good reputation. Measured:</p>
+
+  <pre><code><span class="out">  500,000 cached links -> 52.5 MB held, forever
+  per key              : 110 bytes</span></code></pre>
+
+  <p>52 MB does not sound alarming. That is the problem. It grows quietly, in proportion to <b>traffic</b> rather than to your data. It looks exactly like the leak you hunted in <a href="./0034-build-find-and-fix-a-real-leak.html">week 34</a>. A cache keyed by something unbounded, like a search query or a request id, has no ceiling at all.</p>
+
+  <p>Redis gives you two controls for this, and you should set both:</p>
+
+  <pre><code>SET link:abc "https://..." EX 60        <span class="cmt"># always set a TTL. no exceptions.</span>
+
+<span class="cmt"># redis.conf — the ceiling, for when a TTL is not enough</span>
+maxmemory 512mb
+maxmemory-policy allkeys-lru            <span class="cmt"># evict least-recently-used when full</span></code></pre>
+
+  <div class="trap">
+    <span class="label">The default policy is not the one you want</span>
+    Redis defaults to <code>noeviction</code>: when memory is full it <b>refuses writes</b> and returns an
+    error. Your cache stops accepting new entries and starts returning errors on <code>SET</code>, at the
+    worst possible moment. Choose the policy on purpose.
+  </div>
+
+  <!-- ============ REDIS DOWN ============ -->
+  <h2>What does your service do when Redis is down?</h2>
+  <p>This must be a tested path, because it is not a rare one. Redis restarts, fails over, and gets network partitions. The same 200 requests, two designs, measured:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Design</th><th>Failed requests</th><th>Database queries</th></tr></thead>
+    <tbody>
+      <tr><td>The cache error propagates</td><td><b>200</b></td><td>0</td></tr>
+      <tr><td>Catch it, fall through to the database</td><td>0</td><td><b>200</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Row 1 is the accident nobody intends: an <b>optional</b> dependency taking down a service that could have answered every request. Row 2 is right, and it has a condition attached.</p>
+
+  <div class="trap">
+    <span class="label">Degrading only works if the database can take it</span>
+    Falling through means <b>100% of traffic reaches Postgres</b>, all at once. If your pool is sized for a
+    90% cache hit rate, you have just handed it ten times its normal load — and
+    <a href="./0040-postgres-pools-transactions-and-n-plus-one.html">week 40</a> showed exactly what that
+    queue does to response times.
+    <p style="margin:.6rem 0 0;">So degrading is not free. It needs a short cache timeout, so a slow Redis does not become a slow request. It also needs you to have decided what happens if the database cannot cope. Load shedding — serving 503 to some traffic — is a legitimate answer.</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">The sentence to be able to say</span>
+    &ldquo;<b>Redis is optional for reads and required for nothing.</b> If it is down we serve from Postgres,
+    which we have load-tested at 100% miss rate, and we shed load above N requests per second.&rdquo;
+    That is a designed answer. &ldquo;It should still work&rdquo; is a hope.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A cache is a second copy of your data in a faster place. Every good thing and every bad thing about caching comes from there being <b>two copies</b>.</p>
+    <p class="part cont">So the question is never &ldquo;is the cache correct?&rdquo; It is &ldquo;how wrong may it be, and for how long?&rdquo; If you cannot answer that for a piece of data, you are not ready to cache it. That answer is also your TTL.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A printed price list at the till. It is much faster than phoning head office. It is also whatever was true when it was printed.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A printed list is obviously old. You can see the date on it. A cache looks exactly as authoritative as the database, so nothing about a stale answer feels wrong. I measured a read returning <code>https://first.test</code> while the database held <code>https://SECOND.test</code> — no error, no log line, no slowdown.</p>
+    <p class="part limit cont">And a price list has one more difference that matters: when it goes missing, one person walks to the phone. When a cached key expires, a hundred requests walk to the database at the same instant. I measured that too. 100 concurrent requests for one missing key produced <b>100 queries</b>, because none had finished writing the answer yet.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People measure a cache by its <b>hit rate</b> and stop there. A 99% hit rate says nothing about the 1%. That 1% is where all the damage lives: cold start, a deploy, a Redis restart, or a popular key expiring.</p>
+    <p class="part cont">Those moments are correlated by design — everything warmed together expires together. Measured: 1,000 keys on an identical 60-second TTL all expire in the <b>same second</b>, forever, once a minute. Adding ±50% jitter brought the worst second down to 23.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain why a cache can produce zero benefit at exactly the moment it is needed most. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — cache the spine, then break it three ways</h2>
+
+  <p><b>Requirements.</b> Create each bug on purpose <b>before</b> you fix it:</p>
+  <ol>
+    <li>Cache the code-to-URL lookup in Redis. Measure the hit and miss latency separately.</li>
+    <li><b>Create a stale read.</b> Update a link, watch the old target still serve. Then fix it with invalidation <b>and</b> a TTL, and say in one sentence how wrong the cache may now be.</li>
+    <li><b>Create a stampede.</b> 100 concurrent requests on a cold key. Count the database queries — you should see about 100. Add single-flight and count again.</li>
+    <li><b>Create unbounded growth.</b> Cache with no TTL, drive traffic, watch memory climb. Then set a TTL, <code>maxmemory</code> and <code>allkeys-lru</code>.</li>
+    <li>Add <b>±50% jitter</b> to every TTL.</li>
+    <li><b>Kill Redis while load is running.</b> The service must keep answering. Write down what happened to latency and to the pool's <code>waitingCount</code>.</li>
+    <li>Make step 6 an <b>automated test</b>, not a thing you did once.</li>
+  </ol>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;Users say they see old data about 30 seconds after saving.&rdquo;</p>
+    Explain the mechanism in two sentences. Then give <b>two</b> fixes with different trade-offs, and say
+    which you would ship and why. &ldquo;About 30 seconds&rdquo; is the clue — it is naming something in your
+    configuration.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Redis as more than a cache</b> — its data structures, pub/sub, streams and Lua scripts — is a large
+    and useful subject. <b>Distributed locks</b> are famously easy to get wrong and worth reading about
+    carefully before using. <b>Cache-aside versus write-through versus write-behind</b> are named patterns
+    worth knowing. <b>Redis Cluster, persistence and failover</b> matter once it is not optional.
+    <b>An HTTP cache</b> with <code>ETag</code> and <code>Cache-Control</code> is often the cheaper win, and
+    it sits in front of everything here.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://redis.io/docs/latest/develop/">Redis developer documentation</a>,
+    <a href="https://redis.io/docs/latest/develop/reference/eviction/">key eviction</a>, and the
+    <a href="https://github.com/redis/ioredis">ioredis</a> client.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — tell me your TTL and the sentence that justifies it, and I'll argue with it.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A cache is a <b>second copy</b>. The question is never &ldquo;is it correct?&rdquo; but &ldquo;how wrong, for how long?&rdquo; — and that is your TTL.</li>
+      <li>Use invalidation <b>and</b> a TTL. Invalidation is exact but fragile; the TTL is the net under your mistake.</li>
+      <li>Measured: 100 concurrent requests on one cold key → <b>100 queries</b>. Single-flight → <b>1</b>.</li>
+      <li>Identical TTLs synchronise. Measured: 1,000 expiries in one second → <b>23</b> with ±50% jitter.</li>
+      <li>No TTL and no eviction is a leak: <b>52.5 MB</b> for 500,000 keys, growing with traffic. Redis defaults to <code>noeviction</code>.</li>
+      <li>When Redis dies, either 200 requests fail or <b>200 hit the database</b>. Degrading is right only if the database can take it.</li>
+      <li>Hit rate hides all of this. The damage lives in the misses, and misses arrive together.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a cache helps least at the moment you need it most.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Redis documentation ("Key eviction", developer docs); ioredis. The stale read and the stampede counts were measured against <b>PostgreSQL 18.3</b> via PGlite 0.5.8 on <b>Node v24.14.0</b> on 2026-08-28. The TTL jitter figures, the 52.5 MB growth and the cache-down table came from running the same code that day. An in-process cache stood in for Redis. The failure modes shown are properties of the caching logic, not of Redis itself. All are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0040-postgres-pools-transactions-and-n-plus-one.html">← Lesson 40</a>
+    <a href="./0042-background-work-queues-retries-idempotency.html">Next: Lesson 42 — Background work — queues, retries, idempotency →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "100 requests arrive together for one key that is not cached yet. How many reach the database?",
+      options: [
+        "About 100 — every request misses, because none of the others has written the value yet",
+        "One — the cache library serialises concurrent lookups for the same key by default",
+        "About 10 — the pool limits concurrency, so most requests find the value already cached",
+        "None — the requests wait on the cache until the key appears, then all read it"
+      ],
+      answer: 0,
+      why: "Measured: exactly 100 queries. Every request checked the cache and every one missed, because the first answer had not come back yet. This is cache stampede, and it happens on cold start, after a deploy, after a Redis restart, and whenever a popular key expires. Single-flight — caching the in-progress promise, not just the finished value — brought it to 1 query."
+    },
+    {
+      q: "Why add random jitter to every TTL?",
+      options: [
+        "Keys warmed together expire together, so identical TTLs create a load spike every cycle",
+        "Redis rounds equal TTLs to the same second, which makes eviction order unpredictable",
+        "It spreads keys across Redis shards, which balances memory use across the cluster",
+        "A fixed TTL lets an attacker learn the cache schedule and time requests to miss"
+      ],
+      answer: 0,
+      why: "Measured: 1,000 keys warmed together with an identical 60-second TTL all expire in the same second, forever, once a minute. With ±50% jitter the busiest second held 23. It is the same principle as jittered retry backoff — anything synchronised becomes a spike."
+    },
+    {
+      q: "Redis goes down. Your code catches the error and reads from Postgres instead. What must you have checked?",
+      options: [
+        "That Postgres can survive 100% of traffic, since every request now reaches it",
+        "That the cache client retries fast enough to reconnect before the pool drains",
+        "That the TTLs are short enough for the cache to refill quickly once Redis returns",
+        "That reads and writes both degrade, so the two paths cannot disagree about state"
+      ],
+      answer: 0,
+      why: "Measured: with the error caught, 0 requests failed and all 200 reached the database. That is the right design, but it is not free. A pool sized for a 90% hit rate has just been handed ten times its normal load, and week 40 showed what that queue does to response times. Degrading needs a load-tested database and a decision about shedding load."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you pick a TTL?”",
+      answer: "From the requirement, not from habit. A cache is a second copy of the data, so the only real question is <b>how wrong it may be and for how long</b> — and that answer <em>is</em> the TTL. I want to be able to say a sentence like &ldquo;a user may see a link's old target for up to 60 seconds after an edit&rdquo;, because that is something I can put in front of a product owner. I also invalidate on write, and keep the TTL underneath as a safety net, since invalidation depends on remembering every write path including ones added later. And I add ±50% jitter, because keys warmed together otherwise expire together — I measured 1,000 expiries landing in the same second. <br>Why: turning the TTL into a product sentence, rather than a number, is what makes this answer land."
+    },
+    {
+      prompt: "Interviewer: “What is a cache stampede and how do you stop it?”",
+      answer: "It is when many requests miss the same key at the same moment and all go to the database, because the first answer has not come back yet. I measured 100 concurrent requests on one cold key producing <b>100 queries</b> — the cache gave zero benefit at exactly the moment it mattered. The fix is <b>single-flight</b>: cache the in-progress promise, not just the finished value, so request one hundred waits on request one's promise instead of starting its own query. That brought it to one query. I also delete from the in-flight map on failure, or one failed lookup poisons that key forever, and I remember it is per process — with eight cluster workers that is eight queries, not one. <br>Why: the per-process caveat is the detail that shows you have actually run this in a real deployment."
+    },
+    {
+      prompt: "Interviewer: “What happens to your service when Redis goes down?”",
+      answer: "It keeps serving, from Postgres, and that is a tested path rather than a hope. I measured both designs: if the cache error propagates, all 200 requests fail — an optional dependency taking down a service that could have answered everything. If I catch it, zero fail and all 200 reach the database. But that second one has a condition: my pool is sized for a 90% hit rate, so falling through hands it ten times its normal load. So I need a short cache timeout so a slow Redis does not become a slow request, a database I have load-tested at 100% miss rate, and a decision about shedding load above some rate. <br>Why: stating the condition on the good design, instead of just naming the good design, is the difference between an answer and a slogan."
+    }
+  ]);
+</script>

@@ -1,0 +1,532 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The costs you can actually control — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 33 of 52 · Lesson 33 · Performance &amp; memory · <b>Depth week</b></p>
+  <h1>The costs you can actually control</h1>
+  <p class="subtitle">Micro-optimisation is mostly a waste. So every change this week must be justified by a measurement.</p>
+  <p class="expertise"><span class="tag depth">depth</span><span class="wk">Week 33 of 52.</span> This lesson builds one domain-expert ability: <b>throw away your own good idea because the number said no</b>. <a href="../reference/52-week-plan.html#w33">Week 33 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a cache that made the code <b>slower</b> and leaked 200,000 entries. You will find it with your own benchmark, and delete it.
+  </div>
+
+  <div class="note">
+    <span class="label">Why this week is marked depth</span>
+    Not because benchmarking is unimportant, but because <b>the answer is usually &ldquo;do not bother&rdquo;</b>.
+    The skill worth having is not making code faster. It is being able to tell, honestly, whether you did.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — most benchmarks lie</h2>
+  <p><a href="./0031-measure-first.html">Week 31</a> said no claim without a number. This week adds the harder half: <b>most numbers are not evidence</b>. A benchmark without these four things is a story:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Requirement</th><th>What it prevents</th></tr></thead>
+    <tbody>
+      <tr><td><b>Warm-up</b></td><td>Measuring the first, unoptimised pass of the compiler</td></tr>
+      <tr><td><b>Repeats</b></td><td>One unlucky run deciding your architecture</td></tr>
+      <tr><td><b>Variance, reported</b></td><td>Believing a difference smaller than your noise</td></tr>
+      <tr><td><b>Enough iterations</b></td><td>Timing the clock instead of the code</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Here is the harness. Warm up, repeat, take the median, and print the spread next to it:</p>
+
+  <pre><code>function bench(name, fn, { warmup = 5, runs = 15, iters = 200000 } = {}) {
+  for (let w = 0; w &lt; warmup; w++) for (let i = 0; i &lt; iters; i++) fn(i);
+  const times = [];
+  for (let r = 0; r &lt; runs; r++) {
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i &lt; iters; i++) fn(i);
+    times.push(Number(process.hrtime.bigint() - t0) / 1e6);
+  }
+  times.sort((a, b) =&gt; a - b);
+  const median = times[Math.floor(runs / 2)];
+  const spread = (times[runs - 1] - times[0]) / median * 100;   <span class="cmt">// print this. always.</span>
+  return { name, median, spread };
+}</code></pre>
+
+  <div class="tip">
+    <span class="label">The rule that makes it honest</span>
+    <b>If the difference is smaller than the spread, there is no difference.</b> Print both, and let that
+    rule decide — not your hope for the change you just spent an afternoon writing.
+  </div>
+
+  <!-- ============ RUN 1 vs RUN 2 ============ -->
+  <h2>Watch the verdict change when you add iterations</h2>
+  <p>The same three candidates, twice: 20,000 iterations then 200,000. Measured on Node v24.14.0:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Candidate</th><th>20k iterations</th><th>200k iterations</th></tr></thead>
+    <tbody>
+      <tr><td>Manual string concat vs <code>JSON.stringify</code></td><td>&plusmn;101% → <b>within noise</b></td><td>&plusmn;25% → <b>48.6x faster</b></td></tr>
+      <tr><td><code>Buffer.allocUnsafe</code> vs <code>Buffer.alloc</code></td><td>&plusmn;316% → <b>within noise</b></td><td>&plusmn;31% → <b>1.74x faster</b></td></tr>
+      <tr><td>A <code>Map</code> cache over unique keys</td><td>within noise</td><td>within noise, and <b>slower</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Look at those spreads</span>
+    &plusmn;316%. The slower run took four times as long as the fastest one. Any single number from that
+    batch is meaningless, and if I had printed only a median I would have published a confident, invented
+    fact.
+    <p style="margin:.6rem 0 0;">This is why the spread goes next to every result. It is not decoration —
+    on the first run it was the <b>only</b> thing telling me the measurement had failed.</p>
+  </div>
+
+  <!-- ============ THE RESULTS ============ -->
+  <h2>Three candidates, honestly judged</h2>
+
+  <h3>1 · JSON — a real win, with a condition</h3>
+  <pre><code><span class="out">JSON.stringify every time     42.34 ms  ±3%    (baseline)
+pre-stringified, reused        0.85 ms  ±75%   49.6x faster
+manual string concat           0.87 ms  ±25%   48.6x faster</span></code></pre>
+
+  <p><b>Keep it</b> — but read what it actually says. Reusing a pre-built string is 49x faster than building it. That is obvious once stated: not doing work beats doing work. It only applies where the value <b>does not change</b>, like a health-check body or a cached response.</p>
+
+  <p>And note the manual concat is <b>the same speed</b> as the pre-built string, not faster. On the first run it looked like the winner at &plusmn;101% spread. It was not.</p>
+
+  <h3>2 · Parsing — no effect at all</h3>
+  <pre><code><span class="out">JSON.parse                    35.02 ms  ±2%    (baseline)
+JSON.parse + destructure      35.82 ms  ±3%    within noise</span></code></pre>
+
+  <p><b>Throw it away.</b> A change with no measured effect is not neutral — it costs a review, a diff, and the next reader's attention. Delete it and say why.</p>
+
+  <h3>3 · Buffers — real, and narrow</h3>
+  <pre><code><span class="out">Buffer.alloc each time        74.99 ms  ±29%   (baseline)
+Buffer.allocUnsafe each time  43.03 ms  ±31%   1.74x faster
+reuse one shared buffer       12.48 ms  ±74%   6.01x faster</span></code></pre>
+
+  <div class="trap">
+    <span class="label"><code>allocUnsafe</code> is 1.74x faster and hands you old memory</span>
+    It skips zeroing, so the buffer contains whatever was there before — possibly another request's data.
+    Safe only if you overwrite every byte before reading any. Use it for a buffer you are about to fill
+    completely, never for one you might read from first.
+    <p style="margin:.6rem 0 0;">And the shared buffer is 6x faster and <b>not safe under concurrency</b>. Two requests using it at once corrupt each other. That is exactly the mistake I made in
+    <a href="./0015-readable-writable-and-backpressure.html">week 15</a>, where a reused buffer made a
+    benchmark lie.</p>
+  </div>
+
+  <h3>4 · The cache — the one to delete</h3>
+  <p>A <code>Map</code> in front of a small computation. First with three hot keys, then with realistic traffic:</p>
+
+  <pre><code><span class="cmt">// 3 hot keys — the demo everyone runs</span>
+<span class="out">no cache    3.75 ms  ±11%   (baseline)
+Map cache   1.85 ms  ±6%    2.03x faster</span>
+
+<span class="cmt">// 200,000 unique keys — what production actually looks like</span>
+<span class="out">no cache    5.30 ms  ±9%    (baseline)
+Map cache   7.07 ms  ±38%   within noise — and the median is SLOWER
+
+cache now holds 200000 entries and will never shrink.</span></code></pre>
+
+  <div class="trap">
+    <span class="label">This is the result the week exists for</span>
+    Same code, same cache. With three keys it looked like a 2x win. With realistic key variety it bought
+    <b>nothing measurable</b>, and the median was worse — because every miss now costs a lookup, a
+    computation <b>and</b> an insert.
+    <p style="margin:.6rem 0 0;">And it kept <b>200,000 entries forever</b>. So the honest verdict is: no
+    speed benefit, plus a permanent memory cost that grows with traffic. That is
+    <a href="./0034-build-find-and-fix-a-real-leak.html">week 34</a>'s leak, introduced on purpose by an
+    optimisation.</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">Why the demo lied</span>
+    Three keys means a 100% hit rate after the first three calls. Your benchmark chose the input, and the
+    input decided the answer. <b>Benchmark with the key distribution you actually have</b>, or you are
+    measuring a system nobody runs.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 255" role="img" aria-labelledby="fig33-title" width="640" height="255">
+      <title id="fig33-title">The same cache looks like a win or a loss depending on the input you chose</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">THE SAME CACHE, TWO INPUT DISTRIBUTIONS</text>
+
+      <rect x="20" y="38" width="290" height="96" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="165" y="58" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">3 HOT KEYS — the demo</text>
+      <text x="165" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">no cache 3.75 ms · cache 1.85 ms</text>
+      <text x="165" y="100" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">2.03x faster</text>
+      <text x="165" y="120" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">100% hit rate after three calls</text>
+
+      <rect x="330" y="38" width="290" height="96" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="475" y="58" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">200,000 KEYS — production</text>
+      <text x="475" y="80" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">no cache 5.30 ms · cache 7.07 ms</text>
+      <text x="475" y="100" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700;">no gain, and slower</text>
+      <text x="475" y="120" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px; font-weight: 700;">200,000 entries held forever</text>
+
+      <rect x="20" y="152" width="600" height="38" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="170" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Nothing about the code changed. The benchmark chose the input,</text>
+      <text x="320" y="185" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">and the input decided the answer.</text>
+
+      <text x="320" y="220" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">When a benchmark tells you something you wanted to hear, suspect the benchmark.</text>
+      <text x="320" y="242" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Both columns measured on Node v24.14.0, 200,000 iterations, 15 runs, median with spread.</text>
+    </svg>
+    <figcaption>The left column is a true measurement of a system nobody runs.</figcaption>
+  </div>
+
+  <!-- ============ CORRECTNESS ============ -->
+  <h2>When a cache is a correctness bug, not a speed win</h2>
+  <p><a href="./0041-redis-and-the-three-ways-a-cache-lies.html">Week 41</a> covers this for a shared cache. In-process, the same rule applies with an extra trap:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Cache this</th><th>Never cache this</th></tr></thead>
+    <tbody>
+      <tr><td>A pure function of its input</td><td>Anything that reads the clock</td></tr>
+      <tr><td>A value that changes only on deploy</td><td>Anything scoped to a user, in a process-wide cache</td></tr>
+      <tr><td>A bounded set of keys</td><td>Anything keyed by user input — no ceiling</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The worst in-process caching bug</span>
+    A process-wide cache holding per-user data. With <code>cluster</code> from
+    <a href="./0024-child-processes-and-cluster.html">week 24</a>, each worker has its own copy, so the bug
+    appears on some requests and not others. It looks like a race condition and it is a cache key that
+    forgot the user.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A benchmark gives you a number whether or not the number means anything. So you print the <b>spread</b> next to it — how far apart the fastest and slowest runs were.</p>
+    <p class="part cont">If the difference between two options is smaller than that spread, there is no difference. That holds however much you want one. That rule is the whole discipline.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Weighing yourself once and concluding you lost weight. You need several weighings, and you need to know how much the scale wobbles, before a change means anything.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A scale wobbles by about the same amount every time. A benchmark's wobble depends on what you are measuring, and it can be enormous.</p>
+    <p class="part limit cont">I measured a buffer comparison at <b>&plusmn;316%</b>. The slowest run took four times as long as the fastest, so any single number from it was worthless. The spread was the only thing telling me so. Ten times the iterations settled it to &plusmn;31%, and only then did a real 1.74x difference appear. The first run had found nothing at all.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People benchmark the input that shows the result they hoped for, usually without noticing. My <code>Map</code> cache looked <b>2.03x faster</b> on three hot keys — a 100% hit rate after the first three calls.</p>
+    <p class="part cont">On 200,000 unique keys, which is what production looks like, it bought nothing measurable and the median was <b>slower</b>. Every miss now costs a lookup, the computation <em>and</em> an insert. It also kept 200,000 entries forever. The code never changed; the input decided the answer.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain how a cache can be twice as fast in a benchmark and slower in production. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — three candidates, and a rejection list</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Write the harness: warm-up, repeats, median, and <b>the spread printed next to every result</b>.</li>
+    <li>Benchmark three real candidates on the spine. JSON handling, buffer reuse, and one cache.</li>
+    <li>Run each at <b>two iteration counts</b>. If a verdict changes between them, the smaller run was not a measurement.</li>
+    <li>Benchmark the cache with your <b>real key distribution</b>, not three keys.</li>
+    <li>Keep only what beat its own spread. <b>Delete the rest, including the ones you liked.</b></li>
+    <li>Write the <b>rejection list</b>: what you tried, what it measured, and why you kept the old code. That list is the deliverable.</li>
+    <li>Take the winner and check it end to end with <code>autocannon</code>. A 49x win on a function that is 0.1% of a request is a 0.1% win.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">Requirement 7 is the one that keeps you honest</span>
+    Every measurement in this lesson is a <b>micro</b>-benchmark. A function being 49x faster tells you
+    nothing about the request until you know what fraction of the request that function was.
+    <a href="./0050-build-the-spine-rebuilt-in-nestjs.html">Week 50</a> makes the same point from the other
+    side: 4.8 µs was 25% of an empty handler and 0.03% of a real one.
+  </div>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;Is <code>JSON.parse</code> your bottleneck?&rdquo;</p>
+    Do not answer yes or no. Say <b>how you would find out</b> — and the answer is week 31's CPU profile,
+    not a micro-benchmark. A micro-benchmark tells you how fast a function is. A profile tells you whether
+    anyone is calling it enough to matter.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Hidden classes and inline caches</b> in V8 explain <em>why</em> some of these differences exist, and
+    are fascinating and rarely actionable. <b>Object shape consistency</b> is one micro-optimisation that
+    genuinely holds up. <b><code>--allow-natives-syntax</code></b> lets you ask V8 whether a function was
+    optimised or deoptimised. <b>Benchmark.js and mitata</b> do the statistics properly and are worth using
+    over a hand-rolled harness. <b>Memory versus speed</b> trades are usually the interesting ones, and
+    almost never appear in a timing benchmark.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: Node.js docs — <a href="https://nodejs.org/api/perf_hooks.html">perf_hooks</a>,
+    especially <code>process.hrtime.bigint()</code> and <code>performance.now()</code>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your rejection list. The ideas you threw away tell me more than the one you kept.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A benchmark needs <b>warm-up, repeats, enough iterations, and the spread printed</b>. Three of four is a story.</li>
+      <li><b>If the difference is smaller than the spread, there is no difference.</b></li>
+      <li>Measured &plusmn;316% on one comparison — ten times the iterations brought it to &plusmn;31%. A verdict that changes with the iteration count means the smaller run measured nothing.</li>
+      <li>Measured: a cache was <b>2.03x faster</b> on 3 keys and <b>slower</b> on 200,000 — and held every entry forever.</li>
+      <li>Your benchmark chooses the input, and the input chooses the answer. Use your real key distribution.</li>
+      <li><code>allocUnsafe</code> is 1.74x faster and hands you old memory. A shared buffer is 6x faster and unsafe under concurrency.</li>
+      <li>Keep the <b>rejection list</b>. What you threw away, and why, is the actual output of the week.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>when a benchmark tells you what you hoped to hear, suspect the benchmark first.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "perf_hooks". Every timing, spread and verdict here came from running the harness on <b>Node v24.14.0</b>, on 2026-08-28. It ran at both 20,000 and 200,000 iterations, with 15 runs each. The results are reported as measured, including the ones that contradicted the change being tested. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0032-memory-and-heap-snapshots.html">← Lesson 32</a>
+    <a href="./0034-build-find-and-fix-a-real-leak.html">Next: Lesson 34 — Build — find and fix a real leak, and write it up →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A benchmark reports a candidate is 15% faster, with a spread of ±316%. What do you conclude?",
+      options: [
+        "Nothing — the measurement failed, and the spread is what tells you so",
+        "That it is 15% faster, since the median is robust to a few slow outlier runs",
+        "That the machine was busy, so the result should be scaled down proportionally",
+        "That the candidate is faster in the best case but unpredictable under load"
+      ],
+      answer: 0,
+      why: "A ±316% spread means the slowest run took four times as long as the fastest. Any single number from that batch is meaningless, and printing the spread is the only thing that reveals it. Measured: ten times the iterations brought the same comparison to ±31%, and only then did a real 1.74x difference appear."
+    },
+    {
+      q: "A Map cache measured 2.03x faster on 3 keys and slower on 200,000. What changed?",
+      options: [
+        "Only the input — every miss now costs a lookup, the computation and an insert",
+        "The Map's internal hashing degrades once it holds more than a few thousand keys",
+        "Garbage collection ran during the larger benchmark, which inflated its median",
+        "The computation itself gets cheaper at scale, so the cache has less to save"
+      ],
+      answer: 0,
+      why: "The code was identical. Three keys gives a 100% hit rate after the first three calls, which is a system nobody runs. With realistic key variety the cache bought nothing measurable, the median was worse, and it kept 200,000 entries forever. The benchmark chose the input, and the input chose the answer."
+    },
+    {
+      q: "Someone asks whether JSON.parse is your bottleneck. What is the right response?",
+      options: [
+        "Say how you would find out — a CPU profile, not a micro-benchmark",
+        "Benchmark JSON.parse against alternatives and compare the medians",
+        "Check the payload sizes, since parse time scales with input length",
+        "Replace it with a faster parser and measure the endpoint before and after"
+      ],
+      answer: 0,
+      why: "A micro-benchmark tells you how fast a function is. A profile tells you whether anyone calls it enough for that to matter. A 49x speed-up on a function that is 0.1% of a request is a 0.1% win — which is the same lesson week 50 taught from the other direction."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you benchmark a change?”",
+      answer: "Warm-up, repeats, enough iterations, and I always print the <b>spread</b> next to the median. The rule is that if the difference between two options is smaller than the spread, there is no difference. I have seen why that matters: one comparison came back at <b>±316%</b>, meaning the slowest run took four times the fastest, so any number from it was worthless. Ten times the iterations brought it to ±31% and a real 1.74x difference appeared. I also run at two iteration counts, because a verdict that changes between them means the smaller run measured nothing at all. <br>Why: the two-iteration-count check is a concrete habit, not a general appeal to rigour."
+    },
+    {
+      prompt: "Interviewer: “Tell me about an optimisation you threw away.”",
+      answer: "A <code>Map</code> cache in front of a small computation. On three hot keys it measured 2.03x faster, which is the demo everybody runs. On 200,000 unique keys — the real distribution — it bought nothing measurable and the median was <b>slower</b>, because every miss now pays for a lookup, the computation and an insert. And it held all 200,000 entries forever, so I had traded no speed for an unbounded memory leak. The code never changed; my benchmark had chosen the input and the input had chosen the answer. I deleted it and wrote down why. <br>Why: naming the mechanism for why it got slower, rather than just the result, is what shows you understood the failure."
+    },
+    {
+      prompt: "Interviewer: “When is micro-optimisation worth doing?”",
+      answer: "Rarely, and only after a profile says the function matters. A micro-benchmark tells me how fast a function is; a CPU profile tells me whether anything calls it enough for that to matter. I measured a 49x speed-up from reusing a pre-built JSON string — real, but only useful where the value never changes, like a health-check body. If that function is 0.1% of a request, a 49x win is a 0.1% win. So my last step is always to check the winner end to end with a load test, because the micro number and the request number are different questions. <br>Why: insisting on the end-to-end check as a step, not a caveat, is what separates this from a generic warning about premature optimisation."
+    }
+  ]);
+</script>

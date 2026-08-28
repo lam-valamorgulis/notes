@@ -1,0 +1,494 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The async ladder — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 2 of 7 · Lesson 4 · Async under pressure</p>
+  <h1>The async ladder — callbacks, promises, <code>await</code></h1>
+  <p class="subtitle">Three rungs, thirty years apart. Each one fixed something real and gave something up. Say both halves and you sound senior.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 2 of 7.</span> This lesson builds one domain-expert ability: <b>explain it from first principles, with no jargon and no notes</b>. <a href="../reference/7-day-plan.html#d2">Day 2 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can walk the ladder from callbacks to <code>await</code> in about sixty seconds. For each rung you name <b>what it fixed</b> and <b>what it cost</b>. You never say "<code>await</code> waits" without adding "but the thread does not".
+  </div>
+
+  <h2>Start from the problem</h2>
+
+  <p>Day 1 gave us the rule. One thread runs your JavaScript, so nothing may sit and wait.</p>
+
+  <p>That creates an awkward question. If a function cannot wait for its answer, how does it return one?</p>
+
+  <p>It cannot. So it must not try. Instead you hand over a piece of code to run <em>later</em>, when the answer exists.</p>
+
+  <p>In 2009 JavaScript had exactly one way to do that. Pass a function as an argument.</p>
+
+  <div class="soundbite">
+    <span class="label">The whole reason callbacks exist</span>
+    <p>A callback is not a design choice. It is the <b>only</b> tool the language had for saying "call me back later".</p>
+  </div>
+
+  <h2>Rung 1 — callbacks, and the error-first rule</h2>
+
+  <pre><code>const { readFile } = require('node:fs');
+
+readFile('a.txt', 'utf8', (err, data) =&gt; {     <span class="cmt">// error first, always</span>
+  if (err) return console.error(err);
+  console.log(data.length);
+});</code></pre>
+
+  <p>The first argument is the error. That is a <b>convention</b>, not a language rule. Node chose it, and every Node API follows it.</p>
+
+  <p>It works. But it has three faults, and you should be able to name all three.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Fault</th><th>What goes wrong</th></tr></thead>
+    <tbody>
+      <tr><td><b>Nesting</b></td><td>Three dependent steps means three levels of indent. Ten steps is unreadable.</td></tr>
+      <tr><td><b>No composition</b></td><td>A callback is not a value. You cannot return it, store it, or put it in an array.</td></tr>
+      <tr><td><b>Errors by hope</b></td><td><code>try</code>/<code>catch</code> does not reach inside. If you forget <code>if (err)</code>, the failure is silent.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The second fault is the deepest one. Everything on rung 2 follows from fixing it.</p>
+
+  <h2>Rung 2 — a promise is a value</h2>
+
+  <p>Here is the idea in one line. Do not hand over the code. Hand back an <b>object that stands for the future result</b>.</p>
+
+  <p>Now the future result is a normal value. You can return it from a function.</p>
+
+  <p>You can store it in a variable, put it in an array, and pass it to another function.</p>
+
+  <pre><code>const { readFile } = require('node:fs/promises');
+
+const p = readFile('a.txt', 'utf8');   <span class="cmt">// p is a value, right now</span>
+const all = [p, readFile('b.txt', 'utf8')];   <span class="cmt">// so it goes in an array</span></code></pre>
+
+  <p>That single change buys composition. <code>Promise.all</code> only exists because a promise is a value.</p>
+
+  <p>It also buys real error routing. A rejection travels down the chain until something catches it.</p>
+
+  <div class="tip">
+    <span class="label">Two ways to get promises from old code</span>
+    <code>util.promisify</code> wraps any error-first function. <code>node:fs/promises</code> is the ready-made promise version of <code>node:fs</code>. Both were checked on Node v24.14.0 and read the same file to the same length.
+  </div>
+
+  <p>What did rung 2 cost? A new vocabulary, and chains that still read sideways rather than downward.</p>
+
+  <h2>Rung 3 — <code>await</code> is syntax over rung 2</h2>
+
+  <p>This is the sentence that matters. <b><code>async</code> and <code>await</code> add no new capability.</b></p>
+
+  <p>An <code>async</code> function returns a promise. <code>await</code> unwraps one. That is all.</p>
+
+  <p>What it buys is enormous anyway. The code reads top to bottom, and <code>try</code>/<code>catch</code> works again.</p>
+
+  <pre><code>async function load() {
+  try {
+    const a = await readFile('a.txt', 'utf8');
+    const b = await readFile('b.txt', 'utf8');
+    return a.length + b.length;
+  } catch (err) {
+    console.error('one of the reads failed:', err.message);
+    throw err;
+  }
+}</code></pre>
+
+  <p>And the cost? Two traps, both very common in review.</p>
+
+  <ul>
+    <li><b>Accidental queueing.</b> Two <code>await</code> lines in a row run one after the other. If they do not depend on each other, that is wasted time.</li>
+    <li><b>The forgotten <code>await</code>.</b> The call still runs. The error escapes your <code>try</code>. Lesson 5 measures exactly what happens.</li>
+  </ul>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig4-title">
+      <title id="fig4-title">Three rungs of the async ladder, each with what it fixed and what it cost</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">THE SAME MECHANISM, THREE TIMES</text>
+
+      <rect x="20" y="30" width="600" height="70" rx="8" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 2;"></rect>
+      <text x="36" y="52" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700;">RUNG 1 · CALLBACK</text>
+      <text x="36" y="72" style="fill: var(--good); font-family: sans-serif; font-size: 10.5px;">fixed: the thread never waits</text>
+      <text x="36" y="89" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px;">cost: nesting, no composition, errors only by convention</text>
+      <text x="600" y="72" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">fn(err, data)</text>
+
+      <line x1="320" y1="100" x2="320" y2="114" style="stroke: var(--accent); stroke-width: 2;"></line>
+      <polygon points="315,112 320,124 325,112" style="fill: var(--accent);"></polygon>
+
+      <rect x="20" y="126" width="600" height="70" rx="8" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="36" y="148" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700;">RUNG 2 · PROMISE</text>
+      <text x="36" y="168" style="fill: var(--good); font-family: sans-serif; font-size: 10.5px;">fixed: the future result is a value, so it composes</text>
+      <text x="36" y="185" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px;">cost: a new vocabulary, and chains that read sideways</text>
+      <text x="600" y="168" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">p.then(...)</text>
+
+      <line x1="320" y1="196" x2="320" y2="210" style="stroke: var(--accent); stroke-width: 2;"></line>
+      <polygon points="315,208 320,220 325,208" style="fill: var(--accent);"></polygon>
+
+      <rect x="20" y="222" width="600" height="70" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="36" y="244" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-weight: 700;">RUNG 3 · ASYNC / AWAIT</text>
+      <text x="36" y="264" style="fill: var(--good); font-family: sans-serif; font-size: 10.5px;">fixed: reads top to bottom, and try / catch works again</text>
+      <text x="36" y="281" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px;">cost: accidental queueing, and the forgotten await</text>
+      <text x="600" y="264" text-anchor="end" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">await p</text>
+    </svg>
+    <figcaption>Rung 3 is only syntax over rung 2. The machinery underneath never changed.</figcaption>
+  </figure>
+
+  <h2>The proof that <code>await</code> does not block</h2>
+
+  <p>This is the question that catches people. Say the answer with a measurement.</p>
+
+  <pre><code>const t0 = Date.now();
+const beat = setInterval(() =&gt; console.log('  heartbeat at', Date.now() - t0, 'ms'), 50);
+
+async function slowJob() {
+  await new Promise(r =&gt; setTimeout(r, 200));   <span class="cmt">// 200 ms of waiting</span>
+  console.log('slowJob done at', Date.now() - t0, 'ms');
+}
+await slowJob();
+clearInterval(beat);</code></pre>
+
+  <pre><code><span class="out">  heartbeat at 51 ms
+  heartbeat at 102 ms
+  heartbeat at 153 ms
+slowJob done at 202 ms</span></code></pre>
+
+  <p>The heartbeat fired three times <em>during</em> the <code>await</code>. The thread was free the whole time.</p>
+
+  <p><code>await</code> pauses <b>this function</b>. It hands control back to the event loop.</p>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A callback says "here is my phone number, ring me when it is done". You give away a piece of your code.</p>
+    <p class="part cont">A promise flips it round. You keep something instead: an object that will hold the answer. Because you keep it, you can pass it around. <code>await</code> is a shorter way to open it.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A cloakroom ticket. You hand over your coat and get a small numbered ticket.</p>
+    <p class="part cont">The ticket is not the coat. But you can pocket it, or hand it to a friend. You can collect three tickets and fetch all the coats at once. Later you swap the ticket for the coat, or for a note saying it was damaged.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A cloakroom ticket does nothing until you use it. A promise has <b>already started</b> the work the moment it exists.</p>
+    <p class="part limit cont">And a lost ticket only costs you a coat. A promise nobody ever opens can carry a rejection that crashes the process. Lesson 5 is entirely about that difference.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People read <code>await</code> as "stop the program here". It does not. It stops <b>this function</b> only.</p>
+    <p class="part cont">Everything else keeps running. Measured above: a 50 ms heartbeat fired three times during a 200 ms <code>await</code>. Nothing else was frozen.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say what a promise gave you that a callback could not. Then say what <code>await</code> added on top. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is what proves you own it.</p>
+    </div>
+  </div>
+
+  <h2>Two <code>await</code> lines, or one <code>Promise.all</code>?</h2>
+
+  <p>This is the most common review comment on async code. Learn to spot it in one glance.</p>
+
+  <pre><code><span class="cmt">// Slow. b does not need a, but it waits for it anyway.</span>
+const a = await getUser(id);
+const b = await getSettings(id);
+
+<span class="cmt">// Fast. Both start now, both are awaited together.</span>
+const [a, b] = await Promise.all([getUser(id), getSettings(id)]);</code></pre>
+
+  <p>The rule is one question. <b>Does the second call need the first one's result?</b></p>
+
+  <p>If yes, two <code>await</code> lines is correct. If no, it is a bug you can measure.</p>
+
+  <div class="trap">
+    <span class="label">Trap — "async makes it parallel"</span>
+    It does not. <code>async</code> changes what a function returns, nothing else. Two <code>await</code> lines run one after the other, exactly like sync code. Parallelism only appears when you <b>start both promises before awaiting either</b>. That is what <code>Promise.all</code> does, and it is why it exists.
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 3 minutes, out loud</span>
+    <p class="situation">The interviewer says: "Why did the language add promises? Callbacks already worked."</p>
+    Answer out loud before reading on. A weak answer says "callback hell". A strong answer says a promise is a <b>value</b>, so it can be returned, stored and combined. Then it names <code>Promise.all</code> as the thing that becomes possible.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/en/learn/asynchronous-work/asynchronous-flow-control">Asynchronous flow control</a>, then <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises">MDN · Using promises</a>. Forty minutes for both.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0005-the-async-ladder-callbacks-promises-async-await.html">Week 5 · The async ladder</a> ·
+    <a href="../../lessons/0003-callbacks-and-the-event-loop-up-close.html">Week 3 · Callbacks and the event loop up close</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A callback was the <b>only</b> tool the language had for "call me back later".</li>
+      <li>Error-first is a <b>convention</b> Node chose. It is not a language rule.</li>
+      <li>A promise is a <b>value</b> standing for a future result. That is the whole leap.</li>
+      <li>Because it is a value, it composes. <code>Promise.all</code> exists only for that reason.</li>
+      <li><code>async</code>/<code>await</code> adds <b>no new power</b>. It is syntax over promises.</li>
+      <li><code>await</code> pauses one function, never the thread. Measured: a heartbeat fired three times during a 200 ms wait.</li>
+      <li>Two <code>await</code> lines run in sequence. Start both promises first to overlap them.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a promise is a value, and that single change is what bought everything else.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — "Asynchronous flow control" and the <code>util</code> and <code>fs/promises</code> API pages. The heartbeat output and the <code>promisify</code> comparison were measured while writing this lesson. Node v24.14.0, 2026-08-28.</p>
+
+  <div class="ask">
+    Stuck on any of this? <b>Ask your teacher.</b> Say <b>"quiz me on the async ladder"</b> for ten rapid questions with no multiple choice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0003-kata-01-predict-the-print-order.html">← Kata 1 — predict the print order</a></span>
+    <span><a href="0005-async-errors-and-the-combinators.html">Next: Async errors and the combinators →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "What did promises give the language that callbacks could not?",
+      options: [
+        "A value standing for the future result, so it can be returned, stored and combined",
+        "A guarantee that the operation runs on a separate thread from the main one",
+        "A way to cancel work that is already in flight once you no longer need it",
+        "A shorter syntax for the same nesting, with the indentation removed by the engine"
+      ],
+      answer: 0,
+      why: "The leap is that the future result becomes an ordinary value. You can return it from a function, keep it in a variable, or put several in an array. That is why Promise.all can exist at all — it takes a list of values. Promises do not add threads, and they still cannot cancel work. Reduced nesting is a pleasant effect, not the reason."
+    },
+    {
+      q: "A function awaits a promise that takes 200 ms. What happens to the rest of the process?",
+      options: [
+        "It keeps running, because await pauses only this function and returns control to the loop",
+        "It stops for 200 ms, because the single thread is held until the promise settles",
+        "It keeps running only if the awaited promise was created with a timer inside it",
+        "It stops, but timers still fire, because timers run on a separate libuv thread"
+      ],
+      answer: 0,
+      why: "await suspends the current async function and hands the thread back to the event loop. Measured on Node v24.14.0: a 50 ms heartbeat fired at 51, 102 and 153 ms during a 200 ms await. Nothing was frozen. Timers do not run on a libuv thread either — they run in the timers phase, on the one thread, which is exactly why they kept firing."
+    },
+    {
+      q: "Two awaited calls do not depend on each other. What is the correct review comment?",
+      options: [
+        "Start both promises first, then await them together, so the waiting overlaps",
+        "Replace both with callbacks, since callbacks let two operations overlap by default",
+        "Mark the outer function async twice so the engine can schedule the calls together",
+        "Move the second call into a setImmediate so the loop can interleave the two waits"
+      ],
+      answer: 0,
+      why: "Two await lines run strictly in sequence, exactly like synchronous code. The fix is to create both promises before awaiting either, which is what Promise.all does for you. Marking a function async only changes what it returns. Callbacks have no special overlap either, and setImmediate just moves the same sequential wait to a later phase."
+    },
+    {
+      q: "Which statement about the error-first callback convention is correct?",
+      options: [
+        "Node chose it as a convention, so a forgotten error check fails silently",
+        "The language enforces it, so an unchecked error argument raises a TypeError",
+        "It applies only to file system calls, since other modules use an error event",
+        "It was replaced by promises, so modern Node core no longer offers callbacks"
+      ],
+      answer: 0,
+      why: "Error-first is a Node convention, not a language rule. Nothing checks that you looked at the first argument, so forgetting `if (err)` means the failure disappears with no stack and no log. That is the third fault of rung 1, and it is the one promises fixed properly. Core still ships callback versions of nearly everything, alongside the promise ones."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Walk me from callbacks to async await.”",
+      answer: "Three rungs, and each one fixed the fault below it. A callback was the only way the language could say 'call me back later', and it worked, but it had three faults: deep nesting, no composition because a callback is not a value, and errors handled only by a convention that you can forget. A promise fixed the middle one. It is an object standing for the future result, so I can return it, store it, or put several in an array — and that is exactly why Promise.all can exist. Then async and await added no new power at all. They are syntax over the same promise, and what they bought is that the code reads top to bottom and try catch works again. <br>Why: the interviewer is listening for whether you know async await is only syntax. Saying that one sentence separates you from someone who learned the keywords without the model."
+    },
+    {
+      prompt: "Interviewer: “Does await block the thread?”",
+      answer: "No. It pauses that one function and hands control straight back to the event loop. Everything else in the process keeps running. I measured this on Node v24.14.0: I set a heartbeat every 50 ms, then awaited a 200 ms delay, and the heartbeat fired at 51, 102 and 153 ms during the wait. So the thread was free the whole time. The word await is misleading, because the waiting is not done by the thread — the operating system holds it, and my function is resumed as a microtask when the answer arrives. <br>Why: this is a favourite trap. They want to see if you confuse 'this function pauses' with 'the process pauses', because that confusion is the root of most blocking bugs."
+    },
+    {
+      prompt: "Interviewer: “I see two awaits in a row here. Any comment?”",
+      answer: "My first question is whether the second call needs the first call's result. If it does, two awaits in a row is correct and I would leave it. If it does not, this is a real bug and it costs the sum of both waits instead of the longer one. The fix is to create both promises before awaiting either, which is what Promise.all does. I would also say why the mistake is so common: async looks like it should make things parallel, but it only changes what the function returns. Parallelism comes from starting the work early, not from the keyword. <br>Why: they are testing review judgement, not syntax. Asking the dependency question before proposing a fix is the part that shows seniority."
+    }
+  ]);
+</script>

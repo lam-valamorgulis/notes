@@ -1,0 +1,631 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The inspector, and hardening your input — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 37 of 52 · Lesson 37 · Testing &amp; security</p>
+  <h1>The inspector, and hardening your input</h1>
+  <p class="subtitle">Attack your own API before somebody else does. Then debug the fixes with a real debugger.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 37 of 52.</span> This lesson builds one domain-expert ability: <b>find the input that breaks a service, and say what it costs</b>. <a href="../reference/52-week-plan.html#w37">Week 37 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> a <b>32-character string</b> that freezes your whole server for half a minute. You will measure it, understand why, and fix it in one line.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    Weeks 35 and 36 checked that the spine does what you meant. This week checks what it does when someone
+    means you harm. Those are different questions, and the second one has no test suite by default.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — where does trust end?</h2>
+  <p>Your service has a line around it. Inside the line, you wrote everything. Outside, a stranger did. Every security bug in this lesson is the same mistake: <b>something crossed the line without being checked.</b></p>
+
+  <div class="soundbite">
+    <span class="label">The rule for the boundary</span>
+    <p>At the edge, <b>reject — do not coerce</b>. Turning bad input into something usable is how bad input gets in. If you cannot say exactly what shape you want, you cannot defend it.</p>
+  </div>
+
+  <p>Coercion feels helpful. The user sent a number as a string, so you call <code>Number()</code>. They sent an odd URL, so you clean it up. Each small kindness moves the check from &ldquo;is this allowed?&rdquo; to &ldquo;can I make this work?&rdquo; Those are opposite questions.</p>
+
+  <!-- ============ ATTACK 1 ============ -->
+  <h2>Attack 1 — the URL that is not a URL</h2>
+  <p>The spine stores a URL and later redirects to it. Obvious validation: does it parse? Verified on Node v24.14.0:</p>
+
+  <pre><code>new URL('javascript:alert(1)')
+<span class="out">  ACCEPTED -> protocol=javascript:</span>
+new URL('data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;')
+<span class="out">  ACCEPTED -> protocol=data:</span>
+new URL('file:///etc/passwd')
+<span class="out">  ACCEPTED -> protocol=file:</span></code></pre>
+
+  <div class="trap">
+    <span class="label">&ldquo;It parsed&rdquo; is not validation</span>
+    <code>new URL</code> tells you the string is a well-formed URL. It never says the URL is one you should
+    send a person to. Store <code>javascript:alert(1)</code>, redirect a browser to it, and you have
+    published a cross-site scripting attack on your own domain.
+  </div>
+
+  <p>The fix is an <b>allow-list of protocols</b>. Not a block-list — you cannot list every scheme an attacker might find.</p>
+
+  <pre><code>function isSafeTarget(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return false; }        <span class="cmt">// not a URL at all</span>
+  return u.protocol === 'http:' || u.protocol === 'https:';
+}
+<span class="out">  DENY  "javascript:alert(1)"
+  DENY  "data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;"
+  DENY  "file:///etc/passwd"
+  allow "https://ok.test/a"</span></code></pre>
+
+  <p>Now the part most write-ups stop before. Run one more input through the same allow-list:</p>
+
+  <pre><code><span class="out">  allow "http://169.254.169.254/latest/meta-data/"</span></code></pre>
+
+  <div class="trap">
+    <span class="label">That address is not a website</span>
+    <code>169.254.169.254</code> is the cloud metadata endpoint. On many hosts it hands out credentials to
+    anything that asks from inside the machine. It is plain <code>http:</code>, so the protocol allow-list
+    lets it through.
+    <p style="margin:.6rem 0 0;">This is the <b>server-side request forgery</b> shape. It only becomes a real
+    hole if <b>your server fetches the URL</b>. A 302 redirect makes the <em>browser</em> fetch it, which is
+    a much smaller problem. The distinction is the whole risk assessment, and it is yours to make and
+    write down.</p>
+  </div>
+
+  <p>So the honest position after one fix is this. <b>Protocol closed. Private addresses accepted on purpose, because we redirect rather than fetch.</b> That sentence belongs in your security pass next week. A layer you chose not to add is fine. A layer you did not notice is not.</p>
+
+  <!-- ============ ATTACK 2 ============ -->
+  <h2>Attack 2 — prototype pollution</h2>
+  <p>A recursive merge, the kind in every codebase for merging options or settings:</p>
+
+  <pre><code>function merge(target, src) {
+  for (const k in src) {
+    if (typeof src[k] === 'object' &amp;&amp; src[k] !== null) {
+      target[k] = target[k] || {};
+      merge(target[k], src[k]);                  <span class="cmt">// k can be "__proto__"</span>
+    } else target[k] = src[k];
+  }
+  return target;
+}
+
+merge({}, JSON.parse('{"__proto__":{"isAdmin":true}}'));</code></pre>
+
+  <p>Measured immediately afterwards:</p>
+
+  <pre><code><span class="out">  after merge, ({}).isAdmin = true
+  a brand new unrelated object: {"name":"x"} -> isAdmin = true</span></code></pre>
+
+  <p>Read that twice. Not the merged object. <b>Every object in the process</b>, including ones created later, in code that never heard of this request. Any <code>if (user.isAdmin)</code> anywhere is now true.</p>
+
+  <p>Now the detail that tells you where the bug actually is:</p>
+
+  <pre><code>const o = JSON.parse('{"__proto__":{"x":1}}');
+<span class="out">  ({}).x = undefined
+  own properties of the parsed object: [ '__proto__' ]</span></code></pre>
+
+  <div class="tip">
+    <span class="label"><code>JSON.parse</code> is not the problem</span>
+    It puts <code>__proto__</code> in as an ordinary <b>own key</b>. Nothing is polluted yet. The damage
+    happens when <b>your code copies that key onto another object</b> — a merge, an <code>Object.assign</code>,
+    a <code>for...in</code> loop that assigns. So do not go looking for a safer parser. Look at your own
+    assignment code.
+  </div>
+
+  <p>Two fixes, and it is worth knowing why the second one works:</p>
+
+  <pre><code><span class="cmt">// 1 — refuse the dangerous keys, at the boundary</span>
+const BAD = ['__proto__', 'constructor', 'prototype'];
+if (BAD.includes(k)) continue;
+
+<span class="cmt">// 2 — merge into an object that has no prototype to pollute</span>
+const clean = Object.create(null);
+<span class="out">  Object.getPrototypeOf(clean) = null</span>
+merge(clean, JSON.parse('{"__proto__":{"isAdmin":true}}'));
+<span class="out">  ({}).isAdmin = undefined          &lt;- nothing leaked
+  clean own keys = [ '__proto__' ]  &lt;- it became a plain key</span></code></pre>
+
+  <p>With no prototype, <code>__proto__</code> has no special meaning. It is just a string key holding data. That is the one-line version: <b>an object with no prototype cannot have its prototype poisoned.</b></p>
+
+  <!-- ============ ATTACK 3 ============ -->
+  <h2>Attack 3 — one string, half a minute of downtime</h2>
+  <p>Say you validate a code with a regex. Something innocent, like <code>/^(a+)+$/</code>. Feed it a string that <b>almost</b> matches, and measure. Verified:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Input length</th><th>Time to fail the match</th></tr></thead>
+    <tbody>
+      <tr><td>26 characters</td><td>2,224 ms</td></tr>
+      <tr><td>28 characters</td><td>1,760 ms</td></tr>
+      <tr><td>30 characters</td><td>6,978 ms</td></tr>
+      <tr><td><b>32 characters</b></td><td><b>27,874 ms</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Two characters more, four times the wait. That is not a slow function. That is a curve, and the attacker chooses where you sit on it.</p>
+
+  <p>Now the part that matters for a server. A heartbeat every 10 ms, running while the regex runs:</p>
+
+  <pre><code>const evil = /^(a+)+$/;
+let beats = 0;
+const timer = setInterval(() =&gt; { beats++; }, 10);
+<span class="cmt">// ... then, on the next tick:</span>
+evil.test('a'.repeat(30) + '!');
+
+<span class="out">regex took                    : 35893 ms
+heartbeats expected during it : 3589
+heartbeats that actually ran  : 0</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Zero out of 3,589</span>
+    Not &ldquo;delayed&rdquo;. Not &ldquo;slow&rdquo;. <b>None ran.</b> For 36 seconds the process did nothing else —
+    no requests served, no health check answered, no shutdown signal handled.
+    <p style="margin:.6rem 0 0;">This is <a href="./0022-cpu-bound-versus-io-bound.html">week 22</a> arriving as
+    an attack. Regular expressions run on the main thread, in C++, with no yielding. Your load balancer marks the instance unhealthy and moves the traffic to the next one. There, the attacker sends the same 32 characters.</p>
+  </div>
+
+  <p>The cause is <b>backtracking</b>. <code>(a+)+</code> gives the engine many different ways to split the same run of <code>a</code>s. When the string cannot match, it must try all of them before giving up. The number of ways doubles with each added character.</p>
+
+  <div class="tip">
+    <span class="label">How to spot one before it ships</span>
+    Look for a repeat inside a repeat: <code>(a+)+</code>, <code>(a*)*</code>, <code>(a|aa)+</code>. Then ask
+    the real question — <b>does user input reach this regex?</b> A slow regex on your own constant is a
+    curiosity. The same regex on a request body is an outage.
+    <p style="margin:.6rem 0 0;">The fix here is usually not a cleverer regex. It is <b>a length limit</b> before the match, plus a simpler pattern. <code>/^[a-z0-9]{1,32}$/</code> has no nesting and cannot backtrack this way.</p>
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 270" role="img" aria-labelledby="fig37-title" width="640" height="270">
+      <title id="fig37-title">A backtracking regex freezes the event loop completely</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">/^(a+)+$/ AGAINST 30 CHARACTERS THAT CANNOT MATCH</text>
+
+      <text x="20" y="46" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">expected heartbeats — one every 10ms for 35.9 seconds</text>
+      <rect x="20" y="54" width="600" height="26" rx="4" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <g style="stroke: var(--accent); stroke-width: 2;">
+        <line x1="32" y1="60" x2="32" y2="74"></line><line x1="62" y1="60" x2="62" y2="74"></line>
+        <line x1="92" y1="60" x2="92" y2="74"></line><line x1="122" y1="60" x2="122" y2="74"></line>
+        <line x1="152" y1="60" x2="152" y2="74"></line><line x1="182" y1="60" x2="182" y2="74"></line>
+        <line x1="212" y1="60" x2="212" y2="74"></line><line x1="242" y1="60" x2="242" y2="74"></line>
+        <line x1="272" y1="60" x2="272" y2="74"></line><line x1="302" y1="60" x2="302" y2="74"></line>
+        <line x1="332" y1="60" x2="332" y2="74"></line><line x1="362" y1="60" x2="362" y2="74"></line>
+        <line x1="392" y1="60" x2="392" y2="74"></line><line x1="422" y1="60" x2="422" y2="74"></line>
+        <line x1="452" y1="60" x2="452" y2="74"></line><line x1="482" y1="60" x2="482" y2="74"></line>
+        <line x1="512" y1="60" x2="512" y2="74"></line><line x1="542" y1="60" x2="542" y2="74"></line>
+        <line x1="572" y1="60" x2="572" y2="74"></line><line x1="602" y1="60" x2="602" y2="74"></line>
+      </g>
+      <text x="628" y="71" text-anchor="end" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;"></text>
+      <text x="20" y="96" style="fill: var(--accent); font-family: monospace; font-size: 11px;">3589</text>
+
+      <text x="20" y="126" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">heartbeats that actually ran</text>
+      <rect x="20" y="134" width="600" height="26" rx="4" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="320" y="151" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">— nothing —</text>
+      <text x="20" y="176" style="fill: var(--warn); font-family: monospace; font-size: 11px;">0</text>
+
+      <rect x="20" y="192" width="600" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="213" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">No request served. No health check answered. No SIGTERM handled. For 36 seconds.</text>
+
+      <text x="320" y="248" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">The attacker sends 32 characters and picks how long you are down.</text>
+      <text x="320" y="264" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured on Node v24.14.0 — 35,893 ms, 0 of 3,589 heartbeats.</text>
+    </svg>
+    <figcaption>Regular expressions run on the main thread and do not yield. Backtracking is a denial-of-service tool.</figcaption>
+  </div>
+
+  <!-- ============ ATTACK 4 ============ -->
+  <h2>Attack 4 — path traversal, and the fix that is still wrong</h2>
+  <p>Serve a file from a folder. The obvious code:</p>
+
+  <pre><code>path.join('/srv/app/public', userInput)
+
+<span class="out">  join("../../etc/passwd") -> /srv/etc/passwd        &lt;- outside the folder
+  join("ok.txt")           -> /srv/app/public/ok.txt</span></code></pre>
+
+  <p><code>path.join</code> resolves <code>..</code> as part of its job. It is doing exactly what it promises. The mistake is believing it defends anything.</p>
+
+  <p>So people write the check. Here is the version that looks right and is not:</p>
+
+  <pre><code>const full = path.resolve(ROOT, userInput);
+if (full.startsWith(ROOT)) return full;          <span class="cmt">// looks fine…</span>
+
+<span class="out">  "../public-evil/secrets" -> /srv/app/public-evil/secrets     ACCEPTED</span></code></pre>
+
+  <div class="trap">
+    <span class="label">One missing separator</span>
+    <code>/srv/app/public-evil/secrets</code> starts with <code>/srv/app/public</code>. A sibling folder whose
+    name merely <b>begins with</b> your folder's name walks straight through. Compare against
+    <code>ROOT + path.sep</code>:
+    <pre style="margin:.6rem 0 0;"><code>if (full.startsWith(ROOT + path.sep)) return full;
+<span class="out">  "../public-evil/secrets" -> null    DENIED
+  "../../etc/passwd"       -> null    DENIED
+  "ok.txt"                 -> /srv/app/public/ok.txt</span></code></pre>
+  </div>
+
+  <p>This is the most useful lesson in the whole week. <b>A fix you did not test is a fix you do not have.</b> Both versions look correct while reading. Only one of them is.</p>
+
+  <!-- ============ ATTACK 5 ============ -->
+  <h2>Attack 5 — the body with no end</h2>
+  <p>You already fixed this one in <a href="./0020-http-from-scratch.html">week 20</a>: count bytes as they arrive and destroy the socket past the limit. Check it is still true, because it is the easiest protection to lose in a refactor to a framework.</p>
+
+  <pre><code>curl -X POST http://localhost:3000/links \
+  -H 'content-type: application/json' \
+  --data-binary @&lt;(head -c 5000000 /dev/zero | tr '\0' 'a')
+<span class="cmt"># want: 413, fast, and memory flat while it happens</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Never trust <code>content-length</code></span>
+    It is a claim by the client, not a fact. Count the bytes you actually receive. A client can send a
+    small <code>content-length</code> and then keep sending.
+  </div>
+
+  <!-- ============ INSPECTOR ============ -->
+  <h2>Now debug the fixes with a real debugger</h2>
+  <p>You have five fixes to verify. <code>console.log</code> can do it, badly: edit, restart, read, repeat, then remove the logs and hope you got them all.</p>
+
+  <pre><code>node --inspect server.js
+<span class="out">Debugger listening on ws://127.0.0.1:9229/c3299a52-21e3-484b-bafa-a6fd9bcea632
+For help, see: https://nodejs.org/en/docs/inspector</span></code></pre>
+
+  <p>Open <code>chrome://inspect</code>, or use your editor's Node debugger. Two flags, and the difference matters:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>What it does</th><th>Use it when</th></tr></thead>
+    <tbody>
+      <tr><td><code>--inspect</code></td><td>Opens the port, <b>runs normally</b></td><td>The bug is in a request handler</td></tr>
+      <tr><td><code>--inspect-brk</code></td><td>Opens the port, <b>pauses before line one</b></td><td>The bug is in startup or module loading</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Verified: with <code>--inspect-brk</code>, a <code>console.log</code> on the first line <b>never printed</b> until a client attached. That is the whole point of it.</p>
+
+  <p>The feature worth learning today is the <b>conditional breakpoint</b>. Right-click a line number, choose Edit breakpoint, and give it an expression:</p>
+
+  <pre><code>raw.startsWith('javascript:')          <span class="cmt">// stop only on the attack input</span>
+input.length &gt; 24                      <span class="cmt">// stop only where the regex gets slow</span>
+!full.startsWith(ROOT + path.sep)      <span class="cmt">// stop only when the traversal check denies</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Why this beats a log line, specifically</span>
+    A log tells you one value you thought to print. A breakpoint gives you <b>the whole scope</b> — every
+    variable, the call stack, and the ability to run expressions right there. When you do not yet know
+    which value is wrong, printing is guessing and the debugger is looking.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Your service has a line around it. Inside it, you wrote the code. Outside it, a stranger writes the input. Every bug in this lesson is one thing crossing that line unchecked.</p>
+    <p class="part cont">So at the edge you <b>reject</b> rather than tidy up. A URL that parses is not a URL you should redirect to. A key called <code>__proto__</code> is not a key you should copy. A 32-character string is not a string you should run a nested regex over.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A door with a guest list. You are not judging whether someone looks respectable. You check the name against the list, and if it is not there they do not come in.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A guest list has one door. Your service has several, and each one lets a different thing through. The protocol list stopped <code>javascript:</code>, and still allowed <code>http://169.254.169.254</code> — the cloud address that hands out credentials.</p>
+    <p class="part limit cont">So one check is never &ldquo;secure&rdquo;. It closes one door. The professional habit is to say out loud which doors are shut, and which you left open on purpose. In the spine's case, we redirect the browser rather than fetch the URL. So that address is somebody else's problem. That is a decision, and it belongs in writing.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People look for the dangerous <b>function</b> — a safer JSON parser, a stricter URL class. That is the wrong hunt. <code>JSON.parse</code> does not pollute anything; it stores <code>__proto__</code> as an ordinary own key.</p>
+    <p class="part cont">The damage happens in <b>your own merge</b>, when you copy that key onto a normal object. The dangerous thing is usually plain code you wrote to be helpful, so no library upgrade will save you.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain how a 32-character string can take a server offline. Then say why a length limit fixes it. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — attack the spine, then fix it</h2>
+
+  <p><b>Requirements.</b> For each of the five, write the attack <b>first</b>, as a failing test:</p>
+  <ol>
+    <li><b>A bad scheme.</b> Store <code>javascript:alert(1)</code> and follow the redirect. Then allow-list protocols. Then decide about <code>169.254.169.254</code> and <b>write down which way you decided</b>.</li>
+    <li><b>Prototype pollution.</b> Find every merge, <code>Object.assign</code> and <code>for...in</code> that touches request data. Pollute through one. Fix it. Prove <code>({}).isAdmin</code> is <code>undefined</code> after.</li>
+    <li><b>A slow regex.</b> Check every regex that user input reaches. Add a length limit before the match. Measure the worst input before and after.</li>
+    <li><b>Path traversal</b>, if you serve any file. Write the <code>startsWith(ROOT)</code> version, watch <code>../public-evil</code> pass, then add <code>path.sep</code>.</li>
+    <li><b>An oversized body.</b> Confirm 413 and flat memory, with the 5 MB curl above.</li>
+    <li>Set <b>one conditional breakpoint</b> that stops only on an attack input. No <code>console.log</code> in this exercise at all.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">Write the attack before the fix</span>
+    If you fix first, you never find out whether you were vulnerable, and you never find out whether the
+    fix works. Two of the five fixes in this lesson look correct and are not — the missing
+    <code>path.sep</code>, and the protocol allow-list that still permits the metadata address. Only a test
+    tells them apart.
+  </div>
+
+  <div class="drill">
+    <span class="label">Name three ways a JSON body can hurt a Node service</span>
+    <p class="situation">This is a common interview question, and most answers stop at &ldquo;injection&rdquo;.</p>
+    Give three that apply to <b>Node specifically</b>, name the mechanism for each, and say which one takes
+    the whole process down rather than corrupting one request. Then say which of the three your spine is
+    still open to right now.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>SQL injection</b> needs a database, and arrives with the data layer in
+    <a href="../reference/52-week-plan.html#w40">weeks 40&ndash;43</a>. <b>Authentication and sessions</b> are a
+    subject of their own and deserve more than a section. <b>Dependency and supply-chain risk</b> —
+    <code>npm audit</code>, lockfiles, install scripts — is real and worth its own reading.
+    <b>Rate limiting</b> is the other half of denial-of-service defence. <b>Helmet and CORS headers</b>
+    matter once a browser is involved.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://nodejs.org/en/learn/getting-started/security-best-practices">Node.js security best practices</a>,
+    the <a href="https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html">OWASP Node.js Security Cheat Sheet</a>,
+    and the Node <a href="https://nodejs.org/en/learn/getting-started/debugging">debugging guide</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your five attack tests and I'll tell you which sixth one I would add.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>At the boundary, <b>reject — do not coerce</b>. Coercion turns &ldquo;is this allowed?&rdquo; into &ldquo;can I make this work?&rdquo;.</li>
+      <li><code>new URL('javascript:alert(1)')</code> <b>succeeds</b>. Allow-list the protocol — and note it still lets <code>169.254.169.254</code> through.</li>
+      <li><code>JSON.parse</code> does not pollute — <code>__proto__</code> becomes an own key. <b>Your merge</b> is the bug.</li>
+      <li><code>Object.create(null)</code> has no prototype to poison. Or refuse <code>__proto__</code>, <code>constructor</code>, <code>prototype</code>.</li>
+      <li><code>/^(a+)+$/</code> on 30 characters: <b>35,893 ms, 0 of 3,589 heartbeats</b>. Limit length before the match.</li>
+      <li><code>path.resolve</code> then <code>startsWith(ROOT + path.sep)</code>. Without <code>path.sep</code>, <code>public-evil</code> passes.</li>
+      <li><code>--inspect</code> runs; <code>--inspect-brk</code> pauses before line one. Conditional breakpoints stop only on the attack.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a fix you did not attack is a fix you do not have.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "Security best practices", "Debugging", "URL", "Path". OWASP Node.js Security Cheat Sheet. The measurements are the accepted <code>javascript:</code> URL and <code>({}).isAdmin === true</code>. Also the 35,893 ms regex with 0 of 3,589 heartbeats, and <code>/srv/app/public-evil/secrets</code> passing the <code>startsWith</code> check. All came from running the code on <b>Node v24.14.0</b>, on 2026-08-28. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0036-async-tests-that-do-not-flake.html">← Lesson 36</a>
+    <a href="./0038-build-the-full-suite-and-the-security-pass.html">Next: Lesson 38 — Build — the full suite and the security pass →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Where does prototype pollution actually happen when a request body contains __proto__?",
+      options: [
+        "In your own merge or assign, when it copies that key onto a normal object",
+        "In JSON.parse, which sets the prototype of the object it returns from the input",
+        "In the HTTP parser, before the body has been handed to any application code",
+        "In V8's property lookup, which follows __proto__ keys on any plain object"
+      ],
+      answer: 0,
+      why: "Measured: after JSON.parse('{\"__proto__\":{\"x\":1}}'), ({}).x is undefined and __proto__ is an ordinary own property of the parsed object. Nothing is polluted yet. The damage needs code that copies that key across — a recursive merge, Object.assign, or a for...in that assigns. So a safer parser fixes nothing."
+    },
+    {
+      q: "A regex takes 35 seconds on a 30-character input. What happened to the other work in that time?",
+      options: [
+        "None of it ran — 0 of 3,589 expected heartbeats fired during the match",
+        "It was delayed but still ran, since V8 yields to the loop between backtracks",
+        "It ran on the libuv thread pool, which regex matching uses for long inputs",
+        "It was queued and then ran late in a burst once the match finally returned"
+      ],
+      answer: 0,
+      why: "Measured with a 10 ms setInterval running across the match: 35,893 ms elapsed, 3,589 heartbeats expected, and exactly 0 ran. Regex matching happens on the main thread in C++ and never yields. That is the week 22 lesson arriving as an attack: no requests, no health checks, no SIGTERM handling."
+    },
+    {
+      q: "Why is startsWith(ROOT) an unsafe path-traversal check even after path.resolve?",
+      options: [
+        "A sibling folder whose name begins with ROOT's name passes the comparison",
+        "path.resolve leaves .. segments in the string when the input is relative",
+        "The check is case sensitive, so an uppercase path escapes it on macOS",
+        "Symbolic links are followed by resolve, so the final path can point elsewhere"
+      ],
+      answer: 0,
+      why: "Measured: '../public-evil/secrets' resolves to /srv/app/public-evil/secrets, which does start with /srv/app/public. Comparing against ROOT + path.sep denies it correctly. It is one character, and it is the difference between a real check and one that only looks like a check."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Name three ways a JSON body can hurt a Node service.”",
+      answer: "First, <b>prototype pollution</b> — a <code>__proto__</code> key that my own merge copies onto an object, which changes every object in the process, so an <code>isAdmin</code> check somewhere unrelated becomes true. Second, an <b>unbounded body</b>, where I must count the bytes I actually receive rather than trusting <code>content-length</code>, which is a client's claim. Third, a value that reaches a <b>backtracking regex</b> — I measured <code>/^(a+)+$/</code> taking 36 seconds on 30 characters, with zero heartbeats running. That third one is the worst, because the first two corrupt or reject one request and the regex takes the whole process offline. <br>Why: three distinct mechanisms, and ranking them by blast radius, is what separates this from a list of words."
+    },
+    {
+      prompt: "Interviewer: “How do you validate a URL a user gives you?”",
+      answer: "Parsing is not validating. <code>new URL('javascript:alert(1)')</code> succeeds — I checked. So I parse to reject malformed input, then <b>allow-list the protocol</b> to <code>http:</code> and <code>https:</code>, never block-list, because I cannot enumerate every scheme an attacker might find. Then I say what that still allows: <code>http://169.254.169.254</code>, the cloud metadata address, passes a protocol allow-list. Whether that matters depends on whether my server <b>fetches</b> the URL or just redirects a browser to it. I write down which one it is, and which risks I accepted. <br>Why: naming the residual risk after the fix is the part that sounds like someone who has shipped this."
+    },
+    {
+      prompt: "Interviewer: “When do you reach for the debugger instead of console.log?”",
+      answer: "When I do not yet know which value is wrong. A log prints one value I thought to print, so it only helps once I already have a theory. <code>--inspect</code> gives me the whole scope, the call stack, and the ability to run expressions where the code is paused. The feature I use most is a <b>conditional breakpoint</b> — an expression on the line so it stops only on the input I care about, like <code>raw.startsWith('javascript:')</code>, instead of on all ten thousand normal requests. I use <code>--inspect-brk</code> when the bug is in startup, because it pauses before the first line runs. <br>Why: the conditional breakpoint is the concrete detail that shows real debugger use rather than knowing the flag exists."
+    }
+  ]);
+</script>

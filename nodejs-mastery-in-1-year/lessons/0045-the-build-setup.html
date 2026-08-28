@@ -1,0 +1,531 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The build setup — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 45 of 52 · Lesson 45 · TypeScript for Node · <b>Depth week</b></p>
+  <h1>The build setup</h1>
+  <p class="subtitle">Mostly a one-time cost. But a stack trace pointing at compiled JavaScript wastes hours.</p>
+  <p class="expertise"><span class="tag depth">depth</span><span class="wk">Week 45 of 52.</span> This lesson builds one domain-expert ability: <b>make the tooling tell you the truth about where an error happened</b>. <a href="../reference/52-week-plan.html#w45">Week 45 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will turn on source maps, watch the stack trace stay <b>wrong</b>, and find the flag nobody mentions.
+  </div>
+
+  <div class="note">
+    <span class="label">Why this week is marked depth</span>
+    You configure this once and then never think about it again. It is here because the failure mode is
+    expensive and silent: everything works, and every error report points at the wrong file for the life
+    of the project.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — Node does not run your code</h2>
+  <p>You write <code>src/lib.ts</code>. Node runs <code>dist/lib.js</code>. Those are different files with different line numbers, and Node has never heard of the first one.</p>
+
+  <div class="soundbite">
+    <span class="label">What a build actually creates</span>
+    <p>A <b>second copy</b> of your program. Everything at run time — stack traces, breakpoints, coverage — describes that copy, not the one you edit.</p>
+  </div>
+
+  <p>So an error report reads like this. Measured on Node v24.14.0:</p>
+
+  <pre><code><span class="out">Error: the real error, thrown on this line
+    at boom (…/dist/lib.js:4:11)
+    at boom (…/dist/lib.js:3:16)
+    at boom (…/dist/lib.js:3:16)</span></code></pre>
+
+  <p><code>dist/lib.js:4</code>. To act on that you must open a generated file and find line 4. Then work out which line you wrote produced it. At 3am, with a production incident, that is minutes you do not have.</p>
+
+  <!-- ============ SOURCE MAPS ============ -->
+  <h2>Source maps — and the step everybody misses</h2>
+  <p>A source map is a file saying &ldquo;line 4 of the output came from line 3 of the input&rdquo;. Turn it on:</p>
+
+  <pre><code>"sourceMap": true</code></pre>
+
+  <p>Rebuild, run again, and measured:</p>
+
+  <pre><code><span class="out">    at boom (…/dist/lib.js:4:11)</span>      <span class="cmt">// …exactly the same.</span></code></pre>
+
+  <div class="trap">
+    <span class="label">The map was generated. Node just did not read it.</span>
+    <code>dist/lib.js.map</code> existed, and <code>dist/lib.js</code> ended with
+    <code>//# sourceMappingURL=lib.js.map</code>. Everything was in place.
+    <p style="margin:.6rem 0 0;">Node does not use source maps unless you ask it to, because resolving them
+    costs work on every stack trace. <b>Generating the map and using the map are two separate decisions</b>,
+    and only one of them is in <code>tsconfig.json</code>.</p>
+  </div>
+
+  <pre><code>node --enable-source-maps dist/main.js
+
+<span class="out">Error: the real error, thrown on this line
+    at boom (…/src/lib.ts:3:9)
+    at boom (…/src/lib.ts:2:25)
+    at boom (…/src/lib.ts:2:25)</span></code></pre>
+
+  <p><code>src/lib.ts:3</code> — the line you wrote, in the file you wrote. Line 3 is the <code>throw</code>, and line 2 is the recursive call. The whole trace is now readable.</p>
+
+  <div class="tip">
+    <span class="label">In production, use the environment variable</span>
+    <code>NODE_OPTIONS=--enable-source-maps</code> works identically and needs no change to your start
+    command — verified. That matters when the process is launched by a container image, a process manager,
+    or a platform you do not control.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig45-title" width="640" height="250">
+      <title id="fig45-title">Generating a source map and using one are two separate decisions</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">THREE SETUPS, THE SAME ERROR</text>
+
+      <rect x="20" y="36" width="600" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="34" y="55" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">A · no source map</text>
+      <text x="34" y="73" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">at boom (dist/lib.js:4:11)</text>
+      <text x="606" y="65" text-anchor="end" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">wrong file</text>
+
+      <rect x="20" y="92" width="600" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="34" y="111" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">B · "sourceMap": true — the .map file exists</text>
+      <text x="34" y="129" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">at boom (dist/lib.js:4:11)</text>
+      <text x="606" y="121" text-anchor="end" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">still wrong</text>
+
+      <rect x="20" y="148" width="600" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="34" y="167" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">C · plus node --enable-source-maps</text>
+      <text x="34" y="185" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">at boom (src/lib.ts:3:9)</text>
+      <text x="606" y="177" text-anchor="end" style="fill: var(--accent); font-family: sans-serif; font-size: 10px; font-weight: 700;">the line you wrote</text>
+
+      <text x="320" y="222" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">B is the dangerous one — it looks configured, and it is not.</text>
+      <text x="320" y="242" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">All three measured on Node v24.14.0 with TypeScript 7.0.2.</text>
+    </svg>
+    <figcaption>Setup B has the map file, the <code>sourceMappingURL</code> comment, and no benefit at all.</figcaption>
+  </div>
+
+  <!-- ============ MODULERESOLUTION ============ -->
+  <h2><code>moduleResolution</code> — it decides <em>when</em> you find the bug</h2>
+  <p>This setting tells TypeScript how to work out what an import refers to. Picking the wrong value does not break the build. It moves the failure to production.</p>
+
+  <p>The same missing extension, under two settings. Measured:</p>
+
+  <pre><code>import { boom } from './lib';         <span class="cmt">// no .js — legal in TypeScript, illegal in Node ESM</span>
+
+<span class="cmt">// moduleResolution: "nodenext"</span>
+<span class="out">src/main.ts(1,22): error TS2835: Relative import paths need explicit file extensions
+  in ECMAScript imports when '--moduleResolution' is 'node16' or 'nodenext'.
+  Did you mean './lib.js'?</span>
+
+<span class="cmt">// moduleResolution: "bundler"</span>
+<span class="out">(compiles clean)</span>
+
+<span class="cmt">// …then, at run time:</span>
+<span class="out">Error [ERR_MODULE_NOT_FOUND]: Cannot find module '…/dist/lib'
+  code: 'ERR_MODULE_NOT_FOUND'</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Same code, same bug, two very different afternoons</span>
+    <code>nodenext</code> names the file, the line, the reason and the fix, before anything runs.
+    <code>bundler</code> compiles happily and hands you a crash on start-up.
+    <p style="margin:.6rem 0 0;">So the rule is simple: <b>if Node runs the output, use
+    <code>nodenext</code></b>. <code>bundler</code> is correct only when a bundler will rewrite the imports
+    for you, and a Node service has no bundler.</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">A change worth knowing about</span>
+    On TypeScript 7.0.2 the old <code>node10</code> value is gone:
+    <code>error TS5108: Option 'moduleResolution=node10' has been removed.</code> If you copy a
+    <code>tsconfig.json</code> from an old blog post, that is the error you will get.
+  </div>
+
+  <h2>The other module error, and it reads strangely</h2>
+  <p>Compile to CommonJS inside a package marked <code>"type": "module"</code>, and Node treats the output as an ES module:</p>
+
+  <pre><code><span class="out">ReferenceError: exports is not defined in ES module scope</span></code></pre>
+
+  <p>Nothing about that message mentions your configuration, which is why it costs people an hour. It means <b>the compiler and the package disagree about what kind of module this is</b>. The two settings must match:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th><code>package.json</code></th><th><code>tsconfig.json</code></th><th>Output</th></tr></thead>
+    <tbody>
+      <tr><td><code>"type": "module"</code></td><td><code>"module": "nodenext"</code></td><td>ES modules — <code>import</code> at run time</td></tr>
+      <tr><td>no <code>type</code> field</td><td><code>"module": "commonjs"</code></td><td>CommonJS — <code>require</code> at run time</td></tr>
+      <tr><td><code>"type": "module"</code></td><td><code>"module": "commonjs"</code></td><td><b><code>exports is not defined</code></b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>This is <a href="./0009-commonjs-vs-esm-and-how-node-finds-a-file.html">week 9</a>'s rule, now with a build in the middle. The <code>.js</code> extension plus the <code>type</code> field decide, and TypeScript must be told the same thing separately.</p>
+
+  <!-- ============ TWO JOBS ============ -->
+  <h2>Type checking and transpiling are two different jobs</h2>
+  <p>This surprises people, so here is the proof rather than the claim. A file that cannot possibly type-check:</p>
+
+  <pre><code>const n: number = "this is definitely not a number";
+console.log('but it RAN, and printed:', n);
+
+<span class="cmt">// tsc --noEmit</span>
+<span class="out">src/broken.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.</span>
+
+<span class="cmt">// tsx src/broken.ts</span>
+<span class="out">but it RAN, and printed: this is definitely not a number</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Why they can be separated at all</span>
+    <b>Transpiling</b> one file needs only that file — delete the types, emit JavaScript, done.
+    <b>Type checking</b> needs every file the program can reach, because a type may be defined anywhere.
+    <p style="margin:.6rem 0 0;">That is why a runner like <code>tsx</code> starts instantly without understanding your program. It is also why the type check belongs in a separate command.</p>
+  </div>
+
+  <p>So run them separately, and put each where it belongs:</p>
+
+  <pre><code>"scripts": {
+  "dev":        "tsx watch src/main.ts",              <span class="cmt">// no build step at all</span>
+  "typecheck":  "tsc --noEmit",                        <span class="cmt">// the real check — CI runs this</span>
+  "build":      "tsc",                                 <span class="cmt">// check AND emit, for production</span>
+  "start":      "node --enable-source-maps dist/main.js"
+}</code></pre>
+
+  <div class="trap">
+    <span class="label">The failure this arrangement invites</span>
+    <code>tsx</code> ignores type errors, so a broken type can sit in your branch all day while everything
+    appears to work. <b>The type check must be a CI step</b>, not something you remember to run. Week 38's
+    workflow already has a place for it.
+  </div>
+
+  <p>And <code>tsx</code> has one more benefit worth naming: it applies source maps automatically. The stack trace above pointed at <code>src/lib.ts:3:9</code> in development with no flag and no build.</p>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Node never runs the file you wrote. It runs a second copy that a compiler produced, with different line numbers. It has never heard of your original.</p>
+    <p class="part cont">So every stack trace describes the copy. A source map is a small file that translates back. It says which line of the output came from which line of the input.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A translated book with a table matching each page to the original's page. The table is useless unless the reader knows to look at it.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A reader who ignores the table still notices they have the wrong page. Node does not. It prints a confident, well-formatted stack trace pointing at a file you never wrote, and nothing indicates anything is missing.</p>
+    <p class="part limit cont">I measured this. With <code>"sourceMap": true</code>, the <code>.map</code> file existed and the <code>//# sourceMappingURL</code> comment was in the output — and the trace still said <code>dist/lib.js:4:11</code>. Only <code>node --enable-source-maps</code> changed it to <code>src/lib.ts:3:9</code>. <b>Generating a map and using one are two separate decisions</b>, and only one of them lives in <code>tsconfig.json</code>.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think <code>moduleResolution</code> is a detail. It decides <b>when you find out</b> about a broken import. The same missing <code>.js</code> extension produced <code>TS2835</code> at compile time under <code>nodenext</code>, naming the fix. Under <code>bundler</code> it compiled <b>completely clean</b>, then crashed on start-up with <code>ERR_MODULE_NOT_FOUND</code>.</p>
+    <p class="part cont">Same code, same bug, two very different afternoons. If Node runs the output, use <code>nodenext</code>. <code>bundler</code> is right only when a bundler rewrites the imports, and a Node service has none.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In three sentences, explain why turning on source maps did not fix the stack trace. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — a setup that tells the truth</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>A <code>tsconfig.json</code> for Node ESM: <code>"module": "nodenext"</code>, <code>"moduleResolution": "nodenext"</code>, <code>"strict": true</code>, <code>"sourceMap": true</code>.</li>
+    <li><code>"type": "module"</code> in <code>package.json</code>, matching. Break the match on purpose once and read the error.</li>
+    <li><code>tsx watch</code> for development. No build step in the loop.</li>
+    <li><code>tsc</code> for production, and <code>tsc --noEmit</code> as a separate command <b>that CI runs</b>.</li>
+    <li><b>Throw an error on purpose from production code and read the trace.</b> If it names a <code>.js</code> file, you are not finished.</li>
+    <li>Add <code>--enable-source-maps</code>, or <code>NODE_OPTIONS</code>, and check the same trace again.</li>
+    <li>Drop the <code>.js</code> from one import. Confirm <code>nodenext</code> catches it before anything runs.</li>
+    <li>Ship the <code>.map</code> files with your build, or step 6 does nothing in production.</li>
+  </ol>
+
+  <div class="trap">
+    <span class="label">Requirement 8 is quietly easy to miss</span>
+    A Docker build that copies only <code>dist/**/*.js</code>, or a bundler configured to drop maps, leaves
+    you with the flag enabled and no maps to read. Everything looks configured and the traces are wrong
+    anyway — the exact failure this whole lesson is about, one layer further out.
+  </div>
+
+  <div class="drill">
+    <span class="label">The drill</span>
+    <p class="situation">&ldquo;It compiles but crashes at run time with a module error. Name two causes.&rdquo;</p>
+    You have both, measured. Say the error each one produces, and then say which
+    <code>moduleResolution</code> value would have caught the first at compile time. The follow-up is
+    &ldquo;so why would anyone use <code>bundler</code>?&rdquo; — and there is a good answer.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Node's own type stripping</b> lets recent versions run <code>.ts</code> files directly, and it is
+    moving fast enough to be worth checking against your version rather than a blog post.
+    <b>Project references</b> matter in a monorepo. <b><code>esbuild</code> and <code>swc</code></b> are the
+    transpilers underneath most fast tooling. <b>Bundling a server</b> is sometimes worth it for start-up
+    time and image size. <b>Path aliases</b> are convenient and need matching configuration in three
+    places, which is its own small trap.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: the <a href="https://www.typescriptlang.org/tsconfig/">tsconfig reference</a> —
+    especially <a href="https://www.typescriptlang.org/tsconfig/#moduleResolution">moduleResolution</a> —
+    and <a href="https://nodejs.org/api/cli.html#--enable-source-maps">Node's --enable-source-maps</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a production stack trace and I'll tell you whether your build is honest.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Node runs a <b>second copy</b> of your program. Every trace, breakpoint and coverage number describes that copy.</li>
+      <li>Measured: <code>"sourceMap": true</code> alone changed <b>nothing</b> — the map existed and Node ignored it.</li>
+      <li><code>node --enable-source-maps</code> turned <code>dist/lib.js:4:11</code> into <code>src/lib.ts:3:9</code>. <code>NODE_OPTIONS</code> works too.</li>
+      <li><code>moduleResolution</code> decides <b>when</b> you find a bad import: <code>nodenext</code> gave <code>TS2835</code>; <code>bundler</code> compiled clean then crashed with <code>ERR_MODULE_NOT_FOUND</code>.</li>
+      <li>If Node runs the output, use <code>nodenext</code>. <code>bundler</code> only when a bundler rewrites the imports.</li>
+      <li><code>exports is not defined in ES module scope</code> means <code>package.json</code> and <code>tsconfig.json</code> disagree about the module kind.</li>
+      <li>Transpiling needs <b>one file</b>; type checking needs <b>every file</b> — which is why <code>tsx</code> ran code that failed <code>tsc</code>. So the type check is its own CI step, and the <code>.map</code> files must ship.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>generating a source map and using one are two separate decisions. Only one is in <code>tsconfig.json</code>.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> TypeScript tsconfig reference ("moduleResolution"); Node.js CLI documentation ("--enable-source-maps"). The traces and error codes here are <code>dist/lib.js:4:11</code>, <code>src/lib.ts:3:9</code>, <code>TS2835</code>, <code>ERR_MODULE_NOT_FOUND</code>, <code>TS5108</code> and <code>exports is not defined in ES module scope</code>. So is <code>tsx</code> running code that <code>tsc</code> rejected. All came from running the code with <b>TypeScript 7.0.2</b> on <b>Node v24.14.0</b>, on 2026-08-28. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0044-the-type-system-you-actually-need.html">← Lesson 44</a>
+    <a href="./0046-build-migrate-the-spine-to-typescript.html">Next: Lesson 46 — Build — migrate the spine to TypeScript →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "You set \"sourceMap\": true and rebuilt. The stack trace still names dist/lib.js. Why?",
+      options: [
+        "Node does not read source maps unless --enable-source-maps is passed",
+        "The map was generated for the wrong output directory and cannot be found",
+        "Source maps only apply to breakpoints in a debugger, never to stack traces",
+        "The sourceMappingURL comment must be an absolute path for Node to follow it"
+      ],
+      answer: 0,
+      why: "Measured: dist/lib.js.map existed and dist/lib.js ended with //# sourceMappingURL=lib.js.map. The trace was unchanged until node --enable-source-maps was added, which turned dist/lib.js:4:11 into src/lib.ts:3:9. Generating a map and using one are two separate decisions."
+    },
+    {
+      q: "An import missing its .js extension compiled cleanly and crashed on start-up. What was misconfigured?",
+      options: [
+        "moduleResolution was bundler; nodenext would have reported TS2835 at compile time",
+        "The output directory was excluded from the type check, so the import was never resolved",
+        "package.json was missing its type field, so Node guessed the module format wrongly",
+        "skipLibCheck was on, which suppresses resolution errors in relative imports"
+      ],
+      answer: 0,
+      why: "Measured: with moduleResolution nodenext, tsc reported TS2835 and even suggested './lib.js'. With bundler it compiled clean, then Node threw ERR_MODULE_NOT_FOUND. bundler is correct only when a bundler will rewrite the imports, and a Node service has none — so if Node runs the output, use nodenext."
+    },
+    {
+      q: "tsx ran a file that assigns a string to a number. Why is that not a bug in tsx?",
+      options: [
+        "Transpiling needs only one file; type checking needs every file the program reaches",
+        "tsx uses a relaxed subset of the type system that ignores primitive mismatches",
+        "The assignment is legal because TypeScript widens the annotation to string at run time",
+        "tsx defers type checking until the value is used, and the value was only logged"
+      ],
+      answer: 0,
+      why: "They are genuinely different jobs. Transpiling deletes the types and emits JavaScript from a single file. Type checking must reach every file, because a type can be defined anywhere. That is why tsx starts instantly without understanding your program — and why the type check has to be its own CI step, or a broken type sits in the branch all day."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Your production stack traces point at compiled JavaScript. Fix it.”",
+      answer: "Two settings, and people usually only know the first. <code>\"sourceMap\": true</code> in <code>tsconfig.json</code> generates the map, and <code>node --enable-source-maps</code> makes Node actually read it — I have measured that the first alone changes nothing, even with the <code>.map</code> file present and the <code>sourceMappingURL</code> comment in place. In production I set <code>NODE_OPTIONS=--enable-source-maps</code>, since the start command is often owned by a platform. And I check that the <code>.map</code> files actually ship — a Docker build copying only <code>*.js</code> leaves the flag on with nothing to read. <br>Why: knowing that generating and using are separate, and then remembering the shipping step, is what makes this a fix rather than a setting."
+    },
+    {
+      prompt: "Interviewer: “It compiles but crashes at run time with a module error. Two causes?”",
+      answer: "First, a relative import with no <code>.js</code> extension. TypeScript allows it, Node ESM does not, and you get <code>ERR_MODULE_NOT_FOUND</code>. That one is a configuration choice: with <code>moduleResolution: nodenext</code> the compiler reports <code>TS2835</code> and suggests the fix, and with <code>bundler</code> it compiles completely clean. Second, compiling to CommonJS inside a package marked <code>\"type\": \"module\"</code>, which gives <code>ReferenceError: exports is not defined in ES module scope</code> — the compiler and the package disagree about the module kind. Neither message mentions the config, which is why both cost an hour. <br>Why: naming the exact error strings, and pointing out that one of them is a config choice, is what shows you have hit both."
+    },
+    {
+      prompt: "Interviewer: “Why keep type checking and transpiling as separate commands?”",
+      answer: "Because they are genuinely different jobs. Transpiling one file needs only that file — delete the types and emit JavaScript. Type checking needs every file the program can reach, since a type may be defined anywhere. That is why <code>tsx</code> can start instantly without understanding my program, and I proved it: <code>tsx</code> happily ran a file that assigned a string to a <code>number</code> while <code>tsc --noEmit</code> reported <code>TS2322</code>. The consequence is that the type check has to be a CI step. Otherwise a broken type sits in a branch all day while everything appears to work. <br>Why: the proof — code that ran and did not check — is more convincing than the explanation on its own."
+    }
+  ]);
+</script>

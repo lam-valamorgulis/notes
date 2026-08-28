@@ -1,0 +1,540 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transform streams and pipeline — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 16 of 52 · Lesson 16 · Streams</p>
+  <h1>Transform streams and <code>pipeline</code></h1>
+  <p class="subtitle">Chaining stages is easy. Cleaning up when one of them fails is the part that has a right answer.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 16 of 52.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/52-week-plan.html#w16">Week 16 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will answer &ldquo;why <code>pipeline</code> and not <code>pipe</code>?&rdquo; with a failure you have reproduced, not with &ldquo;it is better&rdquo;. You will also write a <code>Transform</code> from scratch, including the part everyone forgets.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0015-readable-writable-and-backpressure.html">Week 15</a> was one producer and one consumer. Real work has stages in between: parse, filter, compress, write. This week is how to join them so a failure in the middle does not leave the rest running.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — a stage is both ends at once</h2>
+  <p>You have a readable source and a writable destination. Now you want something in the middle: uppercase every line, or strip a column, or gzip.</p>
+  <p>What is that middle thing? Ask what it must do:</p>
+  <ul>
+    <li>It has to <b>accept</b> chunks. That is a Writable.</li>
+    <li>It has to <b>produce</b> chunks. That is a Readable.</li>
+  </ul>
+  <p>So it is both. Node calls the general case a <b>Duplex</b>. The special case, where the output is made <em>from</em> the input, is a <b>Transform</b>. That is the whole idea. A Transform is a Writable and a Readable stuck together, with your function in the middle.</p>
+
+  <pre><code>const { Transform } = require('node:stream');
+
+const upper = new Transform({
+  transform(chunk, encoding, callback) {
+    callback(null, chunk.toString().toUpperCase());   <span class="cmt">// error first, then output</span>
+  },
+});</code></pre>
+
+  <p>Backpressure passes straight through it, for free. If the destination says <code>false</code>, the Transform stops pulling, and the source stops being read. The message from week 15 travels the whole chain.</p>
+
+  <h2>The part everyone forgets — <code>_flush</code></h2>
+  <p>Some transforms hold data back. A line splitter cannot emit a line until it has seen the newline, so it keeps a remainder. When the input ends, that remainder is still inside.</p>
+  <p><code>flush</code> is your last chance to push it out:</p>
+
+  <pre><code>const splitLines = new Transform({
+  readableObjectMode: true,
+  transform(chunk, enc, cb) {
+    this.rest = (this.rest || '') + chunk.toString();
+    const parts = this.rest.split('\n');
+    this.rest = parts.pop();            <span class="cmt">// keep the unfinished last piece</span>
+    for (const line of parts) this.push(line);
+    cb();
+  },
+  flush(cb) {
+    if (this.rest) this.push(this.rest);   <span class="cmt">// the final line, with no newline after it</span>
+    cb();
+  },
+});</code></pre>
+
+  <div class="trap">
+    <span class="label">Leave out <code>flush</code> and you lose the last record</span>
+    Silently. The file that ends without a trailing newline drops its final row, and nothing errors. It is the same shape of bug as week 14's split character: <b>correct on tidy data, wrong on real data</b>, and invisible until someone counts.
+  </div>
+
+  <!-- ============ PIPE VS PIPELINE ============ -->
+  <h2>Now the real subject — what happens when a stage fails</h2>
+  <p><code>pipe</code> is the old way to join two streams. It looks fine:</p>
+  <pre><code>source.pipe(transform).pipe(destination);</code></pre>
+
+  <p>Now make the destination fail, and check whether the source was cleaned up. This is the experiment:</p>
+
+  <pre><code>const r = source();                         <span class="cmt">// a readable</span>
+const w = sinkThatErrors();                 <span class="cmt">// a writable that calls cb(new Error(...))</span>
+
+r.pipe(w);
+w.on('error', () =&gt; console.log('source destroyed?', r.destroyed));</code></pre>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The real output</b> (Node v24.14.0):</p>
+  <pre><code><span class="out">pipe     -> source destroyed? false
+pipeline -> source destroyed? true</span></code></pre>
+
+  <p>With <code>pipe</code>, the source is <b>still alive</b>. Its file descriptor is still open. It is still reading. Nothing is consuming what it produces, and nobody will ever close it.</p>
+
+  <div class="soundbite">
+    <span class="label">The answer to the interview question</span>
+    <p><code>pipe</code> forwards data but <b>not failure</b>. When one stream dies, the others are never told. <code>pipeline</code> exists because that clean-up is the same every time, and everybody got it wrong.</p>
+  </div>
+
+  <p>So use <code>pipeline</code>. It takes the stages, plus a callback, and it destroys every stream in the chain when any of them fails:</p>
+
+  <pre><code>const { pipeline } = require('node:stream/promises');
+
+await pipeline(
+  fs.createReadStream('in.csv'),
+  splitLines,
+  upper,
+  fs.createWriteStream('out.csv'),
+);   <span class="cmt">// throws if any stage fails, and cleans up all of them</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Which import to use</span>
+    <code>node:stream</code> gives you the callback version. <code>node:stream/promises</code> gives you
+    the <code>await</code> version. Prefer the promise one — a failed pipeline then throws where you can
+    <code>try/catch</code> it, which is week 6's rule applied here.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 270" role="img" aria-labelledby="fig16-title" width="640" height="270">
+      <title id="fig16-title">pipe leaves the other streams open when one fails; pipeline destroys them all</title>
+
+      <text x="20" y="22" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">pipe — THE FAILURE DOES NOT TRAVEL</text>
+
+      <rect x="20" y="36" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="80" y="55" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">source</text>
+      <text x="80" y="72" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">still open</text>
+
+      <line x1="146" y1="59" x2="196" y2="59" style="stroke: var(--ink-faint); stroke-width: 2;" marker-end="url(#a16)"></line>
+
+      <rect x="202" y="36" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="262" y="55" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">transform</text>
+      <text x="262" y="72" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">still open</text>
+
+      <line x1="328" y1="59" x2="378" y2="59" style="stroke: var(--ink-faint); stroke-width: 2;" marker-end="url(#a16)"></line>
+
+      <rect x="384" y="36" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: 5 3;"></rect>
+      <text x="444" y="55" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">destination</text>
+      <text x="444" y="72" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px;">ERROR</text>
+
+      <text x="516" y="55" style="fill: var(--warn); font-family: sans-serif; font-size: 10px;">file handles leak,</text>
+      <text x="516" y="70" style="fill: var(--warn); font-family: sans-serif; font-size: 10px;">source keeps reading</text>
+
+      <line x1="20" y1="104" x2="620" y2="104" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="132" style="fill: var(--good); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">pipeline — THE FAILURE REACHES EVERY STAGE</text>
+
+      <rect x="20" y="146" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="80" y="165" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">source</text>
+      <text x="80" y="182" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">destroyed</text>
+
+      <rect x="202" y="146" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="262" y="165" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">transform</text>
+      <text x="262" y="182" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">destroyed</text>
+
+      <rect x="384" y="146" width="120" height="46" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="444" y="165" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">destination</text>
+      <text x="444" y="182" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">ERROR</text>
+
+      <path d="M 444 200 L 444 212 L 80 212 L 80 196" style="fill: none; stroke: var(--good); stroke-width: 2.2;" marker-end="url(#a16g)"></path>
+      <text x="262" y="228" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">pipeline destroys backwards, then calls you once</text>
+
+      <text x="320" y="256" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px;">Measured on Node v24.14.0: after a sink error, <tspan style="font-family: monospace;">r.destroyed</tspan> is false with pipe and true with pipeline.</text>
+
+      <defs>
+        <marker id="a16" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+        <marker id="a16g" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--good);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>The difference is not style. One leaks file handles on every failure; the other does not.</figcaption>
+  </div>
+
+  <!-- ============ ASYNC GENERATORS ============ -->
+  <h2>A stage does not have to be a stream</h2>
+  <p><code>pipeline</code> accepts an <b>async generator</b> as a stage. Often that is clearer than a
+  <code>Transform</code> subclass, because the state is just a local variable:</p>
+
+  <pre><code>await pipeline(
+  Readable.from(['a\n', 'b\n', 'c\n']),
+  async function* (source) {
+    for await (const chunk of source) yield chunk.toString().toUpperCase();
+  },
+  async function (sink) {
+    for await (const chunk of sink) out.push(chunk);
+  },
+);
+<span class="out">// out.join('') === "A\nB\nC\n"</span></code></pre>
+
+  <p>Verified on Node v24.14.0. The <code>for await</code> loop is the backpressure: nothing is pulled
+  from the source until the body comes round again.</p>
+
+  <div class="tip">
+    <span class="label">When to use which</span>
+    Use an <b>async generator</b> for one-off logic inside a pipeline — it is shorter and the remainder is
+    a plain variable. Use a <b>Transform class</b> when the stage is reused in several places, or when you
+    need the extra control that <code>flush</code>, <code>destroy</code> and options give you.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      You join several machines into a line, and work passes down it. A middle machine is just one that both takes work in and puts work out.</p>
+    <p class="part cont">The hard part is not joining them. It is what happens when one machine breaks. The old way told the machine after it, and nobody else. The machines before it kept working, feeding a line that goes nowhere.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A factory line with a fire alarm. <code>pipe</code> is a line with no alarm at all. If one station stops, the stations behind it keep pushing work onto the floor. <code>pipeline</code> is the same line with one alarm wired to every station.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      In a factory, work piling on the floor is obvious. Somebody shouts. Here nothing is visible: the source keeps its file open, keeps reading, and never finishes.</p>
+    <p class="part limit cont">Nothing crashes and nothing is logged. You find out weeks later, when the process runs out of file descriptors under load. That is a long way from the failure that caused it. <b>The alarm is not for safety. It is because without it, the failure has no symptom at all.</b></p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think <code>pipe</code> versus <code>pipeline</code> is a style preference, like <code>var</code> against <code>let</code>. It is not. They behave identically on the happy path and differently on every failure.</p>
+    <p class="part cont">So the difference is invisible in every test that passes. It appears only in the case you did not test. That is why &ldquo;we have always used <code>pipe</code> and it is fine&rdquo; is not evidence of anything.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say what <code>pipeline</code> does that <code>pipe</code> does not. Name the failure, not the feature. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — prove the leak, then close it</h2>
+  <p>Save as <code>leak.js</code> and run it twice.</p>
+
+  <pre><code>const { Readable, Writable, pipeline } = require('node:stream');
+const mode = process.argv[2];                     <span class="cmt">// 'pipe' or 'pipeline'</span>
+
+const src = () =&gt; {
+  let i = 0;
+  return new Readable({ read() { this.push(i++ &lt; 5 ? `row ${i}\n` : null); } });
+};
+const sink = () =&gt; new Writable({
+  write(c, e, cb) { cb(new Error('sink exploded')); },
+});
+
+const r = src(), w = sink();
+
+if (mode === 'pipe') {
+  r.pipe(w);
+  w.on('error', () =&gt; setImmediate(() =&gt;
+    console.log('pipe     -&gt; source destroyed?', r.destroyed)));
+} else {
+  pipeline(r, w, () =&gt; setImmediate(() =&gt;
+    console.log('pipeline -&gt; source destroyed?', r.destroyed)));
+}</code></pre>
+
+  <pre><code>node leak.js pipe
+node leak.js pipeline</code></pre>
+
+  <p><b>Then build the real thing.</b> A three-stage pipeline over a CSV:</p>
+  <ol>
+    <li><b>Split</b> the byte stream into lines, with a <code>flush</code> for the last one.</li>
+    <li><b>Filter</b> — drop rows whose amount is below a threshold.</li>
+    <li><b>Write</b> the survivors to a new file.</li>
+  </ol>
+  <p>Then <b>throw from the middle stage on purpose</b>, on row 50. Run it with <code>pipe</code> and with
+  <code>pipeline</code>, and check the output file both times. With <code>pipe</code> you get a
+  half-written file and no error. With <code>pipeline</code> you get an exception you can catch.</p>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Two lines of output from <code>leak.js</code>, and a note of what the output file contained after each
+    version of the three-stage run. The second pair matters more — a half-written file that reported
+    success is the failure mode this whole lesson is about.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A worker imports uploaded CSVs. Under load it dies with <code>EMFILE: too many open files</code>. The team raises the file-descriptor limit. It survives two weeks, then dies again.</p>
+    Say what is actually happening, why raising the limit only bought time, and the change that fixes it.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Duplex</b> streams where the two sides are unrelated — a socket, for example — are the general case,
+    and <code>Transform</code> is the one you write. <b><code>compose</code></b>, which packs several stages
+    into one reusable stream, is worth knowing once you have used pipelines for a while.
+    <b>Zlib streams</b> are a real Transform you get for free, and they are one line, so they are not a
+    lesson. <b>Testing a stream</b> is <a href="../reference/52-week-plan.html#w36">week 36</a>.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary source: Node.js docs — <a href="https://nodejs.org/api/stream.html#streampipelinestreams-callback">stream.pipeline</a>, and the <code>Transform</code> section of <a href="https://nodejs.org/api/stream.html">stream</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a <code>pipe</code> chain from your own code and I'll show you which handle stays open when the last stage fails.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A middle stage takes chunks in and puts chunks out, so it is a Writable and a Readable at once. Node calls it a <b>Transform</b>.</li>
+      <li>Backpressure passes through a Transform for free. The signal reaches the whole chain.</li>
+      <li><code>flush</code> is your last chance to push held-back data. Forget it and the final record vanishes silently.</li>
+      <li><code>pipe</code> forwards data but <b>not failure</b>. Measured: after a sink error the source is <code>destroyed: false</code>.</li>
+      <li><code>pipeline</code> destroys every stage. Measured: <code>destroyed: true</code>.</li>
+      <li>Prefer <code>node:stream/promises</code>, so a failed pipeline throws where you can catch it.</li>
+      <li>An <b>async generator</b> is a valid stage, and is often clearer than a Transform subclass.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b><code>pipe</code> and <code>pipeline</code> behave identically until something fails.</b> That is exactly why no passing test can tell them apart.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "stream", "stream.pipeline". Two results here came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are the <code>destroyed</code> flags after a sink error, and the async-generator stage output. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0015-readable-writable-and-backpressure.html">← Lesson 15</a>
+    <a href="./0017-build-a-file-too-big-for-memory.html">Next: Lesson 17 — Build — a file too big for memory →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "The last stage of a pipe chain fails. What happens to the source stream?",
+      options: [
+        "It stays open and keeps reading, because pipe forwards data only",
+        "It is destroyed at once, because the error travels back up the chain",
+        "It pauses and waits, in case the failing stage is able to recover",
+        "It throws its own error, which ends the whole process immediately"
+      ],
+      answer: 0,
+      why: "pipe forwards data but not failure. I measured this: after a sink error, r.destroyed is false with pipe and true with pipeline. The source keeps its file handle open and keeps reading, which is why a service that pipes eventually dies with EMFILE."
+    },
+    {
+      q: "Your line-splitting Transform has no flush. What goes wrong, and when?",
+      options: [
+        "The last line is lost when the input has no trailing newline",
+        "Every line is emitted twice, because the remainder is never cleared",
+        "The stream never ends, because Node waits for a flush to be called",
+        "Lines longer than the highWaterMark are silently cut into two rows"
+      ],
+      answer: 0,
+      why: "A splitter holds back the piece after the final newline, waiting for more. If the input ends there, that piece is still inside the transform. flush is the last chance to push it. With no flush the final record disappears and nothing errors."
+    },
+    {
+      q: "Why can a passing test suite never tell you pipe and pipeline apart?",
+      options: [
+        "They behave identically whenever nothing in the chain fails",
+        "Both are compiled to the same internal call by the Node runtime",
+        "Test streams are always in object mode, where clean-up is automatic",
+        "The difference only appears once the chain has four or more stages"
+      ],
+      answer: 0,
+      why: "On the happy path the two are the same, so any test that passes exercises no difference at all. The difference is entirely in the failure path. That is why 'we have always used pipe and it has been fine' is not evidence — it only says nothing has failed yet."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why pipeline instead of pipe?”",
+      answer: "Because <code>pipe</code> forwards data but not failure. If one stream in the chain errors, the others are never told, so the source keeps its file handle open and keeps reading into nothing. I measured it: after a sink error, <code>r.destroyed</code> is <code>false</code> with <code>pipe</code> and <code>true</code> with <code>pipeline</code>. <code>pipeline</code> destroys every stage and calls back once. I use the version from <code>node:stream/promises</code>, so a failure throws where I can catch it. <br>Why: naming the leaked handle turns this from a style opinion into a defect you can point at."
+    },
+    {
+      prompt: "Interviewer: “What is a Transform stream?”",
+      answer: "A stage that is a Writable and a Readable at the same time. It accepts chunks, does something to them, and pushes chunks out. Backpressure passes straight through, so a slow destination still reaches back and pauses the original source. The part people forget is <code>flush</code>: if the transform holds data back — a line splitter waiting for a newline — <code>flush</code> is the last chance to emit it when the input ends. Without it the final record disappears with no error. <br>Why: mentioning <code>flush</code> unprompted is the detail that shows you have actually written one."
+    },
+    {
+      prompt: "Interviewer: “A CSV worker keeps dying with EMFILE. We raised the limit and it came back.”",
+      answer: "Raising the limit treats the symptom. <code>EMFILE</code> means file handles are being opened and never closed, so a higher limit only changes how long it takes. I would look for <code>pipe</code> chains where a stage can fail: the failure does not travel, so the source is left open on every bad file. The fix is <code>pipeline</code>, which destroys every stage when any one fails. I would also check that failures are actually being logged, because this leak is completely silent. <br>Why: saying a raised limit only buys time is the sentence that shows you found the cause, not the symptom."
+    }
+  ]);
+</script>

@@ -1,0 +1,537 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build — the spine API, version 1 — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 21 of 52 · Lesson 21 · Events &amp; servers</p>
+  <h1>Build — the spine API, version 1</h1>
+  <p class="subtitle">The service you keep. Everything from here to week 52 hardens this one program.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 21 of 52.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. Every decision this week is one you will live with for 31 weeks. <a href="../reference/52-week-plan.html#w21">Week 21 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> one small API that works, with an error shape and status codes you can defend. It is deliberately unfinished. <b>Its value is that you never throw it away.</b>
+  </div>
+
+  <div class="note">
+    <span class="label">This week changes the shape of the course</span>
+    Weeks 1&ndash;20 built twenty separate things and threw them all away. That was right: a toy is the fastest
+    way to feel one idea. From this week the course does the opposite. <b>One service, thirty-one weeks</b>,
+    each one making it survive something it could not survive before.
+  </div>
+
+  <!-- ============ WHY ONE SERVICE ============ -->
+  <h2>Why one service, and not thirty more toys</h2>
+  <p>A toy teaches an idea. It cannot teach the things that only appear over time:</p>
+  <ul>
+    <li><b>Change is expensive.</b> Week 46 migrates this to TypeScript. That only means something if the code was written before you knew it was coming.</li>
+    <li><b>Numbers need a baseline.</b> Week 30 load-tests it, week 34 fixes a leak, week 50 rebuilds it in NestJS. Each of those compares against <em>this week's</em> numbers. There is nothing to compare a toy to.</li>
+    <li><b>Decisions have consequences.</b> The error shape you pick today is the one an exception filter has to reproduce in week 48. Choosing badly is part of the lesson.</li>
+  </ul>
+
+  <div class="soundbite">
+    <span class="label">The rule for the rest of the year</span>
+    <p><b>Do not restart this project.</b> When it becomes ugly in week 33, making an ugly real service good <em>is</em> the exercise. A rewrite is you avoiding the lesson.</p>
+  </div>
+
+  <!-- ============ WHAT IT IS ============ -->
+  <h2>What you are building — a link shortener</h2>
+  <p>Small enough to finish in a week, and it happens to need every single thing this course teaches later. That is why it was chosen:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What it needs</th><th>Which week collects the debt</th></tr></thead>
+    <tbody>
+      <tr><td>Short codes must be unique → a real <code>409</code></td><td>this week</td></tr>
+      <tr><td>Shut down without dropping a redirect</td><td><a href="../reference/52-week-plan.html#w27">27</a></td></tr>
+      <tr><td>Reads vastly outnumber writes → caching</td><td><a href="../reference/52-week-plan.html#w41">41</a></td></tr>
+      <tr><td>Click counts must not be written on the hot path → a queue</td><td><a href="../reference/52-week-plan.html#w42">42</a></td></tr>
+      <tr><td>Anyone can POST anything → real input hardening</td><td><a href="../reference/52-week-plan.html#w37">37</a></td></tr>
+      <tr><td>One row per code → a database with a unique index</td><td><a href="../reference/52-week-plan.html#w40">40</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Every one of those is a genuine requirement of the product, not homework invented to fit a syllabus. That is the whole point of picking a real thing.</p>
+
+  <!-- ============ ERROR SHAPE ============ -->
+  <h2>Decide the error shape now, once</h2>
+  <p>This is the decision with the longest reach. Every route, every middleware, every test and eventually a NestJS exception filter has to agree with it.</p>
+
+  <pre><code>{
+  "error": {
+    "code": "code_taken",                        <span class="cmt">// stable, machine-readable</span>
+    "message": "That short code is already in use.",   <span class="cmt">// for a human</span>
+    "details": { "code": "abc123" }              <span class="cmt">// optional, structured</span>
+  }
+}</code></pre>
+
+  <p>Three properties, and each earns its place:</p>
+  <ul>
+    <li><code>code</code> is what a client branches on. <b>It must never change</b>, even when the wording does. Rewording a message is a patch; renaming a <code>code</code> is a breaking change.</li>
+    <li><code>message</code> is for a person reading a log or a screen. It may be reworded freely.</li>
+    <li><code>details</code> is structured, so a client can show which field was wrong without parsing English.</li>
+  </ul>
+
+  <div class="trap">
+    <span class="label">The mistake this avoids</span>
+    The common shape is <code>{ "error": "That short code is already in use." }</code>. It works until a
+    client needs to branch on the failure, and then somebody writes
+    <code>if (err.includes('already in use'))</code>. Now your <b>error text is an API</b>, and improving the
+    wording breaks a customer. Give clients something stable to branch on, so the words stay yours.
+  </div>
+
+  <h2>Status codes, and the one people get wrong</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Code</th><th>When</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td><b>200</b></td><td>Read succeeded</td><td>—</td></tr>
+      <tr><td><b>201</b></td><td>Created</td><td>Must include a <code>Location</code> header pointing at the new thing.</td></tr>
+      <tr><td><b>301</b> / <b>302</b></td><td>The redirect itself</td><td><b>302</b> here. A 301 is cached by browsers forever, and you cannot take it back.</td></tr>
+      <tr><td><b>400</b></td><td>The request is malformed</td><td>Broken JSON, missing field, not a URL.</td></tr>
+      <tr><td><b>404</b></td><td>No such code</td><td>—</td></tr>
+      <tr><td><b>409</b></td><td>The request is valid but conflicts with the current state</td><td>The one people get wrong. See below.</td></tr>
+      <tr><td><b>413</b></td><td>Body over the limit</td><td>Week 20's rule.</td></tr>
+      <tr><td><b>500</b></td><td>You broke</td><td>Never leak a stack trace into it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><b>400 against 409 is the useful distinction.</b> Ask: <em>could this exact request have succeeded a
+  minute ago?</em> If no, it is a <code>400</code>: the JSON is broken, or the URL is not a URL. Retrying will never help.</p>
+  <p> If yes, and it only fails because of what exists <em>now</em>, it is a
+  <code>409</code>. A client can act on that difference. A 409 means &ldquo;pick another code&rdquo;. A 400 means &ldquo;your request is wrong&rdquo;.</p>
+
+  <div class="tip">
+    <span class="label">Choose 302, and know why</span>
+    A <code>301</code> is a <b>permanent</b> redirect, and browsers cache it aggressively — sometimes until
+    the user clears their history. Ship a 301 by mistake and you cannot change where that link points, for
+    anyone who has already followed it. <code>302</code> gives up a little speed and keeps control. That is
+    the trade, and it is exactly the kind of thing week 21 exists to make you decide deliberately.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig21-title" width="640" height="250">
+      <title id="fig21-title">The spine API and the thirty-one weeks that harden it</title>
+
+      <text x="20" y="22" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">ONE SERVICE · WEEK 21 TO WEEK 52</text>
+
+      <rect x="20" y="36" width="112" height="46" rx="7" style="fill: var(--accent); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="76" y="56" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 11px; font-weight: 700;">WEEK 21</text>
+      <text x="76" y="72" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 9px;">raw http, in memory</text>
+
+      <line x1="136" y1="59" x2="600" y2="59" style="stroke: var(--rule); stroke-width: 3;"></line>
+
+      <circle cx="196" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="196" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">24</text>
+      <text x="196" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">cluster</text>
+
+      <circle cx="266" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="266" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">27</text>
+      <text x="266" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">shutdown</text>
+
+      <circle cx="336" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="336" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">34</text>
+      <text x="336" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">leak fixed</text>
+
+      <circle cx="406" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="406" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">38</text>
+      <text x="406" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">tested</text>
+
+      <circle cx="476" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="476" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">43</text>
+      <text x="476" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">db + cache</text>
+
+      <circle cx="546" cy="59" r="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></circle>
+      <text x="546" y="86" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 9px; font-weight: 700;">46</text>
+      <text x="546" y="98" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 8px;">TypeScript</text>
+
+      <rect x="500" y="118" width="120" height="42" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="560" y="136" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11px; font-weight: 700;">WEEK 50</text>
+      <text x="560" y="151" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">rebuilt in NestJS</text>
+
+      <text x="320" y="192" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Every later week compares its numbers against this week's.</text>
+      <text x="320" y="216" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">A toy has no baseline. That is the whole reason for keeping one service.</text>
+    </svg>
+    <figcaption>The spine is not a bigger exercise. It is the only way the later measurements mean anything.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Until now you built a new small thing each week and threw it away. From today you build one thing and keep it.</p>
+    <p class="part cont">Each later week does not add a feature. It makes the same program survive something it could not survive before: being shut down, being overloaded, losing its database. You cannot practise that on something you built yesterday.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Learning to drive. You can practise turning, braking and parking separately in an empty car park. But you only learn to <em>drive</em> by keeping one car on one road, in traffic, for a long time.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A car does not get worse because you drove it badly last month. Your code does. Week 33's version carries every shortcut week 21 took.</p>
+    <p class="part limit cont">That is not a flaw in the exercise — <b>it is the exercise</b>. Living with your own old decision, and paying to change it, is the thing a toy can never teach. The error shape you choose today is the one week 48 must reproduce in a NestJS filter. That holds whether you still like it or not.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People treat the first version as a draft. They plan to &ldquo;do it properly once I know more&rdquo;. That instinct destroys the whole point.</p>
+    <p class="part cont">The value is not in the code. It is in the <b>baseline</b>. Week 30 measures p99 against this week's p99. Week 34 compares memory against this week's memory. Week 50 compares NestJS against this week's raw <code>http</code>. Rewrite it in week 33 and every one of those comparisons is gone. <b>The ugliness is the data.</b></p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why this course keeps one service for thirty-one weeks. Say what building thirty-one small ones would lose. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — the spine, version 1</h2>
+  <p>Raw <code>http</code>, no framework, no database. In-memory storage is <b>correct for this week</b>. Week 24 shows exactly why it stops being correct, and that lesson needs the mistake to exist first.</p>
+
+  <p><b>The routes:</b></p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Route</th><th>Does</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /links</code></td><td>Create a short code for a URL</td><td><code>201</code> + <code>Location</code>, or <code>400</code>, or <code>409</code></td></tr>
+      <tr><td><code>GET /links/:code</code></td><td>Read one link and its click count</td><td><code>200</code> or <code>404</code></td></tr>
+      <tr><td><code>GET /:code</code></td><td>Redirect, and count the click</td><td><code>302</code> or <code>404</code></td></tr>
+      <tr><td><code>DELETE /links/:code</code></td><td>Remove it</td><td><code>204</code> or <code>404</code></td></tr>
+      <tr><td><code>GET /health</code></td><td>Liveness</td><td><code>200</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p><b>Requirements.</b> Every one is a decision you will be asked about later:</p>
+  <ol>
+    <li>One <code>sendError(res, status, code, message, details)</code> helper. <b>Every</b> failure goes through it. No route writes an error body by hand.</li>
+    <li>A validation step that rejects a non-URL with <code>400</code> and a <code>code</code> of <code>invalid_url</code>. Use the <code>URL</code> constructor, not a regular expression.</li>
+    <li>A duplicate custom code returns <code>409</code>, not <code>400</code>. Be able to say why.</li>
+    <li>The 1 MB body limit from <a href="./0020-http-from-scratch.html">week 20</a>, returning <code>413</code>.</li>
+    <li>Every handler ends the response on <b>every</b> path. Prove it — see the check below.</li>
+    <li>A <code>README.md</code> that says what this service is, and one paragraph headed <b>&ldquo;What this does not do yet&rdquo;</b>.</li>
+  </ol>
+
+  <p class="small" style="margin-bottom:.3rem;"><b>The one helper that matters</b></p>
+  <pre><code>function sendError(res, status, code, message, details) {
+  if (res.headersSent) return res.destroy();     <span class="cmt">// week 20 — too late for a clean reply</span>
+  const body = JSON.stringify({ error: { code, message, ...(details &amp;&amp; { details }) } });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),   <span class="cmt">// week 14 — bytes, not characters</span>
+  });
+  res.end(body);
+}</code></pre>
+
+  <p><b>Prove requirement 5</b>, because it is the one that silently fails:</p>
+  <pre><code><span class="cmt"># hit every route, including the failures, and count sockets before and after</span>
+lsof -p $(pgrep -f "node spine.js") | grep -c TCP
+for i in $(seq 1 30); do
+  curl -s -o /dev/null localhost:3000/health
+  curl -s -o /dev/null -X POST localhost:3000/links -d 'not json'
+  curl -s -o /dev/null localhost:3000/nope
+done
+sleep 2
+lsof -p $(pgrep -f "node spine.js") | grep -c TCP    <span class="cmt"># must return to the first number</span></code></pre>
+
+  <div class="tip">
+    <span class="label">What to hand in — and keep for 31 weeks</span>
+    Three things, in the repository, from today:
+    <ul style="margin:.4rem 0 0;">
+      <li>The <code>README.md</code>, with its &ldquo;What this does not do yet&rdquo; paragraph.</li>
+      <li>A <code>DECISIONS.md</code> with today's four choices, and one line of reasoning for each. They are the error shape, 302 over 301, 409 over 400, and in-memory storage.</li>
+      <li>The socket count, before and after.</li>
+    </ul>
+    <code>DECISIONS.md</code> is the one that pays off. In week 50 you will read it and find out whether you still agree with yourself.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">A teammate reviews your API and says: &ldquo;Just return 400 for everything that is not a 500. Clients only check whether it worked, and fewer codes is simpler.&rdquo;</p>
+    Give the strongest version of their argument, then say what you would lose. Name one client behaviour that becomes impossible.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Authentication</b> is not here, because anyone can create a link and that is a real product decision, not
+    an oversight. <b>Persistence</b> is <a href="../reference/52-week-plan.html#w40">week 40</a>; in-memory is
+    correct for now and week 24 shows why it breaks. <b>Rate limiting</b> is
+    <a href="../reference/52-week-plan.html#w37">week 37</a>. <b>Versioning the API</b> is a real subject this
+    course does not cover, and you should read about it before you ever ship one.
+  </div>
+
+  <div class="note">
+    <span class="label">🎉 Weeks 18–21 complete</span>
+    You can write an <code>EventEmitter</code> from scratch, explain why the whole standard library feels the
+    same, build an HTTP router with no framework, and you now have <b>the service you keep</b>. Next on
+    <a href="../index.html">The Map</a>: <b>weeks 22–25 — concurrency and scale</b>, starting with the
+    question of what actually blocks your one thread.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Status">MDN HTTP status codes</a>
+    (read 409 and 413 properly) and <a href="https://github.com/goldbergyoni/nodebestpractices">Node.js Best Practices</a>, the error-handling section.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me your <code>DECISIONS.md</code> and I'll argue the other side of each one, so you find out whether your reasons hold.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>From this week there is <b>one service for thirty-one weeks</b>. Do not restart it.</li>
+      <li>Its value is the <b>baseline</b>. Weeks 30, 34 and 50 all compare against today's numbers.</li>
+      <li>The error shape is <code>{ error: { code, message, details } }</code>. <code>code</code> is stable; <code>message</code> is not.</li>
+      <li>Never make clients branch on error text, or your wording becomes an API.</li>
+      <li><b>400 against 409:</b> could this exact request have worked a minute ago? If yes, it is a 409.</li>
+      <li><code>302</code>, not <code>301</code>. A 301 is cached in browsers and cannot be taken back.</li>
+      <li>Write <code>DECISIONS.md</code> today. In week 50 you find out whether you still agree.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>the ugliness is the data.</b> A rewrite in week 33 destroys every measurement the rest of the year depends on.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> MDN — HTTP response status codes; Node.js Best Practices — error handling. The status-code semantics here follow RFC 9110. The body-limit and <code>headersSent</code> behaviour was measured in <a href="./0020-http-from-scratch.html">week 20</a> on <b>Node v24.14.0</b>. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0020-http-from-scratch.html">← Lesson 20</a>
+    <a href="./0022-cpu-bound-versus-io-bound.html">Next: Lesson 22 — CPU-bound versus I/O-bound →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A client asks for a custom short code that someone else already took. Which status?",
+      options: [
+        "409, because the request is valid and only conflicts with current state",
+        "400, because the client sent a value the server was unable to accept",
+        "403, because the client has no permission to use another user's code",
+        "422, because the body parsed correctly but failed a semantic check"
+      ],
+      answer: 0,
+      why: "Ask whether this exact request could have succeeded a minute ago. It could have — the code was free then. So the failure is about state, not about the request being malformed, and that is 409. A 400 tells the client to fix its request; a 409 tells it to try a different code."
+    },
+    {
+      q: "Why should clients branch on an error code field rather than the message text?",
+      options: [
+        "Otherwise rewording a message silently breaks every client that parsed it",
+        "Because message strings are translated, so their length varies by locale",
+        "Because Node truncates long error messages when it serialises the body",
+        "Because the code field is indexed by log tools and the message is not"
+      ],
+      answer: 0,
+      why: "If a client writes err.includes('already in use'), the English text has become part of your API. Improving the wording then breaks a customer. A stable code field gives clients something to branch on and keeps the words yours to change."
+    },
+    {
+      q: "Why does this course keep one service for thirty-one weeks?",
+      options: [
+        "So later measurements have a baseline that a fresh project cannot give",
+        "Because building new projects each week would take too much extra time",
+        "So the codebase grows large enough to need a framework by the year's end",
+        "Because employers ask to see one long-running project rather than many"
+      ],
+      answer: 0,
+      why: "Week 30 compares p99 against week 21's, week 34 compares memory, week 50 compares NestJS against raw http. A rewrite destroys every one of those comparisons. Living with your own earlier decisions, and paying to change them, is a thing no toy can teach."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you design error responses for an API?”",
+      answer: "I use one shape everywhere: <code>{ error: { code, message, details } }</code>. The <b><code>code</code> is stable and machine-readable</b> — clients branch on it, so it never changes even when the wording does. The <code>message</code> is for a human and can be reworded freely. <code>details</code> is structured, so a client can highlight the wrong field without parsing English. The mistake I avoid is returning only a message string, because then somebody writes <code>err.includes('already in use')</code> and my error text has become an API. <br>Why: naming the failure you are designing against is stronger than listing the fields."
+    },
+    {
+      prompt: "Interviewer: “When is 409 the right status, and not 400?”",
+      answer: "I ask one question: <b>could this exact request have succeeded a minute ago?</b> If no — the JSON is malformed, a required field is missing, the URL is not a URL — it is a <code>400</code>, and retrying will never help. If yes, and it fails only because of what exists right now, it is a <code>409</code>. That difference is actionable for the client: a 409 means try a different value, a 400 means fix your request. <br>Why: giving the test rather than the definition is what makes this repeatable in an interview."
+    },
+    {
+      prompt: "Interviewer: “Why 302 and not 301 for a link shortener?”",
+      answer: "A <code>301</code> is permanent, and browsers cache it hard — sometimes until the user clears their history. So if I ever need to change where a short link points, or delete it, everyone who already followed it keeps going to the old place and my server is never asked again. <code>302</code> costs one round trip each time and keeps control of the destination. For a shortener, where changing or removing a link is a normal operation, that trade is clearly worth it. <br>Why: naming what you gave up — the cached round trip — shows it was a decision, not a default."
+    }
+  ]);
+</script>

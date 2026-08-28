@@ -1,0 +1,491 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pipeline versus pipe, and the chunk trap — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 3 of 7 · Lesson 8 · Streams and memory</p>
+  <h1><code>pipeline</code> versus <code>pipe</code>, and the chunk trap</h1>
+  <p class="subtitle">Two stream bugs that never raise an error. One leaks file descriptors. The other corrupts your data quietly.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 3 of 7.</span> This lesson builds one domain-expert ability: <b>predict how it behaves in a case never seen before</b>. <a href="../reference/7-day-plan.html#d3">Day 3 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can say why <code>pipeline</code> exists, in one sentence, with a measured fact. And you can explain why a chunk boundary breaks both lines and letters.
+  </div>
+
+  <h2>Problem one — the sink fails halfway</h2>
+
+  <p>You copy a big file to a network target. Halfway through, the target rejects a write.</p>
+
+  <p>The writable stream errors. Ask the question that matters. <b>What happens to the reader?</b></p>
+
+  <p>Nothing happens to it. It is a separate object. It still holds an open file descriptor.</p>
+
+  <p>It may also keep reading, because nobody told it to stop. In a server that runs this per request, you leak a descriptor every time.</p>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    After the sink errored, <code>pipe</code> left the source with <code>destroyed: false</code>. The same failure through <code>pipeline</code> gave <code>destroyed: true</code>.
+  </div>
+
+  <h2>Derive why <code>pipe</code> cannot fix this</h2>
+
+  <p>Look at what <code>pipe</code> is. It is a method on <em>one</em> readable stream.</p>
+
+  <p>It knows about its own source and one destination. It forwards data and it honours backpressure. That is all.</p>
+
+  <p>It does not own the chain. With three streams there are three <code>pipe</code> calls, and none of them can see the whole line.</p>
+
+  <p>So no single <code>pipe</code> call has the information needed to tear everything down. It is not a bug. It is a missing job.</p>
+
+  <div class="soundbite">
+    <span class="label">Say this, word for word</span>
+    <p><b>"<code>pipe</code> forwards data between two streams. <code>pipeline</code> owns the whole chain, so it can destroy every stream when any one of them fails."</b></p>
+  </div>
+
+  <pre><code><span class="cmt">// pipe — no owner. A sink error leaves the source open.</span>
+source.pipe(gzip).pipe(sink);
+sink.on('error', handle);       <span class="cmt">// source and gzip are still alive</span>
+
+<span class="cmt">// pipeline — one owner for the whole chain.</span>
+import { pipeline } from 'node:stream/promises';
+await pipeline(source, gzip, sink);   <span class="cmt">// any failure destroys all three</span></code></pre>
+
+  <p>The promise form also gives you one <code>try</code>/<code>catch</code> instead of an error listener on every stream.</p>
+
+  <h2>Problem two — a chunk is not a line</h2>
+
+  <p>You read a CSV file and process it row by row. The obvious code looks correct.</p>
+
+  <pre><code><span class="cmt">// WRONG — splits each chunk on its own.</span>
+for await (const chunk of createReadStream('rows.csv')) {
+  for (const line of chunk.toString('utf8').split('\n')) {
+    process(line);
+  }
+}</code></pre>
+
+  <p>A chunk is a fixed number of <b>bytes</b>. The default is 65536.</p>
+
+  <p>Your rows are not 65536 bytes long. So a boundary lands in the middle of a row, again and again.</p>
+
+  <p>That row becomes two fragments. Both look like valid rows to your code. Neither is one.</p>
+
+  <div class="trap">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    Naive per-chunk splitting damaged <b>1093 of 2000</b> CSV rows, <b>with no error at all</b>. Carrying the remainder damaged <b>0</b>. The exact count changes with chunk size. With a 128-byte chunk the same 2000 rows produced over 2000 broken fragments.
+  </div>
+
+  <h2>The worse half — a chunk is not even a letter</h2>
+
+  <p>A boundary can also land inside a single character. UTF-8 uses one to four bytes per character.</p>
+
+  <p>Take the word <code>'việt'</code>. It is <b>4 characters</b> and <b>6 bytes</b>.</p>
+
+  <pre><code>const s = 'việt';
+s.length                          <span class="out">// 4  — characters</span>
+Buffer.from(s, 'utf8').length     <span class="out">// 6  — bytes</span>
+<span class="cmt">// bytes: 76 69 e1 bb 87 74   — the letter ệ takes three bytes</span></code></pre>
+
+  <p>Now cut at byte 3 and decode each half on its own. That is exactly what per-chunk <code>toString</code> does.</p>
+
+  <pre><code>head.toString('utf8')    <span class="out">// "vi&#xFFFD;"   — one replacement character</span>
+tail.toString('utf8')    <span class="out">// "&#xFFFD;&#xFFFD;t"  — two more</span>
+head + tail              <span class="out">// "vi&#xFFFD;&#xFFFD;&#xFFFD;t" — three, and ệ is gone forever</span></code></pre>
+
+  <p>The letter cannot be recovered by joining the strings afterwards. The decoding already threw the bytes away.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="fig8-title">
+      <title id="fig8-title">A chunk boundary cuts through a CSV row and through a single UTF-8 letter</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">A CHUNK IS A COUNT OF BYTES — NOTHING ELSE</text>
+
+      <rect x="20" y="30" width="290" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="165" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">chunk 1 — 65536 bytes</text>
+
+      <rect x="330" y="30" width="290" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="475" y="52" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">chunk 2 — 65536 bytes</text>
+
+      <line x1="320" y1="24" x2="320" y2="290" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 5 4;"></line>
+      <text x="320" y="18" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">the boundary</text>
+
+      <text x="20" y="96" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">IT CUTS A ROW</text>
+
+      <rect x="150" y="106" width="170" height="30" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="235" y="126" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10.5px;">42,anna,anna@ma</text>
+      <rect x="320" y="106" width="150" height="30" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="395" y="126" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10.5px;">il.com,active</text>
+      <text x="20" y="156" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">Two fragments. Both parse. Neither is a row. 1093 of 2000 damaged, silently.</text>
+
+      <text x="20" y="192" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">IT CUTS A LETTER</text>
+
+      <rect x="150" y="202" width="170" height="30" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="235" y="222" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">76 69 e1</text>
+      <rect x="320" y="202" width="150" height="30" rx="5" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="395" y="222" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 11px;">bb 87 74</text>
+      <text x="484" y="222" style="fill: var(--ink-faint); font-family: monospace; font-size: 10px;">'việt' = 6 bytes</text>
+      <text x="20" y="252" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">The letter ệ is three bytes. Split it and both halves decode to nothing.</text>
+
+      <rect x="20" y="264" width="600" height="26" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="281" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">Fix both at once: keep the remainder, or let readline do it for you.</text>
+    </svg>
+    <figcaption>The same cause, two failures. A chunk boundary respects neither your rows nor your alphabet.</figcaption>
+  </figure>
+
+  <h2>The fix, derived</h2>
+
+  <p>The last piece of a chunk is not a finished row. So do not treat it as one.</p>
+
+  <p>Keep it. Glue it to the front of the next chunk. That is the whole pattern.</p>
+
+  <pre><code><span class="cmt">// RIGHT — carry the remainder across the boundary.</span>
+let rest = '';
+for await (const chunk of createReadStream('rows.csv')) {
+  const parts = (rest + chunk.toString('utf8')).split('\n');
+  rest = parts.pop();          <span class="cmt">// the last piece is unfinished — keep it</span>
+  for (const line of parts) process(line);
+}
+if (rest) process(rest);        <span class="cmt">// the final row has no newline after it</span></code></pre>
+
+  <p>That fixes the rows. It does <b>not</b> fix the letters, because <code>chunk.toString()</code> already destroyed them.</p>
+
+  <p>For text, do not write this at all. Use the tool that solves both problems.</p>
+
+  <pre><code><span class="cmt">// BEST — readline handles rows and multi-byte letters, in constant memory.</span>
+import { createInterface } from 'node:readline';
+
+const rl = createInterface({
+  input: createReadStream('rows.csv'),
+  crlfDelay: Infinity,          <span class="cmt">// treat \r\n as one line ending</span>
+});
+
+for await (const line of rl) process(line);</code></pre>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Node hands you the file in blocks of a fixed size. It counts bytes, and it counts nothing else.</p>
+    <p class="part cont">It does not know where your rows end. It does not know where your letters end. Both get cut in half, and neither cut raises an error.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A long letter cut into pieces with a ruler, every ten centimetres. The cuts land in the middle of words.</p>
+    <p class="part cont">If you read each piece on its own, you get half-words. If you keep the last half-word and join it to the next piece, you get the letter back.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      With paper you can always see the cut and tape it back. With bytes you cannot.</p>
+    <p class="part limit cont">Once you call <code>toString()</code> on half a letter, the broken bytes become a replacement character. Joining the strings afterwards does not bring the letter back. The information is already gone.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People believe a chunk is a "piece of text". It is a count of bytes, and the count was chosen by <code>highWaterMark</code>.</p>
+    <p class="part cont">Nothing about it lines up with your data. And because both failures are silent, the code looks correct in review and in a small test file.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why joining two decoded halves does not repair a split letter. Then say what you would use instead. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>The follow-up questions, and the short answers</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>They ask</th><th>You say</th></tr></thead>
+    <tbody>
+      <tr><td>"Why <code>pipeline</code> over <code>pipe</code>?"</td><td><code>pipe</code> forwards data. <code>pipeline</code> owns the chain, so it destroys every stream on failure.</td></tr>
+      <tr><td>"What breaks with <code>pipe</code>?"</td><td>Measured: the source stayed <code>destroyed: false</code>. In a server that is a leaked descriptor per request.</td></tr>
+      <tr><td>"Is <code>pipe</code> ever fine?"</td><td>For a short script that exits anyway. Never in a long-running service.</td></tr>
+      <tr><td>"Why not split each chunk?"</td><td>A chunk is a byte count. Boundaries land inside rows and inside letters.</td></tr>
+      <tr><td>"How do you fix the rows?"</td><td>Carry the last fragment into the next chunk. Or use <code>readline</code>.</td></tr>
+      <tr><td>"And the letters?"</td><td><code>readline</code>, or <code>setEncoding</code>, or <code>StringDecoder</code>. All three hold partial bytes.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 3 minutes, out loud</span>
+    <p class="situation">The interviewer says: "Our importer works on the test file. In production a few hundred rows come out corrupted, and the job reports success. What is happening?"</p>
+    Answer out loud before reading on. A good answer names the chunk boundary as the cause. It explains why a small test file hides the bug. It offers <code>readline</code>, and it points out that no error is possible here by design.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/api/stream.html">Node.js <code>stream</code> API</a>. Read the <code>stream.pipeline</code> section and the "Piping to writable streams from async iterators" section. Twenty minutes.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0014-buffers-and-binary.html">Week 14 · Buffers and binary</a> ·
+    <a href="../../lessons/0016-transform-streams-and-pipeline.html">Week 16 · Transform streams and pipeline</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li><code>pipe</code> forwards data between two streams. It <b>never owns the chain</b>, so it cannot clean it up.</li>
+      <li>Measured: after a sink error, <code>pipe</code> left the source <code>destroyed: false</code>; <code>pipeline</code> gave <code>true</code>.</li>
+      <li>Use <code>pipeline</code> from <code>node:stream/promises</code>. One owner, one <code>try</code>/<code>catch</code>.</li>
+      <li>A chunk is a <b>count of bytes</b>. It respects neither your rows nor your letters.</li>
+      <li>Measured: naive per-chunk splitting damaged <b>1093 of 2000</b> rows, with <b>no error</b>.</li>
+      <li>Fix rows by <b>carrying the remainder</b> into the next chunk. Fix letters with <code>readline</code>.</li>
+      <li><code>'việt'</code> is <b>4 characters and 6 bytes</b>. Cut it at byte 3 and the letter <code>ệ</code> is gone.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>both of these bugs are completely silent, so a green test run proves nothing.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — the <code>stream</code> API reference and the <code>buffer</code> API reference. The CSV damage count came from the parent course. The <code>destroyed</code> results, the byte values of <code>'việt'</code> and the small-chunk fragment count were measured while writing this lesson. All on <b>Node v24.14.0</b>, 2026-08-28.</p>
+
+  <div class="ask">
+    Stuck on any of this? <b>Ask your teacher.</b> Say <b>"quiz me on streams"</b> for ten rapid questions with no multiple choice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0007-backpressure-and-the-pull-model.html">← Backpressure</a></span>
+    <span><a href="0009-kata-03-errors-per-hour-in-a-50gb-log.html">Next: Kata 3 — a 50 GB log →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A sink errors halfway through source.pipe(gzip).pipe(sink). What is the state of the source?",
+      options: [
+        "Still open and not destroyed, because no single pipe call owns the whole chain",
+        "Destroyed straight away, because an error always travels backwards along a pipe",
+        "Paused but not destroyed, and it resumes as soon as a new sink is attached later",
+        "Ended cleanly, because Node treats a sink error as a normal end of the whole stream"
+      ],
+      answer: 0,
+      why: "pipe is a method on one readable that knows about one destination. It forwards data and honours backpressure, and that is the whole job. No call in the chain can see the other streams, so nothing has the information needed to tear them down. Measured on Node v24.14.0, the source stayed destroyed: false. Through pipeline the same failure gave destroyed: true, because pipeline owns every stream you pass it."
+    },
+    {
+      q: "Why does splitting each chunk on newline corrupt rows without ever raising an error?",
+      options: [
+        "A chunk is a fixed byte count, so boundaries land inside rows and produce two fragments",
+        "The split method silently drops any line that is longer than the chunk size in bytes",
+        "Reading a stream reorders chunks, so rows arrive in a different order than on the disk",
+        "The newline character is encoded differently in each chunk, so the split misses some rows"
+      ],
+      answer: 0,
+      why: "highWaterMark decides how many bytes arrive per chunk, and it has no relationship to where your rows end. A boundary inside a row leaves a head fragment at the end of one chunk and a tail fragment at the start of the next. Both fragments look like ordinary rows to your code, so nothing can detect the problem. The parent course measured 1093 of 2000 rows damaged, with the job reporting success."
+    },
+    {
+      q: "You call toString on each half of a split multi-byte letter, then join the two strings. What do you get?",
+      options: [
+        "Replacement characters where the letter was, because decoding already discarded the bytes",
+        "The original letter back, since joining the strings restores the full byte sequence again",
+        "An exception from the second decode, because its first bytes are not a valid start byte",
+        "An empty string in place of the letter, because invalid sequences are removed on decode"
+      ],
+      answer: 0,
+      why: "Each toString call decodes independently and turns the incomplete sequence into replacement characters. Measured with 'việt': the head gave one replacement character and the tail gave two, so joining them gives three and the letter is unrecoverable. Nothing throws, because replacement is the defined behaviour for invalid UTF-8. This is why the fix has to happen before decoding, not after."
+    },
+    {
+      q: "Which tool solves the split-row problem and the split-letter problem at the same time?",
+      options: [
+        "readline, because it buffers partial bytes and only yields a line once it is complete",
+        "JSON.parse, because it validates the encoding of the whole payload before returning it",
+        "pipeline, because owning the chain means it can also reassemble boundaries correctly",
+        "Buffer.concat, because joining every chunk first removes all of the boundary problems"
+      ],
+      answer: 0,
+      why: "readline holds an incomplete tail until more bytes arrive, and it decodes with a decoder that keeps partial multi-byte sequences. So it emits whole lines with correct characters, in constant memory. pipeline solves cleanup, not framing. Buffer.concat does work, but only by loading the entire file into memory, which defeats the reason for streaming in the first place."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Why would you use pipeline instead of pipe?”",
+      answer: "Because pipe forwards data and pipeline owns the chain. pipe is a method on one readable stream that knows about one destination, so it can move bytes and honour backpressure, and that is all it can do. When a sink errors, no pipe call has the information to destroy the other streams. I measured that on Node v24.14.0: after a sink error the source stayed destroyed false, and the same failure through pipeline gave true. In a long-running server that difference is a leaked file descriptor on every failed request. I use the promise form from node:stream/promises, so I get one try and catch instead of an error listener per stream. <br>Why: they want to hear that you know the reason, not the rule. Naming the ownership difference is what shows it."
+    },
+    {
+      prompt: "Interviewer: “What is wrong with splitting each chunk on a newline?”",
+      answer: "A chunk is a fixed number of bytes, and it knows nothing about my data. So a boundary lands in the middle of a row, and that row arrives as two fragments in two different chunks. Both fragments look like valid rows to my code, so no error is possible. The parent course measured 1093 of 2000 rows damaged this way, with the job reporting success. The fix for rows is to keep the last fragment of every chunk and glue it to the front of the next one. But that only fixes rows, not letters, so for text I use readline, which does both. <br>Why: the interviewer is checking whether you know that this bug is silent. Saying no error is possible here is the sentence that lands."
+    },
+    {
+      prompt: "Interviewer: “Why can a chunk boundary corrupt a single character?”",
+      answer: "Because UTF-8 uses one to four bytes per character, and a chunk boundary is measured in bytes. Take the word việt. It is four characters and six bytes, and the letter ệ takes three of those bytes on its own. If the boundary lands after the first of those three, each half is decoded separately. The head becomes vi plus one replacement character, and the tail becomes two replacement characters plus t. Joining the strings afterwards does not help, because the decode already discarded the bytes. So the repair has to happen before decoding, which is exactly what readline, setEncoding and StringDecoder all do. <br>Why: this question separates people who have processed real text from people who have only read about streams. A concrete word with real byte counts is the strongest possible answer."
+    }
+  ]);
+</script>

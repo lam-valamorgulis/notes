@@ -1,0 +1,559 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Async tests that do not flake — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 36 of 52 · Lesson 36 · Testing &amp; security</p>
+  <h1>Async tests that do not flake</h1>
+  <p class="subtitle">A test that passes when it should fail is worse than no test. Here is how that happens.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 36 of 52.</span> This lesson builds one domain-expert ability: <b>make a system behave the same way twice</b>. <a href="../reference/52-week-plan.html#w36">Week 36 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will write a test that shows a <b>green tick</b> while asserting something false. Then you will find the one line in the output that gives it away.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0035-node-test-the-built-in-runner.html">Week 35</a> said coverage measures execution, not verification. This week is the same disease, one level deeper: a test that <b>runs</b>, <b>asserts</b>, and still proves nothing.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — what makes a test lie?</h2>
+  <p>Everything in this course since <a href="./0003-callbacks-and-the-event-loop-up-close.html">week 3</a> has been about one fact. Your code does not finish when the function returns. It finishes later, on a queue.</p>
+  <p>A test runner has to decide when your test is over. It cannot read your mind. So it uses a rule:</p>
+
+  <div class="soundbite">
+    <span class="label">The rule the runner uses</span>
+    <p>The test is over when the function <b>returns</b>, or when the promise it returned <b>settles</b>. Anything your test starts but does not hand back is <b>outside</b> the test.</p>
+  </div>
+
+  <p>That is the whole bug. An assertion that runs after the test ended is an assertion the test never saw.</p>
+
+  <!-- ============ THE GREEN LIE ============ -->
+  <h2>Watch a false assertion pass</h2>
+  <p>Three tests. Two of them are wrong on purpose. Verified on Node v24.14.0:</p>
+
+  <pre><code>test('A — assertion in a callback that nobody awaits', () =&gt; {
+  setTimeout(() =&gt; {
+    assert.strictEqual(1, 2);      <span class="cmt">// this is FALSE</span>
+  }, 10);
+});                                 <span class="cmt">// the function returned. the test is over.</span>
+
+async function boom() { throw new Error('should fail the test'); }
+
+test('B — forgot the await', () =&gt; {
+  boom();                           <span class="cmt">// no await, no return</span>
+});
+
+test('C — awaited properly', async () =&gt; {
+  await assert.rejects(boom, /should fail/);
+});</code></pre>
+
+  <p>Now the output. Read the ticks first, then read the rest:</p>
+
+  <pre><code><span class="out">✔ A — assertion in a callback that nobody awaits (0.380042ms)
+✔ B — forgot the await (0.083333ms)
+✔ C — awaited properly (0.336750ms)
+
+ℹ Error: Test "B — forgot the await" generated asynchronous activity after
+  the test ended. This activity created the error "Error: should fail the test"
+  and <b>would have caused the test to fail</b>, but instead triggered an
+  unhandledRejection event.
+
+ℹ Error: Test "A — assertion in a callback that nobody awaits" generated
+  asynchronous activity after the test ended. ... "AssertionError: 1 !== 2"
+
+✖ t36b.test.js (51.062458ms)
+ℹ tests 4   ℹ pass 3   ℹ fail 1</span></code></pre>
+
+  <div class="trap">
+    <span class="label">Look at what actually failed</span>
+    Every named test has a <b>✔</b>. <code>1 !== 2</code> is right there in the output, and test A still passed.
+    <p style="margin:.6rem 0 0;">The <b>✖</b> is on the <b>file</b>. That is why <code>tests 4</code> but only three
+    were written — the file counts as the fourth. Node caught the escaped error and failed the run. But it could not blame a test, <b>because that test was already over</b>.</p>
+  </div>
+
+  <p>Node saves you here. Not every runner does, and not every escaped error lands in time. Do not rely on it. The lesson is the sentence Node printed: <b>would have caused the test to fail</b>.</p>
+
+  <div class="tip">
+    <span class="label">The habit that removes this whole class of bug</span>
+    <b>Return or await everything.</b> If a line in a test starts work, the test must hold on to it. An
+    <code>async</code> test that has no <code>await</code> in it is worth a second look, every time.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 260" role="img" aria-labelledby="fig36-title" width="640" height="260">
+      <title id="fig36-title">An assertion that runs after the test returns is outside the test</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">WHERE THE ASSERTION LANDS DECIDES EVERYTHING</text>
+
+      <rect x="20" y="36" width="255" height="110" rx="8" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="147" y="56" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">INSIDE THE TEST</text>
+      <text x="147" y="78" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">await assert.rejects(boom)</text>
+      <line x1="45" y1="90" x2="250" y2="90" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <text x="147" y="108" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">the runner is still watching</text>
+      <text x="147" y="128" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">a failure fails the test</text>
+
+      <rect x="365" y="36" width="255" height="110" rx="8" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="492" y="56" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">AFTER THE TEST RETURNED</text>
+      <text x="492" y="78" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">setTimeout(() =&gt; assert(...))</text>
+      <line x1="390" y1="90" x2="595" y2="90" style="stroke: var(--rule); stroke-width: 1;"></line>
+      <text x="492" y="108" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">the runner has moved on</text>
+      <text x="492" y="128" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">the test already showed ✔</text>
+
+      <path d="M 280 91 L 358 91" style="fill: none; stroke: var(--ink-faint); stroke-width: 2; stroke-dasharray: 4 3;" marker-end="url(#a36)"></path>
+      <defs><marker id="a36" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" style="fill: var(--ink-faint);"></path></marker></defs>
+      <text x="319" y="82" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">return</text>
+
+      <rect x="20" y="164" width="600" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1;"></rect>
+      <text x="320" y="181" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">The runner ends the test when the function returns, or the returned promise settles.</text>
+      <text x="320" y="196" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Work you do not hand back is work it cannot wait for.</text>
+
+      <text x="320" y="232" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 12px; font-style: italic;">Return or await everything. That is the whole fix.</text>
+      <text x="320" y="250" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 10px;">Measured on Node v24.14.0 — test A printed ✔ with 1 !== 2 in the log.</text>
+    </svg>
+    <figcaption>The ✖ landed on the <b>file</b>, not on test A. Node could not blame a test that had already finished.</figcaption>
+  </div>
+
+  <!-- ============ TIME ============ -->
+  <h2>The second cause: real time</h2>
+  <p>A test that waits for a real timer is slow and unreliable. A retry with a 60-second backoff cannot be tested by waiting 60 seconds. So do not wait. Move the clock.</p>
+
+  <pre><code>test('fake clock fires a 60s timer instantly', (t) =&gt; {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let fired = false;
+  setTimeout(() =&gt; { fired = true; }, 60_000);
+
+  assert.strictEqual(fired, false);
+  t.mock.timers.tick(60_000);        <span class="cmt">// move time forward by hand</span>
+  assert.strictEqual(fired, true);
+});
+<span class="out">✔ fake clock fires a 60s timer instantly (0.931ms)</span></code></pre>
+
+  <p>Sixty seconds of behaviour, checked in under a millisecond. <code>Date</code> works the same way:</p>
+
+  <pre><code>t.mock.timers.enable({ apis: ['Date'], now: 0 });
+Date.now();            <span class="cmt">// 0</span>
+t.mock.timers.tick(5000);
+Date.now();            <span class="cmt">// 5000</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Why this beats a shorter timeout</span>
+    The tempting fix is to make the timeout configurable and set it to 5 ms in tests. That tests
+    <b>a different system</b> — one with a 5 ms backoff. The fake clock tests the real 60-second value.
+    You want the production number in the assertion.
+  </div>
+
+  <h2>The third cause: a sleep pretending to be a wait</h2>
+  <p>This is the single most common flaky test in any codebase:</p>
+
+  <pre><code>startTheJob();
+await sleep(100);                       <span class="cmt">// "it'll be done by then"</span>
+assert.strictEqual(job.status, 'done');</code></pre>
+
+  <p>It passes on your laptop. It fails on continuous integration, where the machine is slower and busy. Then someone changes 100 to 500 and the suite gets slower forever, and it still fails sometimes.</p>
+
+  <p>The fix is to <b>wait for the thing, not for the clock</b>:</p>
+
+  <pre><code><span class="cmt">// best — the code tells you when it is done</span>
+await startTheJob();
+<span class="cmt">// or</span>
+await once(job, 'done');                <span class="cmt">// events/once, from week 18</span>
+
+<span class="cmt">// acceptable when you truly cannot observe it — poll, with a deadline</span>
+async function until(fn, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() &lt; deadline) {
+    if (await fn()) return;
+    await sleep(10);
+  }
+  throw new Error('condition never became true');
+}</code></pre>
+
+  <p><code>until</code> is fast when the job is fast, and it fails with a real message when the job never finishes. A <code>sleep</code> is slow always and lies sometimes.</p>
+
+  <!-- ============ ISOLATION ============ -->
+  <h2>The fourth cause: tests that can see each other</h2>
+  <p>You need to know exactly what runs at the same time as what. Measured, not assumed:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Level</th><th>Default</th><th>Measured</th></tr></thead>
+    <tbody>
+      <tr><td>Tests <b>inside</b> one file</td><td>one at a time, in order</td><td><code>1-start 1-end 2-start 2-end</code></td></tr>
+      <tr><td>Test <b>files</b></td><td><b>parallel</b>, separate processes</td><td>pids 40143 and 40144, both start at the same millisecond</td></tr>
+      <tr><td>Two 400 ms files</td><td>parallel</td><td><b>464 ms</b> total</td></tr>
+      <tr><td>Same two, <code>--test-concurrency=1</code></td><td>serial</td><td><b>916 ms</b> total</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>So the rule that matters: <b>your test files run at the same time, in different processes.</b> Anything outside the process is shared between them.</p>
+
+  <div class="trap">
+    <span class="label">The things two test files fight over</span>
+    A hard-coded <b>port</b>. A <b>database</b> or a table. A <b>file</b> on disk, especially a fixture one
+    test writes and another reads. An <b>environment variable</b>. A row with a fixed id.
+    <p style="margin:.6rem 0 0;">All four produce the same symptom: passes alone, fails in the suite, or
+    fails only sometimes. That symptom is a shared resource until proven otherwise.</p>
+  </div>
+
+  <p>The fixes follow from <a href="./0035-node-test-the-built-in-runner.html">last week</a>. Use <code>listen(0)</code> for a port the operating system picks. Use a unique name per test for anything on disk, and a fresh row rather than a fixed id. Then no two files can collide.</p>
+
+  <h2>Mocks, and when to reach for one</h2>
+  <pre><code>test('mock.method records calls and restores after', (t) =&gt; {
+  const svc = { save(x) { return 'real:' + x; } };
+  t.mock.method(svc, 'save', (x) =&gt; 'fake:' + x);
+
+  assert.strictEqual(svc.save('a'), 'fake:a');
+  assert.strictEqual(svc.save.mock.callCount(), 1);
+  assert.deepStrictEqual(svc.save.mock.calls[0].arguments, ['a']);
+});
+
+test('the mock was restored automatically', () =&gt; {
+  const svc = { save(x) { return 'real:' + x; } };
+  assert.strictEqual(svc.save('a'), 'real:a');       <span class="cmt">// ✔ — no leak</span>
+});</code></pre>
+
+  <p><code>t.mock</code> restores itself when the test ends. That matters. A mock that leaks into the next test is a flake that looks like a bug in that other test.</p>
+
+  <div class="tip">
+    <span class="label">Mock the boundary, not your own code</span>
+    Mock the third-party HTTP call, the clock, the random number. Do not mock your own function to make
+    your own test pass — at that point the test is checking that you wrote the mock correctly.
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A test runner has to decide when your test is finished. It uses a simple rule. The test is over when the function returns, or when the promise you gave back settles.</p>
+    <p class="part cont">So anything your test starts but does not hand back happens <b>after</b> the test. An assertion in there can be false and the test still shows a green tick. Nobody was watching by then.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      An exam invigilator who collects the papers at the bell. Whatever you write after the bell is not marked. It can be brilliant or wrong — it does not count, because the paper is already gone.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      An invigilator sees you still writing and tells you to stop. Node partly does this too. It noticed the late error and failed the <b>file</b>, printing &ldquo;would have caused the test to fail&rdquo;.</p>
+    <p class="part limit cont">But it could not fail the <b>test</b>, because that test was already marked as passed. So the analogy breaks in the direction that matters. The mark stays green, and the complaint appears elsewhere in the output, where nobody looks. Other runners do not complain at all.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People read a green tick as &ldquo;the assertion passed&rdquo;. It really means &ldquo;nothing failed <b>while I was watching</b>&rdquo;. Those are different claims, and an empty test satisfies the second one.</p>
+    <p class="part cont">That is why a missing <code>await</code> is so dangerous. It does not break anything visibly. It quietly moves the check outside the window, and you keep the reassurance without the safety.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain this to a teammate. Their test passed, even though the assertion inside it was false. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — break a test, then fix it</h2>
+
+  <p><b>Requirements:</b></p>
+  <ol>
+    <li>Write a test that shows <b>✔</b> while asserting <code>1 === 2</code>. Keep it. Name it clearly.</li>
+    <li>Find the line in the output that reveals it. Write down the exact wording.</li>
+    <li>Fix it so the same assertion now fails the test. Both versions stay in the file, one skipped.</li>
+    <li>Take the spine's retry or cleanup timer and test it with <code>t.mock.timers</code>. Assert on the <b>production</b> interval, not a shortened one.</li>
+    <li>Replace every <code>sleep</code> in your suite with an awaited signal or the <code>until</code> helper.</li>
+    <li>Run the suite <b>ten times</b> in a row. Any failure at all is a flake, not bad luck.</li>
+  </ol>
+
+  <pre><code>for i in $(seq 1 10); do node --test || echo "FLAKE on run $i"; done</code></pre>
+
+  <div class="trap">
+    <span class="label">If it flakes, do not retry it</span>
+    The industry answer is to mark it flaky and rerun it automatically. That converts a real race
+    condition in your code into a slower test suite, and hides the bug.
+    <p style="margin:.6rem 0 0;">A flaky test is usually telling the truth: <b>the system really is
+    non-deterministic</b>. Find the shared thing. It is almost always a port, a row, a file, or a clock.</p>
+  </div>
+
+  <div class="drill">
+    <span class="label">Diagnose from the symptom alone</span>
+    <p class="situation">A colleague says: &ldquo;This test passes when I run the file on its own. It fails about one time in five when the whole suite runs. It never fails on my machine, only on continuous integration.&rdquo;</p>
+    Give the two most likely causes, and one command each that would confirm or clear them. You have every fact you need in this lesson.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>Test containers</b> — running a real database per test run in Docker — is the right answer for the
+    data layer, and it arrives with the data layer in <a href="../reference/52-week-plan.html#w40">weeks 40&ndash;43</a>.
+    <b>Contract testing</b> between services matters once there is more than one service.
+    <b>Fuzzing and property-based testing</b> find the inputs you never thought of. <b>Snapshot testing</b>
+    is easy to adopt and hard to keep honest.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/api/test.html#mocking">Mocking in node:test</a>,
+    <a href="https://nodejs.org/api/test.html#class-mocktimers">MockTimers</a>, and
+    <a href="https://nodejs.org/api/cli.html#--test-concurrency">--test-concurrency</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a test you think is solid and I'll tell you what would make it flake.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>A test ends when the function <b>returns</b> or the returned promise <b>settles</b>. Everything else is outside it.</li>
+      <li>So a false assertion in a stray callback shows <b>✔</b>. Verified: <code>1 !== 2</code> printed, test passed, and Node failed the <b>file</b> instead.</li>
+      <li><b>Return or await everything.</b> An <code>async</code> test with no <code>await</code> deserves a second look.</li>
+      <li><code>t.mock.timers.tick(60_000)</code> tests a 60-second timer in under a millisecond, at its real value.</li>
+      <li>Never <code>sleep</code> and hope. Await the signal, or poll with a deadline that fails loudly.</li>
+      <li>Test <b>files run in parallel, in separate processes</b>. Ports, rows, files and env vars are shared.</li>
+      <li>Never auto-retry a flake. It is usually telling the truth about a race in your code.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a green tick means &ldquo;nothing failed while I was watching&rdquo; — not &ldquo;the assertion passed&rdquo;.</b></p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "node:test", "MockTimers", "--test-concurrency". Every output shown here came from running the code on <b>Node v24.14.0</b>, on 2026-08-28. That includes the ✔ on the false assertion, the 464 ms parallel run and the 916 ms serial run. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0035-node-test-the-built-in-runner.html">← Lesson 35</a>
+    <a href="./0037-the-inspector-and-hardening-your-input.html">Next: Lesson 37 — The inspector, and hardening your input →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "A test calls setTimeout and asserts 1 === 2 inside the callback. What does the runner report?",
+      options: [
+        "The test passes, and the failure is reported against the file instead",
+        "The test fails, because Node tracks assertions made anywhere in the process",
+        "The test is marked as skipped, since its assertion ran outside the test window",
+        "The test hangs until the runner's default timeout expires and then fails"
+      ],
+      answer: 0,
+      why: "Measured on Node v24.14.0: the test printed a green tick, and 1 !== 2 appeared in the log under a separate note saying the late activity would have caused the test to fail. The ✖ landed on the file. Node cannot fail a test it has already marked as passed."
+    },
+    {
+      q: "Why test a 60-second retry with mock.timers rather than making the interval configurable?",
+      options: [
+        "A shortened interval tests a different system, so the real value is never checked",
+        "Configurable intervals require environment variables, which leak between parallel files",
+        "The fake clock is the only way to make a timer fire before its scheduled deadline",
+        "Node ignores setTimeout values under 1000 ms when the test runner is active"
+      ],
+      answer: 0,
+      why: "Setting the backoff to 5 ms in tests means you have verified a system with a 5 ms backoff. The production number is the one that can be wrong. mock.timers.tick(60_000) keeps the real value in the assertion and still runs in under a millisecond."
+    },
+    {
+      q: "A test passes alone but fails about one run in five inside the full suite. What is the first thing to suspect?",
+      options: [
+        "A resource shared between files, since test files run in parallel processes",
+        "A missing await, because that is the most common cause of a false green tick",
+        "An assertion on an error message rather than on the stable error code field",
+        "Insufficient coverage on the branch that the failing test happens to exercise"
+      ],
+      answer: 0,
+      why: "Measured: test files run in separate processes at the same time — two pids, both starting in the same millisecond. So anything outside the process is shared. A hard-coded port, a fixed database row, a fixture file, or an environment variable produces exactly this symptom."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How can a test pass when the assertion inside it is false?”",
+      answer: "Because the runner decides the test is over when the function <b>returns</b>, or when the promise it returned settles. If the assertion is inside a callback nobody handed back — a <code>setTimeout</code>, or a promise with a missing <code>await</code> — it runs after the test has already been marked passed. I have seen Node print <code>1 !== 2</code> in the log right underneath a green tick. It failed the file and said the error &ldquo;would have caused the test to fail&rdquo;, but it could not fail the test itself. So my rule is: return or await everything. <br>Why: naming the runner's actual end-of-test rule is what shows you understand it rather than having memorised the symptom."
+    },
+    {
+      prompt: "Interviewer: “One of our tests is flaky. What do you do?”",
+      answer: "I do not auto-retry it. A flaky test is usually telling the truth — the system really is non-deterministic — and retrying converts a real race into a slower suite that still ships the bug. I check three things in order. Is there a <code>sleep</code> standing in for a wait, which fails on a slower CI machine? Is there a shared resource — test files run in parallel in separate processes, so a hard-coded port, a fixed row, or a fixture file will collide. And is there real time in the test, which I would replace with a fake clock. <br>Why: refusing the retry, and having an ordered list rather than a vague answer, is the part that reads as experience."
+    },
+    {
+      prompt: "Interviewer: “What do you mock, and what do you leave real?”",
+      answer: "I mock the <b>boundary</b>: the third-party HTTP call, the clock, the random number, anything I do not own and cannot make deterministic. I leave my own code real, because mocking my own function means the test is checking that I wrote the mock correctly, which proves nothing. I use <code>t.mock</code> in the built-in runner because it restores itself when the test ends — a mock that leaks into the next test creates a flake that looks like a bug somewhere else entirely. <br>Why: the boundary rule plus the restore point covers both what to mock and the failure mode of mocking badly."
+    }
+  ]);
+</script>

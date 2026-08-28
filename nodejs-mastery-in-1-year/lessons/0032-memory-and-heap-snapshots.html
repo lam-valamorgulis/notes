@@ -1,0 +1,498 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory and heap snapshots — Node.js Mastery in 1 Year</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Week 32 of 52 · Lesson 32 · Performance &amp; memory</p>
+  <h1>Memory and heap snapshots</h1>
+  <p class="subtitle">Find a leak and name the thing that held the reference. This is the debugging skill with no ready answer online.</p>
+  <p class="expertise"><span class="tag">core</span><span class="wk">Week 32 of 52.</span> This lesson builds one domain-expert ability: <b>debug a problem that has no ready answer online</b>. <a href="../reference/52-week-plan.html#w32">Week 32 in the plan</a> · <a href="../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you will plant a leak, take two snapshots, and name the exact object holding the memory. Measured: heap used went from <b>3.4 MB to 43.5 MB</b>, and the snapshot file from 4.4 MB to <b>54.4 MB</b>.
+  </div>
+
+  <div class="note">
+    <span class="label">Where you are</span>
+    <a href="./0031-measure-first.html">Week 31</a> was about time. This week is about space, and the tool is different — a profile is a tally over time, a snapshot is a photograph of one instant.
+  </div>
+
+  <!-- ============ FIRST PRINCIPLES ============ -->
+  <h2>Start from the problem — a leak in a garbage-collected language</h2>
+  <p>JavaScript frees memory for you. So how can it leak?</p>
+  <p>Because the garbage collector has exactly one rule, and it is not &ldquo;is this still needed?&rdquo;. It is <b>&ldquo;can this still be reached?&rdquo;</b>. Reachable means a chain of references leads to the object from a <b>root</b>. A global, the stack, or a live closure.</p>
+
+  <div class="soundbite">
+    <span class="label">The definition that makes leaks findable</span>
+    <p>A leak in Node is not memory the collector failed to free. It is memory that is <b>still reachable</b> and that you no longer need. The collector is working perfectly. <b>Your code is holding on.</b></p>
+  </div>
+
+  <p>That reframes the whole job. You are not looking for a bug in V8. You are looking for the <b>reference</b>. There is always exactly one thing at the end of it, called the <b>retainer</b>.</p>
+
+  <!-- ============ NOT A LEAK ============ -->
+  <h2>&ldquo;Memory went up&rdquo; is not a leak</h2>
+  <p>Before you investigate anything, rule out the three normal explanations:</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>What you see</th><th>Probably</th><th>How to tell</th></tr></thead>
+    <tbody>
+      <tr><td>Memory rises, then drops sharply</td><td><b>Normal.</b> That is a GC.</td><td>The sawtooth pattern.</td></tr>
+      <tr><td>Memory rises and settles at a plateau</td><td><b>Normal.</b> Caches and pools filling.</td><td>It stops rising.</td></tr>
+      <tr><td>Memory rises to the limit, GC runs constantly, then it dies</td><td>Could be a leak — or a heap that is simply too small.</td><td>Raise the limit. If it just dies later, it is a leak.</td></tr>
+      <tr><td><b>Memory rises steadily and never comes back down</b></td><td><b>A leak.</b></td><td>Compare across two GCs.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Watch <code>v8.getHeapStatistics().used_heap_size</code>, not <code>process.memoryUsage().rss</code>. RSS includes buffers, native allocations and memory the OS has not reclaimed yet, so it is noisy. Used heap is what your JavaScript is actually holding.</p>
+
+  <!-- ============ SNAPSHOTS ============ -->
+  <h2>Two snapshots, and the difference between them</h2>
+  <p>One snapshot tells you what exists. That is rarely enough — plenty of things legitimately exist. <b>Two snapshots tell you what grew</b>, and growth is the signal.</p>
+
+  <pre><code>const v8 = require('node:v8');
+v8.writeHeapSnapshot('./before.heapsnapshot');
+<span class="cmt">// ...do the work you suspect, several times...</span>
+v8.writeHeapSnapshot('./after.heapsnapshot');</code></pre>
+
+  <p>Load both into Chrome DevTools → Memory → Load, then choose <b>Comparison</b>. Sort by <code>#Delta</code>. Verified on Node v24.14.0, with 200,000 objects retained:</p>
+
+  <pre><code><span class="out">before: heap used  3.4 MB | snapshot file  4.4 MB
+after:  heap used 43.5 MB | snapshot file 54.4 MB</span></code></pre>
+
+  <p>Forty megabytes of growth, and the snapshot file grew by fifty. That is the whole diagnosis so far: <em>something</em> is holding 200,000 objects. Now you need to know <b>what</b>.</p>
+
+  <h2>The retainer path — the only screen that matters</h2>
+  <p>Click any object in a snapshot and DevTools shows <b>Retainers</b>. That is the chain of references keeping it alive, read from the object back to a root.</p>
+
+  <pre><code>Object
+ └─ in <b>array</b> of Array
+     └─ in <b>store</b> of Object
+         └─ in <b>module.exports</b> of Module        ← the root</code></pre>
+
+  <p>Read it bottom to top and it becomes a sentence. <em>A module exports an object, which has a property called <code>store</code>, which is an array, which holds this object.</em> That sentence names the line of code to change.</p>
+
+  <div class="tip">
+    <span class="label">This is the skill, and it is the only part that cannot be automated</span>
+    Anything can tell you memory is growing. Only the retainer path tells you <b>which of your own
+    references</b> is the one to remove. Learning to read that chain is the entire value of this week.
+  </div>
+
+  <!-- ============ THE FOUR SHAPES ============ -->
+  <h2>Four leaks, and they are nearly all of them</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Shape</th><th>Looks like</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>A <b>growing collection</b></td><td>A <code>Map</code> or array that only ever gets <code>set</code> and <code>push</code></td><td>A size limit, or a TTL, or an <code>LRU</code>.</td></tr>
+      <tr><td>A <b>forgotten listener</b></td><td><code>emitter.on()</code> per request, never <code>off()</code></td><td>Remove it, or use <code>once</code>. Week 18's warning fires here.</td></tr>
+      <tr><td>A <b>closure holding too much</b></td><td>A small callback keeping a huge buffer alive</td><td>Pull out only the field you need before closing over it.</td></tr>
+      <tr><td>A <b>timer that never stops</b></td><td><code>setInterval</code> with no <code>clearInterval</code></td><td>Clear it, and <code>unref()</code> anything that should not hold the process open.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The closure one is the sneakiest</span>
+    <pre style="margin:0 0 .6rem;"><code>function handler(bigBuffer) {
+  const id = bigBuffer.id;
+  return () =&gt; console.log(id);      <span class="cmt">// looks like it holds one number</span>
+}</code></pre>
+    A closure captures the <b>scope</b>, not the variables it happens to mention. In some engines that
+    callback keeps the whole <code>bigBuffer</code> alive even though it only reads <code>id</code>. This is
+    <a href="./0002-the-javascript-you-need-for-node.html">week 2</a>'s &ldquo;the room cannot be cleared
+    while any key exists&rdquo;, showing up thirty weeks later as a production leak.
+  </div>
+
+  <!-- ============ VISUAL ============ -->
+  <div class="svg-fig">
+    <svg viewBox="0 0 640 250" role="img" aria-labelledby="fig32-title" width="640" height="250">
+      <title id="fig32-title">The garbage collector frees anything unreachable from a root; a leak is a reference you forgot</title>
+
+      <text x="20" y="20" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">REACHABLE MEANS KEPT — WHETHER YOU WANT IT OR NOT</text>
+
+      <rect x="20" y="38" width="96" height="34" rx="6" style="fill: var(--accent); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="68" y="60" text-anchor="middle" style="fill: #fff; font-family: sans-serif; font-size: 10px; font-weight: 700;">ROOT</text>
+
+      <line x1="120" y1="55" x2="156" y2="55" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a32)"></line>
+      <rect x="160" y="38" width="120" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="220" y="60" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">module.exports</text>
+
+      <line x1="284" y1="55" x2="320" y2="55" style="stroke: var(--ink-faint); stroke-width: 1.8;" marker-end="url(#a32)"></line>
+      <rect x="324" y="38" width="96" height="34" rx="6" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="372" y="60" text-anchor="middle" style="fill: var(--ink-soft); font-family: monospace; font-size: 10px;">store</text>
+
+      <line x1="424" y1="55" x2="460" y2="55" style="stroke: var(--warn); stroke-width: 2;" marker-end="url(#a32w)"></line>
+      <rect x="464" y="30" width="156" height="50" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2.5;"></rect>
+      <text x="542" y="50" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">200,000 objects</text>
+      <text x="542" y="66" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">40 MB you no longer need</text>
+
+      <text x="20" y="106" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">Read the chain backwards and it is a sentence that names the line to change.</text>
+
+      <line x1="20" y1="124" x2="620" y2="124" style="stroke: var(--rule); stroke-width: 1; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="150" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">unreachable → collected</text>
+      <rect x="20" y="160" width="280" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2; stroke-dasharray: 5 3;"></rect>
+      <text x="160" y="178" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">3.4 MB after release</text>
+      <text x="160" y="192" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">back to the starting number</text>
+
+      <text x="340" y="150" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">still reachable → kept</text>
+      <rect x="340" y="160" width="280" height="40" rx="6" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="480" y="178" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">43.5 MB and climbing</text>
+      <text x="480" y="192" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">the collector is working correctly</text>
+
+      <text x="320" y="230" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-style: italic;">A leak is not a broken collector. It is a reference you forgot you were keeping.</text>
+
+      <defs>
+        <marker id="a32"  markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--ink-faint);"></path></marker>
+        <marker id="a32w" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" style="fill: var(--warn);"></path></marker>
+      </defs>
+    </svg>
+    <figcaption>Measured on Node v24.14.0: 3.4 MB → 43.5 MB with 200,000 objects retained, and back to 3.4 MB once released.</figcaption>
+  </div>
+
+  <!-- ============ FEYNMAN ============ -->
+  <!-- FEYNMAN BLOCK — four required parts. Shape documented in NOTES.md. -->
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      The computer throws away anything you can no longer get to. It does not ask whether you still want it. It only asks whether there is <em>any</em> path from your program to that thing.</p>
+    <p class="part cont">So a leak is not the cleaner failing to do their job. It is you still holding one end of a string tied to something you thought you had thrown away.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A cleaner who takes away anything not attached to the building. Furniture bolted down stays. So does a huge box, if one thin string still runs from it to a hook on the wall.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A cleaner could <em>see</em> the string and ask you about it. The collector cannot, and neither can you, because the string is usually not where you would look.</p>
+    <p class="part limit cont">The room is your whole process, and the hook can be anywhere.</p>
+    <p class="part limit cont">An array you forgot. A listener nobody removed. A closure that captured more than it uses. That is why the answer is a <b>tool</b> and not care. You take two photographs of the room and compare them. The tool traces the string back to the hook for you. Nobody finds these by reading code.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People see memory rising and call it a leak. Rising memory is <b>normal</b> — caches fill, pools warm up, the collector waits until it is worth running.</p>
+    <p class="part cont">The signal is not &ldquo;it went up&rdquo;. It is <b>&ldquo;it went up and never came back down across two collections&rdquo;</b>. Chasing the first thing wastes a day tuning something that was working. The opposite mistake is worse. A slow leak looks completely normal for hours, right until the process is killed.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, explain why a garbage-collected language can still leak. Use the word <b>reachable</b>. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Reading the block above feels like understanding. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <!-- ============ BUILD ============ -->
+  <h2>Build it for real — plant three leaks, find all three</h2>
+
+  <p>Add three deliberate leaks to a copy of the spine, one at a time. Find each one from the snapshots alone.</p>
+
+  <ol>
+    <li><b>A growing <code>Map</code>.</b> Cache every request by URL, never evict.</li>
+    <li><b>A forgotten listener.</b> <code>process.on('SIGTERM', ...)</code> inside the request handler.</li>
+    <li><b>A closure holding a buffer.</b> Keep a callback that mentions one field of a large object.</li>
+  </ol>
+
+  <p><b>For each one, in this order:</b></p>
+  <pre><code>1. Snapshot before.
+2. Run 10,000 requests.
+3. Snapshot after.
+4. Compare, sort by #Delta, <b>write down the retainer path</b>.
+5. Fix it. Repeat 1–3 and prove the delta is gone.</code></pre>
+
+  <div class="trap">
+    <span class="label">A measurement trap I hit while writing this lesson</span>
+    My first version of the leak test reported <b>no growth at all</b> — 3.4 MB before and 3.4 MB after,
+    with 200,000 objects supposedly retained. Adding one line that read <code>store.length</code> made the
+    growth appear.
+    <p style="margin:.6rem 0 0;">I could not reproduce that effect reliably enough to explain it. So this lesson does not claim a mechanism. The lesson it <em>does</em> teach is the safe one:
+    <b>a single measurement that says &ldquo;no leak&rdquo; is not evidence.</b> Change one thing, measure
+    again, and be suspicious of a result that is exactly what you hoped for.</p>
+  </div>
+
+  <div class="tip">
+    <span class="label">What to hand in</span>
+    Three retainer paths, written out as sentences, and the before-and-after delta for each. The paths
+    matter more than the fixes — the fix is usually one line, and finding it is the whole job.
+  </div>
+
+  <div class="drill">
+    <span class="label">Scenario</span>
+    <p class="situation">RSS climbs about 40 MB an hour and never comes down. The service is restarted nightly, so nobody has ever seen it fail. A colleague suggests raising <code>--max-old-space-size</code> and moving on.</p>
+    Say what raising the limit actually buys, what one measurement would tell you whether this is a leak at all, and what you would do in the first ten minutes.
+  </div>
+
+  <div id="quiz1"></div>
+
+  <h2>Say it like an interviewer just asked</h2>
+  <div id="recall1"></div>
+
+  <div class="note">
+    <span class="label">What this lesson left out on purpose</span>
+    <b>How V8's collector works</b> — generational collection, scavenge against mark-compact — is genuinely
+    interesting and does not change what you do. <b><code>WeakMap</code> and <code>WeakRef</code></b> hold
+    references that do not keep an object alive, and are the right tool for a cache keyed by object; worth
+    reading about once the four shapes above are familiar. <b>Native memory leaks</b> in a C++ addon do not
+    appear in a heap snapshot at all, and need different tools.
+  </div>
+
+  <div class="note">
+    <span class="label">Read this next</span>
+    Primary sources: Node.js docs — <a href="https://nodejs.org/en/learn/diagnostics/memory">Memory diagnostics</a> and <a href="https://v8.dev/docs">V8 documentation</a>.
+  </div>
+
+  <div class="ask">
+    I'm your teacher — send me a retainer path you cannot read and I'll translate it into the line of code it is pointing at.
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>The collector asks <b>&ldquo;is this reachable?&rdquo;</b>, never &ldquo;is this needed?&rdquo;</li>
+      <li>A leak is memory <b>still reachable</b> that you no longer want. The collector is fine; your code is holding on.</li>
+      <li>Watch <code>used_heap_size</code>, not <code>rss</code>. RSS is noisy.</li>
+      <li>Rising memory is normal. <b>Rising and never returning across two collections</b> is the signal.</li>
+      <li>One snapshot shows what exists. <b>Two show what grew.</b> Sort the comparison by <code>#Delta</code>.</li>
+      <li>The <b>retainer path</b> is the only screen that matters. Read it backwards as a sentence.</li>
+      <li>Four shapes cover nearly all of them: growing collection, forgotten listener, fat closure, uncleared timer. Be suspicious of any measurement that says exactly what you hoped.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>you are not looking for a bug in the collector.</b> You are looking for the reference you forgot you were keeping.</p>
+  </div>
+
+  <p class="small" id="src"><b>Sources:</b> Node.js official documentation — "Memory diagnostics"; V8 documentation. The heap numbers came from running the code on <b>Node v24.14.0</b> on 2026-08-28. They are 3.4 MB before and 43.5 MB with 200,000 objects retained.</p>
+  <p class="small">Also snapshot files of 4.4 MB and 54.4 MB, and 3.4 MB again after release. They are measurements, not memories. Links checked 2026-08-28.</p>
+
+  <div class="footer-nav">
+    <a href="./0031-measure-first.html">← Lesson 31</a>
+    <a href="./0033-the-costs-you-can-actually-control.html">Next: Lesson 33 — The costs you can actually control →</a>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "How can a garbage-collected language leak memory at all?",
+      options: [
+        "The collector frees only unreachable objects, and yours are still reachable",
+        "The collector runs on a schedule, so it falls behind under sustained load",
+        "Objects above a certain size are never collected and must be freed by hand",
+        "Closures are exempt from collection, so anything captured is kept for ever"
+      ],
+      answer: 0,
+      why: "The collector asks whether an object can still be reached from a root, never whether you still want it. A leak is memory that is still reachable and no longer needed. The collector is working correctly; some reference in your code is holding on."
+    },
+    {
+      q: "Memory rises steadily all afternoon. What makes that a leak rather than normal behaviour?",
+      options: [
+        "It never comes back down after a collection, not merely that it went up",
+        "It rises faster than the request rate, which normal caching cannot explain",
+        "It crosses half of the configured maximum old space size for the process",
+        "It rises in RSS while the used heap size stays completely flat throughout"
+      ],
+      answer: 0,
+      why: "Rising memory is normal: caches fill, pools warm up, and the collector waits until running is worthwhile. The signal is memory that rises and does not return across two collections. Chasing the rise alone wastes a day tuning something that was working."
+    },
+    {
+      q: "In a heap snapshot, which view actually tells you what to change?",
+      options: [
+        "The retainer path, which names the chain of references keeping it alive",
+        "The shallow size column, which shows how much each object holds itself",
+        "The constructor list, which groups every object by the class that made it",
+        "The allocation timeline, which shows the moment each object was created"
+      ],
+      answer: 0,
+      why: "Anything can tell you memory is growing. Only the retainer path names which of your own references is keeping the object alive. Read it backwards and it becomes a sentence that points at one line of code. This is the part that cannot be automated."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “How do you find a memory leak in Node?”",
+      answer: "First I decide it <b>is</b> a leak. Rising memory is normal; the signal is memory that rises and never returns across two collections, and I watch <code>used_heap_size</code> rather than RSS because RSS is noisy. Then I take <b>two heap snapshots</b> — one before, one after doing the suspect work many times — and compare them, sorted by delta. The screen that matters is the <b>retainer path</b>, which names the chain of references keeping the objects alive. Read backwards it is a sentence, and that sentence points at one line. <br>Why: separating &ldquo;is it a leak&rdquo; from &ldquo;where is it&rdquo; is what makes this a method rather than a tool list."
+    },
+    {
+      prompt: "Interviewer: “Memory grows 40 MB an hour but a nightly restart hides it. Worth fixing?”",
+      answer: "Raising the limit or restarting buys time and answers nothing — it only changes how long until it fails, and it will fail at the worst moment when traffic grows. The measurement I want is whether the heap returns after a collection: if it does not, it is a leak. Then two snapshots and the retainer path tell me which reference to remove, and the fix is usually one line. Nearly all of these are one of four shapes: a growing collection, a listener never removed, a closure holding more than it uses, or a timer never cleared. <br>Why: naming what the restart actually buys, rather than just objecting to it, is the stronger answer."
+    },
+    {
+      prompt: "Interviewer: “What kinds of leak have you actually seen?”",
+      answer: "Four shapes cover nearly all of them. A <b>growing collection</b> — a <code>Map</code> used as a cache with no eviction. A <b>forgotten listener</b>, where something adds a handler per request and never removes it; Node's own MaxListeners warning fires on that one. A <b>closure holding too much</b>, because a closure captures the scope rather than the variables it mentions, so a small callback can keep a large buffer alive. And a <b>timer never cleared</b>. I confirm each one from the retainer path rather than by reading code. <br>Why: the closure case is the one that shows you have debugged a real leak, not read a list."
+    }
+  ]);
+</script>

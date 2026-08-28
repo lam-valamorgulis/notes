@@ -1,0 +1,552 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The full mock — four rounds — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 7 of 7 · Lesson 19 · The rehearsal</p>
+  <h1>The full mock — four rounds</h1>
+  <p class="subtitle">Nothing new today. Four rounds, a clock, and a score sheet. Everything out loud.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 7 of 7.</span> This lesson builds one domain-expert ability: <b>judge someone else's work in it, and say what is wrong and why</b>. Today the work you judge is your own. <a href="../reference/7-day-plan.html#d7">Day 7 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you have answered about fifty questions out loud, on a clock. You know your five worst answers by name. You have fixed those five and said them again.
+  </div>
+
+  <div class="note">
+    <span class="label">Today teaches nothing new</span>
+    Every idea in this mock is already in Days 1 to 6. If you meet something here you have never seen, that is a gap in the earlier days, not new material. Go back to that lesson, then return. <b>Do not learn anything new today.</b>
+  </div>
+
+  <h2>Start from the problem</h2>
+
+  <p>You can read every lesson in this sprint and still freeze in the room.</p>
+
+  <p>That is not a knowledge failure. Reading and speaking use different skills.</p>
+
+  <p>Reading is recognition. You see the answer and think "yes, I know that". Recognition feels like mastery and is not.</p>
+
+  <p>Speaking is retrieval. Nothing is on the page. You must pull the answer out of memory, in order, in English, while a stranger watches.</p>
+
+  <p>So the only honest test is a test that looks like the real thing. That means a clock, a score, and no notes.</p>
+
+  <div class="soundbite">
+    <span class="label">The rule for today</span>
+    <p><b>If you did not say it out loud, you did not practise it. Reading the answer again is the thing that feels like work and is not.</b></p>
+  </div>
+
+  <h2>Four rounds, and they are not worth the same</h2>
+
+  <p>Most candidates prepare as if every round scores equally. They do not.</p>
+
+  <p>The three technical rounds test things thousands of people can also do. Round 4 tests something only you can do.</p>
+
+  <p><b>Round 4 outweighs the three trivia rounds put together.</b> Say that to yourself before you start.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 290" role="img" aria-labelledby="fig19-title">
+      <title id="fig19-title">The four mock rounds, their length, and their real weight</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">TIME SPENT</text>
+
+      <rect x="20" y="28" width="240" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="30" y="46" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">1 · Live coding — 30 min</text>
+
+      <rect x="20" y="60" width="160" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="30" y="78" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">2 · Debugging — 20 min</text>
+
+      <rect x="20" y="92" width="200" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="30" y="110" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">3 · System design — 25 min</text>
+
+      <rect x="20" y="124" width="120" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="30" y="142" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">4 · Your service — 15 min</text>
+
+      <line x1="20" y1="164" x2="620" y2="164" style="stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 4 4;"></line>
+
+      <text x="20" y="188" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WEIGHT IN THE DECISION</text>
+
+      <rect x="20" y="198" width="90" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="30" y="216" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">1 · coding</text>
+
+      <rect x="116" y="198" width="90" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="126" y="216" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">2 · debug</text>
+
+      <rect x="212" y="198" width="90" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="222" y="216" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10.5px;">3 · design</text>
+
+      <rect x="308" y="198" width="312" height="26" rx="5" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2.5;"></rect>
+      <text x="318" y="216" style="fill: var(--accent-2); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">4 · the service you actually built</text>
+
+      <text x="320" y="252" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 11px;">Thousands of people can pass rounds 1 to 3. Nobody else can pass round 4.</text>
+      <text x="320" y="276" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Shortest round. Largest weight. Prepare it accordingly.</text>
+    </svg>
+    <figcaption>Time spent and weight carried are not the same shape. Round 4 is the one that decides.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Knowing an answer and saying an answer are two different skills. Only one of them is tested tomorrow.</p>
+    <p class="part cont">Today you practise the one that is tested. You say fifty answers out loud, mark each one, and repair the worst five.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A musician who has read the score is not ready for the concert. Reading the notes is not playing them.</p>
+    <p class="part cont">The last rehearsal is played at full speed, in the room, with mistakes left in. That is what today is.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A musician plays the same piece every night. You cannot know tomorrow's questions.</p>
+    <p class="part limit cont">So you are not rehearsing answers. You are rehearsing <b>the shape</b> of an answer. State the rule, name the trade-off, give a number, say what you would measure. That shape survives a question you have never seen. A memorised answer does not.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People re-read their weak answers instead of re-saying them. Re-reading feels productive and changes almost nothing.</p>
+    <p class="part cont">The gap only closes when the words leave your mouth. Fix five answers, then <b>say each one out loud again</b> before you stop.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why round 4 outweighs the technical rounds. Then say what you will do with your five worst answers. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. It is the last teach-back of the sprint.</p>
+    </div>
+  </div>
+
+  <h2>Round 1 · Live coding — 30 minutes</h2>
+
+  <p>Two tasks. Both are katas you have already run. This time you are marked on narration too.</p>
+
+  <div class="drill">
+    <span class="label">Task A · 15 minutes</span>
+    <p class="situation">"Fetch 500 URLs, ten at a time. Add a timeout and a retry."</p>
+    Empty file. Talk before you type. See <a href="0006-kata-02-500-urls-ten-at-a-time.html">Kata 2</a> for the reference solution and the talking script.
+  </div>
+
+  <div class="drill">
+    <span class="label">Task B · 15 minutes</span>
+    <p class="situation">"Count errors per hour in a log file that is far bigger than memory."</p>
+    Empty file. Say the memory claim before you write it. See <a href="0009-kata-03-errors-per-hour-in-a-50gb-log.html">Kata 3</a>.
+  </div>
+
+  <p>Then the follow-up questions. These are worth as much as the code.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Round 1 question</th><th>Mark</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Why bound the concurrency at all? What breaks without a limit?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>2</td><td>How did you pick ten? What would make you pick a different number?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>3</td><td>Why does your pool keep results in input order?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>4</td><td>What does <code>Promise.all</code> do with the losers when one rejects?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>5</td><td>When would you use <code>allSettled</code> instead?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>6</td><td>Which requests do you retry, and which do you never retry?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>7</td><td>Why add jitter to the backoff?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>8</td><td>How does your timeout actually stop the request on the wire?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>9</td><td>Why <code>readline</code> and not <code>split</code> on the whole file?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>10</td><td>What bounds the memory in your log counter? Not the file size — what?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>11</td><td>What happens at a chunk boundary in the middle of a line?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>12</td><td>What would you use in production instead of hand-writing the pool?</td><td>☐ ✓ ~ ✗</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — silent coding</span>
+    A candidate who thinks silently for ninety seconds and writes perfect code scores worse than one who thinks out loud and writes good code. <b>They cannot grade silence.</b> If you are stuck, say what you are stuck on. That sentence is worth more than the decision.
+  </div>
+
+  <h2>Round 2 · Debugging — 20 minutes</h2>
+
+  <p>Three scenarios. You are marked on <b>the order you check things in</b>, not on the answer.</p>
+
+  <p>Anyone can list possible causes. Only some people measure before they guess.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Round 2 question</th><th>Mark</th></tr></thead>
+    <tbody>
+      <tr><td>13</td><td>"The service stopped answering. CPU is at 40%." Where do you look first?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>14</td><td>What number would you collect before touching any code?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>15</td><td>How do you measure event loop delay in a running process?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>16</td><td>Name three ways one handler can hold the thread.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>17</td><td>Can a hang happen with no loop in the code at all?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>18</td><td>"Memory grows 40 MB an hour." Is that a leak? How do you decide?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>19</td><td>Which metric do you watch, and why not RSS?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>20</td><td>What do two heap snapshots give you that one does not?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>21</td><td>What is a retainer path, and how do you read it?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>22</td><td>Name the four shapes almost every Node leak takes.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>23</td><td>"We drop requests on every deploy." What is happening?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>24</td><td>Why is <code>process.exit()</code> the wrong tool for a shutdown?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>25</td><td>Why does <code>server.close()</code> alone take so long?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>26</td><td>What does <code>closeIdleConnections()</code> change, and by how much?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>27</td><td>What does registering <code>uncaughtException</code> do to the process?</td><td>☐ ✓ ~ ✗</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="tip">
+    <span class="label">The order that scores</span>
+    <b>1.</b> Say what symptom you would confirm first. <b>2.</b> Name the number you would collect. <b>3.</b> Say what that number would tell you either way. <b>4.</b> Only then name causes. Guessing a cause in sentence one loses the round even when the guess is right.
+  </div>
+
+  <h2>Round 3 · System design — 25 minutes</h2>
+
+  <p>One brief: <b>send one million notifications an hour</b>. You are marked on the questions you ask before you draw.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Round 3 question</th><th>Mark</th></tr></thead>
+    <tbody>
+      <tr><td>28</td><td>What do you ask before drawing anything?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>29</td><td>One million an hour — what is that per second, and is it flat?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>30</td><td>Is a notification allowed to arrive twice? What changes if not?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>31</td><td>Why does a queue belong here at all?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>32</td><td>What goes on the queue — the whole message, or an identifier?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>33</td><td>How many workers, and what decides that number?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>34</td><td>The provider rate-limits you. Where does the limit live?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>35</td><td>A job fails. What happens next, and how many times?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>36</td><td>What is a dead-letter queue for, and who reads it?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>37</td><td>Where does the database become the bottleneck?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>38</td><td>What do you cache, and how does that cache get wrong?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>39</td><td>Is any part of this CPU-bound? What would you do if it were?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>40</td><td>How do you know it is working? Name three things you would graph.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>41</td><td>The queue is growing faster than it drains. What do you do?</td><td>☐ ✓ ~ ✗</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Full working of this brief is in <a href="0018-system-design-one-million-notifications.html">Lesson 18</a>. Do not open it during the round.</p>
+
+  <h2>Round 4 · Tell me about something you built — 15 minutes</h2>
+
+  <p>Ninety seconds on the spine API. Then two levels of follow-up, which is where the round is really decided.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Round 4 question</th><th>Mark</th></tr></thead>
+    <tbody>
+      <tr><td>42</td><td>Tell me about something you built. Ninety seconds.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>43</td><td>Draw it. Client to storage, and label one arrow that fails.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>44</td><td>Why 302 and not 301 on the redirect?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>45</td><td>When is it a 400 and when is it a 409? Give me the test.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>46</td><td>Why does your error shape have a code as well as a message?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>47</td><td>Tell me about a bug you fixed. Symptom, measurement, mechanism, fix.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>48</td><td>Tell me a second one, in a different part of the system.</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>49</td><td>What would you change about it today, and why did you not then?</td><td>☐ ✓ ~ ✗</td></tr>
+      <tr><td>50</td><td>What part of it are you least happy with?</td><td>☐ ✓ ~ ✗</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Before round 4, say this to yourself</span>
+    <p><b>"This is the only material in the whole interview that nobody else in the queue has. I will not rush it, and I will give one real number."</b></p>
+  </div>
+
+  <h2>The score sheet, and what to do with it</h2>
+
+  <p>Mark every answer with one of three marks. Be honest. A generous mark today costs you tomorrow.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Mark</th><th>Means</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><b>✓</b></td><td>Clean. Arrived without hesitation.</td><td>Nothing. Leave it alone.</td></tr>
+      <tr><td><b>~</b></td><td>Got there, but slowly or in a mess.</td><td>Only fix it if it is in your worst five.</td></tr>
+      <tr><td><b>✗</b></td><td>Lost it. Guessed, or went silent.</td><td>Candidate for the worst five.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">After the mock · the only repair rule</span>
+    <p class="situation">Take your <b>five worst answers</b>. Only five, even if you marked eleven badly.</p>
+    Fix those five, then <b>say each one out loud again</b> before you stop. Trying to fix everything on the last day fixes nothing.
+    <ul>
+      <li>Write the five down, in order, worst first.</li>
+      <li>For each, find the one sentence you were missing.</li>
+      <li>Say the whole answer out loud, from the start, twice.</li>
+      <li>Do not re-read the lesson. Say the answer.</li>
+      <li>Then stop. Adding a sixth is how the first five get lost.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — skim only, tonight</span>
+    <a href="https://github.com/goldbergyoni/nodebestpractices">Node.js Best Practices</a>. <b>Read the headings only.</b> Not the bodies. Its job tonight is to make you notice a gap, not to teach you one.
+  </div>
+
+  <div class="tip">
+    <span class="label">The lessons behind each round</span>
+    Round 1 — <a href="0006-kata-02-500-urls-ten-at-a-time.html">Kata 2</a> and <a href="0009-kata-03-errors-per-hour-in-a-50gb-log.html">Kata 3</a> ·
+    Round 2 — <a href="0015-kata-04-the-service-that-hangs.html">Kata 4</a>, <a href="0013-graceful-shutdown.html">L13</a>, <a href="0014-operational-versus-programmer-errors.html">L14</a> ·
+    Round 3 — <a href="0017-the-data-layer.html">L17</a> and <a href="0018-system-design-one-million-notifications.html">L18</a> ·
+    Round 4 — <a href="0010-draw-your-service.html">L10</a>, <a href="0011-two-bugs-you-fixed.html">L11</a>, <a href="0012-the-ninety-second-story.html">L12</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>Reading is recognition. Speaking is retrieval. <b>Only retrieval is tested tomorrow.</b></li>
+      <li>Four rounds: live coding, debugging, system design, and the service you built.</li>
+      <li><b>Round 4 outweighs the other three together.</b> It is the shortest and the most valuable.</li>
+      <li>Round 2 is marked on the <b>order</b> you check things in, not on the cause you name.</li>
+      <li>Round 3 is marked on the questions you ask <b>before</b> you draw anything.</li>
+      <li>Mark every answer ✓ ~ ✗, honestly. A kind mark today is a loss tomorrow.</li>
+      <li>Fix your <b>five worst only</b>, then say each one out loud again, and stop.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>if you did not say it out loud, you did not practise it.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> every question in this mock is drawn from Days 1 to 6 of this sprint. Numbers referenced in the answers were measured on <b>Node v24.14.0</b>, 2026-08-28, and are stated in the lessons they come from. No new number is introduced here.</p>
+
+  <div class="ask">
+    Ready? Say <b>"run the full mock on me"</b> and you get all four rounds in interviewer voice, on a clock, with the score sheet at the end.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0018-system-design-one-million-notifications.html">← System design</a></span>
+    <span><a href="0020-when-you-do-not-know.html">Next: When you do not know →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why does round 4 outweigh the three technical rounds put together?",
+      options: [
+        "It is the only material nobody else can copy, and it proves the other rounds were real",
+        "It is the longest round, so it carries more marks than any of the shorter ones do",
+        "It is scored last, and interviewers weight the final answer they hear most heavily",
+        "It is the round where most candidates fail, so a pass there is rare and valuable"
+      ],
+      answer: 0,
+      why: "Thousands of people can bound concurrency and name the event loop phases. That material is public and everyone prepares it. Your own service is the only evidence that you have shipped something and lived with it. It also validates the other rounds: a candidate who can name a real bug with a mechanism and a number has clearly done the work the trivia only hints at. Length and position in the day change nothing."
+    },
+    {
+      q: "Round 2 is marked on the order you check things in. Why is the order the mark?",
+      options: [
+        "Anyone can list causes; the order shows whether you measure before you guess at all",
+        "A fixed order is faster, so you finish the round inside the twenty minutes given",
+        "The interviewer has a script, and matching its order shows you have read the docs",
+        "Order matters because each check breaks the service further if run out of sequence"
+      ],
+      answer: 0,
+      why: "A list of possible causes is cheap and everyone has one. What separates candidates is whether the first move is a measurement or a guess. Saying which number you would collect, and what that number would tell you either way, shows a method that works on a bug nobody has seen before. Speed is not the point, and there is no secret script to match."
+    },
+    {
+      q: "You finish the mock with eleven weak answers. What is the right next step?",
+      options: [
+        "Fix only the five worst, then say each one out loud again before you stop for today",
+        "Fix all eleven in writing tonight, then read the whole set back once before bed",
+        "Skip the fixes and re-run the full mock, since a second pass finds the same gaps",
+        "Rank all eleven by topic, then re-read the lesson behind each one in order"
+      ],
+      answer: 0,
+      why: "The day before an interview has room for a small number of real repairs. Trying to fix eleven means none of them get said out loud, and saying them is the part that transfers. Writing and re-reading feel productive but stay in recognition memory. Five, said twice each, is a load you can actually carry into the room tomorrow."
+    },
+    {
+      q: "During round 1 you get stuck choosing between two designs. What should you say?",
+      options: [
+        "Say which two you are choosing between, pick one, and give the reason in a sentence",
+        "Say nothing until you have decided, so the interviewer hears one clean answer only",
+        "Ask the interviewer which design they prefer, then build exactly what they named",
+        "Build both quickly, then compare them out loud and delete the weaker one at the end"
+      ],
+      answer: 0,
+      why: "Naming the choice out loud is worth more than the choice itself, because it shows the interviewer how you think. Silence gives them nothing to grade and reads as being stuck. Handing the decision back looks like you have no opinion. Building both burns the clock on a question that a single sentence would have settled."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Tell me about something you built.”",
+      answer: "I built and kept one service rather than many small ones — a link shortener I have hardened over months. It takes a long URL, stores it under a short code, and redirects. The hard constraint is that reads massively outnumber writes, so the redirect path has to stay cheap while the write path stays correct. I chose 302 rather than 301, because a 301 is cached by browsers and cannot be taken back. I own the error shape, the status codes, the shutdown path and the load numbers. The part I would change today is where the click count is written, because it started on the hot path. <br>Why: this round outweighs the technical rounds, because it is the only evidence nobody else in the queue can produce. They are listening for one specific decision with a reason, not a feature list."
+    },
+    {
+      prompt: "Interviewer: “The service stopped answering, and CPU is at 40%. Walk me through it.”",
+      answer: "That shape says the thread is held, not that the machine is out of capacity, so I separate waiting from thinking. Before naming a cause I would collect one number: event loop delay. A heartbeat timer, or monitorEventLoopDelay from perf_hooks. If the delay spikes, some handler is doing synchronous work on the one thread — a large JSON parse, a synchronous file read, a loop over a big array, a synchronous crypto call. If the delay is flat, the hang is somewhere else entirely, and I would look at a pool or a lock instead. Then I profile to find the exact function, rather than reading code and guessing. <br>Why: they are marking the order, not the answer. Naming the measurement before the cause is the whole point of the round."
+    },
+    {
+      prompt: "Interviewer: “How do you prepare for an interview like this?”",
+      answer: "I separate two things that feel the same and are not. Reading an answer is recognition, and it feels like mastery while changing very little. Saying an answer from memory is retrieval, and that is the skill actually tested in the room. So my last day is a full mock on a clock, out loud, with no notes — about fifty questions across live coding, debugging, system design and the project round. I mark each answer clean, slow, or lost. Then I take only my five worst and say each of those out loud again. I do not try to fix everything on the last day, because that fixes nothing. <br>Why: the honest answer here doubles as evidence. Someone who describes retrieval practice, and a limit on last-day repairs, sounds like someone who prepares deliberately for real work too."
+    }
+  ]);
+</script>

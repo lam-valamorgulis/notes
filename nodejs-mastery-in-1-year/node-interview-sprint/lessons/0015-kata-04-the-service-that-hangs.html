@@ -1,0 +1,556 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 4 — the service that hangs — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 5 of 7 · Lesson 15 · Kata · Spoken debugging</p>
+  <h1>Kata 4 — the service that hangs</h1>
+  <p class="subtitle">Ten minutes. No code to write. You debug out loud, and the order you check things in is the whole score.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 5 of 7.</span> This lesson builds one domain-expert ability: <b>debug a problem in it that has no ready answer online</b>. <a href="../reference/7-day-plan.html#d5">Day 5 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can take a vague production complaint and turn it into an ordered search. Out loud, in ten minutes, naming the number you would collect at every step.
+  </div>
+
+  <div class="note">
+    <span class="label">A kata is a performance, not an exam</span>
+    Debugging out loud is a <b>performance skill</b>, not a knowledge skill. You already know the causes from <a href="0013-graceful-shutdown.html">Lesson 13</a> and <a href="0014-operational-versus-programmer-errors.html">Lesson 14</a>. What you are training here is doing it while a stranger watches and says nothing helpful. So <b>run this kata twice</b>. The first run finds the gaps. <b>The second run is the one that tells the truth.</b>
+  </div>
+
+  <h2>The brief, exactly as they will give it</h2>
+
+  <div class="drill">
+    <span class="label">The task · 10 minutes on the clock</span>
+    <p class="situation">"Our Node service stops answering under load. CPU is not pegged. Find the cause, out loud."</p>
+    That is all they say. They will not add facts unless you ask for them. Every question you ask is part of the score.
+  </div>
+
+  <p><b>Set a timer for ten minutes now.</b> Talk the whole time. Do not scroll past this line until it rings.</p>
+
+  <h2>The one thing they are grading</h2>
+
+  <p>They are not grading whether you guess the cause. They are grading your <b>search order</b>.</p>
+
+  <p>A good search order removes half the possibilities with each answer. A guess removes none.</p>
+
+  <div class="soundbite">
+    <span class="label">The sentence that scores highest</span>
+    <p><b>"Before I guess a cause, here is the first number I would collect. And here is what each answer rules out."</b></p>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — "CPU is not pegged, so it is not CPU"</span>
+    This is the trap hidden inside the brief. A blocked event loop is <b>one thread</b>. On an eight-core machine, one fully busy thread is about <b>one eighth</b> of total CPU — near 12%, which looks idle on a dashboard. That is arithmetic, not a measurement. So "CPU is low" does <b>not</b> rule out a blocked loop. It is the first thing you must say out loud.
+  </div>
+
+  <h2>The talking script — what to say, in order</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Step</th><th>Say this out loud</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 · Define "hangs"</b></td><td>"Are requests slow, or do they never answer? Does the health check still pass?"</td></tr>
+      <tr><td><b>2 · Kill the trap</b></td><td>"Low CPU does not rule out a blocked loop. One busy thread on eight cores looks like 12%."</td></tr>
+      <tr><td><b>3 · Name the first number</b></td><td>"So my first measurement is event loop delay, not a profile and not a log."</td></tr>
+      <tr><td><b>4 · Branch</b></td><td>"If the delay is high, it is blocked. If it is flat, the loop is fine and I am waiting on something."</td></tr>
+      <tr><td><b>5 · Go one level</b></td><td>"Blocked, so now I profile and sort by self time." Or: "Not blocked, so I count in-flight work."</td></tr>
+      <tr><td><b>6 · Say the guard</b></td><td>"Then I add the measurement to the service, so nobody has to guess next time."</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>The decision tree, worked</h2>
+
+  <h3>Branch A — is the event loop blocked?</h3>
+
+  <p>This is always the first question. One number answers it.</p>
+
+  <p>The cheapest version is a heartbeat. A timer that reports how late it fired.</p>
+
+  <pre><code>const EVERY = 50;
+let last = Date.now();
+
+setInterval(() =&gt; {
+  const now = Date.now();
+  const late = now - last - EVERY;     <span class="cmt">// how much later than promised</span>
+  last = now;
+  if (late &gt; 20) console.log('heartbeat late by', late, 'ms');
+}, EVERY).unref();                     <span class="cmt">// unref, so it never holds the process open</span></code></pre>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    In the parent course, that 50 ms heartbeat ran <b>3 ms late</b> under heavy I/O and <b>155 ms late</b> under a single CPU burst. Re-run while writing this lesson against a 200 ms synchronous burst, it printed <b>late by 193 ms</b>, on all three runs.
+  </div>
+
+  <p>Those two numbers are the whole branch. <b>3 ms means not blocked. 155 ms means blocked.</b></p>
+
+  <p>The built-in version is better in production, because it keeps a histogram.</p>
+
+  <pre><code>const { monitorEventLoopDelay } = require('node:perf_hooks');
+
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+
+<span class="cmt">// read it whenever you like — these are nanoseconds</span>
+console.log('max', Math.round(h.max / 1e6), 'ms', ' mean', Math.round(h.mean / 1e6), 'ms');</code></pre>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    With <code>resolution: 20</code>, an idle loop reported a <code>max</code> of <b>21 to 27 ms</b> across three runs. After one 300 ms synchronous burst the same <code>max</code> read <b>308 to 318 ms</b>.
+  </div>
+
+  <div class="note">
+    <span class="label">Say this honestly, it earns points</span>
+    The idle reading is not zero. With <code>resolution: 20</code> the floor is about 20 ms, because that is how often it samples. So you compare against <b>your own baseline</b>, never against zero. Saying that out loud shows you have actually read the number, not just the API name.
+  </div>
+
+  <h3>Branch B — blocked. Which function?</h3>
+
+  <p>Now, and only now, profile. Run under <code>--cpu-prof</code> while the load is on.</p>
+
+  <p>Sort by <b>self</b> time, not total time. Total time is sorted by the call stack.</p>
+
+  <p>The top of a total-time list is always <code>main</code>. It is 100% of the time and 0% of the problem.</p>
+
+  <p>Self time names code you can actually change. The usual suspects are worth naming out loud.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Blocking cause</th><th>How it hides</th></tr></thead>
+    <tbody>
+      <tr><td><code>JSON.parse</code> on a large body</td><td>Fast in testing, slow on the one big payload in production.</td></tr>
+      <tr><td>A synchronous <code>fs</code> call</td><td><code>readFileSync</code> in a hot path, usually loading config per request.</td></tr>
+      <tr><td>A loop over a large array</td><td>Fine at 100 rows. Not fine at 100,000.</td></tr>
+      <tr><td>Synchronous crypto or compression</td><td>Looks like a library call, runs on your one thread.</td></tr>
+      <tr><td>A huge regular expression</td><td>Catastrophic backtracking on one unusual input.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Branch C — not blocked. What are we waiting on?</h3>
+
+  <p>The loop is idle and requests still do not finish. So you are waiting, and something is full.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Resource cause</th><th>The number that proves it</th></tr></thead>
+    <tbody>
+      <tr><td><b>Exhausted connection pool</b></td><td>Pool waiting count above zero. Every request queues for a free connection.</td></tr>
+      <tr><td><b>Unbounded <code>Promise.all</code></b></td><td>In-flight request count equals the whole input list. The upstream throttles you.</td></tr>
+      <tr><td><b>No socket timeout</b></td><td>Open sockets grow and never fall. One dead upstream holds them forever.</td></tr>
+      <tr><td><b><code>process.nextTick</code> loop</b></td><td>Loop delay is high but the CPU profile is nearly empty. Phases never run.</td></tr>
+      <tr><td><b>Downstream is simply slow</b></td><td>Your latency matches theirs. Not your bug, and say so plainly.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">The one that fits both branches</span>
+    A <code>process.nextTick</code> callback that queues another <code>nextTick</code> starves the loop with almost no CPU work. Loop delay is high, and the profile shows nothing worth optimising. If those two numbers disagree, say that out loud — it is the strongest single observation in this kata.
+  </div>
+
+  <h3>Branch D — is it memory?</h3>
+
+  <p>If the hang gets worse over hours and a restart fixes it, suspect memory.</p>
+
+  <p>Watch <code>used_heap_size</code>, not <code>rss</code>. The signal is memory that never returns across two collections.</p>
+
+  <p>Then two heap snapshots, sorted by delta, and read the <b>retainer path</b> backwards.</p>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    Heap used went from <b>3.4 MB</b> to <b>43.5 MB</b> with 200,000 objects retained. It returned to <b>3.4 MB</b> once the reference was released. That return is what proves it was a held reference.
+  </div>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 350" role="img" aria-labelledby="fig15-title">
+      <title id="fig15-title">The debugging decision tree, starting from one measurement</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">START WITH ONE NUMBER, NOT WITH A GUESS</text>
+
+      <rect x="160" y="30" width="320" height="30" rx="7" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="50" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">measure event loop delay</text>
+
+      <line x1="250" y1="60" x2="150" y2="86" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="390" y1="60" x2="490" y2="86" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <text x="160" y="80" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">155 ms — BLOCKED</text>
+      <text x="420" y="80" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">3 ms — NOT BLOCKED</text>
+
+      <rect x="20" y="90" width="280" height="30" rx="7" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="160" y="110" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11px; font-weight: 700;">B · profile, sort by SELF time</text>
+
+      <rect x="20" y="126" width="280" height="76" rx="7" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="34" y="145" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">JSON.parse on a large body</text>
+      <text x="34" y="161" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">a synchronous fs call in a hot path</text>
+      <text x="34" y="177" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">a loop over a very large array</text>
+      <text x="34" y="193" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">sync crypto, or a slow regexp</text>
+
+      <rect x="340" y="90" width="280" height="30" rx="7" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="480" y="110" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11px; font-weight: 700;">C · count what is in flight</text>
+
+      <rect x="340" y="126" width="280" height="76" rx="7" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="354" y="145" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">pool waiting count above zero</text>
+      <text x="354" y="161" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">unbounded Promise.all over a list</text>
+      <text x="354" y="177" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">sockets with no timeout, growing</text>
+      <text x="354" y="193" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">the downstream is simply slow</text>
+
+      <rect x="160" y="222" width="320" height="30" rx="7" style="fill: var(--card-bg); stroke: var(--accent-2); stroke-width: 2;"></rect>
+      <text x="320" y="242" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-weight: 700;">D · worse over hours? two heap snapshots</text>
+      <text x="320" y="268" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">3.4 MB to 43.5 MB, then back — read the retainer path backwards</text>
+
+      <rect x="20" y="286" width="600" height="30" rx="7" style="fill: var(--paper); stroke: var(--warn); stroke-width: 2; stroke-dasharray: 4 4;"></rect>
+      <text x="320" y="306" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 10.5px; font-weight: 700;">high loop delay + an empty profile = a nextTick loop starving the phases</text>
+
+      <text x="320" y="338" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Each answer removes half the tree. A guess removes nothing.</text>
+    </svg>
+    <figcaption>One measurement first. The branch you take is decided by a number, never by a hunch.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      A hang has only a few possible causes. So do not guess which one it is.</p>
+    <p class="part cont">Ask questions in an order where every answer throws away half the list. Four questions is enough to reach one cause.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A doctor does not guess the illness from the door. They take a temperature first.</p>
+    <p class="part cont">One cheap number splits the possibilities in two. Then the next test splits what is left.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      A doctor's tests are slow and expensive, so they must ration them. Yours take seconds and cost nothing.</p>
+    <p class="part limit cont">And the doctor has a patient who can describe the symptom. A hung process tells you nothing at all. Every fact you get, you have to go and measure. So there is no excuse for guessing first.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People hear "CPU is not pegged" and delete the whole blocked-loop branch. That is the trap in the brief.</p>
+    <p class="part cont">A blocked loop is one thread. On eight cores that is about 12% of total CPU, which looks idle. Low CPU rules out nothing.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say which number you collect first and why. Then say what a high reading rules out. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>What they ask next</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Follow-up</th><th>The short answer</th></tr></thead>
+    <tbody>
+      <tr><td>"Loop delay is flat. Now what?"</td><td>Then I am waiting, not computing. I count in-flight requests and pool waiters.</td></tr>
+      <tr><td>"Delay is high, profile is empty."</td><td>A <code>nextTick</code> or microtask loop. It starves phases without burning CPU.</td></tr>
+      <tr><td>"Can you measure this in production?"</td><td>Yes. <code>monitorEventLoopDelay</code> is cheap and safe to leave on.</td></tr>
+      <tr><td>"Why self time, not total time?"</td><td>Total time is sorted by the stack, so <code>main</code> is always first and always useless.</td></tr>
+      <tr><td>"How do you stop it happening again?"</td><td>Export loop delay as a metric, and alert on it. Guessing is now unnecessary.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — jumping to a fix</span>
+    "It is probably a slow query, I would add an index" sounds decisive and scores badly. It names a fix for a cause nobody has shown. <b>Naming the number you would collect first is worth more than naming a fix.</b> If you truly must guess, say "my guess is X, and here is the measurement that would prove me wrong".
+  </div>
+
+  <h2>Score yourself</h2>
+
+  <div class="drill">
+    <span class="label">Run it twice today</span>
+    <p class="situation">Run 1: ten minutes, out loud, talking through the whole tree. Run 2, later in the day: no notes, no scrolling back.</p>
+    Tick honestly. Anything unticked after run 2 is tomorrow's warm-up.
+    <ul>
+      <li>I asked what "hangs" means before saying anything else.</li>
+      <li>I said low CPU does not rule out a blocked loop, and gave the arithmetic.</li>
+      <li>I named <b>event loop delay</b> as the first measurement.</li>
+      <li>I said what a high reading and a flat reading each rule out.</li>
+      <li>On the blocked branch I said <b>self time</b>, not total time.</li>
+      <li>On the waiting branch I named the pool, the unbounded <code>Promise.all</code> and missing timeouts.</li>
+      <li>I named the case where delay is high and the profile is empty.</li>
+      <li>I never went silent for more than about ten seconds.</li>
+      <li>I finished with the guard: export the metric, and alert on it.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/api/perf_hooks.html">Node — <code>perf_hooks</code></a>, the <code>monitorEventLoopDelay</code> section only. Then <a href="https://nodejs.org/en/learn/getting-started/profiling">Profiling</a>. Thirty minutes.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0031-measure-first.html">Week 31 · Measure first</a> ·
+    <a href="../../lessons/0022-cpu-bound-versus-io-bound.html">Week 22 · CPU-bound versus I/O-bound</a> ·
+    <a href="../../lessons/0032-memory-and-heap-snapshots.html">Week 32 · Memory and heap snapshots</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>They grade your <b>search order</b>, not your guess. Each answer must remove half the tree.</li>
+      <li>First measurement is always <b>event loop delay</b>. Measured: <b>3 ms</b> under I/O, <b>155 ms</b> under a CPU burst.</li>
+      <li>"CPU is not pegged" rules out nothing. One blocked thread on eight cores is about <b>12%</b>.</li>
+      <li>Blocked → profile with <code>--cpu-prof</code> and sort by <b>self</b> time. Total time always names <code>main</code>.</li>
+      <li>Not blocked → count what is in flight. Pool waiters, unbounded <code>Promise.all</code>, sockets with no timeout.</li>
+      <li>High delay with an <b>empty profile</b> means a <code>process.nextTick</code> loop starving the phases.</li>
+      <li>Finish with the guard: export loop delay as a metric, so nobody guesses next time.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>naming the number you would collect first beats naming a fix.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — <code>perf_hooks</code> and "Profiling". The heartbeat and heap numbers were measured in the parent course. Node v24.14.0, 2026-08-28.</p>
+  <p class="small">The heartbeat re-run and the <code>monitorEventLoopDelay</code> readings were measured while writing this lesson. Same version, same date. The 12% figure is arithmetic for one thread on eight cores, not a measurement. Links checked 2026-08-28.</p>
+
+  <div class="ask">
+    Ready to be graded? Say <b>"run kata 4 on me"</b> and you get a fresh hang, a clock, and follow-ups in interviewer voice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0014-operational-versus-programmer-errors.html">← Operational versus programmer errors</a></span>
+    <span><a href="0016-worker-threads-versus-cluster.html">Next: Day 6 — worker threads versus cluster →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "The brief says CPU is not pegged. What does that fact actually rule out?",
+      options: [
+        "Almost nothing, because one blocked thread on eight cores is only about twelve percent",
+        "A blocked event loop, since blocking work always shows as a fully saturated processor",
+        "A memory leak, because collection pauses would push processor usage close to its limit",
+        "An exhausted connection pool, since queued requests still consume processor time waiting"
+      ],
+      answer: 0,
+      why: "This is the trap hidden in the brief. Your JavaScript runs on one thread, so a fully blocked loop saturates one core and nothing else. On an eight core machine that is roughly one eighth of the total, which reads as idle on a dashboard. So low CPU is not evidence against a blocked loop, and saying that out loud is the first point in this kata. It is arithmetic rather than a measurement, and worth labelling as such."
+    },
+    {
+      q: "Event loop delay is high, but the CPU profile shows almost no self time anywhere. What fits?",
+      options: [
+        "A process.nextTick callback that queues another one, starving the phases with little work",
+        "A very large JSON.parse call, whose cost the sampling profiler is too coarse to capture",
+        "A database query that is slow, which holds the loop while it waits for the row to return",
+        "An unbounded Promise.all, whose pending callbacks block the loop until they all resolve"
+      ],
+      answer: 0,
+      why: "The nextTick queue is drained completely before the loop may advance a phase, so a callback that refills it stops all I/O with almost no CPU cost. That is exactly the pattern of high delay plus an empty profile. A large JSON.parse would appear clearly in self time. A slow query does not hold the loop at all, since waiting is handed away. Pending promises do not block either; they simply have not resolved yet."
+    },
+    {
+      q: "Why sort a CPU profile by self time rather than by total time?",
+      options: [
+        "Total time follows the call stack, so the top entry is always main and never actionable",
+        "Self time is measured with a finer sampling rate, which makes its percentages far more exact",
+        "Total time excludes any function that was inlined by the engine during its optimisation",
+        "Self time counts every call to a function, while total time counts only the first one"
+      ],
+      answer: 0,
+      why: "Total time attributes everything inside a call to the caller, so main sits at the top holding 100% of the time and 0% of the problem. Self time counts only the samples where that function itself was on top of the stack, which names code you can actually change. Both columns come from the same samples at the same rate, so accuracy is not the difference. Inlining and call counts are unrelated to the choice."
+    },
+    {
+      q: "Loop delay is flat under load, and requests still time out. Where do you look next?",
+      options: [
+        "At what is in flight — pool waiters, unbounded fan-out, and sockets that have no timeout",
+        "At the CPU profile, sorted by self time, to find the function that is holding the thread",
+        "At the heap snapshots, comparing them by delta to find the objects that keep growing",
+        "At the garbage collector logs, to see whether long pauses are delaying the loop between ticks"
+      ],
+      answer: 0,
+      why: "A flat delay says the loop is free, so nothing of yours is holding the thread. That means you are waiting, and something you depend on is full or slow. The three usual answers are a connection pool with waiters queued, an unbounded Promise.all that saturates an upstream, and sockets with no timeout that pile up behind one dead dependency. Profiling and heap work are the branches you take when the delay is high or the problem grows over hours."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Our Node service stops answering under load. CPU is not pegged. Go.”",
+      answer: "First I would pin down what hangs means. Are requests slow, or do they never answer, and does the health check still pass? Then I would say something that sounds like a correction: low CPU does not rule out a blocked event loop. My JavaScript runs on one thread, so on eight cores a fully blocked loop is about twelve percent of total CPU and looks idle. So my first measurement is event loop delay, not a profile and not a log search. I would use monitorEventLoopDelay from perf_hooks, or a heartbeat timer. That one number splits the whole problem: high delay means something is holding the thread, flat delay means I am waiting on something outside. <br>Why: they are grading the search order. The candidate who names the first measurement, and says what each answer rules out, beats the one who names a plausible cause."
+    },
+    {
+      prompt: "Interviewer: “The delay is high. What next, and what if the profile is empty?”",
+      answer: "High delay means something holds the thread, so I profile under load with --cpu-prof and sort by self time, not total time. Total time follows the call stack, so its top entry is always main, which is 100% of the time and 0% of the problem. Self time names code I can change. The usual causes are a large JSON.parse, a synchronous fs call in a hot path, a loop over a very large array, synchronous crypto, or a regular expression backtracking on one odd input. If the delay is high and the profile is nearly empty, that disagreement is itself the answer: it points at a process.nextTick callback that queues another nextTick, or a microtask loop. Those starve the phases with almost no CPU work, so no function looks expensive. <br>Why: the empty-profile case is the one that separates people who have profiled a real service from people who have read about profiling."
+    },
+    {
+      prompt: "Interviewer: “How would you stop this happening again?”",
+      answer: "I would leave the measurement in the service rather than reaching for it during an incident. monitorEventLoopDelay is cheap and safe to keep enabled, so I export its max and mean as metrics and alert on them. I would do the same for in-flight request count and connection pool waiters, because those are the two numbers that answer the other branch. One honest detail: the idle reading is not zero. With a resolution of 20 ms I measured an idle max of 21 to 27 ms, and 308 to 318 ms after a 300 ms burst. So the alert compares against our own baseline, never against zero. The point is that next time nobody has to guess, because the number that splits the tree is already on a dashboard. <br>Why: ending with the guard, not the fix, is what makes it sound like production experience rather than a debugging story."
+    }
+  ]);
+</script>

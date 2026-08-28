@@ -1,0 +1,557 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kata 2 — 500 URLs, 10 at a time — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 2 of 7 · Lesson 6 · Kata · Live coding</p>
+  <h1>Kata 2 — 500 URLs, 10 at a time</h1>
+  <p class="subtitle">Fifteen minutes. An empty file. No library, no notes, no copy and paste. Talk the whole time.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 2 of 7.</span> This lesson builds one domain-expert ability: <b>say why it was built this way, and what that choice gives up</b>. <a href="../reference/7-day-plan.html#d2">Day 2 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can write a bounded worker pool from an empty file in fifteen minutes. It has a limit, a timeout and a retry. You can defend every number you chose, and you say what each one gives up.
+  </div>
+
+  <div class="note">
+    <span class="label">A kata is a performance, not an exam</span>
+    Live coding is a <b>performance skill</b>, not a knowledge skill. You already know the idea from <a href="0005-async-errors-and-the-combinators.html">Lesson 5</a>. What you train here is producing it while a stranger watches and the clock runs. So <b>run every kata twice</b>. The first run finds the gaps. <b>The second run is the one that tells the truth.</b>
+  </div>
+
+  <h2>The brief, exactly as they will give it</h2>
+
+  <div class="drill">
+    <span class="label">The task · 15 minutes on the clock</span>
+    <p class="situation">"You have a list of 500 URLs. Fetch them all, but never more than 10 at a time. Handle failures sensibly."</p>
+    That is all they say. The limit is given. Everything else — the timeout, the retry policy, the shape of the result — is a decision they are watching you make.
+  </div>
+
+  <p><b>Set a timer for fifteen minutes now.</b> Open an empty file. Do not scroll past this line.</p>
+
+  <h2>Before you type: sixty seconds of talking</h2>
+
+  <p>This part is worth more than the code. Candidates skip it and lose the round.</p>
+
+  <div class="soundbite">
+    <span class="label">The opening — say it before your first keystroke</span>
+    <p><b>"Let me state my assumptions. I will write a pool of ten workers pulling from one shared list. Not batches of ten. I will keep results in input order."</b></p>
+    <p><b>"Each request gets a timeout. I retry only on network errors and 5xx, never on 4xx. And I return a result per URL rather than throwing. One bad URL must not lose the other 499. Is that the scope you want?"</b></p>
+  </div>
+
+  <p>You have now named the three real decisions before writing a line. If they only want the pool, they will now say so.</p>
+
+  <h2>Batches or a pool? Say why you chose</h2>
+
+  <p>Most candidates write batches. It is the obvious idea, and it is worse.</p>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 280" role="img" aria-labelledby="fig6-title">
+      <title id="fig6-title">Fixed batches leave workers idle, while a pool keeps all ten busy</title>
+
+      <text x="20" y="18" style="fill: var(--warn); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">BATCHES OF TEN · everyone waits for the slowest</text>
+
+      <rect x="20" y="30" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="65" y="44" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 1 · fast</text>
+      <rect x="20" y="54" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--rule); stroke-width: 1.5;"></rect>
+      <text x="65" y="68" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 2 · fast</text>
+      <rect x="20" y="78" width="300" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="170" y="92" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px;">url 3 · slow</text>
+
+      <rect x="110" y="30" width="210" height="44" rx="4" style="fill: var(--paper); stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3;"></rect>
+      <text x="215" y="57" text-anchor="middle" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">idle — nothing may start yet</text>
+
+      <line x1="322" y1="26" x2="322" y2="104" style="stroke: var(--warn); stroke-width: 2; stroke-dasharray: 4 3;"></line>
+      <text x="332" y="112" style="fill: var(--warn); font-family: sans-serif; font-size: 9.5px;">only now does batch 2 begin</text>
+
+      <line x1="20" y1="128" x2="620" y2="128" style="stroke: var(--rule); stroke-width: 1.5;"></line>
+
+      <text x="20" y="154" style="fill: var(--accent); font-family: sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1px;">POOL OF TEN · a free worker takes the next url</text>
+
+      <rect x="20" y="166" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="65" y="180" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 1 · fast</text>
+      <rect x="114" y="166" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="159" y="180" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 11 · next</text>
+      <rect x="208" y="166" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="253" y="180" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 19 · next</text>
+
+      <rect x="20" y="190" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="65" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 2 · fast</text>
+      <rect x="114" y="190" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="159" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 12 · next</text>
+      <rect x="208" y="190" width="90" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 1.5;"></rect>
+      <text x="253" y="204" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9px;">url 23 · next</text>
+
+      <rect x="20" y="214" width="300" height="20" rx="4" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 1.5;"></rect>
+      <text x="170" y="228" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 9px;">url 3 · slow — but it blocks only its own worker</text>
+
+      <text x="332" y="204" style="fill: var(--accent); font-family: sans-serif; font-size: 9.5px;">ten always busy</text>
+
+      <text x="320" y="266" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">Same limit of ten. The pool never leaves a worker idle waiting for a slow neighbour.</text>
+    </svg>
+    <figcaption>Batches synchronise on the slowest item in each group. A pool does not, so it finishes sooner with the same limit.</figcaption>
+  </figure>
+
+  <p>Say that difference out loud. It is the single best sentence in this kata.</p>
+
+  <h2>The talking script — what to say while you type</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Minute</th><th>Say this out loud</th></tr></thead>
+    <tbody>
+      <tr><td><b>0–1</b></td><td>"Assumptions first: a pool not batches, results in order, a timeout, retry only on 5xx."</td></tr>
+      <tr><td><b>1–5</b></td><td>"I will write the pool alone first, with a fake worker, so the concurrency is testable."</td></tr>
+      <tr><td><b>5–9</b></td><td>"Now the fetch. <code>AbortSignal.timeout</code> gives me a real timeout, not a race."</td></tr>
+      <tr><td><b>9–13</b></td><td>"Retry with backoff, plus jitter, so 500 clients do not all retry in the same millisecond."</td></tr>
+      <tr><td><b>13–15</b></td><td>"In production I would use <code>p-limit</code> and <code>undici</code>. I wrote it by hand to show the mechanism."</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Step 1 — the pool, on its own</h2>
+
+  <p>Write this first, with nothing else. It is the part they are really grading.</p>
+
+  <pre><code>async function mapWithLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;                                  <span class="cmt">// the shared cursor</span>
+
+  async function runOne() {
+    while (next &lt; items.length) {
+      const i = next++;                          <span class="cmt">// claim an index, then release</span>
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, runOne);
+  await Promise.all(runners);
+  return results;
+}</code></pre>
+
+  <p>Three things to say about it while you type. Each is one sentence.</p>
+
+  <ul>
+    <li><b><code>next++</code> is safe.</b> One thread runs this, so no two workers can claim the same index.</li>
+    <li><b>Order is kept.</b> Results go to <code>results[i]</code>, not to a <code>push</code>.</li>
+    <li><b><code>Math.min</code> matters.</b> Ten workers over three items would leave seven doing nothing.</li>
+  </ul>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    Over 500 items with a limit of 10, peak concurrency was exactly <b>10</b>, and all 500 results came back in input order. The same 500 items through <code>Promise.all</code> peaked at <b>500</b>.
+  </div>
+
+  <h2>Step 2 — the timeout, and why a race is not one</h2>
+
+  <p>The obvious idea is <code>Promise.race</code> against a timer. Do not do it, and say why.</p>
+
+  <p>A race decides when <em>you</em> stop waiting. The request is still open, still holding a socket.</p>
+
+  <p>With 500 URLs that leaks connections until the process dies. A real timeout must abort the request.</p>
+
+  <pre><code>const res = await fetch(url, { signal: AbortSignal.timeout(300) });</code></pre>
+
+  <p>That closes the socket. The rejection arrives with <code>err.name === 'TimeoutError'</code>, which you can tell apart from your own <code>AbortError</code>.</p>
+
+  <h2>Step 3 — the retry, and the two rules</h2>
+
+  <pre><code>const sleep = (ms) =&gt; new Promise(r =&gt; setTimeout(r, ms));
+
+async function fetchWithRetry(url, { retries = 3, timeoutMs = 300 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+
+      if (res.status &gt;= 400 &amp;&amp; res.status &lt; 500) {
+        return { url, ok: false, status: res.status };   <span class="cmt">// never retry a 4xx</span>
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status); <span class="cmt">// 5xx → retry</span>
+      return { url, ok: true, body: await res.text() };
+
+    } catch (err) {
+      if (attempt &gt;= retries) return { url, ok: false, error: err.name };
+      const backoff = 50 * 2 ** attempt;                 <span class="cmt">// 50, 100, 200 ms</span>
+      await sleep(backoff + Math.random() * backoff);    <span class="cmt">// jitter</span>
+    }
+  }
+}</code></pre>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Rule</th><th>Say this</th></tr></thead>
+    <tbody>
+      <tr><td><b>Never retry a 4xx</b></td><td>The request is wrong. Sending it again cannot change the answer.</td></tr>
+      <tr><td><b>Only retry safe methods</b></td><td>A retried <code>POST</code> can charge a card twice. <code>GET</code> is safe.</td></tr>
+      <tr><td><b>Backoff</b></td><td>A failing service needs room to recover. Doubling gives it room.</td></tr>
+      <tr><td><b>Jitter</b></td><td>Without it, 500 clients retry in the same millisecond and fail together.</td></tr>
+      <tr><td><b>Return, do not throw</b></td><td>One dead URL must not lose the other 499 results.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Putting it together, and the measured result</h2>
+
+  <pre><code>const out = await mapWithLimit(urls, 10, (url) =&gt; fetchWithRetry(url));
+
+console.log('ok    :', out.filter(r =&gt; r.ok).length);
+console.log('failed:', out.filter(r =&gt; !r.ok).length);</code></pre>
+
+  <p>This was run against a local server built to misbehave. One URL never answered, one returned 404, and every seventh request returned 503.</p>
+
+  <pre><code><span class="out">results        : 500
+peak concurrent: 10
+ok             : 498
+failed         : 2
+the 404        : {"ok":false,"status":404}
+the timeout    : {"ok":false,"error":"TimeoutError"}</span></code></pre>
+
+  <p>The 404 was not retried. The 503s were retried and then succeeded. The dead URL gave up after three tries.</p>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      You have 500 jobs and you want ten happening at once. Do not cut the list into groups of ten.</p>
+    <p class="part cont">Instead hire ten workers and give them one shared list. Each worker takes the next job whenever it is free.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      Ten checkouts in a supermarket, with one queue feeding all of them. When a till frees up, the next person goes there.</p>
+    <p class="part cont">The alternative is a separate queue per till. Then one slow customer holds up nine people who could have been served.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      Supermarket tills are real, separate people. Your ten workers are not parallel at all.</p>
+    <p class="part limit cont">They are ten <code>async</code> functions on <b>one</b> thread. The overlap is in the waiting, never in the running. If the worker did heavy CPU work instead of a fetch, the pool would buy you nothing.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People worry that <code>next++</code> needs a lock. It does not, and saying why earns you a point.</p>
+    <p class="part cont">One thread runs your JavaScript, and <code>next++</code> has no <code>await</code> in the middle. So nothing can interleave between reading and writing. In a threaded language this exact line would need a lock.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say why a pool beats fixed batches. Then say why the pool cannot help CPU-heavy work. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. It is the answer to the follow-up, and the follow-up is where the round is decided.</p>
+    </div>
+  </div>
+
+  <h2>What they will ask next</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Follow-up</th><th>The short answer</th></tr></thead>
+    <tbody>
+      <tr><td>"Why not batches of ten?"</td><td>Batches wait for the slowest in each group. A pool never leaves a worker idle.</td></tr>
+      <tr><td>"Why not <code>Promise.race</code> for the timeout?"</td><td>A race stops me waiting. It does not close the socket. That leaks connections.</td></tr>
+      <tr><td>"Why jitter?"</td><td>Without it, every client retries at the same instant and knocks the service over again.</td></tr>
+      <tr><td>"Would you use a library?"</td><td>Yes, <code>p-limit</code>, and <code>undici</code> for connection reuse. I wrote it by hand to show the mechanism.</td></tr>
+      <tr><td>"How do you pick ten?"</td><td>From the other service's limit, not from a feeling. I would measure and tune it.</td></tr>
+      <tr><td>"What if the list were 10 million?"</td><td>I would stream the input rather than build an array. That is Day 3.</td></tr>
+      <tr><td>"How do you test the concurrency?"</td><td>Count live workers in the fake worker and assert the peak never passes the limit.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="trap">
+    <span class="label">Trap — silence while you think</span>
+    A candidate who thinks silently for ninety seconds and writes perfect code scores worse than one who thinks out loud. They cannot grade what they cannot hear. If you are stuck, <b>say what you are stuck on</b>: "I am deciding whether to retry inside the worker or outside it — inside, because then the pool limit still holds during retries." That sentence is worth more than the decision.
+  </div>
+
+  <h2>Score yourself</h2>
+
+  <div class="drill">
+    <span class="label">Run it twice today</span>
+    <p class="situation">Run 1: empty file, fifteen minutes, talking the whole time. Run 2, later in the day: same task, no notes, no scrolling back.</p>
+    Tick honestly. Anything unticked after run 2 is tomorrow's warm-up.
+    <ul>
+      <li>I stated my assumptions before typing.</li>
+      <li>I chose a pool over batches, and said why in one sentence.</li>
+      <li>Results are in input order, not push order.</li>
+      <li><code>Math.min(limit, items.length)</code>, so a short list does not spawn idle workers.</li>
+      <li>The timeout aborts the request, and is not a <code>Promise.race</code>.</li>
+      <li>4xx is never retried. 5xx and network errors are.</li>
+      <li>Backoff has jitter, and I said what jitter prevents.</li>
+      <li>One failure returns a result rather than losing the batch.</li>
+      <li>I named the production library <b>after</b> writing it by hand.</li>
+      <li>I never went silent for more than about ten seconds.</li>
+    </ul>
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source</span>
+    <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise">MDN · Promise</a> for the combinators, then skim <a href="https://github.com/sindresorhus/p-limit">p-limit</a>. Its whole implementation is short — read it once and compare with yours.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0007-many-things-at-once-promise-combinators-and-concurrency.html">Week 7 · Combinators and concurrency</a> ·
+    <a href="../../lessons/0008-build-a-concurrent-multi-api-aggregator.html">Week 8 · Build a concurrent aggregator</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li><b>A pool, not batches.</b> Batches wait for the slowest item in every group.</li>
+      <li>Ten workers share one cursor. <code>next++</code> needs no lock, because one thread runs it.</li>
+      <li>Write to <code>results[i]</code> to keep input order. Never <code>push</code>.</li>
+      <li>A timeout must <b>abort</b> the request. <code>Promise.race</code> leaks the socket.</li>
+      <li>Never retry a 4xx. Retry 5xx and network errors, with backoff <b>and jitter</b>.</li>
+      <li>Return a result per URL. One dead URL must not lose the other 499.</li>
+      <li>Measured: the pool peaked at <b>10</b> in flight, unbounded <code>Promise.all</code> peaked at <b>500</b>.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>they are grading the narration as much as the code.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> MDN's <code>Promise</code> reference and the Node <code>globals</code> page for <code>AbortSignal.timeout</code>. Three things were measured while writing this lesson. The pool, the concurrency peaks, and a full run against a deliberately flaky local server. Node v24.14.0, 2026-08-28.</p>
+
+  <div class="ask">
+    Ready to be graded? Say <b>"run kata 2 on me"</b> — you get the brief, a clock, and follow-ups in interviewer voice.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0005-async-errors-and-the-combinators.html">← Async errors and the combinators</a></span>
+    <span><a href="0007-backpressure-and-the-pull-model.html">Next: Day 3 — backpressure →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "Why is a worker pool better than slicing the list into fixed batches of ten?",
+      options: [
+        "A batch waits for its slowest member, so free workers sit idle until it finishes",
+        "A batch opens all ten sockets at once, while a pool opens them one after another",
+        "A batch cannot keep results in input order, because each group resolves separately",
+        "A batch retries the whole group when any single member of it happens to fail"
+      ],
+      answer: 0,
+      why: "Both shapes cap concurrency at ten, so the limit is not the difference. The difference is idle time: a batch cannot start item eleven until every item in batch one has settled, so one slow URL freezes nine workers. A pool hands the next URL to whichever worker frees up first. Order is easy to keep in both, and neither retries a whole group by design."
+    },
+    {
+      q: "Why use AbortSignal.timeout instead of racing the fetch against a timer?",
+      options: [
+        "A race only stops you waiting, while an abort actually closes the open socket",
+        "A race cannot be used with fetch, because fetch does not return a real promise",
+        "A race resolves before the request is sent, so the retry count is always wrong",
+        "A race throws a TimeoutError that cannot be told apart from a network failure"
+      ],
+      answer: 0,
+      why: "Promise.race settles your side of the wait and nothing else. The request stays open, holding a socket and a file descriptor, and with 500 URLs those accumulate until the process fails. AbortSignal.timeout tears the request down, so the resource is released. It also gives a distinct err.name of TimeoutError, which you can separate from your own AbortError."
+    },
+    {
+      q: "Why must the retry backoff include jitter?",
+      options: [
+        "Without it every client retries in the same instant and knocks the service down again",
+        "Without it the delay doubles too quickly and the last attempt arrives far too late",
+        "Without it the event loop cannot schedule the timers, so some retries never fire",
+        "Without it the retry count drifts, and some requests are attempted more than three times"
+      ],
+      answer: 0,
+      why: "Plain exponential backoff is deterministic, so every client that failed at the same moment waits the same amount and returns together. That synchronised wave is often what keeps a recovering service down. Adding a random component spreads the retries out. The doubling itself is fine, timers still fire without jitter, and the attempt counter is unaffected."
+    },
+    {
+      q: "Inside the pool, why does the shared cursor next++ not need a lock?",
+      options: [
+        "One thread runs the JavaScript, and there is no await between the read and the write",
+        "The cursor is declared with let, so the engine guards it against concurrent writes",
+        "Each worker gets its own copy of the cursor when the async function is created",
+        "Promise.all serialises the workers, so only one of them can ever be running code"
+      ],
+      answer: 0,
+      why: "Interleaving in Node happens only at an await. next++ reads and writes with nothing suspended in between, so no other worker can run during it. In a threaded language this exact line would need a lock. The keyword let gives no guarantee, closures share the one variable rather than copying it, and Promise.all does not serialise anything — it just waits."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “Fetch 500 URLs, ten at a time. Talk me through your approach.”",
+      answer: "I would write a pool rather than batches. Ten worker functions all pull from one shared list using a cursor, and each takes the next index whenever it is free. That matters because batches synchronise on the slowest item in each group, so one slow URL leaves nine workers idle. I write results into results[i] rather than pushing, so the output keeps input order. Then two decisions on top. Each request gets a real timeout with AbortSignal.timeout, not a Promise.race, because a race stops me waiting but leaves the socket open. And I retry only on 5xx and network errors, with exponential backoff plus jitter, never on a 4xx. Finally I return a result object per URL instead of throwing, so one dead URL does not lose the other 499. <br>Why: they want to hear the decisions, not the syntax. Naming batches and rejecting them is what shows you have done this before."
+    },
+    {
+      prompt: "Interviewer: “How do you choose the limit of ten?”",
+      answer: "Not from a feeling. The limit belongs to whatever I am calling, so I start from its published rate limit or its connection budget, and I ask the team that owns it if I can. Then I measure. I raise the limit until either the other service starts returning 429 or 5xx, or my own latency stops improving, and I settle below that. I would also say what the number gives up: a low limit is slower but safe, a high limit is faster until the moment it is not, and the failure is usually sudden rather than gradual. If there is no information at all, ten is a reasonable starting guess for an external HTTP API, and I would say it is a guess. <br>Why: this question is testing whether you treat tuning numbers as evidence or as folklore. Saying 'I would measure it' with the specific signal to watch is the whole answer."
+    },
+    {
+      prompt: "Interviewer: “Would you use a library for this in production?”",
+      answer: "Yes. I would use p-limit for the concurrency and undici for the HTTP client, because undici reuses connections properly and that matters far more than the pool at 500 requests. I would write it by hand in an interview, though, because the mechanism is the thing being tested. The other reason to know the hand-written version is debugging: when a pool misbehaves in production, I need to know whether the limit, the retry, or the connection reuse is the problem, and that means understanding all three. I would also say what the library gives me that my version does not — mainly a well-tested queue and a cleaner cancellation story. <br>Why: naming the library too early looks like avoidance. Naming it at the end, after the hand-written version, shows judgement instead."
+    }
+  ]);
+</script>

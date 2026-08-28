@@ -1,0 +1,513 @@
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operational versus programmer errors, and a real leak — 7-Day Node.js Interview Sprint</title>
+<link rel="stylesheet" href="../assets/base.css">
+
+<div class="wrap">
+  <p class="breadcrumb"><a href="../index.html">← The Map</a></p>
+  <p class="kicker">Day 5 of 7 · Lesson 14 · Production</p>
+  <h1>Operational versus programmer errors, and a real leak</h1>
+  <p class="subtitle">Two production questions with one thing in common. Both are answered badly by candidates who have never been paged at three in the morning.</p>
+  <p class="expertise"><span class="tag">sprint</span><span class="wk">Day 5 of 7.</span> This lesson builds one domain-expert ability: <b>debug a problem in it that has no ready answer online</b>. <a href="../reference/7-day-plan.html#d5">Day 5 in the plan</a> · <a href="../../reference/glossary.html">Glossary</a></p>
+
+  <div class="win">
+    <strong>Your win today:</strong> you can sort any error into two buckets, and say what each bucket does to the process. You can also say how you find a leak, with a number for the heap.
+  </div>
+
+  <h2>Part one — start from the problem</h2>
+
+  <p>An error reaches the top of your program. Nobody caught it.</p>
+
+  <p>Should the process die, or should it keep serving?</p>
+
+  <p>Both answers are correct. They are correct for different errors, and telling them apart is the whole skill.</p>
+
+  <h2>Derive the split</h2>
+
+  <p>Ask one question about the error. <b>Did you expect this could happen, and did you write a plan for it?</b></p>
+
+  <p>If yes, it is an <b>operational error</b>. The outside world failed in a way you already knew about.</p>
+
+  <p>Your code is still correct. Your assumptions still hold. So handle it and keep serving.</p>
+
+  <p>If no, it is a <b>programmer error</b>. It is a bug in your code.</p>
+
+  <p>Now you do not know what else is wrong. A lock may be held. A transaction may be open.</p>
+
+  <p>You cannot reason about the process any more. So end it, and let the platform start a clean one.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Operational — handle it</th><th>Programmer — crash</th></tr></thead>
+    <tbody>
+      <tr><td>An upstream returned 503</td><td><code>Cannot read properties of undefined</code></td></tr>
+      <tr><td>A request timed out</td><td>A function called with the wrong argument</td></tr>
+      <tr><td>The JSON body was malformed</td><td>An invariant you believed was broken</td></tr>
+      <tr><td>The disk was full</td><td>A promise rejection nobody handled</td></tr>
+      <tr><td>A connection was refused</td><td>A typed field that is suddenly <code>undefined</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="soundbite">
+    <span class="label">Say this, word for word</span>
+    <p><b>"An operational error is the world failing in a way I planned for, so I handle it and keep serving. A programmer error means my process state is now unknown, so the safe move is to crash and restart."</b></p>
+  </div>
+
+  <h2>The trap that turns a crash into a zombie</h2>
+
+  <p>Somebody sees crashes in the logs. They add a handler to stop them.</p>
+
+  <pre><code>process.on('uncaughtException', (err) =&gt; {
+  console.log('handler saw:', err.message);   <span class="cmt">// and then… nothing</span>
+});
+
+setTimeout(() =&gt; {
+  console.log('still running 100 ms after the throw');
+}, 100);
+
+throw new Error('programmer error');</code></pre>
+
+  <div class="trap">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    That program printed <code>handler saw: programmer error</code>, then printed <b>still running 100 ms after the throw</b>, then exited with <b>code 0</b>. Registering the handler <b>kept the process alive</b>, and the exit code said everything was fine.
+  </div>
+
+  <p>Look at what that costs you. The bug is still there.</p>
+
+  <p>The request that threw is half-done. Whatever it held is still held.</p>
+
+  <p>And the exit code is 0, so nothing alerts. Your monitoring reports a healthy service.</p>
+
+  <p>A crash is loud, fast and safe. A zombie is silent, slow and wrong.</p>
+
+  <div class="tip">
+    <span class="label">The one correct use of <code>uncaughtException</code></span>
+    Treat it as a <b>last-chance logger</b>, never as recovery. Log the error with its stack, flush the log, then exit with a non-zero code. Same for <code>unhandledRejection</code>. The handler exists so the error is not lost, not so the process survives it.
+  </div>
+
+  <pre><code>process.on('uncaughtException', (err) =&gt; {
+  logger.fatal({ err }, 'uncaught exception — exiting');
+  logger.flush?.();
+  process.exitCode = 1;          <span class="cmt">// non-zero, so the platform notices</span>
+  setTimeout(() =&gt; process.exit(1), 1000).unref();   <span class="cmt">// backstop only</span>
+});</code></pre>
+
+  <h2>Part two — memory that grows</h2>
+
+  <p>Now the second production question. Memory is rising. Is it a leak?</p>
+
+  <p>Rising memory is normal. V8 grows the heap when it is cheaper than collecting.</p>
+
+  <p>So "memory went up" proves nothing on its own. You need a different signal.</p>
+
+  <div class="soundbite">
+    <span class="label">The signal that means leak</span>
+    <p>Memory that rises and <b>never returns across two collections</b>. Not memory that rises. The collector asks "is this reachable?", never "is this needed?". So a leak is memory you still hold and no longer want.</p>
+  </div>
+
+  <p>Watch <code>used_heap_size</code>, not <code>rss</code>. RSS is noisy.</p>
+
+  <p>RSS includes buffers, the thread pool, and memory the operating system has not taken back yet.</p>
+
+  <h2>Finding it — two snapshots and one screen</h2>
+
+  <p>One snapshot shows what exists. It cannot tell you what is new.</p>
+
+  <p>Two snapshots show what <b>grew</b>. Take one, do the suspect work many times, take another.</p>
+
+  <p>Compare them sorted by delta. Then open the <b>retainer path</b> for the biggest growth.</p>
+
+  <p>The retainer path is the chain of references keeping those objects alive. Read it backwards and it becomes a sentence.</p>
+
+  <p>That sentence points at one line of your code. This is the part no tool can do for you.</p>
+
+  <div class="tip">
+    <span class="label">Measured — Node v24.14.0, 2026-08-28</span>
+    Heap used went from <b>3.4 MB</b> to <b>43.5 MB</b> with 200,000 objects retained. After the reference was released it went back to <b>3.4 MB</b>. That return is the proof it was a held reference, not a collector problem.
+  </div>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>The four shapes</th><th>What it looks like</th></tr></thead>
+    <tbody>
+      <tr><td><b>Growing collection</b></td><td>A <code>Map</code> used as a cache with no eviction and no size limit.</td></tr>
+      <tr><td><b>Forgotten listener</b></td><td>A handler added per request, never removed. Node's MaxListeners warning fires.</td></tr>
+      <tr><td><b>Fat closure</b></td><td>A closure captures its whole scope, so a small callback holds a large buffer.</td></tr>
+      <tr><td><b>Uncleared timer</b></td><td>A <code>setInterval</code> nobody clears, holding everything it references.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <figure class="svg-fig">
+    <svg viewBox="0 0 640 330" role="img" aria-labelledby="fig14-title">
+      <title id="fig14-title">The two-bucket error decision, and the shape of a real leak</title>
+
+      <text x="20" y="18" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">ONE QUESTION SORTS EVERY ERROR</text>
+
+      <rect x="150" y="30" width="340" height="28" rx="6" style="fill: var(--card-bg); stroke: var(--accent); stroke-width: 2;"></rect>
+      <text x="320" y="49" text-anchor="middle" style="fill: var(--accent); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">Did I expect this, and plan for it?</text>
+
+      <line x1="240" y1="58" x2="150" y2="80" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <line x1="400" y1="58" x2="490" y2="80" style="stroke: var(--ink-faint); stroke-width: 2;"></line>
+      <text x="182" y="76" style="fill: var(--good); font-family: sans-serif; font-size: 10px; font-weight: 700;">YES</text>
+      <text x="440" y="76" style="fill: var(--warn); font-family: sans-serif; font-size: 10px; font-weight: 700;">NO</text>
+
+      <rect x="20" y="84" width="280" height="62" rx="7" style="fill: var(--card-bg); stroke: var(--good); stroke-width: 2;"></rect>
+      <text x="160" y="104" text-anchor="middle" style="fill: var(--good); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">OPERATIONAL</text>
+      <text x="160" y="122" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">timeout · 503 · bad body · disk full</text>
+      <text x="160" y="138" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">handle it, keep serving</text>
+
+      <rect x="340" y="84" width="280" height="62" rx="7" style="fill: var(--card-bg); stroke: var(--warn); stroke-width: 2;"></rect>
+      <text x="480" y="104" text-anchor="middle" style="fill: var(--warn); font-family: sans-serif; font-size: 11.5px; font-weight: 700;">PROGRAMMER</text>
+      <text x="480" y="122" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">undefined · broken invariant · a bug</text>
+      <text x="480" y="138" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 10px;">state is unknown — crash and restart</text>
+
+      <rect x="340" y="154" width="280" height="26" rx="6" style="fill: var(--paper); stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 4 4;"></rect>
+      <text x="480" y="171" text-anchor="middle" style="fill: var(--ink-soft); font-family: sans-serif; font-size: 9.5px;">uncaughtException here = a zombie, exit code 0</text>
+
+      <text x="20" y="212" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1px;">WHAT A LEAK LOOKS LIKE — HEAP USED, NOT RSS</text>
+
+      <line x1="60" y1="300" x2="620" y2="300" style="stroke: var(--rule); stroke-width: 1.5;"></line>
+      <line x1="60" y1="228" x2="60" y2="300" style="stroke: var(--rule); stroke-width: 1.5;"></line>
+      <text x="24" y="232" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">43.5</text>
+      <text x="30" y="303" style="fill: var(--ink-faint); font-family: sans-serif; font-size: 9px;">3.4</text>
+
+      <polyline points="60,296 130,270 140,286 210,258 220,278 290,248 300,270 370,236 380,232" fill="none" style="stroke: var(--warn); stroke-width: 2.5;"></polyline>
+      <text x="150" y="250" style="fill: var(--warn); font-family: sans-serif; font-size: 10px;">rises, dips at each collection, never returns</text>
+
+      <polyline points="380,232 420,296 500,296 560,296 620,296" fill="none" style="stroke: var(--good); stroke-width: 2.5;"></polyline>
+      <text x="430" y="288" style="fill: var(--good); font-family: sans-serif; font-size: 10px;">reference released → back to 3.4 MB</text>
+
+      <text x="320" y="322" text-anchor="middle" style="fill: var(--accent-2); font-family: sans-serif; font-size: 11px; font-style: italic;">The return is the proof. The collector was never the problem.</text>
+    </svg>
+    <figcaption>One question sorts every error. And a leak is not "memory went up" — it is memory that never comes back down.</figcaption>
+  </figure>
+
+  <div class="feynman">
+    <span class="label">Say it in the simplest words — the Feynman check</span>
+
+    <p class="part"><span class="h">1 · In plain words</span>
+      Some failures are part of the job. A slow network, a bad request, a full disk. You planned for those, so you deal with them and carry on.</p>
+    <p class="part cont">Other failures mean your own code is wrong. Now you do not know what else is broken, so the safe move is to stop and start fresh.</p>
+
+    <p class="part"><span class="h">2 · One analogy</span>
+      A restaurant. A customer sending a dish back is expected, so you cook another one and the evening continues.</p>
+    <p class="part cont">The chef fainting is not expected. You do not keep serving. You close the kitchen, because nobody knows what is half-cooked.</p>
+
+    <p class="part limit"><span class="h">…and where the analogy breaks</span>
+      The restaurant <em>knows</em> the chef fainted. Your process does not know what it half-did.</p>
+    <p class="part limit cont">And a real kitchen cannot prop the chef up in a chair and pretend. Your code can. That is <code>uncaughtException</code> with no exit. I measured it. The process was <b>still running 100 ms after the throw</b>, and it exited with <b>code 0</b>. It looked healthy to every alert you have.</p>
+
+    <p class="part"><span class="h">3 · The sticking point</span>
+      People think crashing is the failure. It is not. Crashing is the <b>safe</b> choice when the state is unknown.</p>
+    <p class="part cont">The unsafe choice is carrying on with a process you can no longer reason about. Crashing is loud, fast and recoverable. A zombie is silent and wrong.</p>
+
+    <div class="part teachback"><span class="h">4 · Now you explain it back</span>
+      <p>In two or three sentences, say which errors you handle and which you crash on. Then say why a zombie is worse than a crash. <b>Send it to me and I will tell you where the gap is.</b>
+      Do not skip this. Saying it in your own words is the part that proves it.</p>
+    </div>
+  </div>
+
+  <h2>The follow-up questions, and the short answers</h2>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>They ask</th><th>You say</th></tr></thead>
+    <tbody>
+      <tr><td>"So you like your service crashing?"</td><td>On a bug, yes. A clean restart beats an unknown state.</td></tr>
+      <tr><td>"How do you restart it?"</td><td>The platform does it. That is what a non-zero exit code is for.</td></tr>
+      <tr><td>"Where does <code>unhandledRejection</code> fit?"</td><td>Same rule. Log it, then exit non-zero. Never swallow it.</td></tr>
+      <tr><td>"Memory grows 40 MB an hour. Restart nightly?"</td><td>That buys time and answers nothing. It fails later, under more traffic.</td></tr>
+      <tr><td>"Which number tells you it is a leak?"</td><td><code>used_heap_size</code> not returning across two collections. RSS is too noisy.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="drill">
+    <span class="label">Drill · 4 minutes, out loud</span>
+    <p class="situation">The interviewer says: "A teammate added an <code>uncaughtException</code> handler that logs and continues. Crashes stopped. Are you happy?"</p>
+    Answer out loud before reading on. A strong answer says the crashes did not stop, only the reporting did. It names the unknown state, the half-done request, and the exit code of 0 that stops anyone being paged. Then it offers the correct version: log, flush, exit non-zero.
+  </div>
+
+  <div id="quiz1"></div>
+  <div id="recall1"></div>
+
+  <div class="tip">
+    <span class="label">Primary source — read this tonight</span>
+    <a href="https://nodejs.org/en/learn/diagnostics/memory">Node — Memory diagnostics</a>, then the <a href="https://nodejs.org/api/process.html">process</a> page's <code>uncaughtException</code> section. Thirty minutes total.
+  </div>
+
+  <div class="tip">
+    <span class="label">Already yours — go deeper later</span>
+    <a href="../../lessons/0028-operational-versus-programmer-errors.html">Week 28 · Operational versus programmer errors</a> ·
+    <a href="../../lessons/0032-memory-and-heap-snapshots.html">Week 32 · Memory and heap snapshots</a> ·
+    <a href="../../lessons/0034-build-find-and-fix-a-real-leak.html">Week 34 · Find and fix a real leak</a>
+  </div>
+
+  <div class="remember">
+    <span class="label">Remember this · the 20-second recap</span>
+    <ul>
+      <li>One question sorts every error: <b>did I expect this, and plan for it?</b></li>
+      <li><b>Operational</b> means the world failed as planned for. Handle it and keep serving.</li>
+      <li><b>Programmer</b> means your state is unknown. Crash, and let the platform restart you.</li>
+      <li><code>uncaughtException</code> with no exit is a <b>zombie</b>. Measured: alive 100 ms later, exit code 0.</li>
+      <li>Use it as a <b>last-chance logger</b> only. Log, flush, exit non-zero.</li>
+      <li>A leak is memory that <b>never returns across two collections</b>. Watch <code>used_heap_size</code>, not <code>rss</code>.</li>
+      <li>Two snapshots, sort by delta, read the <b>retainer path</b> backwards. Measured 3.4 MB to 43.5 MB, then back.</li>
+    </ul>
+    <p class="one-thing">If you remember one thing: <b>a crash is the safe option. Continuing with an unknown state is the dangerous one.</b></p>
+  </div>
+
+  <p class="small"><b>Sources:</b> Node.js official docs — "Memory diagnostics" and the <code>process</code> API. The heap numbers were measured in the parent course on <b>Node v24.14.0</b>, 2026-08-28. The <code>uncaughtException</code> result was re-run while writing this lesson, on the same version and date. Links checked 2026-08-28.</p>
+
+  <div class="ask">
+    Stuck on any of this? <b>Ask your teacher.</b> Say <b>"give me ten errors to sort"</b> and answer each one out loud.
+  </div>
+
+  <div class="footer-nav">
+    <span><a href="0013-graceful-shutdown.html">← Graceful shutdown</a></span>
+    <span><a href="0015-kata-04-the-service-that-hangs.html">Next: Kata 4 — the service that hangs →</a></span>
+  </div>
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+  renderQuiz('#quiz1', [
+    {
+      q: "An upstream API returns 503 and your request handler throws. Which bucket is that, and why?",
+      options: [
+        "Operational, because an upstream failing is a case you expected and planned a response for",
+        "Programmer, because a throw that reaches the handler means an invariant has been broken",
+        "Operational, but only if the upstream is owned by another team inside your company",
+        "Programmer, because a correct handler would have retried the call before it ever threw"
+      ],
+      answer: 0,
+      why: "The sorting question is whether you expected this and wrote a plan for it. An upstream returning 503 is a normal part of running a service, so your code is still correct and your assumptions still hold. You map it to a status code and keep serving. Ownership of the upstream is irrelevant, and a missing retry is a policy choice rather than a bug that puts the process into an unknown state."
+    },
+    {
+      q: "A teammate adds an uncaughtException handler that logs and does not exit. What actually changed?",
+      options: [
+        "The crashes stopped being reported, while the unknown state they signalled stayed exactly the same",
+        "The process now recovers from bugs, so restarts drop and availability genuinely improves",
+        "Errors are routed to the logger instead of stderr, which makes the alerting far more reliable",
+        "Node retries the failed operation once, then continues, so most requests still succeed"
+      ],
+      answer: 0,
+      why: "The bug is still there and the process state is still unknown. What the handler removed is the signal. Measured on Node v24.14.0: the process was still running 100 ms after a throw and exited with code 0, so no alert fires and nobody is paged. The correct shape is to treat the handler as a last-chance logger: log with the stack, flush, then exit with a non-zero code."
+    },
+    {
+      q: "Memory in your service rises steadily. Which observation actually proves it is a leak?",
+      options: [
+        "Used heap does not return to its earlier level across two garbage collections",
+        "Resident set size grows steadily over an hour while request volume stays flat",
+        "The process is restarted nightly and memory is back at its starting point after",
+        "Heap snapshots are larger each time you take one during a normal working day"
+      ],
+      answer: 0,
+      why: "Rising memory is normal, because V8 grows the heap when growing is cheaper than collecting. The signal is memory that rises and never comes back after collection, which means something still holds a reference. RSS is too noisy for this: it includes buffers, the thread pool and memory the operating system has not reclaimed. A nightly restart hides the problem rather than proving anything about it."
+    },
+    {
+      q: "You compared two heap snapshots and sorted by delta. Which screen names the line you must change?",
+      options: [
+        "The retainer path, because it lists the references that are keeping those objects alive",
+        "The shallow size column, because it shows exactly how much each object costs you",
+        "The constructor list, because it groups the growth by the type that was allocated",
+        "The allocation timeline, because it shows the moment each object was first created"
+      ],
+      answer: 0,
+      why: "Delta tells you what grew, and the constructor tells you what kind of thing it is. Neither tells you why it is still alive. The retainer path is the chain of references from a root down to the object, and read backwards it becomes a sentence that points at one line of your code. Shallow size and allocation timing are useful context, but they never name the reference you forgot you were keeping."
+    }
+  ]);
+
+  renderRecall('#recall1', [
+    {
+      prompt: "Interviewer: “When should a Node process crash, and when should it keep going?”",
+      answer: "I sort every error with one question: did I expect this, and did I plan for it? If yes it is an operational error — a timeout, a 503 from an upstream, a malformed body, a full disk. My code is still correct and my assumptions still hold, so I map it to a status code and keep serving. If no it is a programmer error, which means there is a bug. At that point I do not know what else is half-done, what lock is held, or what transaction is open. I cannot reason about the process any more, so the safe move is to exit with a non-zero code and let the platform start a clean one. <br>Why: they are checking whether you treat a crash as a failure or as a tool. Saying 'crash on a bug, on purpose' is the answer that marks production experience."
+    },
+    {
+      prompt: "Interviewer: “Is process.on('uncaughtException') a good idea?”",
+      answer: "As a last-chance logger, yes. As a way to keep running, no. I use it to log the error with its stack, flush the logger, and then exit with a non-zero code. What it must never do is swallow the error and continue. I measured that shape on Node v24.14.0: a handler that only logged left the process still running 100 ms after the throw, and it exited with code 0. So the bug survived, the half-done request survived, and the exit code told every alert that the service was healthy. The crashes did not stop — only the reporting stopped. The same rule applies to unhandledRejection. <br>Why: this is a trap question. They want to know whether you understand that removing the symptom is not the same as fixing the cause."
+    },
+    {
+      prompt: "Interviewer: “How do you find a memory leak in Node?”",
+      answer: "First I decide whether it is a leak at all. Rising memory is normal, because V8 grows the heap when that is cheaper than collecting. The real signal is memory that rises and never returns across two collections, and I watch used_heap_size rather than rss, because RSS is noisy. Then I take two heap snapshots — one before, one after repeating the suspect work many times — and compare them sorted by delta. The screen that matters is the retainer path, which names the chain of references keeping the objects alive; read backwards it is a sentence pointing at one line. I have measured this shape: heap went from 3.4 MB to 43.5 MB with 200,000 objects retained, and returned to 3.4 MB once the reference was released. Nearly all leaks are one of four shapes: a growing collection, a forgotten listener, a fat closure, or an uncleared timer. <br>Why: they want a method, not a tool list. Separating 'is it a leak' from 'where is it' is what makes it repeatable."
+    }
+  ]);
+</script>
