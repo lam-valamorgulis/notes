@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0001 — The design doc</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body class="t1">
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+
+<p class="kicker">Stage 1 — Decide · Lesson 0001</p>
+<h1>The design doc</h1>
+<p class="subtitle">The cheapest place to be wrong is a sentence. Be wrong there
+first.</p>
+
+<div class="win">
+  <strong>Your win this week.</strong> A file called
+  <code>docs/0001-speck.md</code> exists. It says what Speck is, what Speck
+  refuses to do, and one design you rejected. One other human has argued with it.
+  That file is the artefact for weeks 1–2, and half of Gate 1.
+</div>
+
+<p class="expertise">
+  <b>Domain expertise this moves forward:</b> <em>"Say why it was built this way,
+  and what that choice gives up."</em> A design doc is the only artefact whose
+  whole job is to record the trade-off. Without it, in a year, you will remember
+  the choice and not the reason.
+  <b>Tag:</b> <span class="pill core">core</span> — core item 1 of 12.
+</p>
+
+<div class="stagenote">
+  <span class="label">Where you are</span>
+  <p><b>Stage 1 — Decide.</b> Weeks 1–2 of 24. The Stage question is: <em>do we
+  agree what we are building, and in what order?</em></p>
+  <p>The other two Lessons in this block:</p>
+  <ul>
+    <li class="planned">0013 — Non-goals: the section that saves the project <span class="pill depth">depth</span></li>
+    <li class="planned">0014 — Reviewing someone else's design doc <span class="pill depth">depth</span></li>
+  </ul>
+  <p><b>Gate 1</b>, at the end of week 4: a design doc for Speck exists, another
+  person has read it, and it names an option you rejected with the reason. If
+  that is not true, Stage 2 does not start.</p>
+</div>
+
+<!-- ============================================================ 01 -->
+<div class="block why">
+<h2>Why this has to be true</h2>
+
+<p>Start with something you already accept: <b>changing code costs time.</b></p>
+
+<p>Now ask a sharper question. Does every change cost the same? No. Renaming a
+variable costs a minute. Changing what a table means costs a month.</p>
+
+<p>What makes the difference? Not the size of the edit. It is <b>how much
+finished work depends on the thing you are changing.</b></p>
+
+<p>A sentence in a document has nothing depending on it. Delete it, write a new
+one. A column in a live database has every query depending on it, plus every
+screen, plus every backup, plus the rows already sitting in it. You cannot delete
+it. You have to move an entire building.</p>
+
+<p>So the cost of a wrong decision is not fixed. It grows as work piles on top of
+it. And work piles on top of it from the moment you start building.</p>
+
+<div class="soundbite">
+  <span class="label">The whole argument in one line</span>
+  <p>The cost of being wrong grows with time. So the cheapest moment to find out
+  is the earliest moment.</p>
+</div>
+
+<h3>But you cannot find out alone</h3>
+
+<p>Here is the step people skip. Being early is not enough. You also have to
+actually <em>discover</em> the mistake, and a mistake in your head does not
+announce itself. In your head, every plan is coherent. That is what a plan
+<em>is</em> — the version of the idea with the holes smoothed over.</p>
+
+<p>A mistake becomes visible when the idea meets <b>resistance</b>. There are
+three kinds of resistance available, and they cost very different amounts:</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Resistance</th><th>What it costs</th><th>What it catches</th></tr>
+  <tr><td>Building the thing</td><td>Weeks</td><td>Everything, eventually, expensively</td></tr>
+  <tr><td>Another person's opinion</td><td>An hour of theirs</td><td>What they happen to notice</td></tr>
+  <tr><td>Writing it in sentences</td><td>An afternoon</td><td>Every part you were vague about</td></tr>
+</table>
+</div>
+
+<p>Writing is the cheapest resistance there is, and it works even with nobody
+else in the room. The reason is mechanical, not mystical. A vague thought can
+stay vague. A vague sentence <b>looks</b> vague on the page. When you write "the
+widget will handle spam somehow", you can see the word <em>somehow</em>.</p>
+
+<p>So the derivation lands here:</p>
+
+<ol>
+  <li>The cost of being wrong grows with the work built on top.</li>
+  <li>Therefore find out early.</li>
+  <li>You only find out when the idea meets resistance.</li>
+  <li>Writing is the cheapest resistance, and a second reader is the next cheapest.</li>
+  <li><b>Therefore: write the design down, in a form another person can attack,
+  before you build it.</b></li>
+</ol>
+
+<h3>What must be in it, and why</h3>
+
+<p>Step 5 has a word doing all the work: <b>attack</b>. A document you cannot
+disagree with is not resistance. It is a to-do list with headings.</p>
+
+<p>So the sections are not decoration. Each one exists to make a specific
+argument possible <em>now</em> instead of later.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Section</th><th>The argument it lets someone have</th></tr>
+  <tr><td><b>Context and scope</b></td><td>"You have misunderstood the situation."</td></tr>
+  <tr><td><b>Goals</b></td><td>"That is not what success looks like."</td></tr>
+  <tr><td><b>Non-goals</b></td><td>"You cannot leave that out." — or, more often, relief that you are leaving it out.</td></tr>
+  <tr><td><b>The design</b></td><td>"That will not work, and here is where."</td></tr>
+  <tr><td><b>Alternatives considered</b></td><td>"You rejected the right one."</td></tr>
+  <tr><td><b>Cross-cutting concerns</b></td><td>"This leaks customer data."</td></tr>
+</table>
+<p class="verified"><b>Verified:</b> the six section names and their purpose come
+from <a href="https://www.industrialempathy.com/posts/design-docs-at-google/">Design
+Docs at Google</a> (Malte Ubl). The "argument it lets someone have" column is
+<b>ours</b> — the source lists the sections, it does not frame them this way.</p>
+</div>
+
+<div class="recall-inline">
+  <span class="label">Cover the table and answer</span>
+  Two of those six sections are the ones people leave out. Which two, and what
+  argument becomes impossible when they are missing?
+</div>
+
+<h3>The parts that are convention, not logic</h3>
+
+<p>Be honest about which parts of this are derived and which are just what a big
+company settled on.</p>
+
+<div class="note">
+  <span class="label">Convention, not law</span>
+  <p><b>The length.</b> Google's guidance says roughly <b>1–3 pages</b> for a
+  small change and <b>10–20</b> for a large project. Those numbers are an
+  observation about their teams, not a rule you can derive. Several blogs quote
+  "3 to 20 pages" — that is a misquote, and it is
+  <a href="../RESOURCES.md">recorded in RESOURCES.md</a>.</p>
+  <p><b>The section names.</b> A convention. Any set of headings works if it
+  forces goals, non-goals and rejected options into the open.</p>
+  <p><b>Requiring approval before coding.</b> That is a big-company process.
+  Working alone, "approval" means one person read it and pushed back once.</p>
+</div>
+
+<h3>When not to write one</h3>
+
+<p>This part matters as much as the rest, and the same source says it plainly.
+Skip the design doc when:</p>
+
+<ul>
+  <li>the solution is obvious and there are almost no trade-offs;</li>
+  <li>the document would only be an <b>implementation manual</b> — a list of what
+  you will type, with nothing to disagree with;</li>
+  <li>you are prototyping fast, and the overhead would slow the loop that is
+  currently teaching you the most.</li>
+</ul>
+
+<p>Write one when the benefit — agreement now, and a record of the reason later —
+is worth the afternoon it costs. Not otherwise.</p>
+</div>
+
+<!-- ============================================================ 02 -->
+<div class="block feynman">
+<h2>Say it out loud</h2>
+
+<h3>Plain words</h3>
+
+<p>A design doc is you arguing with yourself on paper, before the argument gets
+expensive.</p>
+
+<p>You write down what you are going to build, what you are deliberately
+<em>not</em> going to build, and the other ways you could have done it. Then you
+hand it to one person and ask them to find the hole. Finding the hole costs them
+an hour. Finding it after you built the thing costs you a month.</p>
+
+<h3>One analogy — and where it breaks</h3>
+
+<p><b>The analogy.</b> It is the drawing an architect makes before the builders
+arrive. Moving a wall on the drawing costs a pencil. Moving it after the concrete
+is poured costs a jackhammer, a week, and a very unhappy conversation.</p>
+
+<div class="trap">
+  <span class="label">Where the analogy breaks</span>
+  An architect's drawing is <b>binding</b>. The builders must follow it, and the
+  building is finished exactly as drawn. A design doc is <b>not binding</b>.
+  Software design is partly discovered while building it, so a good doc is
+  expected to be wrong in places by week three.
+  <br><br>
+  If you treat the doc as a contract, you get the worst of both: you move slowly
+  <em>and</em> you follow a plan you already know is wrong. When reality
+  disagrees with the doc, reality wins, and you write down what changed.
+</div>
+
+<h3>The sticking point</h3>
+
+<p>Almost everyone gets this one thing wrong, and it is why so many engineers say
+design docs are a waste of time.</p>
+
+<p><b>They think the doc's job is to describe the plan. It is not. The doc's job
+is to expose the trade-off.</b></p>
+
+<p>A document that only describes the plan cannot be argued with. A reader can
+only say "looks good". They are not being lazy — you gave them nothing to hold.
+So no hole gets found, the doc turns out to be useless, and the conclusion people
+draw is "design docs do not work".</p>
+
+<p>The two sections that turn a description into an argument are
+<b>non-goals</b> and <b>alternatives considered</b>. A doc missing both is a
+to-do list wearing a suit.</p>
+
+<div class="explain">
+  <span class="label">Teach it back</span>
+  <p class="prompt">In two or three sentences, in your own words: why is a design
+  doc that lists no rejected option almost worthless?</p>
+  <p>Write it before you open the box below. Then send your version to me, and I
+  will tell you which part of the idea is not yet solid. Reading a good answer
+  feels like understanding. It is not the same thing.</p>
+</div>
+
+<details class="model">
+  <summary>Show a model answer — only after you have written yours</summary>
+  <p>A design doc exists so someone can find the mistake while it is still cheap
+  to fix. To find a mistake, they need something they can disagree with. If the
+  doc only says what you will build, the only possible response is "fine" —
+  there is no choice on the page to attack.</p>
+  <p>The rejected options are what turn it into a real decision. They show the
+  reader what you weighed, so the reader can tell you that you weighed it wrong.
+  They also survive: in a year, the doc answers "why not the simpler way?" and
+  saves you from redoing the same thinking.</p>
+</details>
+
+<div class="jargon-check">
+  <span class="label">Words that mean you recited the book</span>
+  If your answer contained "alignment", "stakeholders", "single source of truth"
+  or "best practice", you copied a shape instead of an idea. Say it again with
+  none of those four words. If it gets harder, that is the signal.
+</div>
+</div>
+
+<!-- ============================================================ FIGURE -->
+<figure class="figure">
+<svg viewBox="0 0 640 320" role="img" aria-label="A step chart showing that the cost of changing a decision grows depending on where the decision has been recorded: a sentence costs minutes, a prototype costs hours, a schema costs days, live data costs weeks.">
+  <!-- axes -->
+  <line x1="58" y1="268" x2="608" y2="268" class="dg-rule"/>
+  <line x1="58" y1="34"  x2="58"  y2="268" class="dg-rule"/>
+  <text x="10" y="150" class="dg-small" transform="rotate(-90 20 150)">cost to change it</text>
+  <text x="470" y="288" class="dg-small">where the decision now lives →</text>
+
+  <!-- bar 1: a sentence -->
+  <rect x="82"  y="250" width="96" height="18"  class="dg-box"/>
+  <text x="130" y="242" class="dg-label-strong" text-anchor="middle">minutes</text>
+  <text x="130" y="304" class="dg-label" text-anchor="middle">a sentence</text>
+
+  <!-- bar 2: a prototype -->
+  <rect x="208" y="216" width="96" height="52"  class="dg-box"/>
+  <text x="256" y="208" class="dg-label-strong" text-anchor="middle">hours</text>
+  <text x="256" y="304" class="dg-label" text-anchor="middle">a prototype</text>
+
+  <!-- bar 3: the schema -->
+  <rect x="334" y="146" width="96" height="122" class="dg-box"/>
+  <text x="382" y="138" class="dg-label-strong" text-anchor="middle">days</text>
+  <text x="382" y="304" class="dg-label" text-anchor="middle">the schema</text>
+
+  <!-- bar 4: live data -->
+  <rect x="460" y="52"  width="96" height="216" class="dg-box" stroke="currentColor"/>
+  <text x="508" y="44"  class="dg-label-strong" text-anchor="middle">weeks</text>
+  <text x="508" y="304" class="dg-label" text-anchor="middle">live data</text>
+
+  <!-- the marker -->
+  <path d="M130 96 L130 240" class="dg-good" stroke-dasharray="5 4"/>
+  <path d="M124 232 L130 244 L136 232 Z" class="dg-fill-good"/>
+  <text x="146" y="86" class="dg-label-strong">The design doc lives here</text>
+  <text x="146" y="102" class="dg-small">Every hour you delay it, you move right on this chart.</text>
+</svg>
+<figcaption>The same wrong decision, priced at four different moments. Nothing
+about the decision changed — only how much finished work is standing on it.</figcaption>
+</figure>
+
+<!-- ============================================================ 03 -->
+<div class="block hurts">
+<h2>How this fails in production</h2>
+
+<p>Five ways this goes wrong. The first four are the reason people distrust
+design docs. The fifth is the reason they distrust the people who like them.</p>
+
+<div class="scar">
+  <span class="who">The to-do list in a suit</span>
+  The doc lists what will be built. No non-goals, no alternatives. Everyone
+  replies "looks good". Six weeks later two people disagree about whether Speck
+  accepts image attachments — and both of them think the doc agreed with them.
+  <br><br>
+  <b>The tell:</b> nobody left a single comment that changed anything.
+  <b>The fix:</b> before you send it, find the sentence a reasonable engineer
+  would fight you about. If there is not one, you have not made a decision yet.
+</div>
+
+<div class="scar slow">
+  <span class="who">The doc nobody read — fails quietly</span>
+  Fourteen pages, a link in a message, two thumbs-up reactions. This one is
+  dangerous precisely because it feels successful. You now believe the design was
+  reviewed. It was not. You will build on that false confidence for weeks.
+  <br><br>
+  <b>The fix:</b> never ask "any comments?" Ask one specific question that
+  requires having read it. <em>"Which of my three non-goals do you think I will
+  break first?"</em> An unread doc cannot answer that.
+</div>
+
+<div class="scar money">
+  <span class="who">Written after the code — costs real money</span>
+  Very common, and completely pointless. Once the code exists, the doc can only
+  describe it. It cannot change anything, because changing it now means throwing
+  work away — which is exactly the cost the doc was invented to avoid.
+  <br><br>
+  You pay the full price of writing it and get none of the benefit. If a doc is
+  genuinely needed after the fact, write a short record of the decision instead,
+  and be honest that it is a record, not a design.
+</div>
+
+<div class="scar">
+  <span class="who">The doc that will not die</span>
+  Week 1 says Speck stores notes in one table. Week 3 proves that is wrong. The
+  doc still says week 1, and now people argue <em>from the doc</em> against what
+  they can see with their own eyes.
+  <br><br>
+  <b>The fix:</b> a doc has a date and a status. When reality disagrees, reality
+  wins. Mark it superseded and say what changed. A doc pretending to be current
+  is worse than one openly marked stale.
+</div>
+
+<div class="scar slow">
+  <span class="who">A doc for everything — kills the practice</span>
+  Someone reads about design docs and requires one for a two-line config change.
+  The team learns that design docs are paperwork, and quietly stops writing the
+  ones that mattered.
+  <br><br>
+  This failure is named by the source itself: skip the doc when the solution is
+  obvious and the trade-offs are small. <b>The fix:</b> the test is "is there a
+  real choice here?" No choice, no doc.
+</div>
+
+<div class="tip">
+  <span class="label">The pattern under all five</span>
+  Four of the five come from the same mistake: treating the doc as a
+  <em>deliverable</em> instead of a <em>tool for finding mistakes early</em>.
+  Judge any doc by one question — <b>did it change what we build?</b> If not, it
+  did not work, no matter how neat it looks.
+</div>
+</div>
+
+<!-- ============================================================ 04 -->
+<div class="block do">
+<h2>Do it on Speck</h2>
+
+<p>This is the artefact for weeks 1–2. Speck is the invented product this whole
+course builds: a hosted feedback widget. A site owner pastes one
+<code>&lt;script&gt;</code> tag. Visitors leave a short note. The owner reads the
+notes in a dashboard.</p>
+
+<div class="task">
+  <span class="label">The task <span class="needs">a git repo</span><span class="needs">a text editor</span><span class="needs">one human</span></span>
+  <ol>
+    <li>Create a repository called <code>speck</code>. Create the file
+    <code>docs/0001-speck.md</code>.</li>
+    <li>Fill in the six sections below. <b>Keep the whole thing under three
+    pages.</b> Speck is a small product; a 15-page doc for it would be a
+    different failure.</li>
+    <li>Write <b>at least three non-goals</b>. Each one must be something a
+    reasonable person would expect Speck to do. "Speck will not send SMS" is not
+    a non-goal — nobody expected that. "Speck will not let owners reply to a
+    visitor" is a real one.</li>
+    <li>Write <b>at least two alternatives considered</b>, with why you rejected
+    each. One of them must be an option you genuinely find tempting.</li>
+    <li>Write one paragraph each for security, privacy, and how you would know
+    Speck is working.</li>
+    <li>Send it to <b>one</b> human. Ask exactly one question:
+    <em>"Which of my non-goals do you think I will break first, and why?"</em></li>
+  </ol>
+
+  <p class="proof"><b>Proof it worked:</b> three things are true. The file exists.
+  You can argue out loud <em>for</em> the option you rejected — properly, not as a
+  straw man. And one other person has written a comment that made you change a
+  sentence. <b>If nothing changed, the doc did not do its job.</b></p>
+</div>
+
+<h3>The template</h3>
+
+<pre><code># Speck — design doc
+Status: draft · Author: you · Date: 2026-08-29
+
+## Context and scope
+What exists today. Who has this problem. What this document covers,
+and what it does not touch.
+
+## Goals
+What is true when this works. Each one must be checkable.
+
+## Non-goals
+Things Speck could reasonably do, and will not, on purpose.
+At least three. Say why for each.
+
+## The design
+How it works. Start with a rough picture, then the detail.
+Name the parts: the widget, the write endpoint, the store, the dashboard.
+
+## Alternatives considered
+At least two. For each: what it was, and why not.
+One must be an option you actually like.
+
+## Cross-cutting concerns
+Security. Privacy. How you would know it is working.
+</code></pre>
+
+<div class="note">
+  <span class="label">A rule of ours, not the source's</span>
+  <b>If you cannot argue for the rejected option, you did not consider it.</b>
+  Writing "we rejected building our own database because that would be silly" is
+  not a rejected alternative. It is a joke about one. This test is
+  <b>this course's</b>, not Malte Ubl's.
+</div>
+
+<h3>Check yourself</h3>
+<div id="quiz"></div>
+</div>
+
+<h2>Read this week</h2>
+
+<div class="tip">
+  <span class="label">Primary source — read the whole thing</span>
+  <a href="https://www.industrialempathy.com/posts/design-docs-at-google/"><b>"Design
+  Docs at Google" — Malte Ubl</b></a>. About 15 minutes. It is the best single
+  page written on this subject, and everything in Block 01 traces back to it.
+  <br><br>
+  Read it <em>after</em> you have written your first draft of
+  <code>docs/0001-speck.md</code>, not before. You will notice more, because you
+  will have already hit the problems it describes.
+  <br><br>
+  If you want the longer version afterwards:
+  <a href="https://abseil.io/resources/swe-book/html/ch10.html"><i>Software
+  Engineering at Google</i>, chapter 10</a> — free online, and it covers why
+  documents rot and how to stop it.
+</div>
+
+<h2>What this Lesson left out on purpose</h2>
+
+<p>This is a <span class="pill core">core</span> Lesson, so it teaches the 20%
+and skips the rest. Named here so the silence does not read as "that is
+everything":</p>
+
+<ul>
+  <li><b>Non-goals in depth</b> — how to write ones that hold. Queued as Lesson
+  0013.</li>
+  <li><b>Reviewing someone else's doc</b> — the five questions that find the
+  hole. Queued as Lesson 0014.</li>
+  <li><b>ADRs</b> (Architecture Decision Records) — the smaller, one-decision
+  version, written when the decision is made. Defined in the
+  <a href="../reference/glossary.html">glossary</a>; not taught yet.</li>
+  <li><b>Formal RFC processes and design review meetings</b> — they need more
+  people than you have. Depth queue.</li>
+  <li><b>Diagram notations</b> like C4 or UML. A rough box-and-arrow picture is
+  enough at this size.</li>
+</ul>
+
+<!-- ============================================================ RECAP -->
+<div class="remember">
+<h2>Remember this</h2>
+<ul>
+  <li>The cost of a wrong decision grows with the finished work standing on it.
+  So find out early.</li>
+  <li>You only find out when the idea meets resistance. Writing is the cheapest
+  resistance, and a second reader is the next cheapest.</li>
+  <li>Six sections: context and scope, goals, <b>non-goals</b>, the design,
+  <b>alternatives considered</b>, cross-cutting concerns.</li>
+  <li>The doc's job is to expose the trade-off, not to describe the plan. No
+  rejected option means nothing to argue with.</li>
+  <li>Length is convention, not law: about 1–3 pages small, 10–20 large. The
+  "3 to 20" you will see quoted online is a misquote.</li>
+  <li>Skip it when the answer is obvious and the trade-offs are small. Requiring
+  one for everything is how teams learn to hate them.</li>
+  <li>It is not binding. When reality disagrees with the doc, reality wins — and
+  you write down what changed.</li>
+</ul>
+<p class="one-thing">If you remember one thing: a design doc nobody can disagree
+with has already failed.</p>
+</div>
+
+<div class="ask">
+  <b>I am your teacher, not a book.</b> Send me your teach-back answer, or paste
+  your <code>docs/0001-speck.md</code> and I will play the difficult reviewer.
+  If a part of Block 01 did not land, say which sentence — that is the most
+  useful thing you can tell me.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="../reference/glossary.html">Glossary</a></span>
+  <span><a href="../reference/the-build-order.html">The build order</a></span>
+</div>
+
+</div>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz('#quiz', [
+  {
+    q: 'Which section is what makes a design doc reviewable rather than just readable?',
+    options: [
+      'Alternatives considered, with the reasons',
+      'The detailed implementation plan section',
+      'The full list of files being changed',
+      'The delivery timeline with dates on it'
+    ],
+    answer: 0,
+    why: 'A reader can only disagree with a choice. Without rejected options there is no choice on the page, so the only possible reply is "looks good".'
+  },
+  {
+    q: 'Design Docs at Google says NOT to write one. In which case?',
+    options: [
+      'When the solution is obvious and trade-offs are small',
+      'When the project will take longer than one month',
+      'When more than three people are going to read it',
+      'When the system will store any real customer data'
+    ],
+    answer: 0,
+    why: 'The source is explicit. A doc for an obvious change is overhead, and requiring one every time teaches a team to treat design docs as paperwork.'
+  },
+  {
+    q: 'What exactly is a non-goal?',
+    options: [
+      'Something reasonable the design will deliberately not do',
+      'Something the team ran out of time to include here',
+      'Something a later version is expected to deliver instead',
+      'Something the chosen technology stack cannot support'
+    ],
+    answer: 0,
+    why: 'The key word is deliberately. A non-goal is a decision you can defend, not a gap. "Speck will not send SMS" is not one, because nobody expected it.'
+  },
+  {
+    q: 'Why does the cost of a wrong decision grow over time?',
+    options: [
+      'More finished work comes to depend on that decision',
+      'Engineers slowly forget why the choice was made',
+      'Automated testing takes longer as the code grows',
+      'Deadlines make every later change more urgent'
+    ],
+    answer: 0,
+    why: 'Nothing about the decision changes. What changes is how much is standing on it: a sentence has nothing on it, a live table has queries, screens, backups and rows.'
+  }
+]);
+</script>
+</body>
+</html>

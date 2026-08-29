@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Idea to Production</title>
+<link rel="stylesheet" href="../assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="mapnav"><a href="../index.html">← The Map</a></p>
+
+<p class="kicker">Reference · terms</p>
+<h1>Glossary</h1>
+<p class="subtitle">Every term this course uses, in plain words. If a Lesson says
+it, it is here.</p>
+
+<div class="win">
+  <strong>The rule.</strong> A term is introduced once in plain words, then the
+  real name is used from then on. The real name never gets softened into a
+  description, because the real name is the thing you have to type, search for,
+  and say to another engineer.
+</div>
+
+<div class="note">
+  <span class="label">Two kinds of entry</span>
+  Entries marked <b>sourced</b> come from the resource named. Entries marked
+  <b>ours</b> are this course's own wording, and you should not quote them as if
+  a book said them.
+</div>
+
+<h2>Stage 1 — Decide</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Where it comes from</th></tr>
+  <tr>
+    <td><b>Design doc</b></td>
+    <td>A document written before the code. It says what you are building, what
+    you are deliberately not building, how it will work, and which other options
+    you rejected.</td>
+    <td>sourced — <a href="https://www.industrialempathy.com/posts/design-docs-at-google/">Design Docs at Google</a></td>
+  </tr>
+  <tr>
+    <td><b>Non-goal</b></td>
+    <td>A thing the design could reasonably do, and will not. Written down, so
+    nobody argues about it later. Not the same as "we forgot".</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Alternatives considered</b></td>
+    <td>The section listing other designs you thought about, and why you did not
+    pick them. The section that proves the choice was a choice.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Cross-cutting concerns</b></td>
+    <td>The things every part of a design touches: security, privacy, being able
+    to see what it is doing.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>ADR</b> (Architecture Decision Record)</td>
+    <td>A short note recording one decision and its reason. Smaller than a design
+    doc. Written when the decision is made, never edited after.</td>
+    <td>sourced — widely used; see <a href="https://abseil.io/resources/swe-book/html/ch10.html">SWE at Google, ch.&nbsp;10</a> on docs as code</td>
+  </tr>
+  <tr>
+    <td><b>Vertical slice</b></td>
+    <td>A thin piece of work that goes through every layer — screen, server,
+    database — and produces something a user can see.</td>
+    <td>sourced — agile practice; see <a href="https://www.mattblodgett.com/2020/09/start-with-walking-skeleton.html">walking skeleton</a></td>
+  </tr>
+  <tr>
+    <td><b>Horizontal layer</b></td>
+    <td>The opposite. Building all the database, then all the API, then all the
+    UI. Nothing works until the last one is done.</td>
+    <td>ours — the plain contrast term</td>
+  </tr>
+  <tr>
+    <td><b>Walking skeleton</b></td>
+    <td>The thinnest slice of real function that you can build, deploy and test
+    end to end, automatically. It does almost nothing. It is deployed.</td>
+    <td>sourced — Alistair Cockburn, via <a href="https://www.mattblodgett.com/2020/09/start-with-walking-skeleton.html">Blodgett</a></td>
+  </tr>
+  <tr>
+    <td><b>Elephant Carpaccio</b></td>
+    <td>An exercise where a team learns to cut one feature into 15–20 slices,
+    when they first only saw 3.</td>
+    <td>sourced — Cockburn / Kniberg workshop</td>
+  </tr>
+</table>
+</div>
+
+<h2>Stage 2 — Shape</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Where it comes from</th></tr>
+  <tr>
+    <td><b>Data model</b></td>
+    <td>The nouns your system stores and the rules connecting them. In Speck:
+    site, visitor note, owner, plan.</td>
+    <td>sourced — <a href="https://dataintensive.net/">Designing Data-Intensive Applications</a></td>
+  </tr>
+  <tr>
+    <td><b>Schema</b></td>
+    <td>The data model as the database actually holds it: tables, columns, types,
+    constraints.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Migration</b></td>
+    <td>A file that changes the schema, versioned with the code, run in order.
+    Never a change typed by hand into the live database.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Multi-tenant</b></td>
+    <td>One running system serving many separate customers, whose data must never
+    mix. Speck is multi-tenant from day one.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Tenant id</b></td>
+    <td>The column saying which customer a row belongs to. Cheap on day one.
+    Very expensive to add to a full table later.</td>
+    <td>ours — the "cannot add later" framing is this course's</td>
+  </tr>
+  <tr>
+    <td><b>Contract</b></td>
+    <td>The promise your system makes to something outside it: the shape of a
+    request, the shape of a reply, the errors it can return.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>OpenAPI</b></td>
+    <td>A file format describing an HTTP API — every path, parameter and response
+    — that both humans and tools can read.</td>
+    <td>standard — <a href="https://www.openapis.org/">OpenAPI Initiative</a></td>
+  </tr>
+  <tr>
+    <td><b>Breaking change</b></td>
+    <td>A change where a client that worked before now fails, without the client
+    changing at all. Removing a field. Renaming one. Making an optional field
+    required. Tightening authentication.</td>
+    <td>sourced — <a href="https://www.speakeasy.com/api-design/versioning/">Speakeasy</a></td>
+  </tr>
+  <tr>
+    <td><b>Additive change</b></td>
+    <td>A change old clients survive: a new optional field, a new endpoint, a new
+    value in a list they can ignore.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Deprecation</b></td>
+    <td>Marking part of an API as "going away", while it still works, so clients
+    have time to move. OpenAPI 3.1 has a keyword for it.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Twelve-factor app</b></td>
+    <td>Twelve rules for building software that runs the same way everywhere.
+    The ones that matter most here: config comes from the environment, dev and
+    production stay close, logs are just a stream of text.</td>
+    <td>sourced — <a href="https://12factor.net/">12factor.net</a></td>
+  </tr>
+  <tr>
+    <td><b>Config</b></td>
+    <td>Everything that differs between one environment and another: database
+    address, API keys, feature switches. Never in the code.</td>
+    <td>sourced — <a href="https://12factor.net/config">12factor, factor III</a></td>
+  </tr>
+  <tr>
+    <td><b>Environment</b></td>
+    <td>One place the software runs: your laptop, staging, production. Same
+    build, different config.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Dev/prod parity</b></td>
+    <td>Keeping your laptop and production as similar as you can, so a bug shows
+    up before users find it.</td>
+    <td>sourced — <a href="https://12factor.net/dev-prod-parity">12factor, factor X</a></td>
+  </tr>
+  <tr>
+    <td><b>Build artefact</b></td>
+    <td>The one packaged thing your pipeline produces and then promotes through
+    every environment. Built once, never rebuilt per environment.</td>
+    <td>sourced — <a href="https://www.martinfowler.com/bliki/DeploymentPipeline.html">Deployment Pipeline</a></td>
+  </tr>
+  <tr>
+    <td><b>Innovation token</b></td>
+    <td>An imaginary budget of about three novel technology choices. Spend them
+    where they win. Everything else should be boring and well known.</td>
+    <td>sourced — <a href="https://mcfunley.com/choose-boring-technology">Choose Boring Technology</a></td>
+  </tr>
+</table>
+</div>
+
+<h2>Stage 3 — Deliver</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Where it comes from</th></tr>
+  <tr>
+    <td><b>Trunk</b></td>
+    <td>The one main branch everyone merges into. Often called <code>main</code>.</td>
+    <td>sourced — <a href="https://trunkbaseddevelopment.com/">trunkbaseddevelopment.com</a></td>
+  </tr>
+  <tr>
+    <td><b>Trunk-based development</b></td>
+    <td>Everyone merges small changes into trunk at least once a day. Branches
+    live hours, not weeks.</td>
+    <td>sourced — <a href="https://dora.dev/capabilities/trunk-based-development/">DORA</a></td>
+  </tr>
+  <tr>
+    <td><b>Batch size</b></td>
+    <td>How much change goes out at once. Small batches fail small and are easy
+    to undo. Large batches fail large.</td>
+    <td>sourced — <a href="https://itrevolution.com/product/accelerate/">Accelerate</a></td>
+  </tr>
+  <tr>
+    <td><b>Continuous integration</b> (CI)</td>
+    <td>Trunk-based development plus fast automated tests running on every
+    change, so trunk always works.</td>
+    <td>sourced — <a href="https://dora.dev/capabilities/trunk-based-development/">DORA</a></td>
+  </tr>
+  <tr>
+    <td><b>Continuous delivery</b> (CD)</td>
+    <td>Every change that passes the pipeline <em>could</em> go to production at
+    any moment. A human still chooses when.</td>
+    <td>sourced — <a href="https://continuousdelivery.com/">Humble &amp; Farley</a></td>
+  </tr>
+  <tr>
+    <td><b>Continuous deployment</b></td>
+    <td>The same, but no human chooses. Passing the pipeline <em>is</em> the
+    decision. Different from continuous delivery, and often confused with it.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Deployment pipeline</b></td>
+    <td>An ordered set of stages a change must pass. Each stage buys more
+    confidence and costs more time. First failure stops everything.</td>
+    <td>sourced — <a href="https://www.martinfowler.com/bliki/DeploymentPipeline.html">Fowler</a></td>
+  </tr>
+  <tr>
+    <td><b>Unit test</b></td>
+    <td>Tests one small piece on its own. Runs in milliseconds. Points straight
+    at the broken line.</td>
+    <td>sourced — <a href="https://martinfowler.com/articles/practical-test-pyramid.html">Practical Test Pyramid</a></td>
+  </tr>
+  <tr>
+    <td><b>Integration test</b></td>
+    <td>Tests that two real things work together — your code and a real database,
+    for example. Slower, and catches what unit tests cannot.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>End-to-end test</b></td>
+    <td>Drives the whole system like a user does. Most realistic, slowest, and
+    most likely to fail for no reason.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Test pyramid</b></td>
+    <td>The shape of a good suite: many unit tests, fewer integration tests, very
+    few end-to-end tests.</td>
+    <td>sourced — Mike Cohn, then <a href="https://martinfowler.com/bliki/TestPyramid.html">Fowler</a>, then <a href="https://martinfowler.com/articles/practical-test-pyramid.html">Vocke</a></td>
+  </tr>
+  <tr>
+    <td><b>Flaky test</b></td>
+    <td>A test that passes and fails on the same code. Worse than no test,
+    because it teaches you to ignore red.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Test double</b></td>
+    <td>A stand-in for a real thing in a test. A <b>mock</b> is one kind. Too
+    many doubles means you test your fakes, not your system.</td>
+    <td>sourced — <a href="https://martinfowler.com/articles/practical-test-pyramid.html">Vocke</a></td>
+  </tr>
+  <tr>
+    <td><b>Deploy</b></td>
+    <td>Putting new code onto the servers. A technical event. Users may not
+    notice at all.</td>
+    <td>sourced — <a href="https://martinfowler.com/articles/feature-toggles.html">Feature Toggles</a></td>
+  </tr>
+  <tr>
+    <td><b>Release</b></td>
+    <td>Turning a feature on for users. A product event. Separating this from
+    deploy is the key habit of Stage 3.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Feature flag</b> / <b>feature toggle</b></td>
+    <td>A switch that turns a code path on or off without deploying again.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Release toggle</b></td>
+    <td>A flag hiding unfinished work. Short-lived. <b>Must be deleted</b> after
+    the release.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Ops toggle</b></td>
+    <td>A flag that turns an expensive feature off under load. Long-lived on
+    purpose.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Experiment toggle</b></td>
+    <td>A flag that sends different users down different paths, to compare them.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Permission toggle</b></td>
+    <td>A flag that turns features on per customer or per plan. Lives forever.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Dark launch</b></td>
+    <td>Deploying code that runs, but whose result nobody sees yet.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Canary release</b></td>
+    <td>Sending a small share of traffic to the new version first, and watching
+    before sending the rest.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Blue-green deployment</b></td>
+    <td>Two identical environments. Traffic switches from one to the other, and
+    switches straight back if it goes wrong.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Rollback</b></td>
+    <td>Returning to the previous version. The first move in an incident, before
+    understanding anything.</td>
+    <td>sourced — <a href="https://sre.google/static/pdf/IncidentManagementGuide.pdf">Google Incident Management</a></td>
+  </tr>
+  <tr>
+    <td><b>Expand and contract</b></td>
+    <td>Changing a schema in three steps so old and new code both work:
+    <b>expand</b> — add the new thing; <b>migrate</b> — write to both and backfill;
+    <b>contract</b> — drop the old thing. Also called <b>parallel change</b>.</td>
+    <td>sourced — <a href="https://www.tim-wellhausen.de/papers/ExpandAndContract/ExpandAndContract.html">Wellhausen</a></td>
+  </tr>
+  <tr>
+    <td><b>Backfill</b></td>
+    <td>Filling a new column with values for rows that already exist. Done in
+    batches, in the background, restartable.</td>
+    <td>standard term</td>
+  </tr>
+  <tr>
+    <td><b>Zero downtime</b></td>
+    <td>Changing the running system without any request failing. What expand and
+    contract exists to make possible.</td>
+    <td>standard term</td>
+  </tr>
+</table>
+</div>
+
+<h2>Stage 4 — Operate</h2>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Term</th><th>In plain words</th><th>Where it comes from</th></tr>
+  <tr>
+    <td><b>Monitoring</b></td>
+    <td>Watching numbers you decided to watch in advance.</td>
+    <td>sourced — <a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE Book, ch. 6</a></td>
+  </tr>
+  <tr>
+    <td><b>Observability</b></td>
+    <td>Being able to answer a question you did not think of in advance, without
+    shipping new code to find out.</td>
+    <td>standard term, contrasted with monitoring</td>
+  </tr>
+  <tr>
+    <td><b>Four golden signals</b></td>
+    <td><b>Latency</b> — how long a request takes. <b>Traffic</b> — how much
+    demand there is. <b>Errors</b> — how many requests fail. <b>Saturation</b> —
+    how full the system is. If you can watch only four numbers, watch these.</td>
+    <td>sourced — <a href="https://sre.google/sre-book/monitoring-distributed-systems/">SRE Book, ch. 6</a></td>
+  </tr>
+  <tr>
+    <td><b>SLI</b> (Service Level Indicator)</td>
+    <td>One measured number. "The share of requests that returned in under 300
+    milliseconds."</td>
+    <td>sourced — SRE Book</td>
+  </tr>
+  <tr>
+    <td><b>SLO</b> (Service Level Objective)</td>
+    <td>The target for that number. "99% of requests in under 300 milliseconds,
+    measured over 30 days." An internal promise.</td>
+    <td>sourced — SRE Book</td>
+  </tr>
+  <tr>
+    <td><b>SLA</b> (Service Level Agreement)</td>
+    <td>A promise to a customer with money attached if you break it. Speck does
+    not need one yet.</td>
+    <td>sourced — SRE Book</td>
+  </tr>
+  <tr>
+    <td><b>Error budget</b></td>
+    <td>The failure your SLO allows. A 99% SLO permits 1% failure. Spend it on
+    shipping. When it runs out, stop shipping and fix things.</td>
+    <td>sourced — SRE Book</td>
+  </tr>
+  <tr>
+    <td><b>Alert</b> / <b>page</b></td>
+    <td>A message that wakes a human. The rule: if a human does not have to think
+    about it, it should not be a page.</td>
+    <td>sourced — SRE Book, ch. 6</td>
+  </tr>
+  <tr>
+    <td><b>Runbook</b></td>
+    <td>A written list of steps for a known failure. Written for a tired person
+    at 3am, not for you at your best.</td>
+    <td>sourced — <a href="https://sre.google/workbook/incident-response/">SRE Workbook</a></td>
+  </tr>
+  <tr>
+    <td><b>Incident</b></td>
+    <td>A live problem affecting users. It has a start, a person in charge, and
+    an end.</td>
+    <td>sourced — <a href="https://sre.google/static/pdf/IncidentManagementGuide.pdf">Google Incident Management</a></td>
+  </tr>
+  <tr>
+    <td><b>Postmortem</b></td>
+    <td>A written record after an incident: what happened, when, why, and what
+    changes so it does not happen again.</td>
+    <td>sourced — <a href="https://sre.google/workbook/postmortem-culture/">SRE Workbook</a></td>
+  </tr>
+  <tr>
+    <td><b>Blameless</b></td>
+    <td>Assuming everyone involved acted sensibly on the information they had.
+    You fix the system that let it happen, not the person.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Deployment frequency</b></td>
+    <td>DORA metric 1. How often you deploy to production.</td>
+    <td>sourced — <a href="https://cloud.google.com/blog/products/devops-sre/using-the-four-keys-to-measure-your-devops-performance">Four Keys</a></td>
+  </tr>
+  <tr>
+    <td><b>Change lead time</b></td>
+    <td>DORA metric 2. From commit to running in production.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Change failure rate</b></td>
+    <td>DORA metric 3. The share of deploys that needed a fix afterwards.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Failed deployment recovery time</b></td>
+    <td>DORA metric 4. How long from broken to working. Older sources call it
+    <b>MTTR</b> or time to restore service.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>OWASP Top 10</b></td>
+    <td>The ten most critical web application security risks, agreed by a wide
+    group and updated every few years. Current version: <b>2025</b>.</td>
+    <td>sourced — <a href="https://owasp.org/Top10/2025/">OWASP Top 10:2025</a></td>
+  </tr>
+  <tr>
+    <td><b>Broken access control</b> (A01:2025)</td>
+    <td>A user reaching data or actions that are not theirs. Number one on the
+    list. For Speck, the whole game. SSRF now sits inside this category.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>IDOR</b></td>
+    <td>The most common form of it: changing an id in a URL and getting someone
+    else's data.</td>
+    <td>standard term, a kind of A01</td>
+  </tr>
+  <tr>
+    <td><b>Security misconfiguration</b> (A02:2025)</td>
+    <td>Default passwords, open buckets, debug mode left on. Moved up from fifth
+    place in 2021.</td>
+    <td>sourced — <a href="https://owasp.org/Top10/2025/">OWASP Top 10:2025</a></td>
+  </tr>
+  <tr>
+    <td><b>Software supply chain failures</b> (A03:2025)</td>
+    <td>New category in 2025. The risk arrives through your dependencies and your
+    build system, not your code.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>Mishandling of exceptional conditions</b> (A10:2025)</td>
+    <td>New category in 2025. Errors handled badly, failing into an unsafe state.</td>
+    <td>sourced — same</td>
+  </tr>
+  <tr>
+    <td><b>ASVS</b></td>
+    <td>OWASP's checklist version of the same knowledge, at three levels.
+    Level 1 is the right target for a product like Speck.</td>
+    <td>sourced — <a href="https://owasp.org/www-project-application-security-verification-standard/">OWASP ASVS</a></td>
+  </tr>
+  <tr>
+    <td><b>CORS</b></td>
+    <td>The browser rule deciding which websites may call your API from a page.
+    Central to Speck, because its widget runs on other people's sites.</td>
+    <td>standard web platform term</td>
+  </tr>
+  <tr>
+    <td><b>Rate limiting</b></td>
+    <td>Refusing requests above a set speed, per caller. The first defence for a
+    public write endpoint.</td>
+    <td>standard term</td>
+  </tr>
+</table>
+</div>
+
+<h2>Course words</h2>
+
+<p>These are this course's own words. No source uses them this way.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Word</th><th>What it means here</th></tr>
+  <tr><td><b>Speck</b></td><td>The invented product every Lesson builds: a hosted feedback widget.</td></tr>
+  <tr><td><b>Stage</b></td><td>One of the four parts of the course — Decide, Shape, Deliver, Operate. Not the same as a pipeline stage.</td></tr>
+  <tr><td><b>Gate</b></td><td>One sentence that must be true before the next Stage starts. Pass or fail, no middle.</td></tr>
+  <tr><td><b>Artefact</b></td><td>The thing that exists at the end of a two-week block. A file, a deploy, an alarm, a document.</td></tr>
+  <tr><td><b>Core</b> / <b>depth</b></td><td>Core is the 20% taught first. Depth is everything else, queued, not deleted.</td></tr>
+  <tr><td><b>Scar</b></td><td>A block-03 item in a Lesson: a real way this idea fails in production.</td></tr>
+</table>
+</div>
+
+<div class="trap">
+  <span class="label">Two pairs people mix up</span>
+  <b>Deploy and release</b> are not the same thing, and Stage 3 depends on the
+  difference. <b>Pipeline stage</b> and <b>course Stage</b> are also different —
+  this page capitalises the course one.
+</div>
+
+<div class="ask">
+  <b>Found a term in a Lesson that is not here?</b> Tell me and it gets added.
+  A term used but never defined is a bug in the course.
+</div>
+
+<div class="footer-nav">
+  <span><a href="../index.html">← The Map</a></span>
+  <span><a href="the-build-order.html">The build order</a></span>
+  <span><a href="../lessons/0001-the-design-doc.html">Lesson 0001 →</a></span>
+</div>
+
+</div>
+</body>
+</html>

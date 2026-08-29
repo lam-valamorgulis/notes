@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- ============================================================
+     Password gate for the public site.
+
+     deploy-site.sh injects this block into every .html page it
+     publishes. It is NOT part of the source pages, so opening a
+     course on this machine never asks for a password.
+
+     This file is excluded from the rsync, so it is never published
+     as a page of its own.
+
+     How it works:
+       - The <style> below hides the page. It is plain HTML, not
+         something JavaScript adds later, so the page starts hidden
+         and stays hidden if scripts are blocked. Hiding the page
+         from JavaScript instead would mean "scripts off" = "no gate".
+       - The script removes that style straight away if this browser
+         has already unlocked. Both tags sit in the <head>, ahead of
+         any content, so an unlocked reader never sees a flicker.
+       - Otherwise it shows a password box. The right password reveals
+         the page and is remembered in localStorage for this browser,
+         so you type it once, not once per lesson.
+
+     The password itself is NOT in this file. Only its SHA-256 hash
+     is. To change the password, run:
+
+         printf '%s' 'the-new-password' | shasum -a 256
+
+     and paste the result into HASH below. Readers who already
+     unlocked will be asked again, because the stored value no
+     longer matches.
+
+     LIMITS — read these, they matter:
+       1. This is a curtain, not a lock. The whole lesson is inside
+          the same file the browser downloads. Anyone who opens
+          "View source" or runs `curl` on the page reads everything
+          without typing anything.
+       2. It only covers .html pages. The .md files (MISSION.md,
+          NOTES.md, README.md, ...) cannot run JavaScript, so they
+          stay open.
+       3. The published repo is public on GitHub, so every file is
+          readable there regardless of this gate.
+     ============================================================ -->
+<style id="pw-curtain">
+  body > *:not(#pw-gate) { display: none !important; }
+
+  /* Shown only when scripts are blocked. With scripts on the gate
+     covers this, and once unlocked the whole style element is gone. */
+  body::after {
+    content: "These notes are private. Please turn JavaScript on to enter the password.";
+    display: block;
+    padding: 25vh 1.5rem 0;
+    text-align: center;
+    font: 1rem/1.6 Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    color: #767676;
+  }
+
+  #pw-gate {
+    position: fixed; inset: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center;
+    padding: 1.5rem;
+    background: #fdfdfb; color: #1a1a1a;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  }
+  #pw-gate .pw-card { width: 100%; max-width: 24rem; text-align: center; }
+  #pw-gate h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .4rem; letter-spacing: -.01em; }
+  #pw-gate p  { font-size: .9rem; line-height: 1.5; color: #767676; margin: 0 0 1.5rem; }
+  #pw-gate form { display: flex; gap: .5rem; }
+  #pw-gate input {
+    flex: 1; min-width: 0; padding: .6rem .75rem;
+    font: inherit; font-size: 1rem; color: #1a1a1a;
+    background: #fff; border: 1px solid #e3e0d8; border-radius: 6px;
+    outline: none; -webkit-appearance: none; appearance: none;
+  }
+  #pw-gate input:focus { border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.15); }
+  #pw-gate button {
+    padding: .6rem 1.1rem; font: inherit; font-size: 1rem;
+    color: #fff; background: #0f766e;
+    border: 0; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  }
+  #pw-gate button:hover { background: #0c5d56; }
+  #pw-gate .pw-error { min-height: 1.3rem; margin: .75rem 0 0; font-size: .85rem; color: #b45309; }
+  #pw-gate .pw-shake { animation: pw-shake .3s; }
+  @keyframes pw-shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+</style>
+<script>
+(function () {
+  'use strict';
+
+  var KEY  = 'notes-unlocked';
+  var HASH = '86c4336a2020aa1d4edf193b6582c1748410d15a6b79bb0f76e473d8516af772';
+
+  var curtain = document.getElementById('pw-curtain');
+
+  // Already unlocked in this browser? Drop the curtain now, before the parser
+  // has reached any content, and do nothing else. The check is synchronous on
+  // purpose: an unlocked visit must cost nothing and must not flicker.
+  try {
+    if (window.localStorage && localStorage.getItem(KEY) === HASH) {
+      curtain.remove();
+      return;
+    }
+  } catch (e) { /* localStorage blocked (private mode) — fall through to the prompt */ }
+
+  function sha256(text) {
+    var bytes = new TextEncoder().encode(text);
+    return crypto.subtle.digest('SHA-256', bytes).then(function (buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, '0');
+      }).join('');
+    });
+  }
+
+  function build() {
+    var gate = document.createElement('div');
+    gate.id = 'pw-gate';
+    gate.innerHTML =
+      '<div class="pw-card">' +
+        '<h1>These notes are private</h1>' +
+        '<p>Enter the password to read them.</p>' +
+        '<form novalidate>' +
+          '<input type="password" name="pw" autocomplete="current-password" ' +
+                 'aria-label="Password" placeholder="Password" autofocus>' +
+          '<button type="submit">Enter</button>' +
+        '</form>' +
+        '<p class="pw-error" role="alert" aria-live="polite"></p>' +
+      '</div>';
+    document.body.appendChild(gate);
+
+    var card  = gate.querySelector('.pw-card');
+    var form  = gate.querySelector('form');
+    var input = gate.querySelector('input');
+    var error = gate.querySelector('.pw-error');
+    input.focus();
+
+    function reject(message) {
+      error.textContent = message;
+      card.classList.remove('pw-shake');
+      void card.offsetWidth;                       // restart the animation
+      card.classList.add('pw-shake');
+      input.select();
+    }
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      error.textContent = '';
+
+      // crypto.subtle only exists on https:// and localhost. The live site is
+      // https, so this only trips when a staged copy is opened straight off
+      // the disk with file://.
+      if (!window.crypto || !crypto.subtle) {
+        reject('Open this page over https:// — the password check needs a secure connection.');
+        return;
+      }
+
+      sha256(input.value).then(function (digest) {
+        if (digest !== HASH) {
+          reject('That is not the password.');
+          return;
+        }
+        try { localStorage.setItem(KEY, HASH); } catch (e) { /* not remembered, still unlocked */ }
+        curtain.remove();
+        gate.remove();
+      }).catch(function () {
+        reject('Could not check the password. Please try again.');
+      });
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', build);
+  } else {
+    build();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Idea to Production — The Map</title>
+<link rel="stylesheet" href="assets/base.css">
+</head>
+<body>
+<div class="wrap">
+
+<p class="kicker">The Map · single source of truth</p>
+<h1>Idea to Production</h1>
+<p class="subtitle">Someone decided what to build. Now put it in front of real
+users, and keep it working.</p>
+
+<div class="win">
+  <strong>What this course is for.</strong> Twenty-four weeks. One invented
+  product called <b>Speck</b>. At the end, Speck is live, tested, deployed by a
+  pipeline, watched by alarms, and you have broken it on purpose and fixed it.
+  Read <a href="MISSION.md">MISSION.md</a> for the full mission, and
+  <a href="RESOURCES.md">RESOURCES.md</a> for every source used.
+</div>
+
+<h2>The big picture</h2>
+
+<p>Most software that never ships was written. The code existed. What was missing
+was everything around it.</p>
+
+<p>This course teaches the everything-around-it. It starts at the moment the
+decision is already made — someone said <em>build this</em> — and stops when
+strangers depend on it. The half before that moment, finding a problem worth
+solving and cutting it to an MVP, is a different course:
+<a href="../founding-engineer/index.html">Founding Engineer</a>. The two do not
+repeat each other.</p>
+
+<p>The work happens in four Stages, and the order is not decoration. It is the
+order in which mistakes get expensive.</p>
+
+<p><b>Stage 1, Decide.</b> Before any code, you write it down. A
+<a href="lessons/0001-the-design-doc.html">design doc</a> forces the argument to
+happen while it is still cheap — on a page, not in a schema. Then you cut the
+work into <b>vertical slices</b>: thin pieces that go all the way through the
+system and reach production. The first slice is a <b>walking skeleton</b>. It
+does almost nothing, and it is deployed. That is the point.</p>
+
+<p><b>Stage 2, Shape.</b> Now you make the three decisions that are painful to
+undo. The <b>data model</b>, because you will rewrite the front end twice and
+keep the schema. The <b>contract at the edge</b> — Speck puts a
+<code>&lt;script&gt;</code> tag on other people's websites, and you can never
+break it. And <b>config</b>, so the same build runs in every environment with no
+code change.</p>
+
+<p><b>Stage 3, Deliver.</b> This Stage answers one question: how does a change
+get from your laptop to a user, safely, today? Four habits do it.
+<b>Small batches</b> merged to one trunk. A <b>test strategy</b> that one person
+can keep alive. A <b>deployment pipeline</b> where each stage buys more
+confidence. And the habit that makes the rest boring: <b>release is not
+deploy</b>. You ship the code turned off, turn it on with a flag, and change the
+database in steps where old and new code both work.</p>
+
+<p><b>Stage 4, Operate.</b> Live software fails. The question is whether you find
+out from a graph or from a customer. You learn the <b>four golden signals</b>,
+one <b>SLO</b>, the <b>security baseline</b> that matters for a multi-tenant
+product, and what to do in the first ten minutes of an incident. Then you break
+Speck on purpose and write the postmortem.</p>
+
+<p>Twelve core ideas, one per two weeks. Everything else waits in
+<a href="#depth">the depth queue</a>.</p>
+
+<h2 id="progress">Where the course is</h2>
+
+<div class="progress">
+  <div class="bar">
+    <span class="done"></span><span></span><span></span><span></span>
+    <span></span><span></span><span></span><span></span>
+    <span></span><span></span><span></span><span></span>
+  </div>
+  <p class="caption"><b>1 of 12</b> core Lessons written. Stage 1 in progress.
+  Nothing from the depth queue is taught until all twelve are solid.</p>
+</div>
+
+<div class="tracks">
+  <div class="track-card c1">
+    <h3>Stage 1 — Decide</h3>
+    <p>Do we agree what we are building, and in what order?</p>
+    <p class="count">Weeks 1–4 · 2 core Lessons · 1 written</p>
+  </div>
+  <div class="track-card c2">
+    <h3>Stage 2 — Shape</h3>
+    <p>Which decisions will be expensive to undo?</p>
+    <p class="count">Weeks 5–10 · 3 core Lessons · 0 written</p>
+  </div>
+  <div class="track-card c3">
+    <h3>Stage 3 — Deliver</h3>
+    <p>How does code reach users, safely and often?</p>
+    <p class="count">Weeks 11–18 · 4 core Lessons · 0 written</p>
+  </div>
+  <div class="track-card c4">
+    <h3>Stage 4 — Operate</h3>
+    <p>How do we know it is alive, and what happens when it is not?</p>
+    <p class="count">Weeks 19–24 · 3 core Lessons · 0 written</p>
+  </div>
+</div>
+
+<h2 id="speck">The product: Speck</h2>
+
+<p>Every task in every Lesson is done on the same product. <b>Speck</b> is a
+hosted feedback widget. A site owner pastes one <code>&lt;script&gt;</code> tag.
+Visitors leave a short note. The owner reads the notes in a dashboard.</p>
+
+<p>Speck stays the same for all 24 weeks on purpose. The schema you design in
+week 5 is the table you migrate in week 17, with rows in it. A fresh toy project
+per Lesson would hide exactly the problems this course exists to teach.</p>
+
+<div class="table-scroll">
+<table>
+  <tr><th>Speck has</th><th>So the course must teach</th></tr>
+  <tr><td>A public write endpoint anyone can call</td><td>Rate limits, abuse, CORS, input validation</td></tr>
+  <tr><td>Many site owners in one database</td><td>Access control — OWASP's number one risk</td></tr>
+  <tr><td>A script tag on other people's sites</td><td>A public contract you can never break</td></tr>
+  <tr><td>A daily digest email</td><td>Background jobs, retries, doing a thing exactly once</td></tr>
+  <tr><td>Growth from 10 rows to 10 million</td><td>Schema change with users on the table</td></tr>
+  <tr><td>A dashboard behind a login</td><td>Sessions, secrets, config per environment</td></tr>
+</table>
+</div>
+
+<h2 id="weeks">The 24 weeks</h2>
+
+<p>One core Lesson per two weeks. Each block also names its depth Lessons and the
+one artefact it must produce. Each Stage ends with a <b>gate</b> — a sentence
+that must be true before the next Stage starts. The same list, printable, is in
+<a href="reference/the-build-order.html">the build order</a>.</p>
+
+<p class="phase-head p1">Stage 1 — Decide</p>
+<p class="phase-sub">Weeks 1–4. The cheapest place to be wrong is on a page.</p>
+
+<div class="stage s1">
+  <p class="meta">Weeks 1–2 <span class="tag live">Lesson written</span></p>
+  <h3>Write it down before you build it</h3>
+  <p class="desc">The argument you avoid now becomes a rewrite later.</p>
+  <ul class="lesson-links">
+    <li><span class="code">0001</span>
+      <a href="lessons/0001-the-design-doc.html">The design doc</a>
+      <span class="pill core">core</span> — context, goals, <b>non-goals</b>,
+      alternatives considered. A code review before there is code.</li>
+    <li class="planned"><span class="code">0013</span>
+      <b>Non-goals: the section that saves the project</b>
+      <span class="pill depth">depth</span> — writing down what you refuse to build.</li>
+    <li class="planned"><span class="code">0014</span>
+      <b>Reviewing someone else's design doc</b>
+      <span class="pill depth">depth</span> — the five questions that find the hole.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> <code>docs/0001-speck.md</code> — a real design
+  doc for Speck, naming one option you rejected and why.</p>
+</div>
+
+<div class="stage s1">
+  <p class="meta">Weeks 3–4 <span class="tag soon">next</span></p>
+  <h3>Cut it into slices that reach production</h3>
+  <p class="desc">Not all the database, then all the API, then all the UI.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0002</span>
+      <b>Vertical slices and the walking skeleton</b>
+      <span class="pill core">core</span> — the thinnest slice that goes through
+      every layer and deploys.</li>
+    <li class="planned"><span class="code">0015</span>
+      <b>Elephant Carpaccio: finding 15 slices where you saw 3</b>
+      <span class="pill depth">depth</span> — the slicing drill.</li>
+    <li class="planned"><span class="code">0016</span>
+      <b>Slice zero is a deploy, not a login screen</b>
+      <span class="pill depth">depth</span> — why the skeleton starts at the end.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> Speck deployed, doing one nearly useless thing
+  end to end, on a real URL.</p>
+  <p class="buys"><b>Gate 1:</b> a design doc exists, someone else read it, and it
+  names an option you rejected. <b>If it does not, Stage 2 does not start.</b></p>
+</div>
+
+<p class="phase-head p2">Stage 2 — Shape</p>
+<p class="phase-sub">Weeks 5–10. Three decisions that are painful to undo later.</p>
+
+<div class="stage s2">
+  <p class="meta">Weeks 5–6</p>
+  <h3>The data model outlives the code</h3>
+  <p class="desc">You will rewrite the front end twice and keep the schema.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0003</span>
+      <b>The data model outlives the code</b>
+      <span class="pill core">core</span> — model the nouns and the rules before
+      the screens.</li>
+    <li class="planned"><span class="code">0017</span>
+      <b>Choosing the boring stack, once</b>
+      <span class="pill depth">depth</span> — you get about three novel choices.</li>
+    <li class="planned"><span class="code">0018</span>
+      <b>Tenant id: the column you cannot add later</b>
+      <span class="pill depth">depth</span> — where multi-tenancy lives.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> Speck's schema as a migration file, with the
+  tenant boundary in it from the first line.</p>
+</div>
+
+<div class="stage s2">
+  <p class="meta">Weeks 7–8</p>
+  <h3>The contract at the edge</h3>
+  <p class="desc">Speck's script tag lives on other people's sites. It can never break.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0004</span>
+      <b>The contract at the edge</b>
+      <span class="pill core">core</span> — design the API first, and know
+      exactly what counts as a breaking change.</li>
+    <li class="planned"><span class="code">0019</span>
+      <b>Errors are part of the contract</b>
+      <span class="pill depth">depth</span> — a changed error shape breaks clients too.</li>
+    <li class="planned"><span class="code">0020</span>
+      <b>A CI check that fails on a breaking change</b>
+      <span class="pill depth">depth</span> — the rule, enforced by a machine.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> <code>openapi.yaml</code> for Speck, plus a
+  written breaking-change policy you can point at.</p>
+</div>
+
+<div class="stage s2">
+  <p class="meta">Weeks 9–10</p>
+  <h3>Same build, every environment</h3>
+  <p class="desc">One artefact. Different config. No code change.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0005</span>
+      <b>Config from the environment</b>
+      <span class="pill core">core</span> — the twelve-factor rules that survived
+      fifteen years, and the ones that did not.</li>
+    <li class="planned"><span class="code">0021</span>
+      <b>Secrets: the smallest safe version</b>
+      <span class="pill depth">depth</span> — for one person, with no vault.</li>
+    <li class="planned"><span class="code">0022</span>
+      <b>One command to run Speck on a new laptop</b>
+      <span class="pill depth">depth</span> — dev and production, close together.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a README a stranger can follow in 30 minutes.</p>
+  <p class="buys"><b>Gate 2:</b> schema, public API and config are written down,
+  and someone who has never seen Speck runs it in 30 minutes.</p>
+</div>
+
+<p class="phase-head p3">Stage 3 — Deliver</p>
+<p class="phase-sub">Weeks 11–18. How a change gets to a user today, not next month.</p>
+
+<div class="stage s3">
+  <p class="meta">Weeks 11–12</p>
+  <h3>Small batches, one trunk</h3>
+  <p class="desc">Long branches are unmerged risk sitting in a corner.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0006</span>
+      <b>Trunk-based development and small batches</b>
+      <span class="pill core">core</span> — merge at least once a day, three or
+      fewer live branches.</li>
+    <li class="planned"><span class="code">0023</span>
+      <b>Code review when there is nobody to review</b>
+      <span class="pill depth">depth</span> — the one-person substitutes.</li>
+    <li class="planned"><span class="code">0024</span>
+      <b>Commit messages that still help in a year</b>
+      <span class="pill depth">depth</span> — the why, not the what.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> two weeks of Speck commits where no branch
+  lived longer than one day.</p>
+</div>
+
+<div class="stage s3">
+  <p class="meta">Weeks 13–14</p>
+  <h3>Tests one person can maintain</h3>
+  <p class="desc">A slow flaky suite gets switched off, and then protects nothing.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0007</span>
+      <b>A test strategy one person can maintain</b>
+      <span class="pill core">core</span> — many fast, some medium, very few slow.</li>
+    <li class="planned"><span class="code">0025</span>
+      <b>Test the boundary, not the mock</b>
+      <span class="pill depth">depth</span> — the test that passes while the code is broken.</li>
+    <li class="planned"><span class="code">0026</span>
+      <b>Flaky tests are worse than no tests</b>
+      <span class="pill depth">depth</span> — quarantine, then fix or delete.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a suite that runs in under 90 seconds and
+  blocks a bad merge.</p>
+</div>
+
+<div class="stage s3">
+  <p class="meta">Weeks 15–16</p>
+  <h3>The pipeline that ships</h3>
+  <p class="desc">Each stage buys confidence, and each stage costs time.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0008</span>
+      <b>The deployment pipeline</b>
+      <span class="pill core">core</span> — build once, promote the same artefact,
+      deploy on green.</li>
+    <li class="planned"><span class="code">0027</span>
+      <b>What each stage is allowed to cost</b>
+      <span class="pill depth">depth</span> — the time budget per stage.</li>
+    <li class="planned"><span class="code">0028</span>
+      <b>The pipeline is code too</b>
+      <span class="pill depth">depth</span> — reviewed, versioned, testable.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a merge to trunk that reaches production with
+  nobody touching a server.</p>
+</div>
+
+<div class="stage s3">
+  <p class="meta">Weeks 17–18</p>
+  <h3>Release is not deploy</h3>
+  <p class="desc">The habit that makes shipping boring.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0009</span>
+      <b>Release is not deploy — flags and expand/contract</b>
+      <span class="pill core">core</span> — ship it off, turn it on later, and
+      change the schema in three safe steps.</li>
+    <li class="planned"><span class="code">0029</span>
+      <b>The four kinds of flag, and which ones you must delete</b>
+      <span class="pill depth">depth</span> — release, experiment, ops, permission.</li>
+    <li class="planned"><span class="code">0030</span>
+      <b>Backfill a million rows without a lock</b>
+      <span class="pill depth">depth</span> — batches, and how to resume.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> one column added and one dropped on a live
+  Speck table, with no downtime, plus one release rolled back on purpose.</p>
+  <p class="buys"><b>Gate 3:</b> a commit reaches production untouched by hand,
+  and you have rolled a release back on purpose.</p>
+</div>
+
+<p class="phase-head p4">Stage 4 — Operate</p>
+<p class="phase-sub">Weeks 19–24. Find out from a graph, not from a customer.</p>
+
+<div class="stage s4">
+  <p class="meta">Weeks 19–20</p>
+  <h3>Is it alive?</h3>
+  <p class="desc">"Is it healthy?" answered with a number, not a feeling.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0010</span>
+      <b>The four golden signals and one SLO</b>
+      <span class="pill core">core</span> — latency, traffic, errors, saturation,
+      then one promise to users.</li>
+    <li class="planned"><span class="code">0031</span>
+      <b>Logs, metrics, traces: what each one is for</b>
+      <span class="pill depth">depth</span> — three tools, three questions.</li>
+    <li class="planned"><span class="code">0032</span>
+      <b>An alert that does not need a human is a bug</b>
+      <span class="pill depth">depth</span> — why most alerting is noise.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a dashboard with four signals, and exactly one
+  alert that reaches your phone.</p>
+</div>
+
+<div class="stage s4">
+  <p class="meta">Weeks 21–22</p>
+  <h3>The security baseline</h3>
+  <p class="desc">For a multi-tenant product, access control is the whole game.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0011</span>
+      <b>The security baseline — OWASP Top 10:2025</b>
+      <span class="pill core">core</span> — the ten, and the two that actually
+      apply to Speck today.</li>
+    <li class="planned"><span class="code">0033</span>
+      <b>Multi-tenant access control, tested</b>
+      <span class="pill depth">depth</span> — a test that fails if tenant A reads tenant B.</li>
+    <li class="planned"><span class="code">0034</span>
+      <b>Rate limiting a public endpoint</b>
+      <span class="pill depth">depth</span> — the write endpoint anyone can call.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a failing-then-passing test proving one
+  tenant cannot read another's feedback.</p>
+</div>
+
+<div class="stage s4">
+  <p class="meta">Weeks 23–24</p>
+  <h3>When it breaks</h3>
+  <p class="desc">Roll back first. Diagnose second. Blame nobody.</p>
+  <ul class="lesson-links">
+    <li class="planned"><span class="code">0012</span>
+      <b>When it breaks — rollback, incident, postmortem</b>
+      <span class="pill core">core</span> — the first ten minutes, and the
+      four DORA metrics as the scoreboard.</li>
+    <li class="planned"><span class="code">0035</span>
+      <b>The runbook one person can follow at 3am</b>
+      <span class="pill depth">depth</span> — written for a tired version of you.</li>
+    <li class="planned"><span class="code">0036</span>
+      <b>The four DORA metrics on one page</b>
+      <span class="pill depth">depth</span> — measure the pipeline, not the people.</li>
+  </ul>
+  <p class="buys"><b>Artefact:</b> a deliberate outage, an alert received, a
+  rollback done, and a written blameless postmortem.</p>
+  <p class="buys"><b>Gate 4:</b> Speck was broken on purpose, the phone rang, and
+  the postmortem exists. That is the end of the course.</p>
+</div>
+
+<h2 id="depth">The depth queue — the other 80%</h2>
+
+<p>None of this is deleted. All of it waits. Every item here is real work that a
+production system eventually needs, and none of it helps until the twelve core
+items are solid. The one exception is you asking for one — then we do it, and the
+Lesson says which core item got skipped.</p>
+
+<div class="chapter">
+<ul class="lessons">
+  <li><b>Caching and the CDN</b> <span class="pill depth">depth</span>
+    <span class="desc">Where to cache, and the two hard problems: naming and throwing away.</span></li>
+  <li><b>Queues, retries and doing a thing exactly once</b> <span class="pill depth">depth</span>
+    <span class="desc">Speck's digest email is the example. Idempotency keys.</span></li>
+  <li><b>Containers, and when Kubernetes is wrong</b> <span class="pill depth">depth</span>
+    <span class="desc">One deployable unit is correct for a product with no users.</span></li>
+  <li><b>Infrastructure as code</b> <span class="pill depth">depth</span>
+    <span class="desc">Rebuilding the whole environment from a file.</span></li>
+  <li><b>Auth in depth: sessions, tokens, OAuth</b> <span class="pill depth">depth</span>
+    <span class="desc">What each one actually protects against.</span></li>
+  <li><b>Taking money: payments and webhooks</b> <span class="pill depth">depth</span>
+    <span class="desc">The webhook that arrives twice, and the one that never arrives.</span></li>
+  <li><b>Scaling the database</b> <span class="pill depth">depth</span>
+    <span class="desc">Indexes, read replicas, and the point where sharding starts.</span></li>
+  <li><b>Distributed tracing and OpenTelemetry</b> <span class="pill depth">depth</span>
+    <span class="desc">Following one request across services, when there are services.</span></li>
+  <li><b>Load testing and capacity</b> <span class="pill depth">depth</span>
+    <span class="desc">Finding the number where it falls over, before a user does.</span></li>
+  <li><b>Supply chain security</b> <span class="pill depth">depth</span>
+    <span class="desc">OWASP A03:2025. Pinning, SBOMs, and the dependency that changed under you.</span></li>
+  <li><b>Deleting user data properly</b> <span class="pill depth">depth</span>
+    <span class="desc">Retention, backups, and "deleted" meaning deleted.</span></li>
+  <li><b>Disaster recovery you have actually rehearsed</b> <span class="pill depth">depth</span>
+    <span class="desc">A backup nobody restored is a guess, not a backup.</span></li>
+  <li><b>Cost: the bill as a design constraint</b> <span class="pill depth">depth</span>
+    <span class="desc">The query that costs more than the feature earns.</span></li>
+  <li><b>Experiments and A/B tests</b> <span class="pill depth">depth</span>
+    <span class="desc">Experiment flags, and why most results are noise.</span></li>
+  <li><b>Blue-green and canary in detail</b> <span class="pill depth">depth</span>
+    <span class="desc">Beyond the one-machine version taught in Lesson 0009.</span></li>
+  <li><b>Contract testing between services</b> <span class="pill depth">depth</span>
+    <span class="desc">Useful the day Speck stops being one deployable unit.</span></li>
+  <li><b>Performance budgets on the front end</b> <span class="pill depth">depth</span>
+    <span class="desc">Speck's widget runs on other people's pages. Size is a promise.</span></li>
+  <li><b>Handing the code to engineer number two</b> <span class="pill depth">depth</span>
+    <span class="desc">What has to be written down before someone else can help.</span></li>
+</ul>
+</div>
+
+<h2>Reference</h2>
+
+<p>Lessons are read once. These are read many times. They are built to print.</p>
+
+<div class="chapter">
+<ul class="lessons">
+  <li><a href="reference/the-build-order.html">The build order</a>
+    <span class="pill">plan</span>
+    <span class="desc">All 24 weeks on one page: core Lesson, depth Lessons,
+    artefact and gate for each block.</span></li>
+  <li><a href="reference/glossary.html">Glossary</a>
+    <span class="pill">terms</span>
+    <span class="desc">Every term this course uses, in plain words, with the
+    source that defines it. If a Lesson uses a word, it is here.</span></li>
+</ul>
+</div>
+
+<h2>The workspace</h2>
+
+<div class="chapter">
+<ul class="lessons">
+  <li><a href="MISSION.md">MISSION.md</a>
+    <span class="desc">Why this course exists, the 20% core with its sources, and
+    what is deliberately out of scope.</span></li>
+  <li><a href="RESOURCES.md">RESOURCES.md</a>
+    <span class="desc">Every source, annotated, with the date it was last checked
+    and the two URLs that turned out to be wrong.</span></li>
+  <li><a href="NOTES.md">NOTES.md</a>
+    <span class="desc">How Lessons are built here: the four blocks, the Stage
+    colours, and the rules for writing one.</span></li>
+</ul>
+</div>
+
+<h2>Where this sits</h2>
+
+<p>This course is one of several in the same repo. It links sideways instead of
+repeating:</p>
+
+<div class="chapter">
+<ul class="lessons">
+  <li><a href="../founding-engineer/index.html">Founding Engineer</a>
+    <span class="desc">The half before this one: finding a real problem, cutting
+    to an MVP, first users, first price.</span></li>
+  <li><a href="../backend-mastery-tree/index.html">Backend Mastery</a>
+    <span class="desc">How to write the server code. This course assumes you can.</span></li>
+  <li><a href="../nodejs-mastery-in-1-year/index.html">Node.js Mastery</a>
+    <span class="desc">The runtime underneath Speck.</span></li>
+  <li><a href="../frontend-mastery-tree/index.html">Frontend Mastery</a>
+    <span class="desc">The widget and the dashboard.</span></li>
+</ul>
+</div>
+
+<div class="ask">
+  <b>Stuck, or disagree with something?</b> Say so. This Map is a working
+  document, not a finished book. If a Stage is in the wrong order for your real
+  situation, that is a conversation, and the change gets written into a learning
+  record.
+</div>
+
+<div class="footer-nav">
+  <span>Start here → <a href="lessons/0001-the-design-doc.html">Lesson 0001 — The design doc</a></span>
+  <span><a href="reference/the-build-order.html">The build order</a></span>
+</div>
+
+</div>
+</body>
+</html>
